@@ -135,7 +135,8 @@ jobs:
       - name: Show the npm version
         run: npm --version
 
-      # The one publish line. Check this exact command against npm's trusted publishing page on
-      # the first release day, before the first tag is pushed.
+      # The one publish line. It stages the version on npm; nothing is live until a person approves
+      # it with 2FA. The command was checked on 2026-10-11 against npm's trusted publishing and
+      # staged publishing pages.
       - name: Stage the release on npm (a person approves it with 2FA)
         run: npm stage publish --ignore-scripts

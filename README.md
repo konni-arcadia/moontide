@@ -6,6 +6,9 @@
 Claude writes [Strudel](https://strudel.cc) code that plays in your browser and changes without
 ever stopping.**
 
+[![npm version](https://img.shields.io/npm/v/moontide-mcp)](https://www.npmjs.com/package/moontide-mcp)
+[![CI](https://github.com/konni-arcadia/moontide/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/konni-arcadia/moontide/actions/workflows/ci.yml)
+
 <!-- Demo media goes here, right under the pitch. -->
 
 ## How this was made

@@ -202,16 +202,17 @@ test('ask e2e: arming line, live delivery, re-arm and hand-over in a tool reply'
 
   // When the listener ends, the arming line comes back.
   listener.child.kill();
-  await waitForExit(listener.child, 5000);
-  let afterEnd = '';
-  for (let i = 0; i < 100; i++) {
-    afterEnd = await scenario.getCode();
-    if (afterEnd.includes(ARMING_PREFIX)) {
-      break;
+  await waitForExit(listener.child, 10000);
+  // The server notices the closed socket a moment later; poll with the same generous bound as the other waits.
+  let afterEnd = await scenario.getCode();
+  const armingDeadline = Date.now() + 10000;
+  while (!afterEnd.includes(ARMING_PREFIX)) {
+    if (Date.now() > armingDeadline) {
+      throw new Error(`Timed out waiting for the arming line to come back after the listener ended:\n${afterEnd}`);
     }
     await sleep(20);
+    afterEnd = await scenario.getCode();
   }
-  assert.ok(afterEnd.includes(ARMING_PREFIX), 'the arming line must come back once the listener has ended');
 
   // With no listener a request waits, and the next tool reply carries its line once.
   const waitingText = 'make the hats quieter\nand shorter';
@@ -319,6 +320,8 @@ test('ask e2e: an instrument request whose id holds 201 characters is refused in
   assert.equal(typeof refusal.detail, 'string');
   assert.ok(refusal.detail.length > 0);
   await sleep(200);
+  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
+  await scenario.getCode();
   assert.equal(listener.stdout, '', 'a refused request prints nothing');
 });
 
@@ -456,6 +459,8 @@ test('ask e2e: the largest accepted request line reaches the listener whole as o
   assert.equal(refusal.status, 'refused');
   assert.equal(refusal.reason, 'line-too-long');
   await sleep(300);
+  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
+  await scenario.getCode();
   assert.equal(listener.lines().length, 1, 'the longer line never reaches the listener');
 });
 
@@ -492,5 +497,7 @@ test('ask e2e: an error request whose text holds 201 characters is refused inval
   assert.equal(typeof refusal.detail, 'string');
   assert.ok(refusal.detail.length > 0);
   await sleep(200);
+  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
+  await scenario.getCode();
   assert.equal(listener.stdout, '', 'a refused request prints nothing');
 });

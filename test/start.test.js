@@ -31,7 +31,11 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function waitForStderrCount(server, pattern, count, timeoutMs = 10000) {
   const start = Date.now();
   while (countMatches(server.stderrText, pattern) < count) {
-    if (Date.now() - start > timeoutMs) break;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `Timed out waiting for ${count} match(es) of ${pattern} in the server log:\n${server.stderrText}`,
+      );
+    }
     await sleep(10);
   }
 }
@@ -46,6 +50,11 @@ test('a session that connects starts nothing, then the start tool starts Moontid
   assert.ok(!reference.isError, 'the reference answers before any start');
 
   await sleep(300);
+  // A reply to a later request means the server has finished with the earlier ones, so the checks below do not pass only because a line is late.
+  // It also shows that get_code starts nothing.
+  const before = await server.client.callTool({ name: 'get_code', arguments: {} });
+  assert.ok(before.isError, 'get_code before a start is an error');
+  assert.equal(textOf(before), NOT_STARTED_MESSAGE);
   assert.equal(countMatches(server.stderrText, PAGE_LINES), 0, 'no page line before a start');
   assert.equal(countMatches(server.stderrText, NO_BROWSER_LINES), 0, 'no browser line before a start');
 

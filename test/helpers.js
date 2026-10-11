@@ -74,17 +74,22 @@ export async function startMcpClient({ env, start = true, folderName = 'my-proje
   });
 
   const client = new Client({ name: 'moontide-test-client', version: '0.0.0' });
-  await client.connect(transport);
-
   let url = null;
   let port = null;
-  // Moontide starts only on the start tool or a music request, never with the process.
-  if (start) {
-    const reply = await client.callTool({ name: 'start', arguments: {} });
-    if (reply.isError) {
-      throw new Error(`The start tool failed: ${JSON.stringify(reply.content)}`);
+  try {
+    await client.connect(transport);
+    // Moontide starts only on the start tool or a music request, never with the process.
+    if (start) {
+      const reply = await client.callTool({ name: 'start', arguments: {} });
+      if (reply.isError) {
+        throw new Error(`The start tool failed: ${JSON.stringify(reply.content)}`);
+      }
+      ({ url, port } = await waitForUrl(() => stderrText, 10000));
     }
-    ({ url, port } = await waitForUrl(() => stderrText, 10000));
+  } catch (error) {
+    // A failed start must not leave the server child alive, holding a port and its pipes open.
+    await client.close().catch(() => {});
+    throw error;
   }
 
   return {
@@ -157,24 +162,30 @@ export async function spawnServer({ env, start = true, folderName = 'my-project'
   let port = null;
   // Moontide starts only on the start tool or a music request, never with the process.
   if (start) {
-    const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
-    send({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: LATEST_PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: { name: 'moontide-test-raw', version: '0.0.0' },
-      },
-    });
-    send({ jsonrpc: '2.0', method: 'notifications/initialized' });
-    send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'start', arguments: {} } });
-    const reply = await waitForResponse(() => stdoutText, 2, () => stderrText, 10000);
-    if (reply.error || reply.result?.isError) {
-      throw new Error(`The start tool failed: ${JSON.stringify(reply.error ?? reply.result)}`);
+    try {
+      const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
+      send({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: LATEST_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'moontide-test-raw', version: '0.0.0' },
+        },
+      });
+      send({ jsonrpc: '2.0', method: 'notifications/initialized' });
+      send({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'start', arguments: {} } });
+      const reply = await waitForResponse(() => stdoutText, 2, () => stderrText, 10000);
+      if (reply.error || reply.result?.isError) {
+        throw new Error(`The start tool failed: ${JSON.stringify(reply.error ?? reply.result)}`);
+      }
+      ({ url, port } = await waitForUrl(() => stderrText, 10000));
+    } catch (error) {
+      // A failed start must not leave the server child alive, holding a port and its pipes open.
+      child.kill();
+      throw error;
     }
-    ({ url, port } = await waitForUrl(() => stderrText, 10000));
   }
 
   return {
