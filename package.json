@@ -1,0 +1,66 @@
+{
+  "name": "moontide-mcp",
+  "version": "2.0.0",
+  "mcpName": "io.github.konni-arcadia/moontide",
+  "description": "Claude steers live music by writing Strudel code played in a browser page",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "strudel",
+    "live-coding",
+    "music",
+    "midi",
+    "claude"
+  ],
+  "author": "Konni",
+  "homepage": "https://github.com/konni-arcadia/moontide#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/konni-arcadia/moontide.git"
+  },
+  "bugs": {
+    "url": "https://github.com/konni-arcadia/moontide/issues"
+  },
+  "type": "module",
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "moontide-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "page",
+    "reference",
+    "instruments"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test --test-concurrency=1 \"test/*.test.js\"",
+    "prepack": "npm run build",
+    "smoke:npx": "node scripts/smoke-npx.mjs",
+    "check:reference": "node scripts/check-reference.mjs",
+    "tint:report": "npm run build && node scripts/tint-report.mjs",
+    "probe:page": "npm run build && node scripts/probe-page.mjs",
+    "probe:midi": "npm run build && node scripts/probe-midi.mjs",
+    "bench:midi": "npm run build && node scripts/bench-midi-timing.mjs",
+    "bench:edit": "npm run build && node scripts/bench-edit-code.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ws": "8.21.3",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "@types/ws": "8.18.1",
+    "acorn": "8.18.0",
+    "typescript": "7.0.2"
+  }
+}

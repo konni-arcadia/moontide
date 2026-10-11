@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE MIDINameDocument PUBLIC "-//MIDI Manufacturers Association//DTD MIDINameDocument 1.0//EN" "http://www.midi.org/dtds/MIDINameDocument10.dtd" [
+  <!ENTITY e "x">
+]>
+<!-- Written for Moontide's tests. Every name is made up and taken from no instrument or patch file. -->
+<MIDINameDocument>
+  <Author>Moontide test fixture</Author>
+  <MasterDeviceNames>
+    <Manufacturer>Moontide</Manufacturer>
+    <Model>Test Synth</Model>
+    <ChannelNameSet Name="Melodic">
+      <AvailableForChannels>
+        <AvailableChannel Channel="1" Available="true" />
+        <AvailableChannel Channel="2" Available="true" />
+        <AvailableChannel Channel="3" Available="true" />
+        <AvailableChannel Channel="4" Available="true" />
+        <AvailableChannel Channel="5" Available="true" />
+        <AvailableChannel Channel="6" Available="true" />
+        <AvailableChannel Channel="7" Available="true" />
+        <AvailableChannel Channel="8" Available="true" />
+        <AvailableChannel Channel="9" Available="true" />
+        <AvailableChannel Channel="10" Available="false" />
+        <AvailableChannel Channel="11" Available="true" />
+        <AvailableChannel Channel="12" Available="true" />
+        <AvailableChannel Channel="13" Available="true" />
+        <AvailableChannel Channel="14" Available="true" />
+        <AvailableChannel Channel="15" Available="true" />
+        <AvailableChannel Channel="16" Available="true" />
+      </AvailableForChannels>
+      <PatchBank Name="Group One">
+        <MIDICommands>
+          <ControlChange Control="0" Value="0" />
+        </MIDICommands>
+        <PatchNameList>
+          <Patch Number="1" Name="Line -> Arrow" ProgramChange="1" />
+          <Patch Number="2" Name="Alpha &amp; Beta" ProgramChange="2" />
+          <Patch Number="3" Name="Caf&#233; Tone" ProgramChange="003" />
+          <Patch Number="4" Name="=Edge= Tone" ProgramChange="4" />
+          <Patch Number="5" Name="Tone One" ProgramChange="5" />
+        </PatchNameList>
+      </PatchBank>
+      <PatchBank Name="Group Two">
+        <MIDICommands>
+          <ControlChange Control="0" Value="8" />
+        </MIDICommands>
+        <PatchNameList>
+          <Patch Number="1" Name="Beta Two" ProgramChange="0" />
+          <Patch Number="2" Name="Beta Three" ProgramChange="1" />
+          <Patch Number="3" Name="Beta Two" ProgramChange="0" />
+        </PatchNameList>
+      </PatchBank>
+      <PatchBank Name="Group Three">
+        <PatchNameList>
+          <Patch Number="1" Name="Plain One" ProgramChange="20" />
+          <Patch Number="2" Name="Plain Two" ProgramChange="21" />
+          <Patch Number="3" Name="Tone One" ProgramChange="22" />
+          <Patch Number="4" Name="" ProgramChange="23" />
+        </PatchNameList>
+      </PatchBank>
+      <PatchBank Name="Group Four">
+        <MIDICommands>
+          <ControlChange Control="0" Value="12" />
+        </MIDICommands>
+        <PatchNameList>
+          <Patch Number="1" Name="Form A One" ProgramChange="5">
+            <PatchMIDICommands>
+              <ControlChange Control="0" Value="16" />
+              <ProgramChange Number="5" />
+            </PatchMIDICommands>
+          </Patch>
+          <Patch Number="2" Name="Form A Two">
+            <PatchMIDICommands>
+              <ProgramChange Number="6" />
+            </PatchMIDICommands>
+          </Patch>
+        </PatchNameList>
+      </PatchBank>
+      <PatchBank Name="Group Five">
+        <MIDICommands>
+          <ControlChange Control="0" Value="24" />
+        </MIDICommands>
+        <UsesPatchNameList Name="Shared List" />
+      </PatchBank>
+    </ChannelNameSet>
+    <ChannelNameSet Name="Rhythm">
+      <AvailableForChannels>
+        <AvailableChannel Channel="10" Available="true" />
+      </AvailableForChannels>
+      <PatchBank Name="Kits">
+        <PatchNameList>
+          <Patch Number="1" Name="Kit One" ProgramChange="0" />
+          <Patch Number="2" Name="Kit Two" ProgramChange="1" />
+        </PatchNameList>
+      </PatchBank>
+    </ChannelNameSet>
+    <PatchNameList Name="Shared List">
+      <Patch Number="1" Name="Shared One" ProgramChange="0" />
+      <Patch Number="2" Name="Shared Two" ProgramChange="1" />
+    </PatchNameList>
+  </MasterDeviceNames>
+</MIDINameDocument>

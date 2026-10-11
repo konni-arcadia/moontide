@@ -1,0 +1,141 @@
+# This workflow publishes a release to npm. The npm trusted publisher names this file, so do not
+# rename it.
+#
+# A pushed tag that starts with v starts this workflow. Three refusals run first, in this order:
+# the tag equals the package version, the tagged commit is on main, the repository is public.
+# The order is on purpose: a first tag pushed while the repository is still private runs the
+# first two checks for real and stops at the third.
+#
+# The job that runs project code (build) has no token. The job that publishes (publish) is the
+# only one that can get an OIDC token, and it runs no project code other than the publish
+# command. No registry token is stored anywhere: npm trusted publishing is the only way in.
+#
+# Every action reference is a full commit SHA with its version as a comment. Do not use a tag or
+# a branch name: a tag can be moved, a commit cannot.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse unless the tag equals the package version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          [ "$TAG" = "v${version}" ] || { echo "The tag does not match the version in package.json." >&2; exit 1; }
+
+      - name: Refuse unless the tagged commit is on main
+        shell: bash
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "The tagged commit is not on main." >&2; exit 1; }
+
+      - name: Refuse unless the repository is public
+        shell: bash
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          [ "$REPO_PRIVATE" = "false" ] || { echo "The repository is not public (or its visibility could not be read)." >&2; exit 1; }
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install
+        run: npm ci --ignore-scripts
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Keep the build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse unless the tag equals the package version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          [ "$TAG" = "v${version}" ] || { echo "The tag does not match the version in package.json." >&2; exit 1; }
+
+      - name: Refuse unless the tagged commit is on main
+        shell: bash
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "The tagged commit is not on main." >&2; exit 1; }
+
+      - name: Refuse unless the repository is public
+        shell: bash
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          set -euo pipefail
+          [ "$REPO_PRIVATE" = "false" ] || { echo "The repository is not public (or its visibility could not be read)." >&2; exit 1; }
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Get the build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Show the npm version
+        run: npm --version
+
+      # The one publish line. Check this exact command against npm's trusted publishing page on
+      # the first release day, before the first tag is pushed.
+      - name: Stage the release on npm (a person approves it with 2FA)
+        run: npm stage publish --ignore-scripts

@@ -1,0 +1,87 @@
+name: Bug report
+description: Something in Moontide does not work as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this.
+
+        Privacy note: do not paste anything private. Remove names, personal paths and tokens from logs and code before you post them. A security problem does not belong in a public issue: use the private report link on the new-issue page instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the problem in a few sentences.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order, from starting Moontide.
+  - type: input
+    id: version
+    attributes:
+      label: Moontide version
+      description: "The output of npx -y moontide-mcp --version"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: "The output of node --version"
+  - type: dropdown
+    id: browser
+    attributes:
+      label: Browser
+      options:
+        - Chrome
+        - Edge
+        - Safari
+        - Firefox
+        - Other
+  - type: dropdown
+    id: client
+    attributes:
+      label: Claude app
+      options:
+        - Claude Code
+        - Claude Desktop
+        - Other
+  - type: dropdown
+    id: midi
+    attributes:
+      label: Are MIDI instruments involved?
+      options:
+        - "No"
+        - "Yes"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Claude's reply or the terminal output. Remove personal paths and names first."
+      render: shell
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed personal information from what I pasted.
+          required: true

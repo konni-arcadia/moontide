@@ -1,0 +1,5355 @@
+/* Dark full-screen editor with a thin top bar and a full-page
+   audio-unlock overlay. Hand-written, no framework, no bundler. */
+
+:root {
+  --dominant: #0b0d10; /* body/editor background and overlay backdrop base; the real rendered
+                            editor background was not sampled when this was written, so a
+                            seam between the two may show */
+  --secondary: #151920;
+  --accent: #5ec8c0;
+  --destructive: #e5484d;
+  --diff-add: #7fc79a;
+  --diff-remove: #e0898c;
+  --text: #c9d1d9;
+  --surface-2: #1b212a;
+  --border: #262d38;
+  --text-muted: #7d8896;
+  /* Digits that must line up or read as data (ruler cycle numbers,
+     the loop-repeat label, part fractions/countdowns later) — never a general text font. */
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* The "structural / informational" hue — filter curves and loop marks
+     in the Timeline only, never body text and never a track's own color. */
+  --accent-2: #7fb2e5;
+
+  /* Assigned in first-seen order, cycling back to
+     color 1 for a 9th track (page/timeline.js createTrackColors). */
+  --track-1: #c39be8;
+  --track-2: #e0a978;
+  --track-3: #9ac48a;
+  --track-4: #e58fb0;
+  --track-5: #7d8ed8;
+  --track-6: #d4b06a;
+  --track-7: #b8c46a;
+  --track-8: #cf8f6a;
+
+  /* The same eight hues, used only to tell History branch lines apart. */
+  --branch-1: var(--track-1);
+  --branch-2: var(--track-2);
+  --branch-3: var(--track-3);
+  --branch-4: var(--track-4);
+  --branch-5: var(--track-5);
+  --branch-6: var(--track-6);
+  --branch-7: var(--track-7);
+  --branch-8: var(--track-8);
+
+  /* The neutral wash of the code line a mixer change just wrote. Used by
+     .mx-flash only; the accent stays reserved. */
+  --line-flash: color-mix(in srgb, var(--text) 14%, transparent);
+
+  /* The neutral wash of the code block of the selected Mixer strip. Used by .mx-lit only; softer than
+     the flash, and the accent stays reserved. */
+  --code-lit: color-mix(in srgb, var(--text) 8%, transparent);
+
+  /* The two Jam hues, a note to avoid and a chord note outside the scale.
+     Used only by #jam-* and .jam-* selectors (test/page-accent.test.js pins it); the accent and
+     destructive hues stay out of the Jam view, a warning is not an error. */
+  --jam-avoid: #ef5f65;
+  --jam-outside: #f2a93b;
+
+  /* Responsive base: every size in the page derives from this one
+     root font size, so the whole page reads well from a 1080p laptop (15px floor) to 4K
+     (22px ceiling). vh is deliberately left out so window height/aspect ratio never affect
+     text size. */
+  font-size: clamp(15px, 0.78vw, 22px);
+
+  /* The height of the top bar, in one place. The (i) popovers and the return banner
+     derive their vertical offset from it, so a taller or slimmer bar moves them with it. */
+  --bar-height: 2.25rem;
+}
+
+body {
+  margin: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--dominant);
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--text);
+}
+
+/* The bar sits in #chrome, which also holds the session strip and the drawer, and is the anchor the drawer
+   overlays from. The slim bar: --bar-height with a hairline under it. */
+#chrome {
+  position: relative;
+  flex: none;
+}
+
+#top-bar {
+  box-sizing: border-box;
+  height: var(--bar-height);
+  padding: 0 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: var(--secondary);
+  border-bottom: 1px solid var(--border);
+}
+
+/* .bar-text is the same look for a status item that left the bar for a drawer card: the drawer's spans are
+   not direct children of the header, so they carry the class instead. */
+#top-bar > span,
+.bar-text {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* The bar's own text is the Bar size, 0.9375rem; the drawer's .bar-text and the banner keep the
+   smaller Label size. The Label-size parts of the bar (the BPM unit, the cycle, the Layout word, the view digit) say so
+   in their own rules. */
+#top-bar > span {
+  font-size: 0.9375rem;
+}
+
+#top-bar [data-accent="true"] {
+  color: var(--accent);
+}
+
+/* The one Play/Stop button. It shows the action (Play while the sound is
+   not playing, Stop while it plays), so it is neutral: a fill, a hairline border and the text color, never the accent
+   (that belongs to the Playing word and its dot) and never red (red is for the failed-change banner alone). It is a
+   button, not a <span>, so it needs its own font/box rules instead of inheriting #top-bar > span's. The width does
+   not jump between Play and Stop. No transition and no animation. */
+#transport-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-width: 4.5rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  margin: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  line-height: 1.5;
+  cursor: pointer;
+  /* Never shortened or wrapped: the fit steps give up other text first. */
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+#transport-button:hover {
+  border-color: var(--text-muted);
+}
+
+#transport-button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The mark beside the word is a shape, so the state is not carried by color alone: a triangle for Play, a square for
+   Stop. 0.75rem square, drawn with clip-path so it needs no image. */
+.transport-mark {
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  background: var(--text);
+}
+
+#transport-button[data-action="play"] .transport-mark {
+  clip-path: polygon(0 0, 100% 50%, 0 100%);
+}
+
+/* A Play that cannot act (nothing to play, or this tab lost the role) stays reachable and says why on a press and in
+   its title: aria-disabled, never the disabled attribute. Dashed outline, transparent fill, muted text. */
+#transport-button[aria-disabled="true"] {
+  background: transparent;
+  border: 1px dashed var(--text-muted);
+  color: var(--text-muted);
+  cursor: default;
+}
+
+#transport-button[aria-disabled="true"] .transport-mark {
+  background: var(--text-muted);
+}
+
+/* The failed-change banner, in flow under the bar. A row that wraps: the lead, the
+   sentence about the music, the one-line message, and the buttons at the right end (they drop to their own line when
+   the row is full; nothing is cut). Red is for this banner only and never for text: ONE rule holds the destructive
+   left edge and the 9% tint of the failed change (test/page-destructive.test.js pins the selector). A notice (a
+   refusal, an Ask problem) has a muted left edge and the secondary fill. No animation: it appears and disappears. */
+#problem-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-height: 2.25rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--secondary);
+  border-bottom: 1px solid var(--border);
+  border-left: 0.25rem solid var(--text-muted);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#problem-banner[hidden] {
+  display: none;
+}
+
+#problem-banner[data-kind="change"] {
+  background: color-mix(in srgb, var(--destructive) 9%, var(--secondary));
+  border-left: 0.25rem solid var(--destructive);
+}
+
+.problem-lead {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.problem-consequence {
+  white-space: nowrap;
+}
+
+.problem-consequence:empty {
+  display: none;
+}
+
+/* The message: one line, ending in an ellipsis when cut (the one allowed ellipsis of the bar chrome: the full text is
+   one click away). No display rule, so the browser's [hidden] default works unaided. */
+#problem-banner #eval-error {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.problem-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+#problem-banner button,
+#problem-menu button {
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#problem-banner button:hover,
+#problem-menu button:hover {
+  border-color: var(--text-muted);
+}
+
+#problem-banner button:focus-visible,
+#problem-menu button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The banner takes focus only when the user's Esc (or a menu choice) gives it back; the ring is 1px neutral. */
+#problem-banner:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+/* The right-click popover of the banner, three plain buttons in a column at the pointer (left and top are set
+   by page/problem-view.js, clamped inside the window). Fixed and above the drawer; no shadow, no animation. */
+#problem-menu {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  box-sizing: border-box;
+  padding: 0.25rem;
+  background: var(--secondary);
+  border: 1px solid var(--border);
+}
+
+#problem-menu[hidden] {
+  display: none;
+}
+
+#problem-menu button {
+  text-align: left;
+}
+
+/* The failure line of a refused Copy (weight 600) and the Details box take a full row of their own. Neither has a
+   display rule, so the browser's [hidden] default works unaided. The box scrolls inside its own max-height and its text
+   stays selectable. */
+#problem-copy-failure {
+  flex: 1 1 100%;
+  margin: 0;
+  font-weight: 600;
+}
+
+#problem-details {
+  flex: 1 1 100%;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0.5rem;
+  max-height: 12rem;
+  overflow: auto;
+  background: var(--dominant);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/* Visually hidden, kept in the accessibility tree: the alert region that announces a failed change. Always present and
+   never [hidden] (an alert that exists at load is not announced; its text is set later), the #change-status recipe. */
+#problem-alert {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The Views and Layout groups are real buttons. DOM order is the Tab order and
+   the visual order: nothing is moved with CSS order. A flexible spacer pushes the Layout group and what follows to
+   the right end. The two 1px separators are decoration. No transition, animation or [data-motion] rule. The bar has
+   no overflow: hidden, so its own overflow is what the fit loop measures. */
+#bar-spacer {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+#top-bar .bar-sep {
+  flex: none;
+  align-self: center;
+  box-sizing: border-box;
+  width: 0;
+  height: 1.25rem;
+  border-left: 1px solid var(--border);
+}
+
+#top-bar .layout-word {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+/* A segmented group: a 1px frame on the dominant fill, no padding and no gap, so it is 1.75rem tall plus its frame and
+   fits the slim bar. The buttons inside are the hit targets (at least 1.75rem square). The Edits timing group of the
+   Settings card is the third of them and shares every rule below; it only sets its own text size. */
+#view-buttons,
+#layout-buttons,
+#change-timing {
+  display: inline-flex;
+  flex: none;
+  align-items: stretch;
+  box-sizing: border-box;
+  gap: 0;
+  padding: 0;
+  background: var(--dominant);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  line-height: 1.5;
+}
+
+#view-buttons button,
+#layout-buttons button,
+#change-timing button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  margin: 0;
+  padding: 0 0.5rem;
+  background: transparent;
+  border: none;
+  border-radius: 0.25rem;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#layout-buttons button {
+  font-family: var(--font-mono);
+}
+
+#view-buttons button:hover,
+#layout-buttons button:hover,
+#change-timing button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* The selected view or layout: the surface fill, the text color and a 1px inset ring. Not bold, so the group never
+   changes width when the selection moves. Muted text never sits on this fill. */
+#view-buttons button[aria-pressed="true"],
+#layout-buttons button[aria-pressed="true"],
+#change-timing button[aria-pressed="true"] {
+  background: var(--surface-2);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+#view-buttons button:focus-visible,
+#layout-buttons button:focus-visible,
+#change-timing button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+/* The drawer's group keeps the Label size of the drawer (the bar's groups use the Bar size) and never wraps its words. Its
+   own rule, because #change-timing is a div inside a flex row. */
+#change-timing {
+  flex: none;
+  max-width: 100%;
+}
+
+#change-timing button {
+  font-size: 0.8125rem;
+}
+
+/* The digit is mono Label size; it takes its color from the button (muted at rest, the text color when selected). */
+.view-digit {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+/* The status of the latest request to Claude. No display rule: #top-bar > span styles it and the browser's [hidden]
+   works unaided, so nothing to say takes no width. It sits before the Session button in the markup, so it is right of
+   the Layout group. It holds the long sentence and a short form: the short one is for fit step 3 and is aria-hidden. */
+#ask-status {
+  flex: none;
+}
+
+#ask-status .ask-short {
+  display: none;
+}
+
+/* Fit step 3 and 4: the short form shows, and the long sentence is visually hidden but kept in the accessibility tree
+   (never display: none), the recipe of #change-status. */
+#top-bar[data-fit="3"] #ask-status .ask-short,
+#top-bar[data-fit="4"] #ask-status .ask-short {
+  display: inline;
+}
+
+#top-bar[data-fit="3"] #ask-status .ask-long,
+#top-bar[data-fit="4"] #ask-status .ask-long {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The cycle and beat beside the tempo, quiet decoration (Label size, mono, muted). The hidden attribute
+   hides it while nothing plays, so it has no display rule. Fit step 1 drops it with the wordmark (.bar-deco). */
+#top-bar #cycle-beat {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* Whether page requests reach Claude live. No display rule: #top-bar > span
+   styles it and the browser's [hidden] works unaided. After #ask-status in the markup, same order,
+   so it sits right of the request status and left of the motion switch, and the request status
+   appearing never moves it. */
+#page-requests {
+  flex-shrink: 0;
+}
+
+/* Quiet muted text, never an accent: the words carry the state, and the accent stays for what is
+   live in the music. The id pair beats #top-bar > span. */
+#page-requests {
+  color: var(--text-muted);
+}
+
+/* The info buttons: the letter i in a round 1.75rem button, never the sketch's 19px
+   one. Both share this one rule. The border and the letter turn to the text color on hover and while the popover is open;
+   the focus ring is the neutral 1px one; no animation. */
+#page-requests-info,
+#midi-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  box-sizing: border-box;
+  width: 1.75rem;
+  height: 1.75rem;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  margin: 0 0 0 0.25rem;
+  padding: 0;
+  vertical-align: middle;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1;
+  cursor: pointer;
+}
+
+#page-requests-info:hover,
+#midi-info:hover,
+#page-requests-info[aria-expanded="true"],
+#midi-info[aria-expanded="true"] {
+  border-color: var(--text);
+  color: var(--text);
+}
+
+#page-requests-info:focus-visible,
+#midi-info:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The (i)'s popover, right under the top bar at its right end. Label size, no shadow (only
+   #ask-box has one), no accent. No display rule, so the browser's [hidden] works unaided. */
+#page-requests-help,
+#midi-help {
+  position: fixed;
+  top: calc(var(--bar-height) + 0.5rem);
+  right: 1rem;
+  z-index: 1000;
+  max-width: 24rem;
+  /* The offset above plus a 0.5rem margin below: in a short window the popover scrolls instead of being cut off. */
+  max-height: calc(100vh - var(--bar-height) - 1rem);
+  overflow-y: auto;
+  box-sizing: border-box;
+  padding: 0.5rem;
+  background: var(--secondary);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#page-requests-help p,
+#midi-help p {
+  margin: 0 0 0.5rem;
+}
+
+#page-requests-help p:last-child,
+#midi-help p:last-child {
+  margin-bottom: 0;
+}
+
+#page-requests-help code,
+#midi-help code {
+  font-family: var(--font-mono);
+}
+
+/* MIDI port indicator: between the request status and the page-requests status, so the
+   page-requests (i) and the motion switch never move when it appears. No display rule on the span, so
+   the browser's [hidden] works unaided. Quiet muted text when all is well; --text and weight 600 when a
+   port needs attention; never an accent or the destructive color (a port problem is not a failed
+   evaluation). It never shrinks. */
+#midi-state {
+  flex-shrink: 0;
+}
+
+#midi-state {
+  color: var(--text-muted);
+}
+
+#midi-state[data-attention="true"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* One dot per port, before the text. Shape tells the two kinds apart: filled is connected, a hollow
+   ring is missing. The dot itself is the existing .state-dot. */
+#midi-dots {
+  display: inline-flex;
+  gap: 0.25rem;
+  margin-right: 0.25rem;
+  vertical-align: middle;
+}
+
+#midi-dots[hidden] {
+  display: none;
+}
+
+.midi-dot[data-kind="hollow"] {
+  background: transparent;
+  border: 1px solid var(--text);
+  box-sizing: border-box;
+}
+
+/* A dash is "not checked": Web MIDI is not on, so there is nothing to read. A ring reads "missing", a disc
+   reads "there". The width comes from .state-dot. */
+.midi-dot[data-kind="unknown"] {
+  height: 1px;
+  border-radius: 0;
+  background: var(--text-muted);
+  box-sizing: border-box;
+}
+
+/* A ring with a slash is "switched off": a ring says "not there", the slash says "on purpose". One
+   diagonal made of 1px stops, so the dot keeps the .state-dot size. Muted, never a color. */
+.midi-dot[data-kind="off"] {
+  border: 1px solid var(--text-muted);
+  box-sizing: border-box;
+  background: linear-gradient(to top right, transparent calc(50% - 1px), var(--text-muted) calc(50% - 1px), var(--text-muted) 50%, transparent 50%);
+}
+
+/* The MIDI popover shares the #page-requests-help rule blocks above, so the two cannot drift. Its port
+   list has no bullets; the width cap is the shared max-width with the window edge margin inside it. */
+#midi-help {
+  max-width: min(24rem, calc(100vw - 2rem));
+}
+
+#midi-help ul {
+  margin: 0 0 0.5rem;
+  padding: 0;
+  list-style: none;
+}
+
+#midi-help li + li {
+  margin-top: 0.25rem;
+}
+
+#midi-help li {
+  overflow-wrap: anywhere;
+}
+
+.midi-outputs {
+  color: var(--text-muted);
+}
+
+/* The return banner after a hidden period: a fixed box under the top bar, so it floats over the page and
+   never moves the layout and never takes focus. Above the code, below a popover the user opened (1000)
+   and the audio-unlock overlay (2000). Its own [hidden] rule, because it has a display rule. */
+#midi-banner {
+  position: fixed;
+  top: calc(var(--bar-height) + 0.5rem);
+  right: 1rem;
+  z-index: 900;
+  max-width: min(24rem, calc(100vw - 2rem));
+  box-sizing: border-box;
+  padding: 0.5rem;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.25rem;
+  background: var(--secondary);
+  border: 1px solid var(--text-muted);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  transition: opacity 150ms;
+}
+
+#midi-banner[hidden] {
+  display: none;
+}
+
+#midi-banner[data-leaving="true"] {
+  opacity: 0;
+}
+
+#midi-banner-text {
+  margin: 0;
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The return banner's Dismiss: a quiet outlined button of at least 1.75rem square, in the muted color, like the
+   Session card's #take-back (the underline of the old text button would float away from a taller box). */
+#midi-banner-dismiss {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  padding: 0 0.75rem;
+  margin: 0;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#midi-banner-dismiss:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+#midi-banner-dismiss:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+/* MIDI: the superseded-tab segment: neutral text and a quiet button, never an accent
+   or the destructive color (the Stop red means silence; this says where the sound is). No display
+   rule on the segment, so the browser's [hidden] works unaided (test/page-hidden.test.js). */
+#midi-takeover {
+  color: var(--text);
+  flex-shrink: 0;
+}
+
+/* The card's Play in this tab button: a quiet outlined button of at least 1.75rem square. */
+#take-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  padding: 0 0.75rem;
+  margin: 0 0 0 0.5rem;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+#take-back:not(:disabled):hover {
+  border-color: var(--text-muted);
+}
+
+#take-back:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#take-back:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+/* Same box/font rules as the other bar buttons (inherited font, Label size),
+   but never destructive- or accent-colored (turning motion off is not a
+   destructive action). */
+#motion-switch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  padding: 0 0.75rem;
+  margin: 0;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+  color: var(--text-muted);
+  /* Never shortened or wrapped onto a second line (same as #transport-button). */
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+#motion-switch:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+#motion-switch:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The tempo readout, the pending-change countdown, the hand-edit setting and the hidden
+   status line. No display rule on the three ids (#top-bar > span styles them and the browser's [hidden]
+   works unaided), and no transition, animation or [data-motion] rule: they never move, in either motion
+   mode. None of them shrinks or ellipsizes; the fit step below takes text away instead. */
+#top-bar #tempo-readout {
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+/* The readout is always in the bar and has no hidden state. The number reads as data
+   and is the one large text of the chrome (Tempo role: 1.25rem, weight 600): mono tabular digits in a box that is at
+   least 3ch wide and right-aligned, so 98 becoming 118 moves nothing. The idle dash is muted. */
+#tempo-readout .tempo-num {
+  display: inline-block;
+  min-width: 3ch;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+#tempo-readout[data-idle="true"] .tempo-num {
+  color: var(--text-muted);
+}
+
+/* The unit is Label size and muted; the tempo a waiting change brings (the arrow part) is mono and muted too. */
+#tempo-readout .tempo-unit {
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+#tempo-readout .tempo-arrow {
+  font-family: var(--font-mono);
+  font-size: 0.9375rem;
+  color: var(--text-muted);
+}
+
+/* The only new accent-2 selector of the top bar: "structural / informational", the hue of the queued Parts
+   card. A waiting change is normal, not live music (the accent) and not an error (the destructive color). */
+#top-bar #pending-change {
+  flex-shrink: 0;
+  white-space: nowrap;
+  color: var(--accent-2);
+}
+
+/* Visually hidden, kept in the accessibility tree: the live region for queued, canceled and setting lines.
+   Always present and never [hidden], so it is announced reliably. */
+#change-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The fit steps (page/top-bar-view.js): the loop restarts at data-fit="0" and raises the step
+   while the bar overflows, so the page gives up text in this order and never clips: 1 the decoration (the wordmark and
+   the cycle and beat), 2 the names of the unselected view buttons (the digit and the selected name stay), 3 the long
+   texts to their short form (the pending-change lead, the BPM unit, the word Layout, the ' here' after Stopped, the ask
+   status), 4 tighter spacing. Plain attribute selectors, because the stylesheet has no at-rule. The full text stays in
+   an aria-label, a title or the visually hidden long form, so nothing is lost to a screen reader. Each step includes the
+   ones before it. */
+#top-bar[data-fit="1"] .bar-deco,
+#top-bar[data-fit="2"] .bar-deco,
+#top-bar[data-fit="3"] .bar-deco,
+#top-bar[data-fit="4"] .bar-deco {
+  display: none;
+}
+
+#top-bar[data-fit="2"] #view-buttons button[aria-pressed="false"] .view-name,
+#top-bar[data-fit="3"] #view-buttons button[aria-pressed="false"] .view-name,
+#top-bar[data-fit="4"] #view-buttons button[aria-pressed="false"] .view-name {
+  display: none;
+}
+
+#top-bar[data-fit="3"] .pending-lead,
+#top-bar[data-fit="4"] .pending-lead {
+  display: none;
+}
+
+#top-bar[data-fit="3"] .tempo-unit,
+#top-bar[data-fit="4"] .tempo-unit {
+  display: none;
+}
+
+#top-bar[data-fit="3"] .layout-word,
+#top-bar[data-fit="4"] .layout-word {
+  display: none;
+}
+
+#top-bar[data-fit="3"] .state-here,
+#top-bar[data-fit="4"] .state-here {
+  display: none;
+}
+
+#top-bar[data-fit="4"] {
+  gap: 0.25rem;
+  padding: 0 0.5rem;
+}
+
+#top-bar[data-fit="4"] .bar-sep {
+  display: none;
+}
+
+#top-bar[data-fit="4"] #transport-button,
+#top-bar[data-fit="4"] #session-button {
+  padding: 0 0.5rem;
+}
+
+#top-bar[data-fit="4"] #view-buttons button {
+  padding: 0 0.25rem;
+}
+
+#sound-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.state-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+/* The sound state's dot is a hollow 1px muted ring while the music does not play and a filled accent dot while
+   it does (shape as well as color), and the word beside it is muted until it says Playing. No pulse. */
+#sound-state .state-dot {
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px solid var(--text-muted);
+}
+
+#sound-state:not([data-accent="true"]) .state-label,
+#sound-state .state-here {
+  color: var(--text-muted);
+}
+
+#sound-state[data-accent="true"] .state-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The Session button at the right end of the bar, the
+   strip that repeats what must not hide behind a click, and the drawer that holds the quiet status items. Nothing
+   here moves: no transition, animation or [data-motion] rule, in either motion mode. Colors are the neutral ones;
+   the accent stays on Playing and red stays off. Every button is at least 1.75rem square. */
+#session-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#session-button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+/* Something needs the user: text color, weight 600 and a neutral outline; the count sits in a pill. Never accent, never red. */
+#session-button[data-needs="true"] {
+  color: var(--text);
+  font-weight: 600;
+  border-color: var(--text-muted);
+}
+
+#session-button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#session-count {
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: 0.75rem;
+  padding: 0 0.5rem;
+  font-family: var(--font-mono);
+  font-weight: 400;
+}
+
+/* The strip: one muted line under the bar, only while the drawer is closed and a condition holds. */
+#session-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-height: 1.75rem;
+  padding: 0.25rem 0.75rem;
+  background: var(--secondary);
+  border-bottom: 1px solid var(--border);
+  border-left: 0.25rem solid var(--text-muted);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#session-strip[hidden] {
+  display: none;
+}
+
+#strip-take-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#strip-take-back[hidden] {
+  display: none;
+}
+
+#strip-take-back:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+#strip-take-back:disabled {
+  background: transparent;
+  color: var(--text-muted);
+  cursor: default;
+}
+
+#strip-take-back:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The drawer: an overlay under the bar that pushes nothing, above the page and below the popovers (1000) and the
+   return banner (900). Its cards fill the width in columns of at least 16rem. */
+#session-drawer {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 800;
+  box-sizing: border-box;
+  max-height: calc(100vh - 6rem);
+  overflow: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  align-items: start;
+  gap: 0.75rem;
+  padding: 1rem;
+  background: var(--secondary);
+  border-bottom: 1px solid var(--border);
+  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.45);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#session-drawer[hidden] {
+  display: none;
+}
+
+#session-drawer:focus {
+  outline: none;
+}
+
+#session-drawer:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.session-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 0.75rem;
+  background: var(--dominant);
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+}
+
+/* A card holding something that needs the user. */
+.session-card[data-needs="true"] {
+  border-color: var(--text-muted);
+}
+
+/* A card whose status item is hidden is not rendered (no MIDI use, no page-requests status yet). */
+#session-card-midi:has(#midi-state[hidden]),
+#session-card-requests:has(#page-requests[hidden]) {
+  display: none;
+}
+
+/* The Last change card says so when there is no version yet. */
+#session-card-change:has(#version-indicator:not([hidden])) .session-empty {
+  display: none;
+}
+
+/* Inside a card the texts wrap instead of being cut: the 39-character MIDI line fits a 16rem card. */
+.session-card .bar-text {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.session-card-title {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.session-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+/* The first row of the Session card names this page's server. Stacked so only the value wraps at the narrowest
+   card; the value wraps and is never cut. The row is never hidden: a page without a label has the row removed. */
+.session-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.session-identity .session-key {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#session-label {
+  margin: 0;
+  min-width: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.session-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* A refused or disconnected socket, a build mismatch, a lost tab: the problem row is weight 600. The softer "Moontide was
+   updated" line (data-issues holds "updated", not "build") stays weight 400. */
+#session-drawer[data-issues~="connection"] #connection-state,
+#session-drawer[data-issues~="build"] #build-mismatch,
+#session-drawer[data-issues~="tab"] #midi-takeover {
+  font-weight: 600;
+}
+
+#workspace {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Layout b: the view sits beside the code instead of under it. The code (#editor-area, flex: 1) takes what the
+   view leaves: #view-panel is a share of the workspace (--view-size, written by page/main.js from the separator's
+   number), not flex-based. */
+#workspace[data-layout="b"] {
+  flex-direction: row;
+}
+
+#workspace[data-layout="b"] #view-panel {
+  width: var(--view-size, 45%);
+  height: 100%;
+}
+
+/* Layout c: the view lays full-screen over faint code. */
+#workspace[data-layout="c"] {
+  position: relative;
+}
+
+#workspace[data-layout="c"] #view-panel {
+  position: absolute;
+  inset: 0;
+  height: auto;
+  border: none;
+  background: color-mix(in srgb, var(--dominant) 82%, transparent);
+}
+
+#workspace[data-layout="c"]:not([data-view="none"]) #editor-area {
+  opacity: 0.3;
+}
+
+/* Calm 150ms opacity fade on open/close/layout change, motion-gated.
+   #view-panel un-hides first, then flips data-shown to 'true' on the next
+   frame so the transition actually runs (page/main.js). */
+[data-motion="on"] #view-panel {
+  transition: opacity 150ms ease;
+}
+
+#view-panel[data-shown="false"] {
+  opacity: 0;
+}
+
+/* With motion off, nothing animates anywhere in the page. */
+[data-motion="off"] * {
+  transition: none;
+}
+
+#editor-area {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* A strip under the code (the default layout a). #view-panel and #timeline-view both set
+   their own display below, so each needs its own [hidden] override (test/page-hidden.test.js) —
+   the same pattern as #audio-unlock-overlay[hidden] further down. */
+#view-panel {
+  box-sizing: border-box;
+  flex: none;
+  height: var(--view-size, 42%);
+  background: var(--secondary);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#view-panel[hidden] {
+  display: none;
+}
+
+/* The border between the editor and the view. A div with role separator in #workspace, 0.5rem thick,
+   with a 1px line centered in it (the view panel has no border of its own, the line is the border). The ::before is the
+   hit area: 0.75rem on each side in the cross direction (2rem in all). The grip pill and the readout are decoration on
+   top of it and never take the pointer. Layout c has no handle (page/main.js hides it); the value, the keys and the
+   storage are page/split-model.js and page/split-view.js. Nothing here animates. */
+#split-handle {
+  position: relative;
+  z-index: 2;
+  flex: none;
+  height: 0.5rem;
+  cursor: row-resize;
+  touch-action: none;
+}
+
+#split-handle[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="b"] #split-handle {
+  width: 0.5rem;
+  height: auto;
+  cursor: col-resize;
+}
+
+#split-handle::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -0.75rem;
+  bottom: -0.75rem;
+}
+
+#workspace[data-layout="b"] #split-handle::before {
+  top: 0;
+  bottom: 0;
+  left: -0.75rem;
+  right: -0.75rem;
+}
+
+#split-handle::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  margin: auto 0;
+  height: 1px;
+  background: var(--border);
+}
+
+#workspace[data-layout="b"] #split-handle::after {
+  margin: 0 auto;
+  height: auto;
+  width: 1px;
+}
+
+#split-handle:hover::after,
+#split-handle:focus-visible::after,
+#workspace[data-dragging] #split-handle::after {
+  background: var(--text-muted);
+}
+
+#split-handle:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+#split-grip {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-evenly;
+  width: 1.75rem;
+  height: 0.5rem;
+  background: var(--secondary);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  pointer-events: none;
+}
+
+#workspace[data-layout="b"] #split-grip {
+  flex-direction: column;
+  width: 0.5rem;
+  height: 1.75rem;
+}
+
+#split-grip > span {
+  width: 0.25rem;
+  height: 0.25rem;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+#split-handle:focus-visible #split-grip,
+#workspace[data-dragging] #split-grip {
+  border-color: var(--text-muted);
+}
+
+/* The readout: shown while dragging, while the handle has keyboard focus, and for 1.5s after a release or a key step
+   (page/split-view.js sets data-kept with a timer). Right of the grip in layout a, below it in layout b. */
+#split-readout {
+  position: absolute;
+  left: calc(50% + 1.25rem);
+  top: 50%;
+  transform: translateY(-50%);
+  visibility: hidden;
+  box-sizing: border-box;
+  padding: 0 0.25rem;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: var(--secondary);
+  border: 1px solid var(--border);
+  pointer-events: none;
+}
+
+#workspace[data-layout="b"] #split-readout {
+  left: 50%;
+  top: calc(50% + 1.25rem);
+  transform: translateX(-50%);
+  width: 6rem;
+  white-space: normal;
+  text-align: center;
+}
+
+#split-handle[data-kept] #split-readout,
+#split-handle:focus-visible #split-readout,
+#workspace[data-dragging] #split-readout {
+  visibility: visible;
+}
+
+/* The polite announcement of the new size, in the accessibility tree and off the screen. */
+#split-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#workspace[data-dragging] {
+  user-select: none;
+}
+
+/* Fills whatever box #view-panel resolves to for the current layout (the strip's share, the
+   side panel's share, or the full-screen overlay's height: auto) — border/background
+   live on #view-panel alone, so #timeline-view never redeclares its own fixed size. */
+#timeline-view {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#timeline-view[hidden] {
+  display: none;
+}
+
+/* The ruler, lanes and playhead all sit in one grid so the playhead can span every row over
+   the track column alone (never the name gutter). Three explicit rows:
+   the ruler (auto), the sections (auto, so 0 px when the code has no arrange()) and the lanes
+   (minmax(0, 1fr): all the spare height, scrolling past it). Without them the rows were implicit
+   auto rows: the playhead covered the ruler row only and spare height opened a band above the
+   lanes. */
+#timeline-body {
+  display: grid;
+  grid-template-columns: 8.5em minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+#timeline-body[hidden] {
+  display: none;
+}
+
+/* Two Label lines tall (2 x 0.8125rem x 1.5): the cycle marks on the first line, the playhead's
+   cycle reading on the second, so the reading never lands on a mark. */
+#timeline-ruler {
+  grid-column: 2;
+  grid-row: 1;
+  height: 2.4375rem;
+  position: relative;
+}
+
+.ruler-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+#timeline-sections {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+#timeline-lanes {
+  grid-column: 1 / -1;
+  grid-row: 3;
+  overflow-y: auto;
+}
+
+/* Left updates only, no CSS transition — the playhead must move exactly with the scheduler's
+   clock. Its containing block is its own grid area (col 2,
+   spanning every row), set via JS as a left percentage of that area's width. With the explicit
+   rows above, line -1 is the end of the lanes row, so the playhead spans the whole body, down to
+   the bottom of the view even below the last lane. */
+#timeline-playhead {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 0.125rem;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+/* top is the ruler's second Label line: the playhead's top is the ruler's top. The box starts at
+   the line's right edge and carries the gap as padding, so its measured width includes the gap
+   and page/main.js can tell when it would pass the track column's right edge. */
+#timeline-playhead .playhead-cycle {
+  position: absolute;
+  top: 1.21875rem;
+  left: 100%;
+  padding-left: 0.125rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* Near the end of a page the reading flips to the left of the line so it is never clipped: the
+   box then ends at the line's left edge, with the same gap and the same width. A plain jump, no
+   transition, with motion on or off. page/main.js sets the attribute (updatePlayhead). */
+#timeline-playhead[data-reading-side="left"] .playhead-cycle {
+  left: auto;
+  right: 100%;
+  padding-left: 0;
+  padding-right: 0.125rem;
+}
+
+.lane[data-color="1"] { --lane-color: var(--track-1); }
+.lane[data-color="2"] { --lane-color: var(--track-2); }
+.lane[data-color="3"] { --lane-color: var(--track-3); }
+.lane[data-color="4"] { --lane-color: var(--track-4); }
+.lane[data-color="5"] { --lane-color: var(--track-5); }
+.lane[data-color="6"] { --lane-color: var(--track-6); }
+.lane[data-color="7"] { --lane-color: var(--track-7); }
+.lane[data-color="8"] { --lane-color: var(--track-8); }
+
+.lane {
+  display: grid;
+  grid-template-columns: 8.5em minmax(0, 1fr);
+  min-height: 1.75em;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  border-left: 0.1875rem solid var(--lane-color);
+}
+
+.lane[data-muted="true"] {
+  opacity: 0.35;
+}
+
+.lane-gutter {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-width: 0;
+  padding: 0 0.5rem;
+}
+
+.lane-name {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.lane-sub {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+}
+
+/* The instrument tag of a MIDI lane, its own line between the name and the sub line. The name part
+   ellipsizes; the channel part never shrinks, so the channel is always the part that stays whole. */
+.lane-tag {
+  display: flex;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.lane-tag-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lane-tag-channel {
+  flex: 0 0 auto;
+  white-space: pre;
+}
+
+.event[data-kind="note"] {
+  fill: color-mix(in srgb, var(--lane-color) 40%, transparent);
+}
+
+.event[data-kind="tick"] {
+  fill: color-mix(in srgb, var(--lane-color) 70%, transparent);
+}
+
+.loop-mark {
+  stroke: var(--accent-2);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.lane-curve {
+  fill: none;
+  stroke: var(--accent-2);
+  vector-effect: non-scaling-stroke;
+}
+
+/* A MIDI rhythm lane with a known drum map is drawn as one row per drum note, labelled with
+   the drum name. The svg's cell is made explicit so the label overlay shares it; the svg of a drum lane fills the
+   lane's height so rows and labels line up. The overlay never takes the pointer and is hidden from screen
+   readers (the svg carries the spoken label). Nothing here moves, fades or takes an accent color. */
+.lane-events,
+.lane-drums {
+  grid-column: 2;
+  grid-row: 1;
+}
+
+.lane[data-drum-rows] .lane-events {
+  align-self: stretch;
+  width: 100%;
+  height: 100%;
+}
+
+.lane-drums {
+  display: grid;
+  grid-auto-rows: 1fr;
+  padding-left: 0.25rem;
+  pointer-events: none;
+  user-select: none;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* A block box centered in its row by the grid (a flex box would not cut its text with an ellipsis). */
+.drum-row-label {
+  align-self: center;
+  justify-self: start;
+  min-width: 0;
+  max-width: 7rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 0 0.125rem var(--surface-2), 0 0 0.25rem var(--surface-2);
+}
+
+.drum-row-number {
+  font-family: var(--font-mono);
+}
+
+.drum-band {
+  fill: transparent;
+}
+
+.lane[data-drum-rows="3"] { min-height: 3.75rem; }
+.lane[data-drum-rows="4"] { min-height: 5rem; }
+.lane[data-drum-rows="5"] { min-height: 6.25rem; }
+.lane[data-drum-rows="6"] { min-height: 7.5rem; }
+.lane[data-drum-rows="7"] { min-height: 8.75rem; }
+.lane[data-drum-rows="8"] { min-height: 10rem; }
+
+/* The arrange() sections above the lanes — same grid columns as .lane, so
+   a section span lines up with the ruler/lane track column beneath it. No accent is used here
+   (accent stays reserved for "live now"/"structural" states, never a static
+   section label). */
+.section-row {
+  display: grid;
+  grid-template-columns: 8.5em minmax(0, 1fr);
+  height: 1.5em;
+}
+
+.section-row-gutter {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.section-track {
+  position: relative;
+}
+
+.section-span {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  padding: 0 0.25rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.section-span[data-narrow] {
+  color: transparent;
+}
+
+#timeline-message {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  padding: 1rem;
+  margin: 0;
+}
+
+/* The History view. #history-view fills the panel like #timeline-view; #history-scroll
+   is its only vertical scroll container. Rows are a [graph] [main] grid so a later tree mode
+   can draw in the graph cell. Layout c centers the content in one column. */
+#history-view {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#history-view[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="c"] #history-view {
+  width: 100%;
+  max-width: 60rem;
+  align-self: center;
+}
+
+#history-header {
+  display: flex;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+/* The List / Tree switch: one group with a hairline border; the pressed segment sits on a lighter
+   surface (no weight change, so switching never changes a segment's width). */
+#history-mode {
+  display: flex;
+  border: 1px solid var(--border);
+}
+
+#history-mode button {
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  padding: 0 0.5rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+#history-mode button:hover {
+  color: var(--text);
+}
+
+#history-mode button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+#history-mode button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+#history-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#history-notice {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 0.25rem 1rem;
+}
+
+#history-message {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 1rem;
+}
+
+#history-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#history-body[hidden] {
+  display: none;
+}
+
+/* The layout-a pane beside the list. Driven by the layout attribute, never by .hidden, so the
+   split does not jump when a diff opens or closes. */
+#history-detail {
+  display: none;
+}
+
+#workspace[data-layout="a"] #history-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+#workspace[data-layout="a"] #history-body[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="a"] #history-detail {
+  display: block;
+  background: var(--surface-2);
+  padding: 1rem;
+  overflow: auto;
+  min-height: 0;
+}
+
+#history-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: none;
+}
+
+#history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.hist-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--graph-width, 1rem) minmax(0, 1fr);
+  gap: 0.5rem;
+  min-height: 2.75rem;
+  padding: 0.25rem 1rem;
+  /* A short row centers its text by centering the grid tracks, not by stretching the text cell:
+     the text cell then ends exactly where line 2 ends, and so does the toggle placed on it. */
+  align-content: center;
+  /* One end column: the status slot on line 1 and the room for the toggle on line 2. */
+  --hist-end-column: 5rem;
+}
+
+/* The graph cell is drawn over the row's left gutter and spans the row's full height (an expanded
+   diff included), so lane lines stay continuous. It sits outside the grid flow; the columns above
+   reserve its width, taken from --graph-width (set on #history-view in tree mode). */
+.hist-graph {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 1rem;
+  width: var(--graph-width, 1rem);
+}
+
+.hist-main {
+  grid-column: 2;
+  grid-row: 1;
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+
+/* The keyboard selection: a quiet surface and an inset hairline ring, no accent. */
+.hist-row[data-selected="true"] {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+#history-more[data-selected="true"] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.hist-main:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+/* Nothing to restore on the current row, and nothing works while disconnected: no pointer, and no
+   hover fill. The hover fill lives on the row, so the graph gutter and the Changes toggle sit on
+   it, and it skips every row whose restore button is aria-disabled. The text keeps its full
+   color (the notice explains it). */
+.hist-row:hover:not(:has(> .hist-main[aria-disabled="true"])) {
+  background: var(--surface-2);
+}
+
+.hist-main[aria-disabled="true"] {
+  cursor: default;
+}
+
+.hist-line1 {
+  display: flex;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.hist-version {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+
+.hist-time {
+  flex-shrink: 0;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.hist-origin {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.hist-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hist-line2 {
+  display: flex;
+  gap: 0.5rem;
+  padding-right: var(--hist-end-column); /* room for the Changes toggle, which cannot join this line's flow: it stays outside the restore button */
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.hist-summary {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.hist-counts {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.25rem;
+  font-family: var(--font-mono);
+}
+
+.hist-count-add {
+  color: var(--diff-add);
+}
+
+.hist-count-remove {
+  color: var(--diff-remove);
+}
+
+.hist-status {
+  flex-shrink: 0;
+  min-width: var(--hist-end-column);
+  margin-left: auto;
+  text-align: right;
+  color: var(--text-muted);
+}
+
+/* A new row fades in over 150 ms with motion on (no slide, no height animation); with motion off
+   the rule below never matches a transition and the row is simply there. */
+[data-motion="on"] .hist-row {
+  transition: opacity 150ms ease;
+}
+
+.hist-row[data-shown="false"] {
+  opacity: 0;
+}
+
+/* A favorite shows its star and name after the label; the name truncates at 10rem. */
+.hist-favorite {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  gap: 0.25rem;
+}
+
+.hist-star {
+  flex-shrink: 0;
+}
+
+.hist-favorite-name {
+  min-width: 0;
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A session divider sits directly below the oldest row of the session it starts, on the same
+   [graph] [text] grid as a row. It is not interactive. */
+.hist-divider {
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--graph-width, 1rem) minmax(0, 1fr);
+  gap: 0.5rem;
+  padding: 0.25rem 1rem;
+}
+
+.hist-divider-text {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.hist-divider-text::before,
+.hist-divider-text::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+/* Show older versions loads the next 100 below the list; its status line sits under it. */
+#history-more {
+  display: block;
+  margin-top: 1.5rem;
+  padding: 0.25rem 1rem;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+#history-more:hover:not(:disabled) {
+  color: var(--text);
+}
+
+#history-more:disabled {
+  cursor: default;
+}
+
+#history-more[hidden] {
+  display: none;
+}
+
+#history-more-status {
+  display: block;
+  margin: 0;
+  padding: 0 1rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#history-more-status[hidden] {
+  display: none;
+}
+
+/* The Changes toggle sits in the row grid, on the bottom-right of the text cell, which is line 2's
+   cell. It is a sibling of .hist-main, never inside it, and an open diff under the row cannot move
+   it. Later in the DOM, it paints above the text cell and takes the clicks. */
+.hist-toggle {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: end;
+  justify-self: end;
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+.hist-toggle:hover,
+.hist-toggle:focus-visible {
+  color: var(--text);
+}
+
+.hist-toggle:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 0.125rem;
+}
+
+/* The line diff. In layouts b and c it sits under its row in the main column, capped at 24rem;
+   in layout a it fills the #history-detail pane beside the list. Long lines scroll sideways and
+   never wrap. */
+.hist-diff {
+  grid-column: 2;
+  grid-row: 2;
+  max-height: 24rem;
+  overflow: auto;
+  padding: 0.25rem 0 0.5rem;
+}
+
+#history-detail .hist-diff {
+  max-height: none;
+  padding: 0;
+}
+
+.hist-diff-header,
+.hist-diff-message {
+  display: block;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.hist-diff-header {
+  margin-bottom: 0.25rem;
+}
+
+.hist-diff-line {
+  display: flex;
+  min-width: max-content;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--text-muted);
+}
+
+.hist-diff-sign {
+  flex: 0 0 1rem;
+  width: 1rem;
+}
+
+.hist-diff-line[data-kind="add"] {
+  color: var(--diff-add);
+  background: color-mix(in srgb, var(--diff-add) 14%, transparent);
+}
+
+.hist-diff-line[data-kind="del"] {
+  color: var(--diff-remove);
+  background: color-mix(in srgb, var(--diff-remove) 14%, transparent);
+}
+
+.hist-detail-placeholder {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+/* The current version: a dot in the graph gutter and the word Current. Both take the accent
+   only while sound is playing (page/history-view.js sets data-live), else the plain text color. */
+.hist-node {
+  position: absolute;
+  top: 0.609375rem;
+  left: 0.25rem;
+  display: block;
+  width: 0.5rem;
+  height: 0.5rem;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+/* Tree mode: every drawn piece carries data-color (its lane's number, 1 to 8) and takes that hue. */
+.hist-graph [data-color="1"] { --branch-color: var(--branch-1); }
+.hist-graph [data-color="2"] { --branch-color: var(--branch-2); }
+.hist-graph [data-color="3"] { --branch-color: var(--branch-3); }
+.hist-graph [data-color="4"] { --branch-color: var(--branch-4); }
+.hist-graph [data-color="5"] { --branch-color: var(--branch-5); }
+.hist-graph [data-color="6"] { --branch-color: var(--branch-6); }
+.hist-graph [data-color="7"] { --branch-color: var(--branch-7); }
+.hist-graph [data-color="8"] { --branch-color: var(--branch-8); }
+
+/* A vertical piece of a lane. Its left and vertical extent are set by the page. */
+.hist-lane-line {
+  position: absolute;
+  width: 0.125rem;
+  background: var(--branch-color);
+}
+
+/* An elbow at a fork: the ended lane's line down to the node's height, then across to the node. */
+.hist-elbow {
+  position: absolute;
+  box-sizing: border-box;
+  border-right: 0.125rem solid var(--branch-color);
+  border-bottom: 0.125rem solid var(--branch-color);
+}
+
+/* A node in tree mode is a ring in its lane's hue; the current version's node is filled. The live
+   rule below (reserved accent) wins over the ring fill, and the plain current fill is kept off a
+   live row so it never hides the accent. */
+.hist-node[data-color] {
+  background: var(--secondary);
+  border: 0.125rem solid var(--branch-color);
+}
+
+.hist-row[data-current="true"]:not([data-live="true"]) .hist-node[data-color] {
+  background: var(--text);
+}
+
+.hist-current {
+  color: var(--text);
+}
+
+.hist-row[data-live="true"] .hist-node {
+  background: var(--accent);
+}
+
+.hist-row[data-live="true"] .hist-current {
+  color: var(--accent);
+}
+
+/* The Parts view. #parts-message shares #timeline-message's Body-size/color role for
+   the "no parts" sentence; no display: rule of its own, so the browser's [hidden] default
+   applies unaided (same pattern as #top-bar > span). #parts-view fills the panel like the other
+   views (flex: 1; min-height: 0), so #parts-rows gets a bounded height and scrolls; without it
+   the view grew to its content and the panel cut off the last rows. */
+#parts-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem;
+  gap: 0.5rem;
+}
+
+#parts-view[hidden] {
+  display: none;
+}
+
+#parts-message {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+/* The Parts view's "Ask Claude to add sections" button and the line under it: neutral, no accent or
+   destructive color. No display rule on either, so the browser's [hidden] works unaided. */
+#parts-ask {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  min-height: 2rem;
+  padding: 0 1rem;
+  align-self: flex-start;
+  cursor: pointer;
+}
+
+#parts-ask:hover:not(:disabled) {
+  border-color: var(--text-muted);
+}
+
+#parts-ask:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#parts-ask:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+#parts-ask-status {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+#parts-ask-status[hidden] {
+  display: none;
+}
+
+#parts-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  overflow-y: auto;
+}
+
+.parts-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12rem, 1fr));
+  gap: 0.5rem;
+}
+
+.part-card {
+  min-height: 2.75rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.125rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  text-align: left;
+  padding: 0.5rem;
+  cursor: pointer;
+}
+
+.part-name {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.part-state {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* flex: none: the label's overflow: hidden (for the ellipsis) would otherwise let #parts-rows
+   squeeze it to nothing instead of scrolling. */
+.parts-row-label {
+  flex: none;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The playing card's border and progress fill use the primary accent
+   ("live now"); the queued card's border and countdown text use the secondary accent
+   ("structural / informational"). */
+.part-card[data-state="playing"] {
+  border-color: var(--accent);
+}
+
+.part-card[data-state="queued"] {
+  border-color: var(--accent-2);
+}
+
+.part-card[data-state="queued"] .part-state {
+  color: var(--accent-2);
+}
+
+.part-progress {
+  display: block;
+  height: 0.25rem;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.part-progress-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+}
+
+.part-card[data-state="playing"] .part-progress-fill {
+  background: var(--accent);
+}
+
+/* Strudel inserts the CodeMirror container as the NEXT SIBLING of <strudel-editor>,
+   not inside it. Fill the available height and let CodeMirror handle its own native
+   scrolling/wrapping — no text/font restyling here. The editor itself (.cm-editor) needs the
+   height too: CodeMirror scrolls only inside a .cm-editor of bounded height; without it the
+   editor grew to its content and #editor-area cut off every line past its bottom. */
+#editor-area > strudel-editor + div,
+#editor-area > strudel-editor + div > .cm-editor {
+  height: 100%;
+}
+
+#audio-unlock-overlay {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  padding: 1rem;
+  border: none;
+  background: rgba(11, 13, 16, 0.85);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-family: inherit;
+  /* Stays above the Ask Claude box (z-index 1000). */
+  z-index: 2000;
+}
+
+/* The display rule above beats the browser's [hidden] default, so hiding needs its own rule. */
+#audio-unlock-overlay[hidden] {
+  display: none;
+}
+
+/* Overlay counterpart of the top-bar accent rule (#top-bar [data-accent="true"]):
+   the overlay is a button with its own browser text color, so the CTA span needs
+   its own accent rule to render in teal. */
+#audio-unlock-overlay [data-accent="true"] {
+  color: var(--accent);
+}
+
+#audio-unlock-cta {
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+#audio-error {
+  margin-top: 2rem;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+#audio-error[hidden] {
+  display: none;
+}
+
+/* The Mixer view. #mixer-view fills the panel like #timeline-view; #mixer-strips is its
+   only scroll container (both axes). Strips never wrap and never shrink below 11rem. */
+#mixer-view {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+#mixer-view[hidden] {
+  display: none;
+}
+
+/* The one notice line above the strips: disconnected, or a hand edit that was not evaluated. */
+#mixer-notice {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+#mixer-notice[hidden] {
+  display: none;
+}
+
+#mixer-message {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 1rem;
+}
+
+#mixer-message[hidden] {
+  display: none;
+}
+
+#mixer-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+#mixer-body[hidden] {
+  display: none;
+}
+
+/* The MIDI tracks that play no notes, in one quiet line under the strips. */
+#mixer-nonotes {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--border);
+}
+
+#mixer-nonotes[hidden] {
+  display: none;
+}
+
+#mixer-strips {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 1rem;
+  display: flex;
+  gap: 0.5rem;
+  align-items: stretch;
+}
+
+/* The strip is exactly 11rem: min-width 0 stops a wide chip value from stretching it (the chips wrap
+   and ellipsize inside it instead). The fill is the panel color, so layouts a and b look unchanged and
+   layout c's faint code no longer runs under chips, Add effect and sends (not --surface-2: muted text
+   on it drops to 4.49:1). It is at least as tall as the strips area and grows past it rather than
+   squash its name, chips or M and S when the view is short; the strips area then scrolls. */
+.mx-strip {
+  flex: 0 0 11rem;
+  align-self: flex-start;
+  min-width: 0;
+  min-height: 100%;
+  background: var(--secondary);
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-top: 0.1875rem solid var(--strip-color, var(--border));
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mx-strip[data-color="1"] { --strip-color: var(--track-1); }
+.mx-strip[data-color="2"] { --strip-color: var(--track-2); }
+.mx-strip[data-color="3"] { --strip-color: var(--track-3); }
+.mx-strip[data-color="4"] { --strip-color: var(--track-4); }
+.mx-strip[data-color="5"] { --strip-color: var(--track-5); }
+.mx-strip[data-color="6"] { --strip-color: var(--track-6); }
+.mx-strip[data-color="7"] { --strip-color: var(--track-7); }
+.mx-strip[data-color="8"] { --strip-color: var(--track-8); }
+
+.mx-name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The name of a track strip is a button: a click selects the strip (its code is lit in the editor). It keeps the
+   look of .mx-name, so no font shorthand (it would undo the size, weight and line-height above). */
+button.mx-name {
+  font-family: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+
+button.mx-name:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.mx-strip[data-selected="true"] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.mx-reason {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-root-note {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-root-note[hidden] {
+  display: none;
+}
+
+/* The instrument tag of a MIDI strip, under its name; the same two parts as the lane tag. It keeps full
+   strength on a strip that is not sounding (the dimming rule below lists only the fader parts). */
+.mx-tag {
+  display: flex;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+.mx-tag[hidden] {
+  display: none;
+}
+
+.mx-tag-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-tag-channel {
+  flex: 0 0 auto;
+  white-space: pre;
+}
+
+.mx-strip[data-editable="false"] .mx-name {
+  color: var(--text-muted);
+}
+
+.mx-strip [data-writes="true"]:disabled {
+  cursor: default;
+}
+
+.mx-chain {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.mx-chip {
+  display: flex;
+  align-items: stretch;
+  min-height: 1.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+/* A MIDI strip draws the control chips of its instrument, then one line that says why browser effects are gone.
+   A control chip is a chip without the bypass dot (a control is not an effect). */
+.mx-midi-chips {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+/* A strip with no readable controls draws no chips: its empty box and rule are not shown either. */
+.mx-midi-chips:empty {
+  display: none;
+}
+
+.mx-midi-chip .mx-chip-body {
+  padding-left: 0.25rem;
+}
+
+.mx-midi-note {
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.mx-midi-note[hidden] {
+  display: none;
+}
+
+.mx-chip[data-bypassed="true"] {
+  opacity: 0.5;
+}
+
+.mx-chip[data-selected="true"] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.mx-chip-dot {
+  flex: 0 0 1.5rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* On: a filled dot. Off (aria-pressed false): a thin ring with no fill. */
+.mx-dot {
+  box-sizing: border-box;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--text);
+  border: 0.125rem solid var(--text);
+}
+
+.mx-chip-dot[aria-pressed="false"] .mx-dot {
+  background: transparent;
+  border-color: var(--text-muted);
+}
+
+.mx-chip-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  align-content: center;
+  column-gap: 0.25rem;
+  row-gap: 0;
+  padding: 0 0.25rem 0 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mx-chip-body:hover {
+  border-color: var(--text-muted);
+}
+
+.mx-chip-name {
+  flex: 0 0 auto;
+  color: var(--text);
+}
+
+.mx-chip-value {
+  flex: 1 0 auto;
+  min-width: 0;
+  max-width: 100%;
+  text-align: right;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-add {
+  min-height: 1.5rem;
+  padding: 0 0.25rem;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+.mx-add:hover {
+  color: var(--text);
+}
+
+.mx-add-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.mx-add-list[hidden] {
+  display: none;
+}
+
+.mx-add-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.25rem;
+  min-height: 1.5rem;
+  padding: 0 0.25rem;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mx-add-item:hover {
+  background: var(--surface-2);
+}
+
+.mx-add-method {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.mx-chip-dot:focus-visible,
+.mx-chip-body:focus-visible,
+.mx-add:focus-visible,
+.mx-add-item:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* The fader starts at 6rem and grows with the strip up to 12rem and no further (the max-height is the
+   12rem fader, the gap and the readout's line), so its readout and M and S stay near the chips; the
+   strip's extra height falls below them. */
+.mx-fader-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.25rem;
+  flex: 1 1 auto;
+  max-height: calc(12rem + 0.25rem + 0.8125rem * 1.25);
+}
+
+/* A native range slider drawn vertically: the minimum is at the bottom. --fill (set by the page)
+   paints the filled part of the track. */
+.mx-fader {
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  flex: 1 1 6rem;
+  max-height: 12rem;
+  min-height: 6rem;
+  width: 1.5rem;
+  margin: 0;
+  background: transparent;
+}
+
+.mx-fader::-webkit-slider-runnable-track {
+  width: 0.25rem;
+  background: linear-gradient(to top, var(--text) var(--fill, 0%), var(--border) var(--fill, 0%));
+}
+
+.mx-fader::-webkit-slider-thumb {
+  appearance: none;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: var(--text);
+  margin-left: -0.375rem;
+}
+
+.mx-fader::-moz-range-track {
+  width: 0.25rem;
+  background: linear-gradient(to top, var(--text) var(--fill, 0%), var(--border) var(--fill, 0%));
+}
+
+.mx-fader::-moz-range-thumb {
+  width: 1rem;
+  height: 1rem;
+  border: none;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+.mx-fader:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.mx-readout {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.25;
+}
+
+.mx-readout[data-muted="true"] {
+  color: var(--text-muted);
+}
+
+/* Mute and solo: two square letter buttons under the fader section. Pressed is inverted (a
+   neutral high-contrast "on", not a hue); the state is the letter plus aria-pressed. */
+.mx-ms {
+  display: flex;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.mx-mute,
+.mx-solo {
+  box-sizing: border-box;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+.mx-mute[aria-pressed="true"],
+.mx-solo[aria-pressed="true"] {
+  background: var(--text);
+  color: var(--dominant);
+}
+
+.mx-mute:focus-visible,
+.mx-solo:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.mx-note {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.mx-note[hidden] {
+  display: none;
+}
+
+/* A strip that does not sound (muted, or another track solos): its fader section is dimmed; the
+   name row and the M and S row stay at full strength. */
+.mx-strip[data-sounding="false"] .mx-chain,
+.mx-strip[data-sounding="false"] .mx-midi-chips,
+.mx-strip[data-sounding="false"] .mx-midi-note,
+.mx-strip[data-sounding="false"] .mx-sends,
+.mx-strip[data-sounding="false"] .mx-fader-section {
+  opacity: 0.6;
+}
+
+/* The two sends between the chain and the fader, and the bus strips that follow the tracks. */
+.mx-sends {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.mx-send {
+  display: grid;
+  grid-template-columns: 3.25rem minmax(0, 1fr) 2.5rem;
+  gap: 0.25rem;
+  align-items: center;
+  height: 1.5rem;
+}
+
+.mx-send-label {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 100%;
+  padding: 0 0.25rem 0 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.mx-send-label:hover {
+  border-color: var(--text-muted);
+}
+
+.mx-send-label:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.mx-send-label:disabled:hover {
+  border-color: transparent;
+}
+
+.mx-send-slider {
+  min-width: 3.5rem;
+}
+
+.mx-send-value {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  text-align: right;
+}
+
+.mx-send-value[data-muted="true"] {
+  color: var(--text-muted);
+}
+
+.mx-send-moving {
+  grid-column: span 2;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.mx-bus {
+  border-top-color: var(--border);
+}
+
+.mx-bus[data-selected="true"] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.mx-bus .mx-chip-name {
+  padding-left: 0.25rem;
+}
+
+.mx-fedby {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Neutral on purpose: no amber and no accent. */
+.mx-warning {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  padding: 0.25rem;
+  color: var(--text);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.mx-warning[hidden] {
+  display: none;
+}
+
+.mx-insp-note {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.mx-fader-line {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* The line that names the other tracks on this instrument and channel; one line, cut with an ellipsis (the
+   title holds every name). Muted, centered, and not part of the dimmed fader section. */
+.mx-shared {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mx-shared[hidden] {
+  display: none;
+}
+
+/* The inspector, a pane and never a popover: to the right of the
+   strips in layouts a and c, under them in layout b. It scrolls on its own; no accent, no destructive color.
+   The 1rem margin is the gap before the pane in layouts a and c: a strip cut by the strips area's own
+   scroll ends before the pane's border instead of looking covered by it. */
+#mixer-inspector {
+  flex: 0 0 22rem;
+  margin-left: 1rem;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 1rem;
+  border-left: 1px solid var(--border);
+  background: var(--secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#mixer-inspector[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="b"] #mixer-body {
+  flex-direction: column;
+}
+
+#workspace[data-layout="b"] #mixer-inspector {
+  flex: 0 1 auto;
+  width: 100%;
+  max-height: 50%;
+  margin-left: 0;
+  border-left: none;
+  border-top: 1px solid var(--border);
+}
+
+.mx-insp-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.mx-insp-title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.mx-insp-close,
+.mx-more-toggle,
+.mx-default,
+.mx-use-fixed,
+.mx-remove {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  text-align: left;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.mx-insp-close:hover,
+.mx-more-toggle:hover,
+.mx-default:hover,
+.mx-use-fixed:hover,
+.mx-remove:hover {
+  color: var(--text);
+}
+
+.mx-insp-close:focus-visible,
+.mx-more-toggle:focus-visible,
+.mx-default:focus-visible,
+.mx-use-fixed:focus-visible,
+.mx-remove:focus-visible,
+.mx-param-slider:focus-visible,
+.mx-send-slider:focus-visible,
+.mx-send-label:focus-visible,
+.mx-param-number:focus-visible,
+.mx-param-select:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.mx-insp-close:disabled,
+.mx-more-toggle:disabled,
+.mx-default:disabled,
+.mx-use-fixed:disabled,
+.mx-remove:disabled {
+  cursor: default;
+  opacity: 0.5;
+  text-decoration: none;
+}
+
+/* The instrument line of a MIDI track's inspector: its tag and sound, mono and muted. */
+.mx-insp-line {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* The sentence of a shared channel in the controls inspector; it wraps. */
+.mx-insp-shared {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.mx-insp-shared[hidden] {
+  display: none;
+}
+
+.mx-insp-gone {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.mx-insp-gone[hidden] {
+  display: none;
+}
+
+.mx-insp-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mx-more {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mx-more[hidden] {
+  display: none;
+}
+
+.mx-row {
+  display: grid;
+  grid-template-columns: 6rem minmax(0, 1fr) 4.5rem;
+  gap: 0.5rem;
+  align-items: center;
+  min-height: 1.5rem;
+}
+
+.mx-row-label {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+}
+
+.mx-row-sub {
+  color: var(--text-muted);
+}
+
+.mx-row[data-default="true"] .mx-param-number {
+  color: var(--text-muted);
+}
+
+.mx-param-slider,
+.mx-send-slider {
+  appearance: none;
+  min-width: 0;
+  height: 1.5rem;
+  margin: 0;
+  background: transparent;
+}
+
+.mx-param-slider::-webkit-slider-runnable-track,
+.mx-send-slider::-webkit-slider-runnable-track {
+  height: 0.25rem;
+  background: linear-gradient(to right, var(--text) var(--fill, 0%), var(--border) var(--fill, 0%));
+}
+
+.mx-param-slider::-webkit-slider-thumb,
+.mx-send-slider::-webkit-slider-thumb {
+  appearance: none;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 50%;
+  background: var(--text);
+  margin-top: -0.375rem;
+}
+
+.mx-param-slider::-moz-range-track,
+.mx-send-slider::-moz-range-track {
+  height: 0.25rem;
+  background: linear-gradient(to right, var(--text) var(--fill, 0%), var(--border) var(--fill, 0%));
+}
+
+.mx-param-slider::-moz-range-thumb,
+.mx-send-slider::-moz-range-thumb {
+  width: 1rem;
+  height: 1rem;
+  border: none;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+.mx-param-slider:disabled,
+.mx-send-slider:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.mx-param-number,
+.mx-param-select {
+  box-sizing: border-box;
+  min-width: 0;
+  height: 1.5rem;
+  padding: 0 0.25rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.25;
+}
+
+.mx-param-number {
+  appearance: textfield;
+  text-align: right;
+}
+
+.mx-param-number::-webkit-inner-spin-button,
+.mx-param-number::-webkit-outer-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.mx-param-select {
+  grid-column: 2 / 4;
+}
+
+.mx-param-number:disabled,
+.mx-param-select:disabled {
+  opacity: 0.5;
+}
+
+/* The Fixed / Moves switch of a filter's cutoff: two text segments in the button style; pressed is
+   the same inverted "on" as M and S (a neutral high-contrast state, not a hue). */
+.mx-move-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.mx-move-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 1.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+}
+
+.mx-move-switch {
+  display: flex;
+}
+
+.mx-move-mode {
+  box-sizing: border-box;
+  min-width: 3.5rem;
+  padding: 0.125rem 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  cursor: pointer;
+}
+
+.mx-move-mode + .mx-move-mode {
+  border-left: none;
+}
+
+.mx-move-mode[aria-pressed="true"] {
+  background: var(--text);
+  color: var(--dominant);
+}
+
+.mx-move-mode:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.mx-move-mode:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.mx-moving {
+  grid-column: 2 / 4;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+}
+
+.mx-moving-text {
+  color: var(--text-muted);
+}
+
+/* The sentence under a control row that a sweep in the code moves: muted, across the whole row. */
+.mx-sweep {
+  grid-column: 1 / -1;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.mx-sweep[hidden] {
+  display: none;
+}
+
+.mx-written {
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+.mx-written[hidden] {
+  display: none;
+}
+
+.mx-written-code {
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.mx-written-label {
+  margin-right: 0.5rem;
+}
+
+.mx-insp-footer {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+.mx-insp-footer[hidden] {
+  display: none;
+}
+
+/* The touched code line: an overlay in the editor's scroll container, never a class on a
+   .cm-line (CodeMirror drops such a class again within a frame during playback). */
+.mx-flash {
+  position: absolute;
+  left: 0;
+  pointer-events: none;
+  background: var(--line-flash);
+}
+
+/* The selected strip's code block: ONE overlay in the editor's scroll container, moved from JS (top,
+   height and width in pixels) and drawn under the flash. No transition and no animation: calm, and never motion. */
+.mx-lit {
+  position: absolute;
+  left: 0;
+  pointer-events: none;
+  background: var(--code-lit);
+}
+
+[data-motion="on"] .mx-flash {
+  transition: opacity 150ms ease;
+}
+
+.mx-flash[data-fading="true"] {
+  opacity: 0;
+}
+
+/* Ask Claude: the small box a right-click opens near the pointer. Left and top are
+   set from JS in pixels; nothing animates and no accent, second accent or destructive color is used. */
+#ask-box {
+  position: fixed;
+  z-index: 1000;
+  width: 24rem;
+  max-width: calc(100vw - 1rem);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: var(--secondary);
+  border: 1px solid var(--text-muted);
+  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.5);
+}
+
+#ask-box[hidden] {
+  display: none;
+}
+
+#ask-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+#ask-context-chip,
+#ask-current-chip {
+  display: block;
+  min-height: 1.5rem;
+  padding: 0 0.5rem;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  background: var(--dominant);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#ask-context-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text);
+}
+
+#ask-current-chip {
+  flex: none;
+  color: var(--text-muted);
+}
+
+#ask-current-chip[hidden] {
+  display: none;
+}
+
+#ask-field {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  font-family: inherit;
+  font-size: 1rem;
+  line-height: 1.5;
+  padding: 0.5rem;
+  min-height: 2.5rem;
+  max-height: 10rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  background: var(--dominant);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+#ask-field:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 0;
+}
+
+#ask-field[aria-invalid="true"] {
+  border-color: var(--text);
+}
+
+#ask-field[aria-invalid="true"]:focus-visible {
+  outline-color: var(--text);
+}
+
+#ask-field::placeholder {
+  color: var(--text-muted);
+}
+
+#ask-message,
+#ask-hint {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+}
+
+#ask-message[hidden] {
+  display: none;
+}
+
+/* The Jam view. #jam-view fills the panel like the other views and scrolls on its
+   own; the message replaces the whole body (never a partial reading). The scale block is the
+   name in the Heading role with one muted sub-line on its baseline (under it when both do not
+   fit) and seven degree chips that wrap onto a second line in a narrow column. Sizes in rem, 1px hairlines only, square corners, no accent. */
+#jam-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 1rem;
+  gap: 0.5rem;
+}
+
+#jam-view[hidden] {
+  display: none;
+}
+
+#jam-message {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+#jam-message[hidden] {
+  display: none;
+}
+
+#jam-message-text {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-message-sub {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-body {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+#jam-body[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="c"] #jam-body {
+  width: 100%;
+  max-width: 100rem;
+  margin: 0 auto;
+}
+
+#jam-info {
+  flex: 1 1 22rem;
+  max-width: 34rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#jam-scale {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.5rem;
+}
+
+#jam-scale-name {
+  min-width: 0;
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#jam-scale-sub {
+  min-width: 0;
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The declared harmony: a quiet line above the scale block and the label before the scale name.
+   Both are hidden without a declaration. Two plain facts: no accent, no mark of agreement or difference. */
+#jam-declared {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.5rem;
+  margin: 0;
+}
+
+#jam-declared[hidden] {
+  display: none;
+}
+
+#jam-declared-label,
+#jam-scale-label {
+  flex: none;
+  min-width: 5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-scale-label[hidden] {
+  display: none;
+}
+
+#jam-declared-value {
+  flex: 1 1 8rem;
+  min-width: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#jam-declared[data-kind="unreadable"] #jam-declared-value {
+  color: var(--text-muted);
+}
+
+#jam-degrees {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+#jam-degrees[hidden] {
+  display: none;
+}
+
+.jam-degree {
+  box-sizing: border-box;
+  min-width: 2.75rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--text-muted);
+  border-radius: 0;
+  background: var(--text-muted);
+  color: var(--dominant);
+}
+
+.jam-degree-note,
+.jam-degree-num {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.jam-degree[data-role="scale"] {
+  background: var(--text-muted);
+  color: var(--dominant);
+  border-color: var(--text-muted);
+}
+
+.jam-degree[data-role="root"] {
+  background: var(--text);
+  color: var(--dominant);
+  border-color: var(--text);
+  font-weight: 600;
+  box-shadow: 0 0 0 0.125rem var(--secondary), 0 0 0 0.25rem var(--text);
+}
+
+#jam-scale-name[data-kind="ambiguous"],
+#jam-scale-name[data-kind="none"] {
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#jam-scale-name[data-kind="none"] {
+  color: var(--text-muted);
+}
+
+/* The status box and the avoid mark. The status box is a neutral box while
+   all is safe and gets the amber border, a thick amber left edge and a faint amber fill while a
+   chord leaves the scale; its time part floats to the right end of the sentence's last line, or
+   to its own line when there is no room there. The degree
+   chip of a note to avoid is crossed: red tint, red border, line-through and a diagonal line. */
+#jam-status {
+  position: relative;
+  display: flow-root;
+  line-height: 1.5;
+  min-height: 2rem;
+  box-sizing: border-box;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+#jam-status[hidden] {
+  display: none;
+}
+
+#jam-status[data-state="warning"] {
+  border: 1px solid var(--jam-outside);
+  border-left: 0.25rem solid var(--jam-outside);
+  background: color-mix(in srgb, var(--jam-outside) 12%, var(--surface-2));
+}
+
+#jam-status-text {
+  display: inline;
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#jam-status-lead {
+  font-weight: 600;
+}
+
+#jam-status-time {
+  float: right;
+  margin-left: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5rem;
+  color: var(--text-muted);
+}
+
+#jam-status-time[hidden] {
+  display: none;
+}
+
+/* The time is the actionable part while the box warns. */
+#jam-status[data-state="warning"] #jam-status-time {
+  color: var(--text);
+}
+
+/* Visually hidden copy of the time, kept in the accessibility tree: the live region reads it when a warning starts or ends. */
+#jam-status-spoken {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.jam-degree[data-role="avoid"] {
+  position: relative;
+  background: color-mix(in srgb, var(--jam-avoid) 30%, var(--dominant));
+  border: 0.125rem solid var(--jam-avoid);
+  color: var(--text);
+}
+
+.jam-degree[data-role="avoid"] .jam-degree-note {
+  text-decoration: line-through;
+}
+
+.jam-degree[data-role="avoid"]::after {
+  content: "";
+  position: absolute;
+  left: -10%;
+  top: 50%;
+  width: 120%;
+  height: 0.125rem;
+  background: var(--jam-avoid);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
+/* Coming up: a caption, the paused line and at most three rows, each a
+   grid of the countdown (mono, right-aligned), the kind word and the text, which wraps and is
+   never cut. The word Warning carries the amber hue; Part stays muted. */
+#jam-paused {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-paused[hidden] {
+  display: none;
+}
+
+#jam-coming {
+  display: flex;
+  flex-direction: column;
+}
+
+#jam-coming-caption {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.jam-row {
+  display: grid;
+  grid-template-columns: 3.5rem 4rem minmax(0, 1fr);
+  gap: 0.5rem;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.jam-row-time {
+  font-family: var(--font-mono);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.jam-row-kind[data-kind="warning"] {
+  color: var(--jam-outside);
+}
+
+.jam-row-kind[data-kind="part"] {
+  color: var(--text-muted);
+}
+
+.jam-row-text {
+  overflow-wrap: anywhere;
+}
+
+.jam-row:focus-visible,
+#jam-status:focus-visible {
+  outline: 1px solid var(--text-muted);
+}
+
+
+/* The instrument column. One box holds the piano (and the
+   fretboard) on the dark well color, so white keys and dots read against it. The piano is 24 keys
+   from C3 to B4 placed by percentage; marks are by pitch class and every mark differs by shape as
+   well as by color: a ring (root), a fill (scale), a cross (avoid), a dashed outline (outside).
+   Nothing animates; sizes in rem, 1px hairlines only, square corners. */
+#jam-instrument {
+  flex: 3 1 32rem;
+  max-width: 64rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+#jam-board {
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  background: var(--dominant);
+  padding: 0.25rem;
+  overflow-x: auto;
+}
+
+#jam-piano {
+  position: relative;
+  height: 7rem;
+  min-width: 28rem;
+  max-width: 56rem;
+  user-select: none;
+}
+
+#jam-piano[hidden] {
+  display: none;
+}
+
+.jam-key {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+  padding-bottom: 0.25rem;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+.jam-key[data-black="true"] {
+  z-index: 1;
+  height: 58%;
+  background: var(--dominant);
+}
+
+.jam-key[data-role="scale"] {
+  background: var(--text-muted);
+  color: var(--dominant);
+}
+
+.jam-key[data-black="true"][data-role="scale"] {
+  background: color-mix(in srgb, var(--text-muted) 55%, var(--dominant));
+  color: var(--text);
+}
+
+.jam-key[data-role="root"] {
+  background: var(--text);
+  color: var(--dominant);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 0.125rem var(--dominant);
+}
+
+.jam-key[data-role="avoid"] {
+  background: color-mix(in srgb, var(--jam-avoid) 30%, var(--dominant));
+  border: 0.125rem solid var(--jam-avoid);
+  color: var(--text);
+}
+
+.jam-key[data-role="avoid"] .jam-key-label {
+  text-decoration: line-through;
+}
+
+.jam-key[data-role="avoid"]::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 0.875rem;
+  width: 1.5rem;
+  height: 0.125rem;
+  margin-left: -0.75rem;
+  background: var(--jam-avoid);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
+.jam-key[data-root="true"] {
+  box-shadow: inset 0 0 0 0.125rem var(--dominant);
+}
+
+.jam-key[data-role="outside"] {
+  background: color-mix(in srgb, var(--jam-outside) 30%, var(--dominant));
+  border: 0.125rem dashed var(--jam-outside);
+  color: var(--text);
+}
+
+/* The Piano / Guitar switch and the fretboard. The switch copies the
+   List / Tree switch: a hairline group, the pressed segment on a lighter surface with no weight
+   change. The fretboard has six string rows of 1.75rem (top row the high e), a 1.5rem gutter for the
+   string names, then 13 columns (the open column and frets 1 to 12) sized by the real fret scale
+   (inline flex shares); the nut is the thick rule after the open column, the string lines grow
+   thicker toward the low E. A cell is the note target; its dot shows the mark, with the same role
+   vocabulary as the piano keys. */
+#jam-controls {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#jam-instrument-switch {
+  display: flex;
+  border: 1px solid var(--border);
+}
+
+#jam-instrument-switch button {
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  min-height: 1.5rem;
+  padding: 0 0.5rem;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+#jam-instrument-switch button:hover {
+  color: var(--text);
+}
+
+#jam-instrument-switch button[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+#jam-instrument-switch button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+#jam-guitar {
+  min-width: 30rem;
+  max-width: 64rem;
+  user-select: none;
+}
+
+#jam-guitar[hidden] {
+  display: none;
+}
+
+.jam-string {
+  display: flex;
+  height: 1.75rem;
+}
+
+.jam-string-name {
+  flex: 0 0 1.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.75rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.jam-fret {
+  position: relative;
+  box-sizing: border-box;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-right: 1px solid var(--border);
+}
+
+.jam-fret[data-fret="0"] {
+  border-right: 0.25rem solid var(--text-muted);
+}
+
+.jam-fret::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0.0625rem;
+  transform: translateY(-50%);
+  background: var(--text-muted);
+  pointer-events: none;
+}
+
+.jam-string[data-string="1"] .jam-fret::before {
+  height: 0.0875rem;
+}
+
+.jam-string[data-string="2"] .jam-fret::before {
+  height: 0.1125rem;
+}
+
+.jam-string[data-string="3"] .jam-fret::before {
+  height: 0.1375rem;
+}
+
+.jam-string[data-string="4"] .jam-fret::before {
+  height: 0.1625rem;
+}
+
+.jam-string[data-string="5"] .jam-fret::before {
+  height: 0.1875rem;
+}
+
+.jam-dot {
+  position: relative;
+  box-sizing: border-box;
+  width: 1.375rem;
+  height: 1.375rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
+.jam-fret[data-role="off"]:not([data-chord="true"]) .jam-dot {
+  visibility: hidden;
+}
+
+.jam-fret[data-role="scale"] .jam-dot {
+  background: var(--text-muted);
+  color: var(--dominant);
+}
+
+.jam-fret[data-role="root"] .jam-dot {
+  background: var(--text);
+  color: var(--dominant);
+  font-weight: 600;
+  box-shadow: 0 0 0 0.125rem var(--dominant), 0 0 0 0.25rem var(--text);
+}
+
+.jam-fret[data-role="avoid"] .jam-dot {
+  background: color-mix(in srgb, var(--jam-avoid) 30%, var(--dominant));
+  border: 0.125rem solid var(--jam-avoid);
+  color: var(--text);
+  text-decoration: line-through;
+}
+
+.jam-fret[data-role="avoid"] .jam-dot::after {
+  content: "";
+  position: absolute;
+  left: -10%;
+  top: 50%;
+  width: 120%;
+  height: 0.125rem;
+  background: var(--jam-avoid);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
+.jam-fret[data-root="true"] .jam-dot {
+  box-shadow: 0 0 0 0.125rem var(--dominant), 0 0 0 0.25rem var(--text);
+}
+
+.jam-fret[data-role="outside"] .jam-dot {
+  background: color-mix(in srgb, var(--jam-outside) 30%, var(--dominant));
+  border: 0.125rem dashed var(--jam-outside);
+  color: var(--text);
+}
+
+.jam-fret-numbers {
+  display: flex;
+  height: 1.5rem;
+}
+
+.jam-fret-number {
+  box-sizing: border-box;
+  min-width: 0;
+  border-right: 1px solid transparent;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.jam-fret-number:nth-child(2) {
+  border-right: 0.25rem solid transparent;
+}
+
+/* The Chord tones checkbox, the chord line and the legend. The checkbox
+   is a native one in a neutral gray (never teal). The legend draws each mark at 1rem next to its
+   word with the same role rules as the keys; the chord-tone mark is a corner square, a square and
+   never a circle, so it cannot be read as a dot. No animation. */
+#jam-chord-tones-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 1.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+#jam-chord-tones {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  accent-color: var(--text-muted);
+}
+
+#jam-legend {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-left: auto;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.jam-legend-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+#jam-legend-chord[hidden] {
+  display: none;
+}
+
+.jam-legend-mark {
+  position: relative;
+  box-sizing: border-box;
+  width: 1rem;
+  height: 1rem;
+  border-radius: 0;
+}
+
+.jam-legend-mark[data-role="scale"] {
+  background: var(--text-muted);
+}
+
+.jam-legend-mark[data-role="root"] {
+  background: var(--text);
+  box-shadow: inset 0 0 0 0.125rem var(--text), inset 0 0 0 0.25rem var(--dominant);
+}
+
+.jam-legend-mark[data-role="avoid"] {
+  background: color-mix(in srgb, var(--jam-avoid) 30%, var(--dominant));
+  border: 0.125rem solid var(--jam-avoid);
+}
+
+.jam-legend-mark[data-role="avoid"]::after {
+  content: "";
+  position: absolute;
+  left: -10%;
+  top: 50%;
+  width: 120%;
+  height: 0.125rem;
+  background: var(--jam-avoid);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
+.jam-legend-mark[data-role="outside"] {
+  background: color-mix(in srgb, var(--jam-outside) 30%, var(--dominant));
+  border: 0.125rem dashed var(--jam-outside);
+}
+
+.jam-legend-mark[data-role="chord"] {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+#jam-chord {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-chord[hidden] {
+  display: none;
+}
+
+.jam-degree[data-chord="true"] {
+  position: relative;
+}
+
+.jam-key[data-chord="true"]::before,
+.jam-fret[data-chord="true"] .jam-dot::before,
+.jam-degree[data-chord="true"]::before,
+.jam-legend-mark[data-role="chord"]::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 0.375rem;
+  height: 0.375rem;
+  background: var(--text);
+  pointer-events: none;
+}
+
+.jam-fret[data-role="off"][data-chord="true"] .jam-dot {
+  visibility: visible;
+  background: var(--surface-2);
+  border: 1px solid var(--text-muted);
+  color: var(--text);
+}
+
+/* The Instruments view. #instruments-view fills the panel like the others; the notice stays on
+   top and #instruments-body scrolls on its own, so the cards are never clipped. Cards are the Parts card look on
+   the panel color, with a 1px border. Nothing here uses the accent: a plugged-in port is not "playing now".
+   Sizes in rem, 1px hairlines only, no motion. */
+#instruments-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+#instruments-view[hidden] {
+  display: none;
+}
+
+#instruments-notice {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+#instruments-notice[hidden] {
+  display: none;
+}
+
+#instruments-message {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 1rem;
+}
+
+#instruments-message[hidden] {
+  display: none;
+}
+
+#instruments-message-text {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#instruments-folder {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#instruments-folder[hidden] {
+  display: none;
+}
+
+#instruments-message-sub,
+#instruments-message-closing {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#instruments-problems {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+#instruments-problems[hidden] {
+  display: none;
+}
+
+#instruments-problems code {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+#instruments-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 1rem;
+}
+
+#instruments-body[hidden] {
+  display: none;
+}
+
+#instruments-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 0.5rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  align-items: start;
+}
+
+#instruments-list[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="c"] #instruments-list {
+  max-width: 100rem;
+  margin: 0 auto;
+  grid-template-columns: repeat(auto-fit, minmax(18rem, 24rem));
+  justify-content: center;
+}
+
+#workspace[data-layout="c"] #instruments-footer {
+  text-align: center;
+}
+
+#instruments-footer {
+  margin: 0.5rem 0 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.instrument-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  color: var(--text);
+  cursor: default;
+}
+
+.instrument-card:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-name {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* The card's header, the name beside its switch. The name takes the room and wraps; the switch
+   never shrinks and never moves below the name. */
+.instrument-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.instrument-head .instrument-name {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* The switch: a native button (role switch) with a track, a thumb and a word. Neutral on purpose: On is not "playing
+   now", so no accent. State is the word and the thumb's place, never a color; nothing moves by animation. */
+.instrument-switch {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 1.75rem;
+  min-width: 3rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.instrument-switch:hover {
+  border-color: var(--text);
+}
+
+.instrument-switch:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-switch[aria-checked="false"],
+.instrument-switch[aria-busy="true"] {
+  color: var(--text-muted);
+}
+
+.instrument-switch[aria-busy="true"] {
+  cursor: default;
+}
+
+.instrument-switch[aria-checked="false"]:hover,
+.instrument-switch[aria-busy="true"]:hover {
+  color: var(--text);
+}
+
+.instrument-switch-track {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: 1.5rem;
+  height: 1rem;
+  border: 1px solid var(--text);
+}
+
+.instrument-switch[aria-checked="false"] .instrument-switch-track,
+.instrument-switch[aria-busy="true"] .instrument-switch-track {
+  border-color: var(--text-muted);
+}
+
+.instrument-switch-thumb {
+  position: absolute;
+  top: 50%;
+  box-sizing: border-box;
+  width: 0.5rem;
+  height: 0.5rem;
+  margin-top: -0.25rem;
+  border-radius: 50%;
+}
+
+/* On: a filled disc at the right. Off: a hollow ring at the left. Pending: a hollow ring in the middle. */
+.instrument-switch[aria-checked="true"] .instrument-switch-thumb {
+  right: 0.25rem;
+  background: var(--text);
+}
+
+.instrument-switch[aria-checked="false"] .instrument-switch-thumb,
+.instrument-switch[aria-busy="true"] .instrument-switch-thumb {
+  left: 0.25rem;
+  background: transparent;
+  border: 1px solid var(--text-muted);
+}
+
+.instrument-switch[aria-busy="true"] .instrument-switch-thumb {
+  left: 0.5rem;
+  right: auto;
+}
+
+.instrument-switch-word {
+  white-space: nowrap;
+}
+
+.instrument-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.instrument-row {
+  display: grid;
+  grid-template-columns: 5rem minmax(0, 1fr);
+  gap: 0.5rem;
+}
+
+.instrument-label {
+  min-width: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.instrument-value {
+  min-width: 0;
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.instrument-mono {
+  font-family: var(--font-mono);
+}
+
+/* One word of the channels (`11–16`) stays on one line; the breaks fall at the spaces. */
+.instrument-word {
+  white-space: nowrap;
+}
+
+.instrument-muted {
+  color: var(--text-muted);
+}
+
+.instrument-port {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.instrument-port .state-dot {
+  flex: none;
+}
+
+.instrument-port-name {
+  min-width: 0;
+  font-family: var(--font-mono);
+}
+
+.instrument-state {
+  display: block;
+  color: var(--text-muted);
+}
+
+.instrument-state[data-attention="true"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* A card switched off stays listed and keeps every row and its place in the grid. Off is a word
+   (`Off`, `switched off`) and a shape (a dashed outline, a crossed dot), not a color: the values dim to the muted
+   text color and the name stays --text, so the card is still found. */
+.instrument-card[data-enabled="false"] {
+  border-style: dashed;
+}
+
+.instrument-card[data-enabled="false"] .instrument-value,
+.instrument-card[data-enabled="false"] .instrument-mono,
+.instrument-card[data-enabled="false"] .instrument-chip-value {
+  color: var(--text-muted);
+}
+
+/* The line after a switch that did not take: the same "needs attention" idiom as an unplugged port (weight, not color). */
+.instrument-error {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* The settings editor of a card. Native controls styled by hand; neutral colors only (no accent,
+   no destructive color). Control text is --text on --surface-2 (muted text on that fill is below 4.5:1), a refusal is
+   weight 600, an invalid field a heavier outline, and nothing animates. */
+.instrument-edit {
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  min-height: 1.75rem;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: inset 0 -1px 0 var(--text-muted);
+}
+
+.instrument-edit[hidden] {
+  display: none;
+}
+
+.instrument-edit:hover {
+  box-shadow: inset 0 -1px 0 var(--text);
+}
+
+.instrument-edit:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  /* Native checkboxes and the select draw dark on this page, like the select's own rule. */
+  color-scheme: dark;
+}
+
+.instrument-editor-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* The Channels group: its legend floats into the label column and the chips take the rest, like the other rows. */
+.instrument-channels-group {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.instrument-channels-group > .instrument-label {
+  float: left;
+  box-sizing: border-box;
+  width: 5rem;
+  margin-right: 0.5rem;
+  padding: 0;
+}
+
+.instrument-channels-group > .instrument-value {
+  display: flow-root;
+}
+
+.instrument-select {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 1.75rem;
+  margin: 0;
+  padding: 0 0.25rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  color-scheme: dark;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.instrument-select:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-channel-set {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.instrument-channel {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  box-sizing: border-box;
+  min-height: 1.75rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.instrument-clock {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  min-height: 1.75rem;
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.instrument-channel input,
+.instrument-clock input {
+  margin: 0;
+  accent-color: var(--text);
+}
+
+.instrument-channel input:focus-visible,
+.instrument-clock input:focus-visible {
+  outline: none;
+}
+
+.instrument-channel:has(input:focus-visible) {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.instrument-clock:has(input:focus-visible) {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-editor [aria-invalid="true"] {
+  outline: 1px solid var(--text);
+  outline-offset: 1px;
+}
+
+.instrument-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.instrument-action {
+  box-sizing: border-box;
+  min-height: 1.75rem;
+  min-width: 3rem;
+  padding: 0 0.5rem;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.instrument-action:hover {
+  border-color: var(--text-muted);
+}
+
+.instrument-action:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+/* Disabled by shape, not by dimming: a dashed outline (the same idiom as an off card). */
+.instrument-action[aria-disabled="true"] {
+  border-style: dashed;
+  cursor: default;
+}
+
+.instrument-action[aria-disabled="true"]:hover {
+  border-color: var(--border);
+}
+
+.instrument-errors {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--text);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.instrument-errors code {
+  font-family: var(--font-mono);
+}
+
+.instrument-hint {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.instrument-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.instrument-inuse-line {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The second muted line of the Controls label: what the chip values are. */
+.instrument-label-hint {
+  display: block;
+}
+
+.instrument-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.instrument-chip {
+  display: inline-flex;
+  gap: 0.25rem;
+  min-height: 1.5rem;
+  align-items: center;
+  padding: 0 0.25rem;
+  border: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.instrument-chip-value {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+/* The Drum kit row and the Drum map line of a card with a rhythm channel. The kit is data in the
+   mono face. The Drum map line is one native disclosure (display only): its summary reads as one sentence, the state
+   is the words `show notes` and `hide notes` (swapped by [open]), never an icon. Neutral colors, no motion. */
+.instrument-drum-kit {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.instrument-drum-maps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.instrument-drum-map {
+  min-width: 0;
+}
+
+.instrument-drum-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  list-style: none;
+  cursor: default;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.instrument-drum-summary::-webkit-details-marker {
+  display: none;
+}
+
+.instrument-drum-summary:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.instrument-drum-show,
+.instrument-drum-hide {
+  color: var(--text-muted);
+}
+
+.instrument-drum-map[open] .instrument-drum-show,
+.instrument-drum-map:not([open]) .instrument-drum-hide {
+  display: none;
+}
+
+.instrument-drum-notes {
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  columns: 9rem;
+  column-gap: 0.5rem;
+}
+
+.instrument-drum-notes li {
+  break-inside: avoid;
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+.instrument-drum-number {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+}
+
+.instrument-drum-unknown,
+.instrument-drum-sub {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+/* Visually hidden, kept in the accessibility tree: the live region for plug changes. Always present and never
+   [hidden], so it is announced reliably (the #change-status recipe). */
+#instruments-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The load failure notice, for a page whose Strudel or acorn script did not load. It stands alone: it needs nothing
+   from the rest of the page, which may never start. The base rule is the strip of the partial case (acorn missing,
+   everything else works): in flow above the bar, the look of a kind-notice failed-change banner, one level above the
+   sound-unlock overlay (2000) so it stays readable. The blocked case (Strudel missing) turns the same element into a
+   centered panel and hides every other child of body, the overlay included. Neutral colors only: the accent is for
+   "live now" and red is for the failed-change banner. No transition, no animation: it appears in one frame. */
+#load-failure {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  box-sizing: border-box;
+  min-height: 2.25rem;
+  padding: 0.5rem 0.75rem;
+  background: var(--secondary);
+  border-bottom: 1px solid var(--border);
+  border-left: 0.25rem solid var(--text-muted);
+  position: relative;
+  z-index: 2001;
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#load-failure[hidden] {
+  display: none;
+}
+
+body[data-load="failed"] > :not(#load-failure):not(#load-failure-alert) {
+  display: none;
+}
+
+body[data-load="failed"] > #load-failure {
+  flex: 1;
+  flex-wrap: nowrap;
+  justify-content: center;
+  padding: 1rem;
+  overflow: auto;
+  background: var(--dominant);
+  border-bottom: none;
+  border-left: none;
+}
+
+#load-failure-box {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 36rem;
+  text-align: left;
+}
+
+#load-failure-box[hidden] {
+  display: none;
+}
+
+body[data-load="degraded"] #load-failure-box {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  max-width: none;
+}
+
+#load-failure-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--text);
+}
+
+body[data-load="degraded"] #load-failure-title {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#load-failure-what {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+#load-failure-todo {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+}
+
+body[data-load="degraded"] #load-failure-what {
+  font-size: 0.8125rem;
+}
+
+body[data-load="degraded"] #load-failure-todo {
+  font-size: 0.8125rem;
+}
+
+/* The failed address: mono, selectable so it can be pasted into a bug report, and wrapped wherever it must be, never
+   cut and never scrolled sideways. */
+#load-failure-addresses {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+#load-failure-addresses[hidden] {
+  display: none;
+}
+
+body[data-load="degraded"] #load-failure-addresses {
+  flex: 1 1 100%;
+}
+
+/* The Claude line: sending and told are muted; the unreachable and refused lines differ by their words and by weight 600, never by hue. */
+#load-failure-claude {
+  margin: 0;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+body[data-load="degraded"] #load-failure-claude {
+  font-size: 0.8125rem;
+}
+
+#load-failure-claude[data-state="unreachable"],
+#load-failure-claude[data-state="refused"] {
+  font-weight: 600;
+  color: var(--text);
+}
+
+#load-failure-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#load-failure-actions[hidden] {
+  display: none;
+}
+
+body[data-load="degraded"] #load-failure-actions {
+  margin-left: auto;
+}
+
+#load-failure-actions button {
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+body[data-load="degraded"] #load-failure-actions button {
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+#load-failure-actions button:hover {
+  border-color: var(--text-muted);
+}
+
+#load-failure-actions button:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#load-failure-dismiss[hidden] {
+  display: none;
+}
+
+/* Visually hidden, kept in the accessibility tree: the alert region that announces the notice once. Always present and
+   never [hidden] (an alert that exists at load is not announced; its text is set later), the #problem-alert recipe. */
+#load-failure-alert {
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

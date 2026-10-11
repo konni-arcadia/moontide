@@ -1,0 +1,58 @@
+# This workflow scans the whole history for secrets. It uses the gitleaks CLI and not
+# gitleaks/gitleaks-action. On a push the action scans only the pushed range and it needs a
+# licence for organisations, while this workflow must scan the full history every time.
+#
+# Every action reference is a full commit SHA with its version as a comment. Do not use a tag or
+# a branch name: a tag can be moved, a commit cannot.
+name: gitleaks
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        shell: bash
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum --check --strict
+          tar -xzf "$tarball" -C "$RUNNER_TEMP" gitleaks
+
+      # The scan uses the default rules only, as the local gate does. A repo-level config or ignore file
+      # could switch the check off for its own secret, so either one fails the run.
+      - name: Refuse gitleaks settings in the repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          found="$(find "$GITHUB_WORKSPACE" -name .git -prune -o \( -name '.gitleaks.toml' -o -name '.gitleaksignore' \) -print)"
+          if [ -n "$found" ]; then
+            echo "A gitleaks config or ignore file is in the repo; the scan must use the default rules only." >&2
+            echo "$found" >&2
+            exit 1
+          fi
+
+      - name: Scan the full history
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/gitleaks-no-ignore"
+          env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML "$RUNNER_TEMP/gitleaks" git "$GITHUB_WORKSPACE" --no-banner --redact --verbose --exit-code 1 --ignore-gitleaks-allow --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks-no-ignore"

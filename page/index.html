@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="moontide-page-token" content="__MOONTIDE_PAGE_TOKEN__">
+  <meta name="moontide-session-label" content="__MOONTIDE_SESSION_LABEL__">
+  <title>Moontide</title>
+  <script
+    src="https://unpkg.com/@strudel/repl@1.3.0/dist/index.js"
+    integrity="sha384-lCEvnEkKT0yduqm8nTtM4FQxz6oegFdhDdI1nOaIpPHuQ8v1PLH7ATGwV66YH+Ot"
+    crossorigin="anonymous"
+  ></script>
+  <script
+    src="https://unpkg.com/acorn@8.18.0/dist/acorn.js"
+    integrity="sha384-WgWa7IMzbWqfzzErkcVQfJDMGL8BWPguzfJMENCZenrpvc27isEGxLTnZb3cbz35"
+    crossorigin="anonymous"
+  ></script>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <section id="load-failure" aria-labelledby="load-failure-title" hidden>
+    <div id="load-failure-box">
+      <h1 id="load-failure-title"></h1>
+      <p id="load-failure-what"></p>
+      <p id="load-failure-todo"></p>
+      <p id="load-failure-addresses"></p>
+      <p id="load-failure-claude" role="status" aria-live="polite"></p>
+      <div id="load-failure-actions">
+        <button type="button" id="load-failure-reload"></button>
+        <button type="button" id="load-failure-dismiss" hidden></button>
+      </div>
+    </div>
+  </section>
+  <div id="load-failure-alert" role="alert"></div>
+  <div id="chrome">
+    <header id="top-bar">
+      <span id="product-name" class="bar-deco"></span>
+      <button type="button" id="transport-button"><span class="transport-mark" aria-hidden="true"></span><span class="transport-word"></span></button>
+      <span id="sound-state" role="group"><span class="state-dot"></span><span class="state-label"></span><span class="state-here"></span></span>
+      <span id="tempo-readout" role="group"><span class="tempo-num"></span><span class="tempo-arrow"></span><span class="tempo-unit"></span></span>
+      <span id="cycle-beat" class="bar-deco" aria-hidden="true" hidden></span>
+      <span id="pending-change" hidden><span class="pending-lead" aria-hidden="true"></span><span class="pending-rest" aria-hidden="true"></span></span>
+      <span id="change-status" role="status" aria-live="polite"></span>
+      <span class="bar-sep" aria-hidden="true"></span>
+      <div id="view-buttons" role="group" aria-label="Views"></div>
+      <span id="bar-spacer"></span>
+      <span class="layout-word"></span>
+      <div id="layout-buttons" role="group" aria-label="Layout"></div>
+      <span class="bar-sep" aria-hidden="true"></span>
+      <span id="ask-status" role="status" aria-live="polite" hidden><span class="ask-long"></span><span class="ask-short" aria-hidden="true"></span></span>
+      <button type="button" id="session-button" aria-expanded="false" aria-controls="session-drawer"><span class="session-label"></span><span id="session-count" hidden></span><span class="session-chevron" aria-hidden="true"></span></button>
+    </header>
+    <div id="problem-banner" data-kind="change" tabindex="-1" hidden><span class="problem-lead"></span><span class="problem-consequence"></span><span id="eval-error" hidden></span><span class="problem-actions"><button type="button" id="problem-details-toggle" aria-expanded="false" aria-controls="problem-details"></button><button type="button" id="problem-copy"></button><button type="button" id="problem-ask" hidden></button><button type="button" id="problem-dismiss"></button></span><p id="problem-copy-failure" hidden></p><pre id="problem-details" hidden></pre></div>
+    <div id="problem-alert" role="alert"></div>
+    <div id="problem-menu" role="group" hidden><button type="button" id="problem-menu-copy"></button><button type="button" id="problem-menu-ask"></button><button type="button" id="problem-menu-dismiss"></button></div>
+    <div id="session-strip" hidden><span id="strip-text"></span><button type="button" id="strip-take-back" hidden></button></div>
+    <div id="session-drawer" role="region" aria-label="Session" tabindex="-1" hidden>
+      <section id="session-card-session" class="session-card">
+        <h2 class="session-card-title" data-copy="cardSession"></h2>
+        <div id="session-identity" class="session-identity"><span class="session-key"></span><span id="session-label"></span></div>
+        <span id="connection-state" class="bar-text"></span>
+        <span id="build-mismatch" class="bar-text" hidden></span>
+        <span id="midi-takeover" class="bar-text" hidden><span id="midi-takeover-text"></span><button type="button" id="take-back"></button></span>
+        <p class="session-hint" data-copy="rightClickHint"></p>
+      </section>
+      <section id="session-card-midi" class="session-card">
+        <h2 class="session-card-title" data-copy="cardMidi"></h2>
+        <span id="midi-state" class="bar-text" hidden><span id="midi-dots" aria-hidden="true"></span><span id="midi-state-text" role="status" aria-live="polite"></span><button type="button" id="midi-info" aria-expanded="false" aria-controls="midi-help"></button></span>
+        <p class="session-hint" data-copy="midiHint"></p>
+      </section>
+      <section id="session-card-requests" class="session-card">
+        <h2 class="session-card-title" data-copy="cardRequests"></h2>
+        <span id="page-requests" class="bar-text" hidden><span id="page-requests-state" aria-live="polite"></span><button type="button" id="page-requests-info" aria-expanded="false" aria-controls="page-requests-help"></button></span>
+      </section>
+      <section id="session-card-settings" class="session-card">
+        <h2 class="session-card-title" data-copy="cardSettings"></h2>
+        <div class="session-row"><span class="bar-text" data-copy="settingsLabel"></span><div id="change-timing" role="group"></div></div>
+        <p class="session-hint" data-copy="timingNote"></p>
+        <div class="session-row"><button type="button" id="motion-switch"></button></div>
+        <p class="session-hint" data-copy="motionNote"></p>
+      </section>
+      <section id="session-card-change" class="session-card">
+        <h2 class="session-card-title" data-copy="cardChange"></h2>
+        <span id="version-indicator" class="bar-text" hidden></span>
+        <p class="session-hint session-empty" data-copy="noChange"></p>
+      </section>
+    </div>
+  </div>
+  <div id="workspace">
+    <main id="editor-area"><strudel-editor id="repl"></strudel-editor></main>
+    <div id="split-handle" role="separator" tabindex="0" aria-controls="view-panel" aria-valuemin="15" aria-valuemax="85" aria-valuenow="42" aria-valuetext="View 42 percent" aria-orientation="horizontal" hidden><span id="split-grip" aria-hidden="true"><span></span><span></span><span></span></span><span id="split-readout" aria-hidden="true"></span></div>
+    <div id="split-status" role="status" aria-live="polite"></div>
+    <section id="view-panel" hidden>
+      <div id="history-view" hidden><div id="history-header"><div id="history-mode" role="group" aria-label="History display"><button type="button" id="history-mode-list">List</button><button type="button" id="history-mode-tree">Tree</button></div><span id="history-count"></span></div><p id="history-notice" role="status" aria-live="polite" hidden></p><p id="history-message" role="status" aria-live="polite"></p><div id="history-body"><div id="history-scroll"><ol id="history-list"></ol><button type="button" id="history-more" hidden></button><p id="history-more-status" role="status" aria-live="polite" hidden></p></div><div id="history-detail"></div></div></div>
+      <div id="timeline-view" hidden>
+        <p id="timeline-message"></p>
+        <div id="timeline-body" hidden>
+          <div id="timeline-ruler"></div>
+          <div id="timeline-sections"></div>
+          <div id="timeline-lanes"></div>
+          <div id="timeline-playhead"><span class="playhead-cycle"></span></div>
+        </div>
+      </div>
+      <div id="mixer-view" hidden><p id="mixer-notice" hidden></p><p id="mixer-message" hidden></p><div id="mixer-body" hidden><div id="mixer-strips"></div><div id="mixer-inspector" hidden></div></div><p id="mixer-nonotes" hidden></p></div>
+      <div id="parts-view" hidden><p id="parts-message"></p><button type="button" id="parts-ask" hidden></button><p id="parts-ask-status" hidden></p><div id="parts-rows"></div></div>
+      <div id="jam-view" hidden><div id="jam-message" hidden><p id="jam-message-text"></p><p id="jam-message-sub" hidden></p></div><div id="jam-body" hidden><div id="jam-info"><p id="jam-declared" hidden><span id="jam-declared-label"></span><span id="jam-declared-value"></span></p><div id="jam-scale"><span id="jam-scale-label" hidden></span><h2 id="jam-scale-name"></h2><p id="jam-scale-sub"></p></div><div id="jam-degrees" role="list"></div><div id="jam-status" role="status" aria-live="polite" hidden><p id="jam-status-text"><strong id="jam-status-lead"></strong><span id="jam-status-rest"></span></p><span id="jam-status-time" aria-hidden="true"></span><span id="jam-status-spoken"></span></div><p id="jam-paused" hidden></p><div id="jam-coming"><p id="jam-coming-caption"></p><div id="jam-rows"></div></div></div><div id="jam-instrument"><div id="jam-controls"><div id="jam-instrument-switch" role="group"><button type="button" id="jam-instrument-piano">Piano</button><button type="button" id="jam-instrument-guitar">Guitar</button></div><label id="jam-chord-tones-label"><input type="checkbox" id="jam-chord-tones"> <span id="jam-chord-tones-text"></span></label><div id="jam-legend"><span id="jam-legend-chord" class="jam-legend-entry" hidden></span></div></div><p id="jam-chord" hidden></p><div id="jam-board"><div id="jam-piano" role="img"></div><div id="jam-guitar" role="img" hidden></div></div></div></div></div>
+      <div id="instruments-view" hidden tabindex="-1"><p id="instruments-notice" hidden></p><div id="instruments-message" hidden><p id="instruments-message-text"></p><code id="instruments-folder" hidden></code><p id="instruments-message-sub" hidden></p><ul id="instruments-problems" hidden></ul><p id="instruments-message-closing" hidden></p></div><div id="instruments-body" hidden><ul id="instruments-list" role="list" aria-label="Instruments"></ul><p id="instruments-footer"></p></div><span id="instruments-status" role="status" aria-live="polite"></span></div>
+    </section>
+  </div>
+  <div id="ask-box" role="dialog" hidden><div id="ask-chips"><span id="ask-context-chip"></span><span id="ask-current-chip" hidden></span></div><textarea id="ask-field" rows="1" aria-describedby="ask-context-chip ask-hint"></textarea><p id="ask-message" hidden></p><p id="ask-hint"></p></div>
+  <div id="page-requests-help" role="dialog" tabindex="-1" hidden></div>
+  <div id="midi-help" role="dialog" tabindex="-1" hidden></div>
+  <div id="midi-banner" role="status" aria-live="polite" hidden><p id="midi-banner-text"></p><button type="button" id="midi-banner-dismiss"></button></div>
+  <button type="button" id="audio-unlock-overlay">
+    <span id="audio-unlock-cta" data-accent="true"></span>
+    <span id="audio-error" hidden></span>
+  </button>
+  <script type="module" src="/load-failure-view.js"></script>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>
