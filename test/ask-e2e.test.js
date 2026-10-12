@@ -150,6 +150,21 @@ function startListenerFrom(replyText, scenario) {
   };
 }
 
+/**
+ * Proves that earlier, refused requests printed nothing. A valid follow-up goes down the same path to the same
+ * listener, and the server handles page frames in order, so once the follow-up line has arrived on the listener's
+ * stdout, a refused request that was going to print would have printed before it. `printedBefore` is the number of
+ * lines the listener had already printed legitimately. Nothing here depends on a fixed pause.
+ */
+async function expectNothingPrintedBefore(trusted, listener, printedBefore, followUpId) {
+  ask(trusted.page, followUpId, 'a valid request after the refused one');
+  await listener.waitForLines(printedBefore + 1, `the line of ${followUpId}`);
+  const lines = listener.lines();
+  assert.equal(lines.length, printedBefore + 1, `only the follow-up was printed after the refused request, got ${JSON.stringify(lines)}`);
+  const followUp = JSON.parse(lines[lines.length - 1].slice(REQUEST_LINE_PREFIX.length + 1));
+  assert.equal(followUp.id, followUpId, 'the last printed line is the follow-up');
+}
+
 test('ask e2e: a page that never authenticates is not the active page and changes no tool reply', async (t) => {
   const scenario = await startScenario(t);
   const page = await connectPage(scenario.port);
@@ -319,10 +334,7 @@ test('ask e2e: an instrument request whose id holds 201 characters is refused in
   assert.equal(refusal.reason, 'invalid');
   assert.equal(typeof refusal.detail, 'string');
   assert.ok(refusal.detail.length > 0);
-  await sleep(200);
-  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
-  await scenario.getCode();
-  assert.equal(listener.stdout, '', 'a refused request prints nothing');
+  await expectNothingPrintedBefore(trusted, listener, 0, 'instrument-follow-up');
 });
 
 test('ask e2e: seven requests sent at once produce a rate-limit refusal', async (t) => {
@@ -458,10 +470,7 @@ test('ask e2e: the largest accepted request line reaches the listener whole as o
   const refusal = await trusted.waitFor((m) => m.type === 'ask-result' && m.id === 'over-line', 'the refusal of the longer line');
   assert.equal(refusal.status, 'refused');
   assert.equal(refusal.reason, 'line-too-long');
-  await sleep(300);
-  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
-  await scenario.getCode();
-  assert.equal(listener.lines().length, 1, 'the longer line never reaches the listener');
+  await expectNothingPrintedBefore(trusted, listener, 1, 'over-line-follow-up');
 });
 
 test('ask e2e: an error request from a trusted page reaches the listener with its context and chip unchanged', async (t) => {
@@ -496,8 +505,5 @@ test('ask e2e: an error request whose text holds 201 characters is refused inval
   assert.equal(refusal.reason, 'invalid');
   assert.equal(typeof refusal.detail, 'string');
   assert.ok(refusal.detail.length > 0);
-  await sleep(200);
-  // A reply to a later request means the server has finished with the earlier one, so this check does not pass only because the event is late.
-  await scenario.getCode();
-  assert.equal(listener.stdout, '', 'a refused request prints nothing');
+  await expectNothingPrintedBefore(trusted, listener, 0, 'error-follow-up');
 });

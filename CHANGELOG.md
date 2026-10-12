@@ -3,6 +3,22 @@
 Notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-10-12
+
+A maintenance release: nothing changes in how Moontide works.
+
+### Added
+
+- A short demo video with sound, linked from a poster image at the top of the README. The video is
+  hosted on YouTube.
+
+### Fixed
+
+- The three tests that check that a refused page request prints nothing now send a valid request
+  afterwards and wait for its line on the same output before they conclude. The 2.0.1 note said such
+  tests made a round trip to the server first; that was not true of these three, which waited on a
+  different output. The start test still waits a fixed 300 ms for a late log line.
+
 ## [2.0.1] - 2026-10-11
 
 A maintenance release: nothing changes in how Moontide works.
@@ -37,5 +53,6 @@ A maintenance release: nothing changes in how Moontide works.
 - Moontide starts when you ask for music or say start, not with every Claude session. Each page and its
   tab title name the folder and the port of their server.
 
+[2.0.2]: https://github.com/konni-arcadia/moontide/releases/tag/v2.0.2
 [2.0.1]: https://github.com/konni-arcadia/moontide/releases/tag/v2.0.1
 [2.0.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.0.0

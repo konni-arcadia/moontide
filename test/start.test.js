@@ -50,8 +50,8 @@ test('a session that connects starts nothing, then the start tool starts Moontid
   assert.ok(!reference.isError, 'the reference answers before any start');
 
   await sleep(300);
-  // A reply to a later request means the server has finished with the earlier ones, so the checks below do not pass only because a line is late.
-  // It also shows that get_code starts nothing.
+  // The pause is what gives a late stderr line time to show up: stderr is a separate pipe from the tool replies, so a
+  // reply says nothing about when a stderr line arrives. The get_code call asserts that it starts nothing.
   const before = await server.client.callTool({ name: 'get_code', arguments: {} });
   assert.ok(before.isError, 'get_code before a start is an error');
   assert.equal(textOf(before), NOT_STARTED_MESSAGE);

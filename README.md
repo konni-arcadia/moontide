@@ -9,7 +9,9 @@ ever stopping.**
 [![npm version](https://img.shields.io/npm/v/moontide-mcp)](https://www.npmjs.com/package/moontide-mcp)
 [![CI](https://github.com/konni-arcadia/moontide/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/konni-arcadia/moontide/actions/workflows/ci.yml)
 
-<!-- Demo media goes here, right under the pitch. -->
+[![Moontide demo: Claude starts a dungeon theme from a few words, then changes it on requests typed in the page](https://i.ytimg.com/vi/kT4UdEi2Z-8/maxresdefault.jpg)](https://youtu.be/kT4UdEi2Z-8)
+
+▶ [Watch the demo on YouTube](https://youtu.be/kT4UdEi2Z-8) (3 minutes, with sound)
 
 ## How this was made
 

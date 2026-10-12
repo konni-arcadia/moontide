@@ -6,12 +6,12 @@
     "url": "https://github.com/konni-arcadia/moontide",
     "source": "github"
   },
-  "version": "2.0.1",
+  "version": "2.0.2",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "moontide-mcp",
-      "version": "2.0.1",
+      "version": "2.0.2",
       "transport": {
         "type": "stdio"
       }
