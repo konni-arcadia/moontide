@@ -72,6 +72,8 @@ A program change and a note at the same instant go out in no fixed order, so a p
 
 The Moontide page reads `sound` when the user has described instruments in instruments.json: `.midi('port name', { midichannel: 3, sound: 'sound name' })` makes the page send that instrument's program change before the new code plays, and get_midi_instruments lists each instrument's sounds. With a change that waits for a bar or phrase line, the page sends the program change just before the line, timestamped at the line.
 
+A track's `.midi()` options are sent once when the code is evaluated, not at a section change; two variations asking different sounds of one channel are refused.
+
 The Moontide page also reads `controls` when the user has described instruments in instruments.json: `.midi('port name', { midichannel: 3, controls: { volume: 100 } })` sets one static level per control of that instrument, in the control's own range, and the page sends it before the new code plays. Control ids and ranges come from get_midi_instruments; a control that leaves the code goes back to the instrument's default; a sweep stays `ccn` and `ccv`. With a change that waits for a bar or phrase line, the page sends the controls just before the line, timestamped at the line.
 
 ## What a MIDI track ignores

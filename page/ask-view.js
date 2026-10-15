@@ -19,6 +19,7 @@ import {
   createAskStatus,
   cutText,
   describeContext,
+  fitGestureToLine,
   fitMomentToLine,
   newAskId,
   partsAskState,
@@ -119,7 +120,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
   // The version id the top bar shows, or null before any version.
   let currentVersion = null;
   // What the right-click pointed at, snapshotted when the box opened: { context, chip } and, when the
-  // Timeline showed the music there, the moment captured at the click.
+  // Timeline showed the music there, the moment captured at the click, and, when a gesture on a note opened the box,
+  // that gesture; for a range, the cycles it was cut to when the pointer left the page (`rangeCut`).
   let snapshot = null;
   // The last request sent: { id, text }, so an accepted request clears its own draft.
   let lastSent = null;
@@ -177,6 +179,7 @@ export function createAskView({ document, send, reportError, clearError, setTime
       chip: snapshot.chip,
       current: currentVersion,
       moment: snapshot.moment,
+      gesture: snapshot.gesture,
     };
   }
 
@@ -189,7 +192,7 @@ export function createAskView({ document, send, reportError, clearError, setTime
   function renderMessage() {
     const length = askField.value.trim().length;
     const tooLongLine = lineTooLong();
-    const text = askMessage({ connected, length, notSent, tokenRefused, lineTooLong: tooLongLine });
+    const text = askMessage({ connected, length, notSent, tokenRefused, lineTooLong: tooLongLine, rangeCut: snapshot === null ? null : (snapshot.rangeCut ?? null) });
     askMessageEl.textContent = text ?? '';
     askMessageEl.hidden = text === null;
     askField.setAttribute('aria-describedby', askMessageEl.hidden ? DESCRIBED_WITHOUT_MESSAGE : DESCRIBED_WITH_MESSAGE);
@@ -264,13 +267,17 @@ export function createAskView({ document, send, reportError, clearError, setTime
   /**
    * Puts a prefill in the field (a failed change sent to Claude). An empty field is simply filled. A field that
    * already holds a draft keeps it: the prefill follows after a blank line, cut so the whole field stays within
-   * MAX_ASK_TEXT_LENGTH. The caret goes to the end so the user types the question after it. When the draft leaves no
-   * room at all, the draft stays as it is (the chip still names the error).
+   * MAX_ASK_TEXT_LENGTH, and is not added again when the draft already ends with it. The caret goes to the end so the
+   * user types the question after it. When the draft leaves no room at all, the draft stays as it is (the chip still
+   * names the error).
    */
   function applyPrefill(prefill) {
     const draft = askField.value;
     if (draft === '') {
       askField.value = prefill;
+    } else if (draft.endsWith(prefill)) {
+      // The request is already there (the same target was asked about twice, or the browser raised a right-click after
+      // a key press that had already opened the box): it is not added a second time.
     } else {
       const room = MAX_ASK_TEXT_LENGTH - draft.length - 2;
       if (room < 1) return;
@@ -284,8 +291,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
    * `{ prefill }` the field also receives that text (see applyPrefill); without it nothing about the field changes.
    */
   function open(descriptor, point, { prefill } = {}) {
-    const { context, chip, moment } = describeContext(descriptor);
-    snapshot = moment === undefined ? { context, chip } : { context, chip, moment };
+    const { context, chip, moment, gesture, rangeCut } = describeContext(descriptor);
+    snapshot = { context, chip, ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }), ...(rangeCut === undefined ? {} : { rangeCut }) };
     askContextChip.textContent = chip;
     askContextChip.setAttribute('title', chip);
     const wasHidden = askBox.hidden;
@@ -327,8 +334,13 @@ export function createAskView({ document, send, reportError, clearError, setTime
     const frame = { type: 'ask', id, text, context: describedContext.context, chip: describedContext.chip, current: currentVersion };
     // The moment rides after `current`, and only when there is one: a frame without it is as it always was.
     // Notes come off its end until the whole line fits what the server takes (the rest counts in `more`).
-    const moment = fitMomentToLine({ ...frame, moment: describedContext.moment });
+    const fields = { ...frame, moment: describedContext.moment, gesture: describedContext.gesture };
+    const moment = fitMomentToLine(fields);
     if (moment !== undefined) frame.moment = moment;
+    // The gesture follows the moment, and only when the box was opened by one. The notes of a range gesture come off its end the
+    // same way; any other gesture is sent as it is.
+    const gesture = fitGestureToLine({ ...fields, moment });
+    if (gesture !== undefined) frame.gesture = gesture;
     send(frame);
     // While the token is refused the line stays: the server's 'token' refusal writes it again, so it never blinks off.
     if (!authRefused) clearError();
@@ -358,6 +370,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
       // The History view must never see this Enter, even after focus moves back to a row.
       event.preventDefault();
       event.stopPropagation();
+      // A held key that opened the box (the auto-repeat lands here once focus has moved) must not also send what is in it.
+      if (event.repeat) return;
       submit();
     } else if (event.key === 'Escape') {
       // Esc closes the box only, never an open view.

@@ -19,6 +19,8 @@ const TOP_BAR_VIEW_PATH = fileURLToPath(new URL('../page/top-bar-view.js', impor
 const PROBLEM_VIEW_PATH = fileURLToPath(new URL('../page/problem-view.js', import.meta.url));
 const SESSION_VIEW_PATH = fileURLToPath(new URL('../page/session-view.js', import.meta.url));
 const LOAD_FAILURE_VIEW_PATH = fileURLToPath(new URL('../page/load-failure-view.js', import.meta.url));
+const STRUCTURE_VIEW_PATH = fileURLToPath(new URL('../page/structure-view.js', import.meta.url));
+const SONG_GRID_VIEW_PATH = fileURLToPath(new URL('../page/song-grid-view.js', import.meta.url));
 const SPLIT_VIEW_PATH = fileURLToPath(new URL('../page/split-view.js', import.meta.url));
 const INSTRUMENTS_VIEW_PATH = fileURLToPath(new URL('../page/instruments-view.js', import.meta.url));
 const HTML_PATH = fileURLToPath(new URL('../page/index.html', import.meta.url));
@@ -38,7 +40,15 @@ const sources = [
   { path: 'page/instruments-view.js', text: readFileSync(INSTRUMENTS_VIEW_PATH, 'utf8') },
   { path: 'page/split-view.js', text: readFileSync(SPLIT_VIEW_PATH, 'utf8') },
   { path: 'page/load-failure-view.js', text: readFileSync(LOAD_FAILURE_VIEW_PATH, 'utf8') },
+  { path: 'page/structure-view.js', text: readFileSync(STRUCTURE_VIEW_PATH, 'utf8') },
+  { path: 'page/song-grid-view.js', text: readFileSync(SONG_GRID_VIEW_PATH, 'utf8') },
 ];
+
+// Elements a view is handed by the page instead of looking them up itself: the variable name, by source.
+const INJECTED_IDS = new Map([
+  ['page/structure-view.js', new Map([['notes', 'song-notes']])],
+  ['page/song-grid-view.js', new Map([['bar', 'song-bar'], ['now', 'song-now'], ['line', 'song-line'], ['list', 'song-cell-list']])],
+]);
 
 /** Maps each `const x = document.getElementById('id')` variable name to its id. */
 function elementIdsByVariable(source) {
@@ -67,7 +77,7 @@ test('every element toggled with .hidden and given a display rule has an #id[hid
     assert.ok(toggledVars.size > 0, `expected ${path} to toggle at least one element with .hidden`);
 
     for (const variable of toggledVars) {
-      const id = ids.get(variable);
+      const id = ids.get(variable) ?? INJECTED_IDS.get(path)?.get(variable);
       assert.ok(id, `${path} toggles ${variable}.hidden but ${variable} is not a getElementById constant`);
       const body = ruleBody(`#${id}`);
       if (body === null || !/\bdisplay\s*:/.test(body)) continue;
@@ -81,7 +91,7 @@ test('every element toggled with .hidden and given a display rule has an #id[hid
 // Elements the views create by class and show with toggleAttribute('hidden', ...): the same trap as
 // the ids above, a class display rule beats the browser's [hidden] rule. Later Mixer plans extend
 // this list with their own classes.
-const HIDDEN_CLASSES = ['.mx-note', '.mx-add-list', '.mx-more', '.mx-insp-gone', '.mx-written', '.mx-insp-footer', '.mx-warning', '.mx-midi-note', '.mx-sweep', '.mx-tag', '.mx-shared', '.mx-insp-shared', '.mx-root-note', '.instrument-edit'];
+const HIDDEN_CLASSES = ['.mx-note', '.mx-add-list', '.mx-more', '.mx-insp-gone', '.mx-written', '.mx-insp-footer', '.mx-warning', '.mx-midi-note', '.mx-sweep', '.mx-tag', '.mx-shared', '.mx-insp-shared', '.mx-root-note', '.instrument-edit', '.tl-note-controls'];
 
 test('every class shown with the hidden attribute and given a display rule has a [hidden] rule', () => {
   for (const selector of HIDDEN_CLASSES) {
@@ -92,6 +102,23 @@ test('every class shown with the hidden attribute and given a display rule has a
     assert.ok(hiddenBody, `${selector} sets display, so page/style.css needs ${selector}[hidden] { display: none; }`);
     assert.match(hiddenBody, /display\s*:\s*none/, `${selector}[hidden] must set display: none`);
   }
+});
+
+// The note panel under the Timeline lanes is shown and hidden by the edit view with the hidden attribute, and so is the group of
+// its controls. Both have a display rule, so both need their own [hidden] rule, and the markup starts the panel hidden.
+test('the Timeline note panel and its controls have their own [hidden] rules, and the view toggles them', () => {
+  for (const selector of ['#timeline-note', '.tl-note-controls']) {
+    const body = ruleBody(selector);
+    assert.ok(body !== null, `page/style.css has no rule for ${selector}`);
+    assert.match(body, /\bdisplay\s*:/, `${selector} sets display`);
+    const hiddenBody = ruleBody(`${selector}[hidden]`);
+    assert.ok(hiddenBody, `${selector} sets display, so page/style.css needs ${selector}[hidden] { display: none; }`);
+    assert.match(hiddenBody, /display\s*:\s*none/, `${selector}[hidden] must set display: none`);
+  }
+  const view = readFileSync(fileURLToPath(new URL('../page/timeline-edit-view.js', import.meta.url)), 'utf8');
+  assert.match(view, /setHidden\(panel,/, 'the view hides and shows the panel');
+  assert.match(view, /setHidden\(controls,/, 'the view hides and shows the controls');
+  assert.match(readFileSync(HTML_PATH, 'utf8'), /<section id="timeline-note"[^>]*\bhidden\b/, 'the panel starts hidden');
 });
 
 // The instruments are words only, so the MIDI view looks up exactly the
@@ -311,4 +338,46 @@ test('a card whose status item is hidden is not rendered, by a rule with its own
   assert.ok(ruleBody('#session-card-requests:has(#page-requests[hidden])'), 'the Page requests card hides with its status');
   assert.match(ruleBody('#session-card-midi:has(#midi-state[hidden])'), /display\s*:\s*none/);
   assert.match(ruleBody('#session-card-requests:has(#page-requests[hidden])'), /display\s*:\s*none/);
+});
+
+// The Song toolbar sits in the Parts view after the notes and before the rows, and both it and its sentence start hidden;
+// each has its own [hidden] rule because each has a display rule.
+test('the song toolbar and its sentence are in the Parts view, start hidden and have a [hidden] rule', () => {
+  const view = html.slice(html.indexOf('<div id="parts-view"'), html.indexOf('<div id="jam-view"'));
+  assert.equal((html.match(/id="song-bar"/g) ?? []).length, 1);
+  assert.equal((html.match(/id="song-now"/g) ?? []).length, 1);
+  assert.match(view, /<div id="song-bar" hidden>/);
+  assert.match(view, /<p id="song-now" hidden><\/p>/);
+  assert.match(view, /<div id="song-launch" role="group"/);
+  assert.equal((html.match(/id="song-line"/g) ?? []).length, 1);
+  assert.match(view, /<p id="song-line" hidden role="status" aria-live="polite"><\/p>/);
+  assert.ok(view.indexOf('id="song-notes"') < view.indexOf('id="song-bar"') && view.indexOf('id="song-bar"') < view.indexOf('id="song-line"') && view.indexOf('id="song-line"') < view.indexOf('id="parts-rows"'), 'notes, then the toolbar, then its sentence, then the rows');
+  for (const id of ['song-bar', 'song-now', 'song-line']) {
+    assert.match(ruleBody(`#${id}[hidden]`) ?? '', /display\s*:\s*none/, `#${id}[hidden] hides it`);
+  }
+});
+
+// The list that opens on a cell is the last thing in the Parts view, outside the grid's scroller, hidden at the start.
+test('the cell list is in the Parts view after the rows, starts hidden as a listbox and has a [hidden] rule', () => {
+  const view = html.slice(html.indexOf('<div id="parts-view"'), html.indexOf('<div id="jam-view"'));
+  assert.equal((html.match(/id="song-cell-list"/g) ?? []).length, 1);
+  assert.match(view, /<div id="song-cell-list" hidden role="listbox" tabindex="-1"><\/div>/);
+  assert.ok(view.indexOf('id="parts-rows"') < view.indexOf('id="song-cell-list"'), 'after the rows, so it is outside the scroller');
+  assert.match(ruleBody('#song-cell-list[hidden]') ?? '', /display\s*:\s*none/);
+  const body = ruleBody('#song-cell-list') ?? '';
+  assert.match(body, /position\s*:\s*fixed/);
+  assert.match(body, /max-height\s*:\s*16rem/);
+  assert.doesNotMatch(body, /\b(transition|animation)\b/);
+});
+
+test('the song launch group shares the three segmented-group rules and none of the new song rules animates', () => {
+  for (const selector of ['#song-launch', '#song-launch button', '#song-launch button:hover', '#song-launch button[aria-pressed="true"]', '#song-launch button:focus-visible']) {
+    assert.ok(ruleBody(selector), `page/style.css needs a rule for ${selector}`);
+  }
+  for (const selector of ['#song-bar', '#song-launch-label', '#song-now', '#song-line', '.song-grid', '.song-grid-scroll', '.song-head', '.song-cell', '.song-fold', '#parts-rows[data-view="song"]']) {
+    const body = ruleBody(selector);
+    assert.ok(body, `page/style.css needs a rule for ${selector}`);
+    assert.doesNotMatch(body, /\b(transition|animation)\b/, `${selector} must not animate`);
+  }
+  assert.doesNotMatch(css, /\[data-motion[^\]]*\][^{}]*\.song-/);
 });

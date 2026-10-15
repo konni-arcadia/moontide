@@ -12,6 +12,7 @@ import {
   startMcpClient,
   waitForExit,
   withoutPageLine,
+  withoutStructureTemplate,
 } from './helpers.js';
 import { REQUEST_LINE_PREFIX, requestLine } from '../dist/ask.js';
 import { MAX_REQUEST_LINE_BYTES } from '../dist/protocol.js';
@@ -170,13 +171,13 @@ test('ask e2e: a page that never authenticates is not the active page and change
   const page = await connectPage(scenario.port);
   scenario.cleanup.push(() => page.close());
 
-  assert.equal(withoutPageLine(await scenario.getCode()), 'Nothing is playing yet.');
+  assert.equal(withoutStructureTemplate(withoutPageLine(await scenario.getCode())), 'Nothing is playing yet.');
 
   const set = await scenario.client.callTool({ name: 'set_code', arguments: { code: 's("bd sd")' } });
   assert.equal(set.isError, true);
   assert.ok(set.content[0].text.startsWith('No page connected'), set.content[0].text);
   assert.ok(!set.content[0].text.includes(ARMING_PREFIX));
-  assert.equal(withoutPageLine(await scenario.getCode()), 'Nothing is playing yet.');
+  assert.equal(withoutStructureTemplate(withoutPageLine(await scenario.getCode())), 'Nothing is playing yet.');
 });
 
 test('ask e2e: arming line, live delivery, re-arm and hand-over in a tool reply', async (t) => {
@@ -212,7 +213,7 @@ test('ask e2e: arming line, live delivery, re-arm and hand-over in a tool reply'
 
   // While the listener is connected the arming line is gone.
   const whileListening = await scenario.getCode();
-  assert.equal(withoutPageLine(whileListening), 'Nothing is playing yet.');
+  assert.equal(withoutStructureTemplate(withoutPageLine(whileListening)), 'Nothing is playing yet.');
   assert.ok(!listener.stdout.includes(listener.token), 'the listener never prints its token');
 
   // When the listener ends, the arming line comes back.
@@ -288,7 +289,7 @@ test('ask e2e: a page with a wrong token is refused and logged; no tool reply ar
   await waitForStderr(scenario, "Refused a page's token");
   await waitForStderr(scenario, 'did not present the page token');
   assert.ok(!scenario.stderrText.includes(wrongToken), 'the server never logs the token it was given');
-  assert.equal(withoutPageLine(await scenario.getCode()), 'Nothing is playing yet.', 'no page is authenticated: no arming line');
+  assert.equal(withoutStructureTemplate(withoutPageLine(await scenario.getCode())), 'Nothing is playing yet.', 'no page is authenticated: no arming line');
 });
 
 test('ask e2e: a request whose context holds a 201-character track is refused invalid, with a detail', async (t) => {

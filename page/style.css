@@ -365,10 +365,11 @@ body {
 
 /* A segmented group: a 1px frame on the dominant fill, no padding and no gap, so it is 1.75rem tall plus its frame and
    fits the slim bar. The buttons inside are the hit targets (at least 1.75rem square). The Edits timing group of the
-   Settings card is the third of them and shares every rule below; it only sets its own text size. */
+   Settings card and the launch group of the Song grid's toolbar share every rule below; they only set their own text size. */
 #view-buttons,
 #layout-buttons,
-#change-timing {
+#change-timing,
+#song-launch {
   display: inline-flex;
   flex: none;
   align-items: stretch;
@@ -383,7 +384,8 @@ body {
 
 #view-buttons button,
 #layout-buttons button,
-#change-timing button {
+#change-timing button,
+#song-launch button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -411,7 +413,8 @@ body {
 
 #view-buttons button:hover,
 #layout-buttons button:hover,
-#change-timing button:hover {
+#change-timing button:hover,
+#song-launch button:hover {
   background: var(--surface-2);
   color: var(--text);
 }
@@ -420,7 +423,8 @@ body {
    changes width when the selection moves. Muted text never sits on this fill. */
 #view-buttons button[aria-pressed="true"],
 #layout-buttons button[aria-pressed="true"],
-#change-timing button[aria-pressed="true"] {
+#change-timing button[aria-pressed="true"],
+#song-launch button[aria-pressed="true"] {
   background: var(--surface-2);
   color: var(--text);
   box-shadow: inset 0 0 0 1px var(--border);
@@ -428,7 +432,8 @@ body {
 
 #view-buttons button:focus-visible,
 #layout-buttons button:focus-visible,
-#change-timing button:focus-visible {
+#change-timing button:focus-visible,
+#song-launch button:focus-visible {
   outline: 1px solid var(--text-muted);
   outline-offset: -1px;
 }
@@ -440,7 +445,8 @@ body {
   max-width: 100%;
 }
 
-#change-timing button {
+#change-timing button,
+#song-launch button {
   font-size: 0.8125rem;
 }
 
@@ -1645,7 +1651,9 @@ body {
   grid-row: 1;
 }
 
-.lane[data-drum-rows] .lane-events {
+/* A lane's event area fills the lane's whole cell, so the rings, ghosts and washes drawn over it (the mark layer fills the same
+   cell) sit on the notes whatever height the lane's name column gives the lane. */
+.lane-events {
   align-self: stretch;
   width: 100%;
   height: 100%;
@@ -1691,6 +1699,234 @@ body {
 .lane[data-drum-rows="6"] { min-height: 7.5rem; }
 .lane[data-drum-rows="7"] { min-height: 8.75rem; }
 .lane[data-drum-rows="8"] { min-height: 10rem; }
+
+/* The editable Timeline: the panel under the lanes, and the marks on a lane. The panel is a quiet strip that is always the
+   same height, so the lanes do not move under the pointer when a note is picked; its two text lines keep their room even
+   when empty. A selected note gets a solid ring, a preview a dashed one, the other places of the same token a dotted one
+   and a range of cycles a wash with two edges: outlines and words only, never the accent colors, which keep their uses
+   (the playhead is the only accent on the Timeline). The marks sit on top of a lane in its own grid cell, never take the
+   pointer and are hidden from screen readers. Nothing here moves, fades or animates. */
+#timeline-note {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  padding: 0.5rem 1rem;
+  background: var(--secondary);
+  border-top: 1px solid var(--border);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#timeline-note[hidden] {
+  display: none;
+}
+
+.tl-note-where {
+  min-width: 0;
+  min-height: 2rem;
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+/* The spaces at the start of the position text are kept when the lane name and the position sit side by side. */
+.tl-note-where > span {
+  white-space: pre-wrap;
+}
+
+.tl-lane-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.tl-note-state {
+  color: var(--text-muted);
+}
+
+.tl-note-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.tl-note-controls[hidden] {
+  display: none;
+}
+
+.tl-group {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+/* A range offers only Ask Claude: the groups and the Make a rest button are hidden, and their display must not undo that. */
+.tl-group[hidden],
+.tl-btn[hidden] {
+  display: none;
+}
+
+.tl-label {
+  color: var(--text-muted);
+  margin-right: 0.25rem;
+}
+
+.tl-value {
+  font-family: var(--font-mono);
+  color: var(--text);
+  margin-right: 0.25rem;
+}
+
+.tl-fixed {
+  color: var(--text-muted);
+  margin-right: 0.25rem;
+}
+
+.tl-btn {
+  box-sizing: border-box;
+  min-width: 2rem;
+  height: 2rem;
+  padding: 0 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  cursor: pointer;
+}
+
+.tl-btn:hover:not([aria-disabled="true"]) {
+  border-color: var(--text-muted);
+}
+
+.tl-btn[aria-disabled="true"] {
+  border-style: dashed;
+  cursor: default;
+}
+
+.tl-btn:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#timeline-note-line,
+.tl-note-hint {
+  flex: 1 0 100%;
+  margin: 0;
+  min-height: 1.5rem;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+#timeline-note-line[data-kind="refused"],
+#timeline-note-line[data-kind="result"],
+#timeline-note-line[data-kind="notice"],
+#timeline-note-line[data-kind="preview"] {
+  color: var(--text);
+}
+
+#workspace[data-layout="b"] #timeline-note-line,
+#workspace[data-layout="b"] .tl-note-hint {
+  min-height: 4rem;
+}
+
+/* In the side panel the buttons wrap into rows when a note is selected; the panel reserves their room, so it keeps one height
+   whether nothing, a note or a drag is shown and the lanes do not move when a note is picked. */
+#workspace[data-layout="b"] #timeline-note {
+  min-height: 19rem;
+}
+
+#timeline-lanes:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+#timeline-lanes[data-dragging] {
+  user-select: none;
+}
+
+/* The pointer only confirms what the words say: a cross over empty lane area, a hand over a note, up-and-down arrows while an
+   editable note is dragged, the plain arrow while a note the page cannot edit is dragged, a cross for a drag across the lanes.
+   The lanes hold the pointer during a drag, so they carry the cursor themselves while one lasts. */
+#timeline-lanes .lane-events {
+  cursor: crosshair;
+}
+
+#timeline-lanes[data-hover="note"] .lane-events {
+  cursor: pointer;
+}
+
+#timeline-lanes[data-dragging="pitch"],
+#timeline-lanes[data-dragging="pitch"] .lane-events {
+  cursor: ns-resize;
+}
+
+#timeline-lanes[data-dragging="refused"],
+#timeline-lanes[data-dragging="refused"] .lane-events {
+  cursor: default;
+}
+
+#timeline-lanes[data-dragging="range"],
+#timeline-lanes[data-dragging="range"] .lane-events {
+  cursor: crosshair;
+}
+
+.lane-marks {
+  grid-column: 2;
+  grid-row: 1;
+  position: relative;
+  pointer-events: none;
+  min-width: 0;
+}
+
+.tl-ring,
+.tl-ghost,
+.tl-same {
+  position: absolute;
+  box-sizing: border-box;
+  min-width: 0.5rem;
+  outline-offset: 0.25rem;
+}
+
+.tl-ring {
+  outline: 1px solid var(--text);
+}
+
+.tl-ghost {
+  outline: 1px dashed var(--text);
+}
+
+.tl-same {
+  outline: 1px dotted var(--text-muted);
+}
+
+/* The element the lanes name with aria-activedescendant: it carries the name of the active note or lane for screen readers and
+   paints nothing. It is not hidden from them, so it is clipped to nothing instead of taking display: none. */
+.tl-active {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  pointer-events: none;
+}
+
+.tl-range {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--text) 14%, transparent);
+  border-left: 1px solid var(--text-muted);
+  border-right: 1px solid var(--text-muted);
+}
 
 /* The arrange() sections above the lanes — same grid columns as .lane, so
    a section span lines up with the ruler/lane track column beneath it. No accent is used here
@@ -2289,6 +2525,7 @@ body {
 #parts-view {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   padding: 1rem;
@@ -2437,6 +2674,361 @@ body {
 
 .part-card[data-state="playing"] .part-progress-fill {
   background: var(--accent);
+}
+
+/* The lines above the Song grid in the Parts view. #song-notes sits between the message and the grid so its lines do not
+   scroll away with a long grid. No accent, no motion. */
+#song-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+#song-notes[hidden] {
+  display: none;
+}
+
+.song-note {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.song-note[data-kind="check-failed"] {
+  color: var(--text-muted);
+}
+
+/* The toolbar above the Song grid: what a launched section waits for, and where the music is. #song-launch shares the
+   segmented group look of the top bar (the selector lists near #view-buttons). No accent, no motion. */
+#song-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: 1rem;
+  row-gap: 0.5rem;
+}
+
+#song-bar[hidden] {
+  display: none;
+}
+
+#song-launch-label,
+#song-now {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#song-now[hidden] {
+  display: none;
+}
+
+/* The one sentence under the toolbar: why the grid is off, what waits, or why a gesture changed nothing. It is the only
+   live region of the view and changes only on a gesture or a state change. A queued launch and one that needs no code
+   change are information, so they are muted; the rest read in the plain text color. No accent, no motion. */
+#song-line {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#song-line[data-kind="queued"],
+#song-line[data-kind="already"] {
+  color: var(--text-muted);
+}
+
+#song-line[hidden] {
+  display: none;
+}
+
+/* The Song grid: sections as columns, groups and tracks as rows. Only .song-grid-scroll scrolls, in both directions; the
+   name column and the header row stay in place (sticky) and are opaque so scrolled cells slide under them. The section
+   header is the Parts card (.part-card), so the playing and queued colors come from the rules above. Nothing here uses an
+   accent, a destructive or a Jam color, and nothing moves: no transition and no animation. */
+#parts-rows[data-view="song"] {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.song-grid-scroll {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  scroll-padding-left: 10rem;
+  scroll-padding-top: 7rem;
+}
+
+.song-grid {
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  width: 100%;
+  min-width: calc(10rem + var(--song-columns) * 10rem);
+  background: var(--dominant);
+}
+
+.song-col-name {
+  width: 10rem;
+}
+
+.song-grid col[data-playing="true"] {
+  background: var(--secondary);
+}
+
+.song-grid tr[hidden] {
+  display: none;
+}
+
+.song-grid th,
+.song-grid td {
+  padding: 0;
+  min-width: 0;
+  text-align: left;
+  vertical-align: top;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.song-grid thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--dominant);
+}
+
+.song-grid .song-colhead {
+  padding: 0.25rem;
+}
+
+.song-grid .song-corner {
+  position: sticky;
+  left: 0;
+  z-index: 3;
+  padding: 0.5rem;
+  color: var(--text-muted);
+}
+
+.song-grid .song-rowhead {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--dominant);
+  padding: 0.25rem 0.5rem;
+  padding-inline-start: calc(0.5rem + var(--depth, 0) * 1rem);
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+
+.song-grid .song-rowhead[data-deep="true"] {
+  padding-inline-start: 4.5rem;
+}
+
+.song-group-row .song-rowhead,
+.song-group-row td {
+  background: var(--secondary);
+}
+
+.song-head {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+}
+
+.song-head .part-name {
+  font-weight: 600;
+}
+
+.song-head-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.5rem;
+}
+
+.song-head .song-head-action,
+.song-head .song-used {
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.song-head .song-harmony {
+  max-height: 3em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.song-fold {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  max-width: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.song-fold:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 0.25rem;
+}
+
+.song-fold-name {
+  min-width: 0;
+}
+
+.song-count {
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.song-cell {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  min-height: 3rem;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0.25rem 0.5rem;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.song-cell:hover:not([aria-disabled="true"]) {
+  border-color: var(--text-muted);
+}
+
+.song-cell:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+/* A control the line switched off stays focusable and keeps its text; only the pointer says it does nothing. */
+.song-cell[aria-disabled="true"],
+.song-head[aria-disabled="true"] {
+  cursor: default;
+}
+
+.song-variation {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.song-cell[data-kind="rest"] .song-variation,
+.song-wait,
+.song-fit {
+  color: var(--text-muted);
+}
+
+/* The second line of a cell: whether a fixed variation fits its section's harmony, or that the cell's change waits for its
+   line. Words in the muted colour, two lines at most; the whole text is in the cell's title. */
+.song-wait,
+.song-fit {
+  max-height: 3em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.song-cell[aria-expanded="true"] {
+  border-color: var(--text-muted);
+}
+
+/* The list that opens on a cell. It is fixed to the window and lives outside the grid's scroller, so the scroller never
+   clips it; the page puts it below the cell or above it and keeps it inside the window. */
+#song-cell-list {
+  position: fixed;
+  z-index: 5;
+  box-sizing: border-box;
+  min-width: 10rem;
+  max-width: 20rem;
+  max-height: 16rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0.25rem;
+  background: var(--secondary);
+  border: 1px solid var(--text-muted);
+}
+
+#song-cell-list[hidden] {
+  display: none;
+}
+
+.song-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 0.5rem;
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.song-option[data-active="true"] {
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+.song-option-note {
+  color: var(--text-muted);
+}
+
+.song-list-note {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.song-option-rest {
+  border-top: 1px solid var(--border);
+}
+
+.song-grid .song-outside-note {
+  padding: 0.25rem 0.5rem;
+  color: var(--text-muted);
 }
 
 /* Strudel inserts the CodeMirror container as the NEXT SIBLING of <strudel-editor>,
@@ -2602,6 +3194,196 @@ body {
 .mx-strip[data-color="6"] { --strip-color: var(--track-6); }
 .mx-strip[data-color="7"] { --strip-color: var(--track-7); }
 .mx-strip[data-color="8"] { --strip-color: var(--track-8); }
+
+/* A group of the song is a frame around the strips of its tracks (and of its sub-groups). The head names the group and
+   stays at the left of the strips area while a wide group scrolls; from the fifth level the frame drops its padding, so a
+   deep tree keeps room for names. A folded group shows its head only. */
+.mx-group {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  min-height: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-top: 0.25rem solid var(--border);
+}
+
+.mx-group[data-deep="true"] {
+  padding: 0;
+  gap: 0;
+}
+
+.mx-group-head {
+  position: sticky;
+  left: 1rem;
+  align-self: flex-start;
+  box-sizing: border-box;
+  width: 11rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  background: var(--secondary);
+}
+
+.mx-group-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  min-height: 1.5rem;
+}
+
+.mx-fold {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-height: 1.5rem;
+  margin: 0;
+  padding: 0;
+  background: none;
+  border: 0;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mx-fold-chevron {
+  flex: 0 0 auto;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+.mx-fold:hover .mx-fold-chevron {
+  color: var(--text);
+}
+
+.mx-fold-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mx-fold:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.mx-group-line {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.mx-group-count {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+/* Some of the group's tracks are muted or soloed: a dashed outline in the text colour (the count line says how many). */
+.mx-group-head .mx-mute[aria-pressed="mixed"],
+.mx-group-head .mx-solo[aria-pressed="mixed"] {
+  border-style: dashed;
+  border-color: var(--text);
+  color: var(--text);
+}
+
+.mx-group-head [data-writes="true"]:disabled {
+  cursor: default;
+}
+
+.mx-group-note {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+.mx-group-note[hidden] {
+  display: none;
+}
+
+.mx-group-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.mx-group-body[hidden] {
+  display: none;
+}
+
+.mx-group-body > .mx-strip,
+.mx-group-body > .mx-group {
+  align-self: stretch;
+  min-height: 0;
+}
+
+/* A track strip's name row: the light, then the name button. The light's box never changes size, so a blink moves nothing.
+   The loop in the page writes the fade as the fill's opacity; nothing here animates. */
+.mx-name-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 1.5rem;
+  min-width: 0;
+}
+
+.mx-name-row > button.mx-name {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+}
+
+.mx-light {
+  flex: 0 0 auto;
+  position: relative;
+  box-sizing: border-box;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 1px solid var(--text-muted);
+  border-radius: 50%;
+}
+
+.mx-light[hidden] {
+  display: none;
+}
+
+.mx-light-fill {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: var(--text);
+  opacity: 0;
+}
+
+/* The steady state of motion off only: lit while the track played within the last cycle. */
+.mx-light[data-lit="true"] .mx-light-fill {
+  opacity: 1;
+}
 
 .mx-name {
   font-size: 0.8125rem;
@@ -3792,6 +4574,19 @@ button.mx-name:focus-visible {
 
 #jam-declared[data-kind="unreadable"] #jam-declared-value {
   color: var(--text-muted);
+}
+
+/* The section whose harmony the line shows, after the value: shown only for a piece with sections. */
+#jam-declared-section {
+  flex: none;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-declared-section[hidden] {
+  display: none;
 }
 
 #jam-degrees {

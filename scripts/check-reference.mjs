@@ -16,6 +16,9 @@ import { VCSL_MANIFEST_COMMIT, VCSL_MANIFEST_URL, VCSL_SAMPLE_BASE } from '../pa
 // The Mixer's hand-written registry: every method, alias and key pack in it is proven
 // against the bundle below.
 import { METHOD_KEYS } from '../page/mixer-registry.js';
+// The helper lines every structured piece carries, written as is: the structure topic must hold exactly this text.
+// A local file of this repository, never text read from the download.
+import { HELPER_TEXT } from '../page/structure.js';
 
 /** Parses the pinned @strudel/repl script tag out of page/index.html's text. */
 export function parsePin(html) {
@@ -67,6 +70,18 @@ const BARE_NAME_EXCLUSIONS = new Map([
   ],
 ]);
 
+// Names the code of a reference example defines or takes from JavaScript itself, so the bundle has no reason to
+// hold them — each with a one-line reason, so an exemption always states why. They are skipped as called names in
+// collectCalledNames, but only in the file that defines them (CODE_DEFINING_FILE): a call of play or reduce in any
+// other topic is still checked against the bundle. This is the structure topic's helper: play is the helper it
+// defines, Error and reduce are JavaScript's.
+export const CODE_DEFINING_FILE = 'structure.md';
+export const CODE_DEFINED_NAMES = new Map([
+  ['play', 'the helper function the structure template defines in the code itself, not a Strudel function'],
+  ['Error', 'the JavaScript built-in error the structure helper throws, not a Strudel function'],
+  ['reduce', 'the JavaScript array method the structure helper sums the section lengths with, not a Strudel function'],
+]);
+
 function fencedJsBlocks(markdown) {
   const blocks = [];
   const re = /```js\n([\s\S]*?)```/g;
@@ -103,13 +118,14 @@ function stripComments(code) {
   return code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
 }
 
-function collectCalledNames(rawText, names) {
+function collectCalledNames(rawText, names, exempt) {
   const text = stripComments(rawText);
   const memberRe = new RegExp(MEMBER_CALL_RE);
   let match;
   while ((match = memberRe.exec(text))) {
     const [, receiver, method] = match;
     if (JS_KEYWORDS.has(method)) continue;
+    if (exempt.has(method)) continue;
     if (receiver && JS_GLOBALS.has(receiver)) continue;
     names.add(method);
   }
@@ -117,6 +133,7 @@ function collectCalledNames(rawText, names) {
   while ((match = bareRe.exec(text))) {
     const name = match[1];
     if (JS_KEYWORDS.has(name)) continue;
+    if (exempt.has(name)) continue;
     names.add(name);
   }
 }
@@ -175,14 +192,15 @@ function collectBareNames(spans, paramNames, names) {
  * JS globals, any member called on a JS global, JS literals, this file's own signature-parameter
  * placeholders and the explicit BARE_NAME_EXCLUSIONS. Returns the unique names, sorted.
  */
-export function extractCalledNames(markdown) {
+export function extractCalledNames(markdown, file = null) {
   const names = new Set();
+  const exempt = file === CODE_DEFINING_FILE ? new Set(CODE_DEFINED_NAMES.keys()) : new Set();
   for (const block of fencedJsBlocks(markdown)) {
-    collectCalledNames(block, names);
+    collectCalledNames(block, names, exempt);
   }
   const spans = inlineCodeSpans(stripFencedBlocks(markdown));
   for (const span of spans) {
-    collectCalledNames(span, names);
+    collectCalledNames(span, names, exempt);
   }
   const paramNames = new Set();
   collectSignatureParamNames(spans, paramNames);
@@ -1754,6 +1772,50 @@ function midiTriggerSeamClaim(bundleText, texts, claim) {
   return [];
 }
 
+// --- note-tag-seam ---
+
+// What page/note-tag.js relies on to learn which track played a note. The repl assigns a new Pattern.prototype.p at the
+// start of each evaluation (so p is an accessor and its setter keeps the newest function), answers silence for a label
+// that starts or ends with an underscore (so such a label is never reported), appends a counter to a label with a dollar
+// sign and stores the pattern under the label (so the tag counts dollar statements the same way, and the counter and the
+// store are reset together when the evaluation hushes). onTrigger runs the trigger the note already had first and keeps
+// a dominant one dominant (so a non-dominant observer leaves a .midi() trigger dominant and the browser sound playing,
+// and the stamp the .midi() trigger records is there when the observer runs). The scheduler plays the default output
+// only when the note has no dominant trigger, then runs the note's trigger with the hap, the time, the tempo and the
+// target time (so the observer gets the target). Bundle-only: no reference sentence states this, so the claim guards the
+// page's code and not a statement made to Claude. The onTrigger and scheduler shapes are also read by midi-dominant, so
+// a change there names both claims. Each pattern is hard-coded with generic names, confirmed against @strudel/repl@1.3.0.
+const NOTE_TAG_P_RE =
+  /([\w$]+)=\(\)=>\{[\w$]+\.prototype\.p=function\((\w+)\)\{return typeof \2=="string"&&\(\2\.startsWith\("_"\)\|\|\2\.endsWith\("_"\)\)\?silence:\(\2\.includes\("\$"\)&&\(\2=`\$\{\2\}\$\{(\w+)\}`,\3\+\+\),([\w$]+)\[\2\]=this,this\)\}/;
+const NOTE_TAG_EVALUATE_RE = /evaluate:async\((\w+),\w+=!0,\w+=!0\)=>\{if\(!\1\)throw new Error\("no code to evaluate"\);try\{\w+\(\{code:\1,pending:!0\}\),await ([\w$]+)\(\),/;
+const NOTE_TAG_RESET_RE = /\w+=function\(\)\{return ([\w$]+)=\{\},(\w+)=0,/;
+const NOTE_TAG_ON_TRIGGER_RE =
+  /onTrigger\((\w+),(\w+)=!0\)\{return this\.withHap\((\w+)=>\3\.setContext\(\{\.\.\.\3\.context,onTrigger:\(\.\.\.(\w+)\)=>\{\3\.context\.onTrigger\?\.\(\.\.\.\4\),\1\(\.\.\.\4\)\},dominantTrigger:\3\.context\.dominantTrigger\|\|\2\}\)\)\}/;
+const NOTE_TAG_SCHEDULER_RE =
+  /getTrigger=\(\{getTime:(\w+),defaultOutput:(\w+)\}\)=>async\((\w+),(\w+),(\w+),(\w+),(\w+)\)=>\{try\{\(!\3\.context\.onTrigger\|\|!\3\.context\.dominantTrigger\)&&await \2\(\3,\4,\5,\6,\7\),\3\.context\.onTrigger&&await \3\.context\.onTrigger\(\3,\1\(\),\6,\7\)\}catch/;
+
+function noteTagSeamClaim(bundleText, texts, claim) {
+  const assign = NOTE_TAG_P_RE.exec(bundleText);
+  if (assign === null) {
+    return [claimFailure(claim.id, 'the repl assigning Pattern.prototype.p with silence for an underscore label and a counter for a dollar label')];
+  }
+  const evaluate = NOTE_TAG_EVALUATE_RE.exec(bundleText);
+  if (evaluate === null || evaluate[2] !== assign[1]) {
+    return [claimFailure(claim.id, 'the repl assigning Pattern.prototype.p again at the start of each evaluation')];
+  }
+  const reset = NOTE_TAG_RESET_RE.exec(bundleText);
+  if (reset === null || reset[1] !== assign[4] || reset[2] !== assign[3]) {
+    return [claimFailure(claim.id, 'the repl resetting its dollar counter and its labeled patterns together when an evaluation hushes')];
+  }
+  if (!NOTE_TAG_ON_TRIGGER_RE.test(bundleText)) {
+    return [claimFailure(claim.id, 'onTrigger running the trigger the note already had first and keeping a dominant one dominant')];
+  }
+  if (!NOTE_TAG_SCHEDULER_RE.test(bundleText)) {
+    return [claimFailure(claim.id, "the scheduler playing the default output only without a dominant trigger, then running the note's trigger with its target time")];
+  }
+  return [];
+}
+
 // --- takeover-gate (17) ---
 
 // What page/takeover.js (gatePattern) and page/query-check.js rely on to land a change on a cycle line: the scheduler
@@ -1884,9 +1946,164 @@ function gainReplacesClaim(bundleText, texts, claim) {
   return midiSentenceFailures(claim, texts, GAIN_REPLACES_SENTENCE_RES);
 }
 
+// --- song structure claims (pick-restart-shift, pick-missing-key, arrange-needs-patterns, scale-patterned,
+// add-number-control, duckorbit-exists) ---
+//
+// What the song structure's code relies on, each a fact visible as text in the pinned bundle and also seen working in
+// the real page. Each claim guards the code shape and, where a reference sentence states the fact to Claude, that
+// sentence too (the structure topic, and the arrange() entry of the functions topic); duckorbit-exists teaches nothing and
+// stays bundle-only. Every pattern is hard-coded with generic names (a minifier rename does not fail it); the capture
+// groups and backreferences tie the names inside one excerpt together. Every sentence pattern is a hard-coded constant too.
+
+// pickRestart picks the pattern named by each outer event and restarts it there: the join shifts the chosen pattern
+// late by the whole begin of the outer event, so the chosen pattern's first cycle sits at the start of the outer event.
+const PICK_RESTART_REGISTER_RE = /pickRestart=register\("pickRestart",function\((\w+),(\w+)\)\{return _pick\(\1,\2,!1\)\.restartJoin\(\)\}\)/;
+const RESET_JOIN_RE =
+  /resetJoin\((\w+)=!1\)\{const (\w+)=this;return new [\w$]+\((\w+)=>\2\.discreteOnly\(\)\.query\(\3\)\.map\((\w+)=>\4\.value\.late\(\1\?\4\.whole\.begin:\4\.whole\.begin\.cyclePos\(\)\)\.query\(\3\)\.map\(/;
+const RESTART_JOIN_RE = /restartJoin\(\)\{return this\.resetJoin\(!0\)\}/;
+
+const PICK_RESTART_SENTENCE_RES = [
+  /A section plays each track's variation from its first cycle every time the section comes round, also when the same name is used twice\./,
+];
+
+function pickRestartShiftClaim(bundleText, texts, claim) {
+  const shapes = [
+    [PICK_RESTART_REGISTER_RE, 'pickRestart joining its picks with restartJoin'],
+    [RESET_JOIN_RE, 'resetJoin shifting the chosen pattern late by the start of the outer event'],
+    [RESTART_JOIN_RE, 'restartJoin calling resetJoin with the whole start'],
+  ];
+  for (const [re, what] of shapes) {
+    if (!re.test(bundleText)) return [claimFailure(claim.id, what)];
+  }
+  return midiSentenceFailures(claim, texts, PICK_RESTART_SENTENCE_RES);
+}
+
+// pick reads the lookup object by the key it is given and has no default: a key the object does not hold gives an event
+// with no value to play (an empty object is the only case that gives silence).
+const PICK_LOOKUP_RE =
+  /_pick=function\((\w+),(\w+),(\w+)=!0\)\{const (\w+)=Array\.isArray\(\1\),(\w+)=Object\.keys\(\1\)\.length;return \1=objectMap\(\1,reify\),\5===0\?silence:\2\.fmap\((\w+)=>\{let (\w+)=\6;return \4&&\(\7=\3\?Math\.round\(\7\)%\5:[\w$]+\(Math\.round\(\7\),0,\1\.length-1\)\),\1\[\7\]\}\)\}/;
+
+const PICK_MISSING_KEY_SENTENCE_RES = [
+  /A cell that names no variation is refused when the code is evaluated, with the section and the track named\./,
+];
+
+function pickMissingKeyClaim(bundleText, texts, claim) {
+  if (!PICK_LOOKUP_RE.test(bundleText)) {
+    return [claimFailure(claim.id, 'pick reading the lookup object by key with no default for a missing key')];
+  }
+  return midiSentenceFailures(claim, texts, PICK_MISSING_KEY_SENTENCE_RES);
+}
+
+// arrange calls .fast on each item it is given and never turns a string into a pattern, so an item that is not a pattern
+// throws when the code is evaluated.
+const ARRANGE_FAST_ITEMS_RE =
+  /function arrange\(\.\.\.(\w+)\)\{const (\w+)=\1\.reduce\(\((\w+),\[(\w+)\]\)=>\3\+\4,0\);return \1=\1\.map\(\(\[(\w+),(\w+)\]\)=>\[\5,\6\.fast\(\5\)\]\),stepcat\(\.\.\.\1\)\.slow\(\2\)\}/;
+
+const ARRANGE_NEEDS_PATTERNS_SENTENCE_RES = [
+  /`arrange` takes patterns: it calls `\.fast` on each item without turning it into a pattern, so a single-quoted string item throws when the code is evaluated\./,
+];
+
+function arrangeNeedsPatternsClaim(bundleText, texts, claim) {
+  if (!ARRANGE_FAST_ITEMS_RE.test(bundleText)) {
+    return [claimFailure(claim.id, 'arrange calling .fast on each item without turning it into a pattern')];
+  }
+  return midiSentenceFailures(claim, texts, ARRANGE_NEEDS_PATTERNS_SENTENCE_RES);
+}
+
+// scale is registered with its first argument turned into a pattern (the register call ends with its patternify flag
+// set), so a pattern of scale names, such as a section's harmony, works; the argument may also be an array.
+const SCALE_REGISTER_START_RE = /const scale=register\("scale",function\((\w+),(\w+)\)\{return Array\.isArray\(\1\)&&\(\1=\1\.flat\(\)\.join\(" "\)\),\2\.withHaps\(/;
+const SCALE_REGISTER_END_RE = /d\.setContext\(\{\.\.\.d\.context,scale:(\w+)\}\)\}\),removeUndefineds\(\w+\)\)\)\},!0,!0\);/;
+
+const SCALE_PATTERNED_SENTENCE_RES = [
+  /A variation in degrees is written as a function of the section's harmony, `\(h\) => n\("0 2 4"\)\.scale\(h\)`; do not read a global harmony pattern inside a variation\./,
+];
+
+function scalePatternedClaim(bundleText, texts, claim) {
+  const shapes = [
+    [SCALE_REGISTER_START_RE, 'scale registered as a function of a scale argument and a pattern'],
+    [SCALE_REGISTER_END_RE, 'the scale registration ending with its patternify flags set'],
+  ];
+  for (const [re, what] of shapes) {
+    if (!re.test(bundleText)) return [claimFailure(claim.id, what)];
+  }
+  return midiSentenceFailures(claim, texts, SCALE_PATTERNED_SENTENCE_RES);
+}
+
+// Adding a bare number to a control pattern changes nothing: an operator that meets an object on either side wraps the
+// other side as { value } and merges the two, and a right-hand side that holds only that wrapped value is refused with
+// a warning that gives the left-hand side back untouched. Adding a control pattern, such as n(2), adds key by key.
+const COMPOSE_OP_RE =
+  /function _composeOp\((\w+),(\w+),(\w+)\)\{return [\w$]+\(\1\)\|\|[\w$]+\(\2\)\?\([\w$]+\(\1\)\|\|\(\1=\{value:\1\}\),[\w$]+\(\2\)\|\|\(\2=\{value:\2\}\),unionWithObj\(\1,\2,\3\)\):\3\(\1,\2\)\}/;
+const UNION_WITH_OBJ_RE =
+  /function unionWithObj\((\w+),(\w+),(\w+)\)\{if\(\2\?\.value!==void 0&&Object\.keys\(\2\)\.length===1\)return [\w$]+\("\[warn\]: Can't do arithmetic on control pattern\."\),\1;const (\w+)=Object\.keys\(\1\)\.filter\((\w+)=>Object\.keys\(\2\)\.includes\(\5\)\);return Object\.assign\(\{\},\1,\2,Object\.fromEntries\(\4\.map\(\5=>\[\5,\3\(\1\[\5\],\2\[\5\]\)\]\)\)\)\}/;
+
+const ADD_NUMBER_CONTROL_SENTENCE_RES = [/To move a pattern of degrees up, add `n\(k\)`, not the bare number `k`\./];
+
+function addNumberControlClaim(bundleText, texts, claim) {
+  const shapes = [
+    [COMPOSE_OP_RE, 'the operator wrapping a non-object side as { value } before merging'],
+    [UNION_WITH_OBJ_RE, 'the merge refusing a lone value with a warning and adding the keys both sides share'],
+  ];
+  for (const [re, what] of shapes) {
+    if (!re.test(bundleText)) return [claimFailure(claim.id, what)];
+  }
+  return midiSentenceFailures(claim, texts, ADD_NUMBER_CONTROL_SENTENCE_RES);
+}
+
+// The duckorbit control exists under its alias duck, and the sound engine reads duckorbit with the other duck keys from
+// the event value.
+const DUCKORBIT_CONTROL_RE = /\{duck\}=registerControl\("duckorbit","duck"\)/;
+const DUCKORBIT_ENGINE_RE = /duckorbit:\w+,duckonset:\w+,duckattack:\w+,duckdepth:\w+,djf:\w+,/;
+
+function duckorbitExistsClaim(bundleText, texts, claim) {
+  const shapes = [
+    [DUCKORBIT_CONTROL_RE, 'the duckorbit control registered with the alias duck'],
+    [DUCKORBIT_ENGINE_RE, 'the sound engine reading duckorbit with duckonset, duckattack and duckdepth'],
+  ];
+  for (const [re, what] of shapes) {
+    if (!re.test(bundleText)) return [claimFailure(claim.id, what)];
+  }
+  return [];
+}
+
+// --- structure-helper and structure-single-quotes ---
+
+// The structure topic's first js block is the template Claude starts from, and it holds the page's own helper text:
+// the page recognises that text as canonical, so the topic and the page cannot drift apart. The sentence naming what
+// the helper does is bound to the same claim.
+const STRUCTURE_HELPER_SENTENCE_RES = [
+  /The helper plays each track's variation for the section the clock names, starts it at its first cycle, and throws, naming the section and the track, for a missing cell or an unknown variation\./,
+];
+
+function structureHelperClaim(bundleText, texts, claim) {
+  const failures = [];
+  for (const file of claim.files) {
+    const first = fencedJsBlocks(texts[file] ?? '')[0] ?? '';
+    if (!first.includes(HELPER_TEXT)) {
+      failures.push(`${claim.id}: cannot find the page's helper text (page/structure.js) in the first js block of ${file}`);
+    }
+  }
+  if (failures.length > 0) return failures;
+  return midiSentenceFailures(claim, texts, STRUCTURE_HELPER_SENTENCE_RES);
+}
+
+// A double-quoted string in the song declaration is turned into a mini-notation pattern by the transpiler (the rule
+// string-forms proves), and then the clock's late(song.shift) receives a pattern where it needs a number.
+const STRUCTURE_SINGLE_QUOTES_SENTENCE_RES = [
+  /Write section names, track names and harmonies in single quotes inside the song declaration: a double-quoted string is a mini-notation pattern and the clock then fails with a message about `late`\./,
+];
+
+function structureSingleQuotesClaim(bundleText, texts, claim) {
+  if (!DOUBLE_QUOTE_RULE_RE.test(bundleText) || !DOUBLE_QUOTE_USE_RE.test(bundleText)) {
+    return [claimFailure(claim.id, 'the rule that a double-quoted string is turned into mini-notation')];
+  }
+  return midiSentenceFailures(claim, texts, STRUCTURE_SINGLE_QUOTES_SENTENCE_RES);
+}
+
 /**
  * The prose facts an earlier diagnosis (and the Mixer's solo marker and delay time, the string forms, the MIDI facts, the t/f flag facts and the gain facts) found can drift — id, the reference
- * files each states them in (plus src/mcp.ts for the server instruction on the solo label), and a pure `check(bundleText, texts, claim)` function returning
+ * files each states them in (plus src/mcp.ts for the server instruction on the solo label; the three claims of the midi trigger seam, the takeover gate and the duckorbit control have none and guard bundle shapes only), and a pure `check(bundleText, texts, claim)` function returning
  * failure strings (each hard-coding its own bundle pattern and reference pattern; never built
  * from downloaded text).
  */
@@ -1916,10 +2133,19 @@ export const PROSE_CLAIMS = [
   { id: 'midi-clock-cyclist', files: ['midi.md'], check: midiClockCyclistClaim },
   { id: 'midi-transport', files: ['midi.md'], check: midiTransportClaim },
   { id: 'midi-trigger-seam', files: [], check: midiTriggerSeamClaim },
+  { id: 'note-tag-seam', files: [], check: noteTagSeamClaim },
   { id: 'takeover-gate', files: [], check: takeoverGateClaim },
   { id: 'mini-atoms-not-boolean', files: ['functions.md'], check: miniAtomsNotBooleanClaim },
   { id: 'truthy-flags', files: ['functions.md'], check: truthyFlagsClaim },
   { id: 'gain-replaces', files: ['effects.md'], check: gainReplacesClaim },
+  { id: 'structure-helper', files: ['structure.md'], check: structureHelperClaim },
+  { id: 'structure-single-quotes', files: ['structure.md'], check: structureSingleQuotesClaim },
+  { id: 'pick-restart-shift', files: ['structure.md'], check: pickRestartShiftClaim },
+  { id: 'pick-missing-key', files: ['structure.md'], check: pickMissingKeyClaim },
+  { id: 'arrange-needs-patterns', files: ['functions.md'], check: arrangeNeedsPatternsClaim },
+  { id: 'scale-patterned', files: ['structure.md'], check: scalePatternedClaim },
+  { id: 'add-number-control', files: ['structure.md'], check: addNumberControlClaim },
+  { id: 'duckorbit-exists', files: [], check: duckorbitExistsClaim },
 ];
 
 /**
@@ -2470,7 +2696,7 @@ async function main() {
       }
     }
 
-    for (const name of extractCalledNames(text)) {
+    for (const name of extractCalledNames(text, file)) {
       namesChecked++;
       if (!nameInBundle(name, bundleText)) {
         failures.push(`${file}: ${name} not found in @strudel/repl@${pin.version}`);

@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   ASK_CONTEXT_KINDS,
+  GESTURE_KINDS,
   MAX_DATA_FOLDER_LENGTH,
   MAX_MIDI_EVENTS,
   MAX_MIDI_FAILURE_LENGTH,
@@ -12,6 +13,8 @@ import {
   MAX_PENDING_SECONDS,
   MAX_PHRASE_CYCLES,
   MAX_REPORTED_BPM,
+  MAX_STRUCTURE_NOTE_LINE,
+  MAX_STRUCTURE_NOTE_LINES,
   MIN_PHRASE_CYCLES,
   parsePageMessage,
 } from '../dist/protocol.js';
@@ -381,19 +384,187 @@ const ASK_CONTEXTS = [
   { kind: 'note', note: 'D' },
   { kind: 'warning', chord: 'Gm7', outside: 'Bb', avoid: 'B', seconds: 4, scale: 'D Dorian' },
   { kind: 'warning', chord: 'G Bb D F', outside: 'Bb', seconds: 0, scale: 'D Dorian' },
+  { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk' },
+  { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'does-not-fit', outside: 'F#, A' },
+  { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'fits' },
+  { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'cannot-check' },
+  { kind: 'cell', section: 'verse', track: 'bass', rest: true },
+  { kind: 'group', name: 'drums', parent: 'rhythm' },
+  { kind: 'group', name: 'drums' },
 ];
 
-test('parsePageMessage accepts an ask frame for each of the sixteen context kinds, unchanged', () => {
+test('parsePageMessage accepts an ask frame for each of the eighteen context kinds that stand alone, unchanged', () => {
   for (const context of ASK_CONTEXTS) {
     const frame = askFrame(context);
     assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame, `kind ${context.kind}`);
   }
-  assert.equal(new Set(ASK_CONTEXTS.map((context) => context.kind)).size, 16);
+  assert.equal(new Set(ASK_CONTEXTS.map((context) => context.kind)).size, 18);
+});
+
+/** A moment as the page sends it for a note of a lane: the cycle of the lane context and of the moment are one number. */
+const GESTURE_MOMENT = {
+  cycle: 12,
+  beat: 3,
+  at: 12.5,
+  version: 4,
+  notes: [{ track: 't2', note: 'c3', velocity: 0.8, start: 12.5, end: 12.75, state: 'sounding' }],
+  more: 0,
+};
+const GESTURE_LANE = { kind: 'lane', track: 't2', cycle: 12 };
+
+test('an ask frame with a lane context, a moment and a bounded gesture parses unchanged', () => {
+  assert.deepEqual([...GESTURE_KINDS], ['pitch', 'rest', 'velocity', 'range']);
+  for (const gesture of [
+    { kind: 'pitch', semitones: 2 },
+    { kind: 'pitch', semitones: -127 },
+    { kind: 'pitch', semitones: 127 },
+    { kind: 'rest' },
+    { kind: 'velocity', direction: 'softer' },
+    { kind: 'velocity', direction: 'louder' },
+  ]) {
+    const frame = askFrame(GESTURE_LANE, { moment: GESTURE_MOMENT, gesture });
+    assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame, JSON.stringify(gesture));
+  }
+});
+
+test('a gesture out of its bounds, of an unknown kind or with a stray key is refused, never trimmed', () => {
+  for (const gesture of [
+    { kind: 'pitch', semitones: 0 },
+    { kind: 'pitch', semitones: 128 },
+    { kind: 'pitch', semitones: -128 },
+    { kind: 'pitch', semitones: 1.5 },
+    { kind: 'pitch', semitones: '2' },
+    { kind: 'pitch' },
+    { kind: 'velocity', direction: 'loud' },
+    { kind: 'velocity' },
+    { kind: 'drag', semitones: 2 },
+    // A range gesture needs a range context: on a lane context with a moment it is refused, whatever it holds.
+    { kind: 'range', version: 4, notes: [], more: 0 },
+    'rest',
+    null,
+  ]) {
+    assert.throws(
+      () => parsePageMessage(JSON.stringify(askFrame(GESTURE_LANE, { moment: GESTURE_MOMENT, gesture }))),
+      startsWith('Invalid page message shape:'),
+      JSON.stringify(gesture),
+    );
+  }
+  // A key a kind does not name is dropped like every unnamed key of a page message, so it never reaches Claude.
+  const parsed = parsePageMessage(JSON.stringify(askFrame(GESTURE_LANE, { moment: GESTURE_MOMENT, gesture: { kind: 'rest', semitones: 4 } })));
+  assert.deepEqual(parsed.gesture, { kind: 'rest' });
+});
+
+test('a gesture comes only with a lane context and a moment', () => {
+  const gesture = { kind: 'pitch', semitones: 2 };
+  const refused = [
+    askFrame(GESTURE_LANE, { gesture }),
+    askFrame({ kind: 'lane', track: 't2' }, { gesture }),
+    askFrame({ kind: 'cell', section: 'verse', track: 'bass', rest: true }, { gesture, moment: GESTURE_MOMENT }),
+    askFrame({ kind: 'session' }, { gesture, moment: GESTURE_MOMENT }),
+    askFrame({ kind: 'part', name: 'verse' }, { gesture, moment: GESTURE_MOMENT }),
+  ];
+  for (const frame of refused) {
+    assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame.context));
+  }
+  // A moment without a gesture is as it always was.
+  const plain = askFrame(GESTURE_LANE, { moment: GESTURE_MOMENT });
+  assert.deepEqual(parsePageMessage(JSON.stringify(plain)), plain);
+});
+
+/** A range of cycles as the page sends it: the context and its gesture, which holds the notes of the lane that start in them. */
+const RANGE_CONTEXT = { kind: 'range', track: 't1', from: 2, to: 5, section: 'x', sectionTo: 'y' };
+const RANGE_NOTES = [
+  { track: 't1', note: 'c3', velocity: 0.8, start: 2, end: 2.25 },
+  { track: 't1', note: 'e3', sound: 'sawtooth', velocity: 0.8, start: 3.25, end: 3.5 },
+  { track: 't1', instrument: 'jx ch 1', note: 36, drum: 'Kick', start: 5.9, end: 6 },
+  { track: 't1', start: 4, end: 4.5 },
+];
+const RANGE_GESTURE = { kind: 'range', version: 4, notes: RANGE_NOTES, more: 0 };
+
+test('a range context with its range gesture parses unchanged, with or without sections and with no notes', () => {
+  for (const [context, gesture] of [
+    [RANGE_CONTEXT, RANGE_GESTURE],
+    [{ kind: 'range', track: 't1', from: 2, to: 5 }, RANGE_GESTURE],
+    [{ kind: 'range', track: 't1', from: 0, to: 0, section: 'x' }, { kind: 'range', version: null, notes: [], more: 0 }],
+    [{ kind: 'range', track: 't1', from: 40, to: 71 }, { kind: 'range', version: 7, notes: RANGE_NOTES, more: 12 }],
+    [{ kind: 'range', track: 'n'.repeat(200), from: 1, to: 2, section: 's'.repeat(200), sectionTo: 'e'.repeat(200) }, RANGE_GESTURE],
+  ]) {
+    const frame = askFrame(context, { gesture });
+    assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame, JSON.stringify(context));
+  }
+  // A key a range note does not name is dropped, like every unnamed key of a page message; a state is not a range note key.
+  const stray = askFrame(RANGE_CONTEXT, { gesture: { ...RANGE_GESTURE, notes: [{ track: 't1', start: 2, end: 3, state: 'sounding', extra: 1 }] } });
+  assert.deepEqual(parsePageMessage(JSON.stringify(stray)).gesture.notes, [{ track: 't1', start: 2, end: 3 }]);
+});
+
+test('a range context out of its bounds, or a range gesture out of its bounds, is refused, never trimmed', () => {
+  const refusedContexts = [
+    { kind: 'range', track: 't1', from: 5, to: 4 },
+    { kind: 'range', track: 't1', from: 0, to: 32 },
+    { kind: 'range', track: 't1', from: 10, to: 42 },
+    { kind: 'range', track: 't1', from: -1, to: 3 },
+    { kind: 'range', track: 't1', from: 1.5, to: 3 },
+    { kind: 'range', track: 't1', from: 1, to: 3.5 },
+    { kind: 'range', track: 't1', from: '1', to: 3 },
+    { kind: 'range', track: '', from: 1, to: 3 },
+    { kind: 'range', from: 1, to: 3 },
+    { kind: 'range', track: 't'.repeat(201), from: 1, to: 3 },
+    { kind: 'range', track: 't1', from: 1, to: 3, section: 's'.repeat(201) },
+    { kind: 'range', track: 't1', from: 1, to: 3, section: 'x', sectionTo: 'y'.repeat(201) },
+    { kind: 'range', track: 't1', from: 1, to: 3, section: '' },
+    { kind: 'range', track: 't1', to: 3 },
+    { kind: 'range', track: 't1', from: 1 },
+  ];
+  for (const context of refusedContexts) {
+    assert.throws(() => parsePageMessage(JSON.stringify(askFrame(context, { gesture: RANGE_GESTURE }))), startsWith('Invalid page message shape:'), JSON.stringify(context));
+  }
+  // The longest range, 32 cycles, is accepted.
+  const widest = askFrame({ kind: 'range', track: 't1', from: 10, to: 41 }, { gesture: RANGE_GESTURE });
+  assert.deepEqual(parsePageMessage(JSON.stringify(widest)), widest);
+  const tooMany = Array.from({ length: 33 }, (_, i) => ({ track: 't1', start: i, end: i + 1 }));
+  for (const gesture of [
+    { ...RANGE_GESTURE, notes: tooMany },
+    { ...RANGE_GESTURE, more: -1 },
+    { ...RANGE_GESTURE, more: 1.5 },
+    { ...RANGE_GESTURE, version: 0 },
+    { ...RANGE_GESTURE, version: '4' },
+    { kind: 'range', notes: [], more: 0 },
+    { kind: 'range', version: 4, more: 0 },
+    { kind: 'range', version: 4, notes: [] },
+    { ...RANGE_GESTURE, notes: [{ track: 't1', start: -1, end: 2 }] },
+    { ...RANGE_GESTURE, notes: [{ track: '', start: 1, end: 2 }] },
+    { ...RANGE_GESTURE, notes: [{ track: 't1', note: 'c'.repeat(201), start: 1, end: 2 }] },
+    { ...RANGE_GESTURE, notes: [{ track: 't1', start: 1 }] },
+  ]) {
+    assert.throws(() => parsePageMessage(JSON.stringify(askFrame(RANGE_CONTEXT, { gesture }))), startsWith('Invalid page message shape:'), JSON.stringify(gesture).slice(0, 80));
+  }
+  const full = Array.from({ length: 32 }, (_, i) => ({ track: 't1', start: i, end: i + 1 }));
+  const fullFrame = askFrame(RANGE_CONTEXT, { gesture: { ...RANGE_GESTURE, notes: full, more: 8 } });
+  assert.deepEqual(parsePageMessage(JSON.stringify(fullFrame)), fullFrame);
+});
+
+test('a range context and a range gesture come together and carry no moment', () => {
+  const refused = [
+    // A range context without its gesture, or with another one.
+    askFrame(RANGE_CONTEXT),
+    askFrame(RANGE_CONTEXT, { gesture: { kind: 'rest' } }),
+    askFrame(RANGE_CONTEXT, { gesture: { kind: 'pitch', semitones: 2 }, moment: GESTURE_MOMENT }),
+    // A range gesture with a moment, or on any context that is not a range.
+    askFrame(RANGE_CONTEXT, { gesture: RANGE_GESTURE, moment: GESTURE_MOMENT }),
+    askFrame(GESTURE_LANE, { gesture: RANGE_GESTURE }),
+    askFrame(GESTURE_LANE, { gesture: RANGE_GESTURE, moment: GESTURE_MOMENT }),
+    askFrame({ kind: 'session' }, { gesture: RANGE_GESTURE }),
+    askFrame({ kind: 'track', track: 't1' }, { gesture: RANGE_GESTURE }),
+  ];
+  for (const frame of refused) {
+    assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame.context) + JSON.stringify(frame.gesture ?? null).slice(0, 40));
+  }
 });
 
 test('context kinds: the sample contexts cover every kind of ASK_CONTEXT_KINDS and no other', () => {
-  const sampled = new Set(ASK_CONTEXTS.map((context) => context.kind));
-  assert.equal(ASK_CONTEXT_KINDS.length, 16);
+  // The range kind needs its gesture, so it is sampled by RANGE_CONTEXT in the tests above instead of in ASK_CONTEXTS.
+  const sampled = new Set([...ASK_CONTEXTS, RANGE_CONTEXT].map((context) => context.kind));
+  assert.equal(ASK_CONTEXT_KINDS.length, 19);
   for (const kind of ASK_CONTEXT_KINDS) assert.ok(sampled.has(kind), `no sample context for ${kind}`);
   for (const kind of sampled) assert.ok(ASK_CONTEXT_KINDS.includes(kind), `${kind} is not in ASK_CONTEXT_KINDS`);
 });
@@ -414,6 +585,55 @@ test('an error context with an empty text, a missing text or a 201-character tex
   assert.deepEqual(parsePageMessage(JSON.stringify(ok)), ok);
   const spaced = askFrame({ kind: 'error', text: '  padded  ' });
   assert.equal(parsePageMessage(JSON.stringify(spaced)).context.text, '  padded  ');
+});
+
+test('a cell or group context name of 201 characters is refused and 200 accepted, in every name field, never trimmed', () => {
+  const long = 'n'.repeat(201);
+  const exact = 'n'.repeat(200);
+  const fields = [
+    ['cell', { section: 'verse', track: 'bass', variation: 'walk' }, ['section', 'track', 'variation']],
+    ['cell', { section: 'verse', track: 'bass', variation: 'walk', fit: 'does-not-fit', outside: 'F#, A' }, ['outside']],
+    ['group', { name: 'drums', parent: 'rhythm' }, ['name', 'parent']],
+  ];
+  for (const [kind, base, names] of fields) {
+    for (const field of names) {
+      const ok = askFrame({ kind, ...base, [field]: exact });
+      assert.deepEqual(parsePageMessage(JSON.stringify(ok)), ok, `${kind} ${field} at 200`);
+      assert.throws(
+        () => parsePageMessage(JSON.stringify(askFrame({ kind, ...base, [field]: long }))),
+        startsWith('Invalid page message shape:'),
+        `${kind} ${field} at 201`,
+      );
+    }
+  }
+  const spaced = askFrame({ kind: 'cell', section: ' verse ', track: 'bass', rest: true });
+  assert.equal(parsePageMessage(JSON.stringify(spaced)).context.section, ' verse ');
+});
+
+test('a cell context needs a variation or a rest (not both, not neither), no fit on a rest, and outside notes only with does-not-fit', () => {
+  const refused = [
+    { kind: 'cell', section: 'verse', track: 'bass' },
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', rest: true },
+    { kind: 'cell', section: 'verse', track: 'bass', rest: true, fit: 'fits' },
+    { kind: 'cell', section: 'verse', track: 'bass', rest: true, fit: 'does-not-fit', outside: 'F#' },
+    { kind: 'cell', section: 'verse', track: 'bass', rest: true, outside: 'F#' },
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', outside: 'F#' },
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'fits', outside: 'F#' },
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'cannot-check', outside: 'F#' },
+  ];
+  for (const context of refused) {
+    assert.throws(() => parsePageMessage(JSON.stringify(askFrame(context))), startsWith('Invalid page message shape:'), JSON.stringify(context));
+  }
+  // What the page does send still passes: every cell sample of the accepted list, with and without a fit.
+  const accepted = [
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'does-not-fit' },
+    { kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'does-not-fit', outside: 'F#, A' },
+    { kind: 'cell', section: 'verse', track: 'bass', rest: true },
+  ];
+  for (const context of accepted) {
+    const frame = askFrame(context);
+    assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame, JSON.stringify(context));
+  }
 });
 
 test('parsePageMessage accepts current null and rejects current 0', () => {
@@ -459,6 +679,15 @@ test('parsePageMessage rejects an unknown kind, a missing required field and a b
     askFrame({ kind: 'warning', chord: 'Gm7', outside: 'Bb', seconds: 1 }),
     askFrame({ kind: 'warning', chord: 'Gm7', outside: '', seconds: 1, scale: 'D Dorian' }),
     askFrame({ kind: 'warning', chord: 'c'.repeat(201), outside: 'Bb', seconds: 1, scale: 'D Dorian' }),
+    askFrame({ kind: 'cell', section: 'verse', variation: 'walk' }),
+    askFrame({ kind: 'cell', track: 'bass', variation: 'walk' }),
+    askFrame({ kind: 'cell', section: '', track: 'bass', variation: 'walk' }),
+    askFrame({ kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', fit: 'maybe' }),
+    askFrame({ kind: 'cell', section: 'verse', track: 'bass', rest: false }),
+    askFrame({ kind: 'cell', section: 'verse', track: 'bass', variation: 'walk', outside: '' }),
+    askFrame({ kind: 'group' }),
+    askFrame({ kind: 'group', name: '' }),
+    askFrame({ kind: 'group', name: 'drums', parent: '' }),
   ];
   for (const frame of bad) {
     assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame.context));
@@ -764,4 +993,30 @@ test('unknown keys of an instrument-settings frame do not reach the settings the
   const parsed = parsePageMessage(JSON.stringify(frame));
   assert.deepEqual(parsed.settings, { port: 'p', channels: [1], clock: true });
   assert.equal('model' in parsed, false);
+});
+
+test('parsePageMessage accepts a structure-note frame with up to three lines and an optional evaluateId', () => {
+  for (const frame of [
+    { type: 'structure-note', lines: [] },
+    { type: 'structure-note', lines: ['one.'] },
+    { type: 'structure-note', lines: ['one.', 'two.', 'x'.repeat(MAX_STRUCTURE_NOTE_LINE)], evaluateId: 'a'.repeat(64) },
+  ]) {
+    assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame);
+  }
+  assert.equal(MAX_STRUCTURE_NOTE_LINES, 3);
+  assert.equal(MAX_STRUCTURE_NOTE_LINE, 600);
+});
+
+test('parsePageMessage rejects a structure-note frame with four lines, a line of 601 characters, an evaluateId of 65 characters or the wrong types', () => {
+  for (const frame of [
+    { type: 'structure-note', lines: ['a', 'b', 'c', 'd'] },
+    { type: 'structure-note', lines: ['x'.repeat(MAX_STRUCTURE_NOTE_LINE + 1)] },
+    { type: 'structure-note', lines: ['a'], evaluateId: 'a'.repeat(65) },
+    { type: 'structure-note', lines: ['a'], evaluateId: '' },
+    { type: 'structure-note', lines: 'a' },
+    { type: 'structure-note', lines: [1] },
+    { type: 'structure-note' },
+  ]) {
+    assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame).slice(0, 80));
+  }
 });

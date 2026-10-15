@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { startMcpClient, PAGE_URL_PATTERN, createFakePage, withoutPageLine } from './helpers.js';
+import { startMcpClient, PAGE_URL_PATTERN, createFakePage, withoutPageLine, withoutStructureTemplate } from './helpers.js';
 import { Session, noPageMessage, NOT_STARTED_MESSAGE, EDIT_NOTHING_PLAYING_MESSAGE } from '../dist/session.js';
 import { HistoryStore, versionNotFoundMessage } from '../dist/history.js';
 import {
@@ -54,7 +54,7 @@ test('a session that connects starts nothing, then the start tool starts Moontid
   // reply says nothing about when a stderr line arrives. The get_code call asserts that it starts nothing.
   const before = await server.client.callTool({ name: 'get_code', arguments: {} });
   assert.ok(before.isError, 'get_code before a start is an error');
-  assert.equal(textOf(before), NOT_STARTED_MESSAGE);
+  assert.equal(withoutStructureTemplate(textOf(before)), NOT_STARTED_MESSAGE);
   assert.equal(countMatches(server.stderrText, PAGE_LINES), 0, 'no page line before a start');
   assert.equal(countMatches(server.stderrText, NO_BROWSER_LINES), 0, 'no browser line before a start');
 
@@ -426,7 +426,9 @@ test('before the start: get_code and stop say how to start; the page-free tools 
   for (const name of ['get_code', 'stop']) {
     const reply = await h.call(name);
     assert.ok(reply.isError, `${name} fails before the start`);
-    assert.equal(textOf(reply), NOT_STARTED_MESSAGE);
+    // get_code also shows the song structure template, since nothing plays yet.
+    const text = name === 'get_code' ? withoutStructureTemplate(textOf(reply)) : textOf(reply);
+    assert.equal(text, NOT_STARTED_MESSAGE);
   }
   assert.ok(NOT_STARTED_MESSAGE.startsWith('Moontide is not started yet:'));
 

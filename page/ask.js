@@ -4,7 +4,8 @@
 // page/ask-view.js.
 
 import { BEATS_PER_CYCLE } from './change-timing.js';
-import { MAX_MOMENT_NOTES } from './timeline.js';
+import { MAX_MOMENT_NOTES, MAX_RANGE_CYCLES } from './timeline.js';
+import { cleanText } from './structure.js';
 
 /** Mirrors src/protocol.ts's MAX_ASK_TEXT_LENGTH by hand (test/ask.test.js checks both are 2000). */
 export const MAX_ASK_TEXT_LENGTH = 2000;
@@ -67,6 +68,24 @@ export const ASK_COPY = {
   // A failed change sent to Claude from the banner (the chip's lead and the first words of the prefill).
   errorChipLead: 'Failed change',
   errorPrefillLead: 'The last change failed with this error:',
+  // The ready-made request on a cell whose fixed variation has notes outside its section's harmony. The words in braces
+  // are filled by cellFitPrefill; the user reads the text, may change it and presses Enter.
+  cellFitRequest: "Fit variation '{variation}' of track '{track}' to the harmony of section '{section}' ({harmony}). It has notes outside it: {notes}.",
+  // The ready-made requests of a gesture on a Timeline note the page cannot edit. timelineEditPrefill fills the words in
+  // braces; the user reads the text, may change it and presses Enter.
+  raiseRequest: "Raise note {note} at cycle {cycle}, beat {beat} of '{track}' by {amount}.",
+  lowerRequest: "Lower note {note} at cycle {cycle}, beat {beat} of '{track}' by {amount}.",
+  restRequest: "Turn note {note} at cycle {cycle}, beat {beat} of '{track}' into a rest.",
+  softerRequest: "Play note {note} at cycle {cycle}, beat {beat} of '{track}' softer.",
+  louderRequest: "Play note {note} at cycle {cycle}, beat {beat} of '{track}' louder.",
+  semitoneAmount: '1 semitone',
+  semitonesAmount: '{n} semitones',
+  octaveAmount: '1 octave',
+  octavesAmount: '{n} octaves',
+  // The line the box shows when a range was cut to the page shown (the pointer left the lanes while the range was drawn). The
+  // words in braces are filled by rangeCutText.
+  rangeCut: 'Cut to the page shown — cycles {a} to {b}.',
+  rangeCutOne: 'Cut to the page shown — cycle {a}.',
 };
 
 /**
@@ -145,14 +164,27 @@ export function counterText(length) {
   return `${length} / ${MAX_ASK_TEXT_LENGTH} — too long. Shorten it to send.`;
 }
 
-/** The one muted message line of the box, in the spec's priority order, or null when none applies. */
-export function askMessage({ connected, length, notSent, tokenRefused, lineTooLong = false }) {
+/** The line that says a range was cut to the page shown, for `cut` = `{ from, to }` (the cycles the range ended up with). */
+export function rangeCutText(cut) {
+  if (cut === null || typeof cut !== 'object' || !isNonNegativeInteger(cut.from) || !isNonNegativeInteger(cut.to) || cut.to < cut.from) {
+    throw new Error('Moontide: a cut range needs whole cycles from and to, to not before from');
+  }
+  const template = cut.from === cut.to ? ASK_COPY.rangeCutOne : ASK_COPY.rangeCut;
+  return template.replace('{a}', String(cut.from)).replace('{b}', String(cut.to));
+}
+
+/**
+ * The one muted message line of the box, in the spec's priority order, or null when none applies. `rangeCut` (`{ from, to }`
+ * or null) is last: it shows only when nothing above it applies.
+ */
+export function askMessage({ connected, length, notSent, tokenRefused, lineTooLong = false, rangeCut = null }) {
   if (!connected) return ASK_COPY.disconnected;
   const counter = counterText(length);
   if (counter !== null && !(lineTooLong && length <= MAX_ASK_TEXT_LENGTH)) return counter;
   if (lineTooLong) return ASK_COPY.lineTooLong;
   if (notSent && tokenRefused) return ASK_COPY.notSentToken;
   if (notSent) return ASK_COPY.notSent;
+  if (rangeCut !== null) return rangeCutText(rangeCut);
   return null;
 }
 
@@ -224,6 +256,12 @@ function requiredBus(descriptor) {
 
 const SEPARATOR = ' \u00B7 ';
 
+/** The words after a cell's name in its chip, by the grid's fit state. */
+const CELL_FIT_WORDS = Object.freeze({ fits: 'fits', 'does-not-fit': 'does not fit', 'cannot-check': 'cannot check' });
+
+/** The most characters the fit part of a cell's chip may take, so the base always keeps room. */
+const MAX_CELL_SUFFIX = 100;
+
 /** The bus name a bus chip shows: 'Reverb bus', with the orbit while several orbits are in use. */
 function busTitle(bus, orbit, multipleOrbits) {
   const name = `${bus === 'reverb' ? 'Reverb' : 'Delay'} bus`;
@@ -246,29 +284,63 @@ function isNonNegativeNumber(value) {
 export const MOMENT_NOTE_FIELDS = Object.freeze(['track', 'instrument', 'sound', 'note', 'drum', 'velocity', 'start', 'end', 'state']);
 
 /**
- * A copy of the moment the Timeline described, checked and with every string cut to the context limit
- * (numbers are untouched). The server refuses what is out of bounds and never trims, so a moment the page got
- * wrong is a loud error here instead of a request that is refused later. The input is never mutated.
+ * The kinds of gesture a request can carry, equal to GESTURE_KINDS in src/protocol.ts (test/ask.test.js pins the two
+ * lists equal). The server rejects a kind it does not know.
  */
-function checkedMoment(kind, moment) {
-  if (moment === null || typeof moment !== 'object') throw missing(kind, 'a moment that is an object');
-  if (!isNonNegativeInteger(moment.cycle)) throw missing(kind, 'a whole number moment cycle of at least 0');
-  if (!Number.isInteger(moment.beat) || moment.beat < 1 || moment.beat > BEATS_PER_CYCLE) {
-    throw missing(kind, `a whole number moment beat from 1 to ${BEATS_PER_CYCLE}`);
+export const GESTURE_KINDS = Object.freeze(['pitch', 'rest', 'velocity', 'range']);
+
+/** The gestures that change one note of the Timeline (the ones a ready-made request is written for). */
+const NOTE_GESTURE_KINDS = Object.freeze(GESTURE_KINDS.filter((kind) => kind !== 'range'));
+
+/**
+ * The keys checkedGesture may copy into a note of a range: the moment note's keys without the state. The server's range note
+ * shape (askRangeNoteShape in src/protocol.ts) names the same keys; test/ask.test.js pins the two lists equal.
+ */
+export const RANGE_NOTE_FIELDS = Object.freeze(MOMENT_NOTE_FIELDS.filter((field) => field !== 'state'));
+
+/** The most semitones one pitch gesture may carry, up or down; equals MAX_GESTURE_SEMITONES in src/protocol.ts. */
+export const MAX_GESTURE_SEMITONES = 127;
+
+/**
+ * A frozen copy of the gesture a descriptor carries, with only the keys its kind names. The server rejects a gesture out
+ * of bounds and never trims it, so a gesture the page got wrong is a loud error here.
+ */
+function checkedGesture(gesture) {
+  if (gesture === null || typeof gesture !== 'object') throw new Error('Moontide: an ask gesture is an object');
+  switch (gesture.kind) {
+    case 'pitch':
+      if (!Number.isInteger(gesture.semitones) || gesture.semitones === 0 || Math.abs(gesture.semitones) > MAX_GESTURE_SEMITONES) {
+        throw new Error(`Moontide: a pitch gesture needs whole semitones from -${MAX_GESTURE_SEMITONES} to ${MAX_GESTURE_SEMITONES} other than 0`);
+      }
+      return Object.freeze({ kind: 'pitch', semitones: gesture.semitones });
+    case 'rest':
+      return Object.freeze({ kind: 'rest' });
+    case 'velocity':
+      if (gesture.direction !== 'softer' && gesture.direction !== 'louder') throw new Error('Moontide: a velocity gesture needs a direction of softer or louder');
+      return Object.freeze({ kind: 'velocity', direction: gesture.direction });
+    case 'range': {
+      if (gesture.version !== null && !(Number.isInteger(gesture.version) && gesture.version > 0)) {
+        throw missing('range', 'a gesture version that is null or a positive whole number');
+      }
+      if (!Array.isArray(gesture.notes) || gesture.notes.length > MAX_MOMENT_NOTES) throw missing('range', `at most ${MAX_MOMENT_NOTES} range notes`);
+      if (!isNonNegativeInteger(gesture.more)) throw missing('range', 'a whole number count of more notes of at least 0');
+      return Object.freeze({ kind: 'range', version: gesture.version, notes: checkedNotes('range', gesture.notes, false), more: gesture.more });
+    }
+    default:
+      throw new Error(`Moontide: unknown ask gesture kind ${String(gesture.kind)}`);
   }
-  if (!isNonNegativeNumber(moment.at)) throw missing(kind, 'a finite moment instant of at least 0');
-  if (moment.version !== null && !(Number.isInteger(moment.version) && moment.version > 0)) {
-    throw missing(kind, 'a moment version that is null or a positive whole number');
-  }
-  if (!Array.isArray(moment.notes) || moment.notes.length > MAX_MOMENT_NOTES) {
-    throw missing(kind, `at most ${MAX_MOMENT_NOTES} moment notes`);
-  }
-  if (!isNonNegativeInteger(moment.more)) throw missing(kind, 'a whole number moment count of more notes of at least 0');
-  const notes = moment.notes.map((note, index) => {
-    const where = `moment note ${index + 1}`;
+}
+
+/**
+ * A checked copy of the notes of a moment (`withState` true) or of a range (no state), every string cut to the context limit.
+ * The input is never mutated; a note that is not as the server takes it is a loud error.
+ */
+function checkedNotes(kind, notes, withState) {
+  return notes.map((note, index) => {
+    const where = `${withState ? 'moment' : 'range'} note ${index + 1}`;
     if (note === null || typeof note !== 'object') throw missing(kind, `${where} as an object`);
     if (typeof note.track !== 'string' || note.track === '') throw missing(kind, `a non-empty track in ${where}`);
-    if (note.state !== 'sounding' && note.state !== 'starts') throw missing(kind, `a state of sounding or starts in ${where}`);
+    if (withState && note.state !== 'sounding' && note.state !== 'starts') throw missing(kind, `a state of sounding or starts in ${where}`);
     if (!isNonNegativeNumber(note.start) || !isNonNegativeNumber(note.end)) {
       throw missing(kind, `a finite start and end of at least 0 in ${where}`);
     }
@@ -293,9 +365,31 @@ function checkedMoment(kind, moment) {
     }
     copy.start = note.start;
     copy.end = note.end;
-    copy.state = note.state;
+    if (withState) copy.state = note.state;
     return copy;
   });
+}
+
+/**
+ * A copy of the moment the Timeline described, checked and with every string cut to the context limit
+ * (numbers are untouched). The server refuses what is out of bounds and never trims, so a moment the page got
+ * wrong is a loud error here instead of a request that is refused later. The input is never mutated.
+ */
+function checkedMoment(kind, moment) {
+  if (moment === null || typeof moment !== 'object') throw missing(kind, 'a moment that is an object');
+  if (!isNonNegativeInteger(moment.cycle)) throw missing(kind, 'a whole number moment cycle of at least 0');
+  if (!Number.isInteger(moment.beat) || moment.beat < 1 || moment.beat > BEATS_PER_CYCLE) {
+    throw missing(kind, `a whole number moment beat from 1 to ${BEATS_PER_CYCLE}`);
+  }
+  if (!isNonNegativeNumber(moment.at)) throw missing(kind, 'a finite moment instant of at least 0');
+  if (moment.version !== null && !(Number.isInteger(moment.version) && moment.version > 0)) {
+    throw missing(kind, 'a moment version that is null or a positive whole number');
+  }
+  if (!Array.isArray(moment.notes) || moment.notes.length > MAX_MOMENT_NOTES) {
+    throw missing(kind, `at most ${MAX_MOMENT_NOTES} moment notes`);
+  }
+  if (!isNonNegativeInteger(moment.more)) throw missing(kind, 'a whole number moment count of more notes of at least 0');
+  const notes = checkedNotes(kind, moment.notes, true);
   return { cycle: moment.cycle, beat: moment.beat, at: moment.at, version: moment.version, notes, more: moment.more };
 }
 
@@ -304,8 +398,9 @@ function checkedMoment(kind, moment) {
  * prefix, a space and the JSON of the fields in the same order (U+2028 and U+2029 escaped), so the page can
  * tell before it sends whether the server will take the line.
  */
-export function requestLineBytes({ id, text, context, chip, current, moment }) {
-  const fields = moment === undefined ? { id, text, context, chip, current } : { id, text, context, chip, current, moment };
+export function requestLineBytes({ id, text, context, chip, current, moment, gesture }) {
+  // The moment, then the gesture, each only when there is one (the order of src/ask.ts's requestLine).
+  const fields = { id, text, context, chip, current, ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }) };
   const json = JSON.stringify(fields).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029');
   return new TextEncoder().encode(`${REQUEST_LINE_PREFIX} ${json}`).length;
 }
@@ -329,21 +424,46 @@ export function fitMomentToLine(fields) {
 }
 
 /**
- * Whether the request fits one line once its moment is cut as far as `fitMomentToLine` cuts it. False means the
- * text, the context and the chip alone are over MAX_REQUEST_LINE_BYTES: a text within the character limit can
- * still get here (JSON writes a control character as six bytes, and some scripts take three), so the box does
- * not send it and says so, instead of letting the server refuse it with the wrong reason.
+ * The gesture of a request cut to what the line holds. A range gesture loses notes from its end, one at a time, counted in
+ * `more`, until the whole line is at most MAX_REQUEST_LINE_BYTES (or no note is left); any other gesture, and undefined, come
+ * back as they are. The input is never mutated, and a gesture that fits is returned as it is. The chip counts notes and
+ * `more` together, so it needs no change.
+ */
+export function fitGestureToLine(fields) {
+  const { gesture } = fields;
+  if (gesture === undefined || gesture.kind !== 'range') return gesture;
+  let notes = gesture.notes;
+  let more = gesture.more;
+  while (notes.length > 0 && requestLineBytes({ ...fields, gesture: { ...gesture, notes, more } }) > MAX_REQUEST_LINE_BYTES) {
+    notes = notes.slice(0, -1);
+    more += 1;
+  }
+  return notes === gesture.notes ? gesture : { ...gesture, notes, more };
+}
+
+/**
+ * Whether the request fits one line once its moment and its range notes are cut as far as `fitMomentToLine` and
+ * `fitGestureToLine` cut them. False means the text, the context and the chip alone are over MAX_REQUEST_LINE_BYTES: a text
+ * within the character limit can still get here (JSON writes a control character as six bytes, and some scripts take three),
+ * so the box does not send it and says so, instead of letting the server refuse it with the wrong reason.
  */
 export function requestFitsLine(fields) {
-  return requestLineBytes({ ...fields, moment: fitMomentToLine(fields) }) <= MAX_REQUEST_LINE_BYTES;
+  const moment = fitMomentToLine(fields);
+  return requestLineBytes({ ...fields, moment, gesture: fitGestureToLine({ ...fields, moment }) }) <= MAX_REQUEST_LINE_BYTES;
+}
+
+/** '3 notes', '1 note' or 'no notes' for a count. */
+function notesWords(count) {
+  return count === 0 ? 'no notes' : count === 1 ? '1 note' : `${count} notes`;
 }
 
 /** The part of a chip that says where and what: 'cycle 34, beat 3 · 3 notes'. */
 function momentChipPart(moment) {
-  const count = moment.notes.length + moment.more;
-  const notes = count === 0 ? 'no notes' : count === 1 ? '1 note' : `${count} notes`;
-  return `cycle ${moment.cycle}, beat ${moment.beat}${SEPARATOR}${notes}`;
+  return `cycle ${moment.cycle}, beat ${moment.beat}${SEPARATOR}${notesWords(moment.notes.length + moment.more)}`;
 }
+
+/** The longest section name the chip of a range shows; the context carries the whole name (cut at the context limit). */
+const MAX_RANGE_CHIP_SECTION = 40;
 
 /**
  * What a right-click pointed at, as the context the server receives and the chip the user sees.
@@ -356,6 +476,7 @@ function momentChipPart(moment) {
 export function describeContext(descriptor) {
   const kind = descriptor && descriptor.kind;
   let moment = descriptor ? descriptor.moment : undefined;
+  let gesture = descriptor ? descriptor.gesture : undefined;
   // A moment is the Timeline's facts at the pointer: a lane, a part header over the lanes and the rest of the
   // Timeline (a session descriptor) carry one; nothing else does.
   if (moment !== undefined && kind !== 'lane' && kind !== 'part' && kind !== 'session') throw new Error(`Moontide: ask context ${kind} cannot carry a moment`);
@@ -490,6 +611,33 @@ export function describeContext(descriptor) {
       }
       break;
     }
+    case 'range': {
+      const track = requiredText(descriptor, 'track');
+      const from = requiredInteger(descriptor, 'from', 0);
+      const to = requiredInteger(descriptor, 'to', from);
+      if (to - from >= MAX_RANGE_CYCLES) throw missing(kind, `at most ${MAX_RANGE_CYCLES} cycles`);
+      const section = optionalText(descriptor, 'section');
+      const sectionTo = optionalText(descriptor, 'sectionTo');
+      if (sectionTo !== undefined && (section === undefined || sectionTo === section)) throw missing(kind, 'a sectionTo only when it differs from the section');
+      if (gesture === undefined || gesture.kind !== 'range') throw missing(kind, 'a range gesture with its notes');
+      gesture = checkedGesture(gesture);
+      const cut = descriptor.cut === undefined || descriptor.cut === null ? null : { from: descriptor.cut.from, to: descriptor.cut.to };
+      if (cut !== null) rangeCutText(cut);
+      context = { kind, track, from, to };
+      if (section !== undefined) context.section = section;
+      if (sectionTo !== undefined) context.sectionTo = sectionTo;
+      // The cycles, the section and the notes are built first and the lane name is cut to the room left, so a long name never
+      // costs the cycles.
+      const parts = [from === to ? `cycle ${from}` : `cycles ${from} to ${to}`];
+      if (section !== undefined) {
+        const shown = (name) => `"${cutText(name, MAX_RANGE_CHIP_SECTION)}"`;
+        parts.push(sectionTo === undefined ? `section ${shown(section)}` : `sections ${shown(section)} to ${shown(sectionTo)}`);
+      }
+      parts.push(notesWords(gesture.notes.length + gesture.more));
+      const tail = parts.join(SEPARATOR);
+      chip = `${cutText(`Range${SEPARATOR}${track}`, MAX_ASK_CONTEXT_LENGTH - SEPARATOR.length - tail.length)}${SEPARATOR}${tail}`;
+      return { context, chip: cutText(chip), gesture, ...(cut === null ? {} : { rangeCut: cut }) };
+    }
     case 'note': {
       const note = requiredText(descriptor, 'note');
       const role = descriptor.role === null ? undefined : descriptor.role;
@@ -523,10 +671,57 @@ export function describeContext(descriptor) {
       chip = `Warning${SEPARATOR}${chord} brings ${outside}${avoid === undefined ? '' : `, avoid ${avoid}`}, ${seconds === 0 ? 'now' : `in ${seconds} s`}`;
       break;
     }
+    case 'cell': {
+      const section = requiredText(descriptor, 'section');
+      const track = requiredText(descriptor, 'track');
+      const variation = optionalText(descriptor, 'variation');
+      const rest = descriptor.rest;
+      if (rest !== undefined && rest !== true) throw missing(kind, 'rest as true, or no rest');
+      // A cell holds one variation or is a rest, never both and never neither.
+      if ((variation === undefined) === (rest === undefined)) throw missing(kind, 'a variation or rest true, not both');
+      const fit = descriptor.fit === null ? undefined : descriptor.fit;
+      let outside;
+      let suffix = rest === undefined ? '' : `${SEPARATOR}rest`;
+      if (fit !== undefined) {
+        // The fit is the grid's word for a fixed variation; a rest has none.
+        if (rest !== undefined) throw missing(kind, 'no fit on a rest');
+        if (!Object.hasOwn(CELL_FIT_WORDS, fit)) throw missing(kind, 'a fit of fits, does-not-fit or cannot-check');
+        outside = optionalText(descriptor, 'outside');
+        if (outside !== undefined && fit !== 'does-not-fit') throw missing(kind, 'outside only with a fit of does-not-fit');
+        suffix = `${SEPARATOR}${CELL_FIT_WORDS[fit]}${outside === undefined ? '' : ` (${outside})`}`;
+      } else if (descriptor.outside !== undefined && descriptor.outside !== null) {
+        throw missing(kind, 'outside only with a fit of does-not-fit');
+      }
+      context = { kind, section, track };
+      if (variation !== undefined) context.variation = variation;
+      if (rest !== undefined) context.rest = true;
+      if (fit !== undefined) context.fit = fit;
+      if (outside !== undefined) context.outside = outside;
+      // The fit part is built first and the base (section, track, variation) is cut to the room left, so a long name
+      // never costs the words that say whether the notes fit.
+      const fitPart = cutText(suffix, MAX_CELL_SUFFIX);
+      const base = `Cell "${section}"${SEPARATOR}${track}${variation === undefined ? '' : `${SEPARATOR}${variation}`}`;
+      chip = `${cutText(base, MAX_ASK_CONTEXT_LENGTH - fitPart.length)}${fitPart}`;
+      break;
+    }
+    case 'group': {
+      const name = requiredText(descriptor, 'name');
+      const parent = optionalText(descriptor, 'parent');
+      context = parent === undefined ? { kind, name } : { kind, name, parent };
+      chip = `Group "${name}"${parent === undefined ? '' : `${SEPARATOR}in "${parent}"`}`;
+      break;
+    }
     default:
       throw new Error(`Moontide: unknown ask context kind ${kind}`);
   }
-  return moment === undefined ? { context, chip: cutText(chip) } : { context, chip: cutText(chip), moment };
+  // A gesture is about one note of a lane: it rides only on a lane that carries a moment (the range gesture is the range
+  // context's own and is checked in its case above).
+  if (gesture !== undefined) {
+    if (kind !== 'lane' || moment === undefined) throw new Error(`Moontide: ask context ${kind} cannot carry a gesture without a lane and its moment`);
+    gesture = checkedGesture(gesture);
+    if (gesture.kind === 'range') throw new Error('Moontide: a range gesture goes only with a range context');
+  }
+  return { context, chip: cutText(chip), ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }) };
 }
 
 /**
@@ -537,6 +732,69 @@ export function describeContext(descriptor) {
 export function errorAskPrefill(fullText) {
   if (typeof fullText !== 'string') throw new Error('Moontide: the error prefill needs the error text as a string');
   return `${ASK_COPY.errorPrefillLead}\n\n${cutText(fullText, MAX_ERROR_PREFILL)}\n\n`;
+}
+
+/**
+ * The text the Ask field starts with on a cell whose fixed variation does not fit its section: ASK_COPY.cellFitRequest with
+ * the variation, the track, the section, the section's harmony text and the outside notes. Every value is a non-empty string,
+ * cleaned of hidden characters and cut at the context limit, so the text stays within the field. A missing value throws.
+ */
+export function cellFitPrefill(values) {
+  const filled = {};
+  for (const field of ['variation', 'track', 'section', 'harmony', 'notes']) {
+    const value = values === null || typeof values !== 'object' ? undefined : values[field];
+    if (typeof value !== 'string' || value === '') throw new Error(`Moontide: the fit request needs a non-empty ${field}`);
+    filled[field] = cutText(cleanText(value));
+  }
+  const text = ASK_COPY.cellFitRequest.replace(/\{(\w+)\}/g, (_, name) => filled[name]);
+  if (text.length > MAX_ASK_TEXT_LENGTH) throw new Error('Moontide: the fit request is longer than the Ask box takes.');
+  return text;
+}
+
+/** A pitch change in words: `1 semitone`, `5 semitones`, `1 octave`, `2 octaves` (a multiple of 12 reads in octaves). */
+function amountWords(size) {
+  if (size % 12 === 0) return size === 12 ? ASK_COPY.octaveAmount : ASK_COPY.octavesAmount.replace('{n}', String(size / 12));
+  return size === 1 ? ASK_COPY.semitoneAmount : ASK_COPY.semitonesAmount.replace('{n}', String(size));
+}
+
+/**
+ * The text the Ask field starts with when the user does something to a Timeline note the page cannot edit: raise, lower,
+ * rest or softer / louder, with the note as the Timeline shows it, its cycle and beat and its track. `values` is `{ kind,
+ * note, cycle, beat, track }` and, for a pitch gesture, `semitones` (a whole number from -127 to 127 other than 0), for a
+ * velocity gesture `direction` ('softer' or 'louder'). The note and the track are cleaned of hidden characters and cut at the
+ * context limit (this is the user's own request, so it keeps the name Claude needs to find the track); anything else wrong
+ * throws.
+ */
+export function timelineEditPrefill(values) {
+  const from = (field) => (values === null || typeof values !== 'object' ? undefined : values[field]);
+  const kind = from('kind');
+  if (!NOTE_GESTURE_KINDS.includes(kind)) throw new Error(`Moontide: the Timeline request needs a kind of ${NOTE_GESTURE_KINDS.join(', ')}`);
+  const note = from('note');
+  if (!((typeof note === 'string' && note !== '') || (typeof note === 'number' && Number.isFinite(note)))) {
+    throw new Error('Moontide: the Timeline request needs the note as a non-empty string or a finite number');
+  }
+  const cycle = from('cycle');
+  if (!isNonNegativeInteger(cycle)) throw new Error('Moontide: the Timeline request needs a whole number cycle of at least 0');
+  const beat = from('beat');
+  if (!Number.isInteger(beat) || beat < 1 || beat > BEATS_PER_CYCLE) throw new Error(`Moontide: the Timeline request needs a whole number beat from 1 to ${BEATS_PER_CYCLE}`);
+  const track = from('track');
+  if (typeof track !== 'string' || track === '') throw new Error('Moontide: the Timeline request needs a non-empty track');
+  const filled = { note: cutText(cleanText(String(note))), cycle: String(cycle), beat: String(beat), track: cutText(cleanText(track)) };
+  let template;
+  if (kind === 'pitch') {
+    const semitones = from('semitones');
+    checkedGesture({ kind, semitones });
+    template = semitones > 0 ? ASK_COPY.raiseRequest : ASK_COPY.lowerRequest;
+    filled.amount = amountWords(Math.abs(semitones));
+  } else if (kind === 'velocity') {
+    const direction = checkedGesture({ kind, direction: from('direction') }).direction;
+    template = direction === 'softer' ? ASK_COPY.softerRequest : ASK_COPY.louderRequest;
+  } else {
+    template = ASK_COPY.restRequest;
+  }
+  const text = template.replace(/\{(\w+)\}/g, (_, name) => filled[name]);
+  if (text.length > MAX_ASK_TEXT_LENGTH) throw new Error('Moontide: the Timeline request is longer than the Ask box takes.');
+  return text;
 }
 
 // The cycle under the pointer on a Timeline lane lives in page/timeline.js next to momentAt, so a lane's

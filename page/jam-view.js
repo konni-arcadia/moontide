@@ -24,6 +24,7 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
   const jamDeclared = document.getElementById('jam-declared');
   const jamDeclaredLabel = document.getElementById('jam-declared-label');
   const jamDeclaredValue = document.getElementById('jam-declared-value');
+  const jamDeclaredSection = document.getElementById('jam-declared-section');
   const jamScaleLabel = document.getElementById('jam-scale-label');
   const jamScaleName = document.getElementById('jam-scale-name');
   const jamScaleSub = document.getElementById('jam-scale-sub');
@@ -165,6 +166,7 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
   let shownDeclaredKind = null;
   let shownDeclaredText = null;
   let shownDeclaredTitle = null;
+  let shownDeclaredSection = null;
   let shownName = null;
   let shownKind = null;
   let shownSub = null;
@@ -220,6 +222,20 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
       jamDeclaredValue.title = declared.title;
       shownDeclaredTitle = declared.title;
     }
+  }
+
+  // The section the Declared line speaks for: its words after the value, hidden for a piece without sections.
+  function renderDeclaredSection(section) {
+    if (section === undefined) throw new Error('Moontide: a ready Jam model needs its section field (null without sections).');
+    if (section === shownDeclaredSection) return;
+    if (section === null) {
+      jamDeclaredSection.textContent = '';
+      jamDeclaredSection.hidden = true;
+    } else {
+      jamDeclaredSection.textContent = section;
+      jamDeclaredSection.hidden = false;
+    }
+    shownDeclaredSection = section;
   }
 
   function renderScale(scale, degrees) {
@@ -477,6 +493,7 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
     }
     lastModel = model;
     renderDeclared(model.declared);
+    renderDeclaredSection(model.section);
     renderScale(model.scale, model.degrees);
     renderStatus(model.status);
     if (model.paused !== shownPaused) {

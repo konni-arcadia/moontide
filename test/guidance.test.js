@@ -50,9 +50,11 @@ test('guidance: read before editing, keep what matters, ask before rewriting, ex
     'write each layer as a labeled statement, name: pattern',
     'with a name that describes its role',
     'the page displays tracks under these names',
-    // How to act on a vague request. The ask-before-rewrite and one-line-explanation rules are
-    // pinned on the set_code description below: the instructions hold only 2048 characters for Claude Code.
-    'act on your own reading',
+    // The standing rule for song structure: the duty and where the form is.
+    'every new piece declares its song structure once at the top',
+    'the structure topic of get_strudel_reference has the form',
+    // The ask-before-rewrite, vague-request and one-line-explanation rules are pinned on the set_code description
+    // below: the instructions hold only 2048 characters for Claude Code.
     'for the functions, sounds and effects',
     // A gradual frame means every change goes through a transition.
     'if the user sets a frame of gradual changes',
@@ -61,9 +63,6 @@ test('guidance: read before editing, keep what matters, ask before rewriting, ex
     'not only as a smaller step',
     'until the user changes or lifts it',
     'within a fraction of a second',
-    // When Claude replaces a sound that failed to load, it must say so.
-    'a sound that failed to load',
-    'tell the user which one and what replaced it, never silently',
     // One fact about MIDI, pointing at the midi topic and the two MIDI tools.
     'play a midi instrument',
     'the midi topic of get_strudel_reference',
@@ -79,6 +78,16 @@ test('guidance: read before editing, keep what matters, ask before rewriting, ex
   // a fact a tool already gives is not repeated in the instructions (decisions.md), and the room it frees
   // is the margin under the 2048 characters.
   assert.ok(!lowerInstructions.includes('gettime()'), 'the getTime() rule belongs in the set_code description, not in the instructions');
+  // The vague-request sentence moved to the set_code description and the failed-sound sentence to the notice texts.
+  assert.ok(!lowerInstructions.includes('act on your own reading'), 'the vague-request sentence belongs in the set_code description');
+  assert.ok(!lowerInstructions.includes('failed to load'), 'the failed-sound sentence belongs in the notice texts');
+  // The rule names no tool that edits, no musical form and no section role.
+  assert.ok(!/arrange|edit_code|\bverse\b|\bchorus\b/i.test(instructions), 'the structure rule names no form');
+  // Named tracks come before the capital-S label rule, and the structure rule right after it.
+  const namedAt = instructions.indexOf('Write each layer as a labeled statement');
+  const capitalAt = instructions.indexOf('A label longer than one character that starts with a capital S');
+  const ruleAt = instructions.indexOf('Every new piece declares');
+  assert.ok(namedAt >= 0 && namedAt < capitalAt && capitalAt < ruleAt, 'order: named tracks, capital S, structure rule');
 
   // Empty case: nothing sets a default pace — every instructions sentence naming
   // "gradual" is conditioned on the user having set a frame.
@@ -100,6 +109,8 @@ test('guidance: read before editing, keep what matters, ask before rewriting, ex
     'including hand edits',
     'ask first',
     'rewrite and say so',
+    // Moved here from the instructions (2048 characters for Claude Code).
+    'act on your own reading',
     'in one line',
     'within a fraction of a second',
     'gettime()',
@@ -624,8 +635,22 @@ test('guidance: edit_code and set_code say when to use which, within the 2048 ch
   }
 
   assert.ok(!(client.getInstructions() ?? '').toLowerCase().includes('edit_code'), 'the instructions must not mention edit_code');
-  // The instructions were 1868 characters before the start sentence (83 characters and a blank line).
-  assert.equal(mcpModule.SERVER_INSTRUCTIONS.length, 1953, 'the instructions stay as they were, plus the start sentence');
+  // The instructions were 1953 characters before the structure rule: it made room by moving the vague-request
+  // sentence (into the set_code description) and the failed-sound sentence (into the notice texts).
+  // 1886 before the framing named the gesture field of a request (nine more characters: "gesture, ").
+  assert.equal(mcpModule.SERVER_INSTRUCTIONS.length, 1895, 'the instructions are pinned at their exact length');
+  assert.ok(
+    mcpModule.CLIENT_INSTRUCTIONS_LIMIT - mcpModule.SERVER_INSTRUCTIONS.length >= 150,
+    'the instructions keep a margin of at least 150 characters under the limit',
+  );
+});
+
+test('guidance: every failed-sound notice text keeps the duty to say which sound was replaced and by what', () => {
+  for (const names of [['kalimba'], ['kalimba', 'steinway'], []]) {
+    const text = soundLoadFailureText('Failed to fetch', names);
+    assert.ok(text.includes('failed to load'), text);
+    assert.ok(text.endsWith('tell the user which one and what replaced it, never silently'), text);
+  }
 });
 
 test('guidance: get_code adds the version line from EDIT_HINT_MIN_LINES lines of code', () => {
@@ -693,6 +718,7 @@ test('guidance: exactly fourteen tools are listed, and resources cover only the 
     'moontide://reference/sounds',
     'moontide://reference/theory',
     'moontide://reference/transitions',
+    'moontide://reference/structure',
     'moontide://reference/midi',
   ].sort();
   assert.deepEqual(uris, expected);

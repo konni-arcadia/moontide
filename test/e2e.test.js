@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { startMcpClient, connectPage, createFakePage, withoutArmingLine, withoutPageLine, waitForUrl } from './helpers.js';
+import { startMcpClient, connectPage, createFakePage, withoutArmingLine, withoutPageLine, withoutStructureTemplate, waitForUrl } from './helpers.js';
 import { FIRST_CYCLE_WATCH_MS } from '../page/ui-state.js';
+import { NO_STRUCTURE_NOTE } from '../dist/mcp.js';
 
 /** Waits a short tick so an unsolicited page frame has time to arrive before a tool call. */
 function tick(ms = 50) {
@@ -43,7 +44,7 @@ test('moontide server end-to-end', async (t) => {
     assert.ok(!result.isError);
     // After the start, get_code names its page: address, port and the tab title (written out, not imported).
     assert.equal(
-      result.content[0].text,
+      withoutStructureTemplate(result.content[0].text),
       `Nothing is playing yet.\n\nPage: ${url} (port ${port}), in the browser tab titled "Moontide \u00b7 my-project \u00b7 ${port}".`,
     );
   });
@@ -546,7 +547,7 @@ test('moontide server end-to-end', async (t) => {
   });
 
   // Letters continue after (kk): the t/f flag note case.
-  await t.test('(ll) set_code with .when("<f t>", ...): the reply ends with the t/f flag note, and the code reaches the page unchanged', async () => {
+  await t.test('(ll) set_code with .when("<f t>", ...): the reply carries the t/f flag note then the new-piece note, and the code reaches the page unchanged', async () => {
     const page = await createFakePage(port);
     fakePages.push(page);
     let receivedCode;
@@ -559,7 +560,10 @@ test('moontide server end-to-end', async (t) => {
     const result = await client.callTool({ name: 'set_code', arguments: { code } });
     assert.ok(!result.isError);
     assert.ok(result.content[0].text.startsWith('ok, playing'));
-    assert.equal(result.content[0].text.split('\n').at(-1), FLAG_NOTE_TEXT);
+    // These pieces declare no structure, so the new-piece note follows the flag note.
+    const lines = result.content[0].text.split('\n');
+    assert.equal(lines.at(-1), NO_STRUCTURE_NOTE);
+    assert.equal(lines.at(-2), FLAG_NOTE_TEXT);
     assert.equal(receivedCode, code, 'the code the page received must be strictly equal to the code sent');
   });
 
@@ -573,7 +577,9 @@ test('moontide server end-to-end', async (t) => {
     assert.ok(!result.isError);
     const lines = result.content[0].text.split('\n');
     assert.equal(lines.at(-1), GETTIME_NOTE_TEXT);
-    assert.equal(lines.at(-2), FLAG_NOTE_TEXT);
+    // The new-piece note sits between the flag note and the getTime note.
+    assert.equal(lines.at(-2), NO_STRUCTURE_NOTE);
+    assert.equal(lines.at(-3), FLAG_NOTE_TEXT);
   });
 
   await t.test('(nn) set_code with a const t/f string passed by name to .when(): the reply carries the flag note', async () => {
@@ -584,7 +590,9 @@ test('moontide server end-to-end', async (t) => {
     const code = 'const fear = "<f f t>"\nchord("C").when(fear, (x) => x.add(1))';
     const result = await client.callTool({ name: 'set_code', arguments: { code } });
     assert.ok(!result.isError);
-    assert.equal(result.content[0].text.split('\n').at(-1), FLAG_NOTE_TEXT);
+    const lines = result.content[0].text.split('\n');
+    assert.equal(lines.at(-1), NO_STRUCTURE_NOTE);
+    assert.equal(lines.at(-2), FLAG_NOTE_TEXT);
   });
 
   await t.test('(oo) set_code with .struct("1 0 1 1") carries no flag note, and a failed set_code with a t/f string carries none either', async () => {

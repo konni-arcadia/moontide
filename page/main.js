@@ -34,6 +34,7 @@ import {
   rulerMarks,
   laneShapes,
   momentAt,
+  rangeNotes,
   drumTrackIndexes,
   sameIndexSet,
   loopPeriod,
@@ -42,6 +43,10 @@ import {
   curvePoints,
   evaluateSolo,
   computeTimeline,
+  drumNoteOf,
+  pitchOf,
+  toLaneEvent,
+  velocityOf,
 } from './timeline.js';
 import {
   applyKey,
@@ -59,10 +64,13 @@ import {
   setJamChordTones,
   motionAfterOsChange,
   setChangeTiming,
+  setSongLaunch,
+  BUILT_VIEWS,
   VIEW_KEYS,
+  VIEW_TITLES,
 } from './views.js';
 import { createHistoryView } from './history-view.js';
-import { MixerRewriteError, touchedRanges, writeBus, writeTrack } from './mixer-rewrite.js';
+import { MixerRewriteError, applyEdits, touchedRanges, writeBus, writeTrack, writeTracks } from './mixer-rewrite.js';
 import { MIXER_COPY, buildMixerModel, clipMixerLabel, forgetBypass, readBypassRecords, rememberBypass, writeBypassRecords } from './mixer-model.js';
 import { createGestureRecorder } from './mixer-gesture.js';
 import { createPreviewSender, midiTag, readMidiTracks, writeMidiControl } from './midi-controls.js';
@@ -82,15 +90,25 @@ import {
   sectionSpans,
 } from './parts.js';
 import { baseTitle, readSessionLabel, renderSessionIdentity } from './session-identity.js';
-import { ASK_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, lineAtY } from './ask.js';
+import { ASK_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, lineAtY, timelineEditPrefill } from './ask.js';
 import { createAskView } from './ask-view.js';
 import { buildReading, readingAt, flattenLanes } from './jam-analysis.js';
 import { readHarmony } from './harmony.js';
+import { SONG_COPY, differsLine, quoted, readStructure, songMessageText, songNoteLines } from './structure.js';
+import { checkSections, evaluateDeclared, expectedSource, sectionStarts } from './structure-check.js';
+import { collectFit, evaluateFit, fitLookup, fitPairs, fitSource, pairKey } from './song-fit.js';
+import { createSongView } from './structure-view.js';
+import { buildSongGrid, cellRecordLabel, playingSection, sectionDeclared, songLine } from './song-grid-model.js';
+import { SongEditRefusal, cellEdit, checkCell, checkSection, launchLine, launchShift, playResetEdit, sameShift, shiftEdit, textAfterCanceledLaunch } from './song-edit.js';
+import { createSongGridView } from './song-grid-view.js';
+import { SONG_FOLDS_COPY, isRememberable, readSongFolds, writeSongFolds } from './song-prefs.js';
 import { JAM_COPY, buildJamModel, jamStuckFor, jamIsStuck } from './jam-model.js';
 import { createJamView } from './jam-view.js';
 import { createInstrumentsView } from './instruments-view.js';
 import { instrumentsModel, readDataFolder, readInstrumentResult } from './instruments-model.js';
 import { createMidiOut, installNoMidiShim, isKnownMidiRejection } from './midi-out.js';
+import { installNoteTag, subscribe as subscribeNotes } from './note-tag.js';
+import { MIDI_LIGHT_OFFSET_MS, createLights, heardMapper, lightLayout, readOutputPair, usableTempo } from './lights.js';
 import {
   hhmm,
   hiddenTransition,
@@ -110,11 +128,14 @@ import {
   BEATS_PER_CYCLE,
   CHANGE_COPY,
   MAX_REPORTED_BPM,
+  MIN_TAKEOVER_LEAD_SECONDS,
   bpmOf,
   bpmText,
   clampPendingSeconds,
+  countdownParts,
   isReportableBpm,
   parseTiming,
+  pinnedTiming,
   queuedLine,
   settingLine,
 } from './change-timing.js';
@@ -125,6 +146,11 @@ import { createSessionView } from './session-view.js';
 import { createSplitView } from './split-view.js';
 import { SPLIT_COPY, SPLIT_DEFAULTS, clampSplit } from './split-model.js';
 import { createTakeover } from './takeover.js';
+import { createPageRewrite } from './page-rewrite.js';
+import { PLACES_MAX_CYCLES, classifyNote, indexCode, perCycleCount, placesOf, readerCounter, trackScope } from './note-locate.js';
+import { NoteEditStop, writeNoteEdit } from './note-edit.js';
+import { NOTE_MARK_HEIGHT } from './timeline-gesture.js';
+import { createTimelineEditView } from './timeline-edit-view.js';
 import { createEvaluateTag } from './evaluate-tag.js';
 
 await customElements.whenDefined('strudel-editor');
@@ -385,6 +411,14 @@ const takeover = createTakeover({
     }
   },
   onCancel(record, reason) {
+    // A section launch that waited for this record is over, whatever the reason.
+    const ownLaunch = gridLaunch !== null && gridLaunch.record === record;
+    if (ownLaunch) {
+      gridLaunch = null;
+      gridQueued = null;
+    }
+    // A cell change that waited for this record is over too: nothing was recorded for it.
+    if (gridCellWait !== null && gridCellWait.record === record) gridCellWait = null;
     // The setup that did not go out is forgotten; one that went out (stamped on the line, it cannot be recalled) is
     // answered by the playing code's sounds and controls sent just after it. The clock serves the playing code's
     // instruments only again.
@@ -406,7 +440,7 @@ const takeover = createTakeover({
     // The server learns about a waiting change that was stopped or replaced, but only when it already heard the
     // reply that announced it (a change canceled before its reply says so in the reply itself). Sent here,
     // synchronously, so it goes out before user-stopped and stop-result (sent after stopSoundLocally resolves)
-    // and before the reply of the newer change. Any other reason (superseded, unload) sends nothing: the
+    // and before the reply of the newer change. Any other reason (superseded, unload, canceled) sends nothing: the
     // server drops the change itself on detach and attach.
     if ((reason === 'stop' || reason === 'replaced') && record.evaluateId !== null && record.replied === true) {
       sendIfOpen(JSON.stringify({ type: 'takeover-canceled', id: record.evaluateId, reason }));
@@ -418,10 +452,16 @@ const takeover = createTakeover({
     if (reason !== 'replaced' && scheduler.pattern === record.gate) scheduler.pattern = record.playingPattern;
     // The repl still holds the canceled change as committed: the readers keep the music that played. A replaced
     // record has a successor that is armed (or takes over at once) in the same turn and clears or keeps this.
-    if (reason === 'stop' || reason === 'superseded' || reason === 'unload') {
+    if (reason === 'stop' || reason === 'superseded' || reason === 'unload' || reason === 'canceled') {
       canceledPlayingCode = record.playingCode;
       canceledPlayingPattern = record.playingPattern;
     }
+    // The person's own cancel of a waiting section launch: the music keeps playing, and the editor goes back to the code
+    // that plays (the launch wrote only the shift into it), unless the person typed over that text meanwhile: typing that
+    // was never evaluated is never replaced. Nothing is sent to the server: a launch has no evaluate id and was never
+    // recorded. A Stop while the launch of the grid waits does the same: the shift it wrote would never play (Play writes
+    // shift 0), and left in the editor it would read as typing that was never evaluated and lock the grid.
+    if (reason === 'canceled' || (reason === 'stop' && ownLaunch)) putBackCanceledLaunch(record);
     // A replaced record has a successor that is armed (its onArmed shows the wait again) or takes over at once
     // (its takeover redraws the views): here the Mixer only stops saying "waiting", with no redraw from the code
     // that is being evaluated.
@@ -430,7 +470,7 @@ const takeover = createTakeover({
     // The countdown always ends with the wait. Stop says so once; any other reason clears the line silently (a
     // replacing change says its own line right after, an immediate one needs none).
     topBarUi.showCountdown(null);
-    if (reason === 'stop') topBarUi.say(CHANGE_COPY.canceled);
+    if (reason === 'stop' || reason === 'canceled') topBarUi.say(CHANGE_COPY.canceled);
     else topBarUi.clearStatus();
   },
   onError: (text, err) => console.error(text, err),
@@ -470,6 +510,7 @@ function drawTopBar() {
     topBarUi.showTempo(idleTempo);
     topBarUi.showCycleBeat(null);
     topBarUi.showCountdown(null);
+    syncGridQueued(null);
     return;
   }
   const record = takeover.pending();
@@ -504,9 +545,34 @@ function drawTopBar() {
   topBarUi.showCycleBeat(cycleBeat(now));
   if (record === null || record.at === undefined || record.boundary - now <= 0) {
     topBarUi.showCountdown(null);
+    syncGridQueued(now);
     return;
   }
   topBarUi.showCountdown({ beatsLeft: (record.boundary - now) * BEATS_PER_CYCLE, at: record.at });
+  syncGridQueued(now);
+}
+
+/**
+ * Hands the queued section header of the Song grid its countdown for this poll: the rest of the top bar's text
+ * (`in 3 bars`, `in 2 beats`, `in 1 beat`) from the same record and the same cycle `now` the bar just drew, so the two
+ * never disagree. `now` is null while nothing plays. The grid is written in the same turn when the text changed.
+ */
+function syncGridQueued(now) {
+  let next = null;
+  if (now !== null && gridLaunch !== null && takeover.pending() === gridLaunch.record && gridLaunch.record.boundary - now > 0) {
+    next = {
+      index: gridLaunch.index,
+      countdownText: countdownParts((gridLaunch.record.boundary - now) * BEATS_PER_CYCLE).rest,
+      line: gridLaunch.record.boundary,
+    };
+  } else if (now !== null && gridAlready !== null && gridAlready.line - now > 0) {
+    // A launch that needs no code change counts down to its natural arrival with the same words.
+    next = { index: gridAlready.index, countdownText: countdownParts((gridAlready.line - now) * BEATS_PER_CYCLE).rest, line: gridAlready.line };
+  }
+  const same = gridQueued === next || (gridQueued !== null && next !== null && gridQueued.index === next.index && gridQueued.countdownText === next.countdownText && gridQueued.line === next.line);
+  if (same) return;
+  gridQueued = next;
+  if (songGridReading !== null) updateSongGridLive();
 }
 
 // The always-on page poll (every 250 ms, for the life of the page). It finishes a waiting change whose line the
@@ -520,6 +586,16 @@ setInterval(() => {
     drawTopBar();
   } catch (err) {
     console.error('Moontide: the top bar could not be drawn:', err);
+  }
+  try {
+    pollSongGrid();
+  } catch (err) {
+    console.error('Moontide: the song grid could not follow the page:', err);
+  }
+  try {
+    pollTimelineEdit();
+  } catch (err) {
+    console.error('Moontide: the Timeline note panel could not follow the page:', err);
   }
 }, 250);
 
@@ -737,6 +813,56 @@ const mixerViewEl = document.getElementById('mixer-view');
 const partsView = document.getElementById('parts-view');
 const partsMessage = document.getElementById('parts-message');
 const partsRows = document.getElementById('parts-rows');
+const songNotesEl = document.getElementById('song-notes');
+if (!songNotesEl) throw new Error('Moontide: the song notes element is missing from the page.');
+// The lines above the song grid in the Parts view; they draw what page/structure.js read from the code.
+const songUi = createSongView({ document, notes: songNotesEl });
+// The Song grid that replaces the Parts rows for a piece that declares a readable song. Its handlers are added as each
+// gesture gets its behaviour; a gesture without one throws, so nothing is ignored silently.
+const songGridHandlers = {};
+const songBarEl = document.getElementById('song-bar');
+const songNowEl = document.getElementById('song-now');
+const songLaunchEl = document.getElementById('song-launch');
+const songLaunchLabelEl = document.getElementById('song-launch-label');
+const songLineEl = document.getElementById('song-line');
+const songCellListEl = document.getElementById('song-cell-list');
+if (!songBarEl || !songNowEl || !songLaunchEl || !songLaunchLabelEl || !songLineEl || !songCellListEl) throw new Error('Moontide: the song toolbar elements are missing from the page.');
+songLaunchLabelEl.textContent = SONG_COPY.launchLabel;
+const songGridUi = createSongGridView({ document, rows: partsRows, bar: songBarEl, now: songNowEl, line: songLineEl, launchGroup: songLaunchEl, list: songCellListEl, handlers: songGridHandlers });
+// The note panel under the Timeline lanes and the selection on the lanes. A click picks a note, the panel says whether the page
+// can edit it, and keys and buttons change its pitch, turn it into a rest or change its velocity when it can. What the panel
+// needs to know is read in describeTimelineNote; the edit itself runs on the serial chain (editTimelineNote), further down.
+const timelineNotePanel = document.getElementById('timeline-note');
+const timelineNoteLine = document.getElementById('timeline-note-line');
+if (!timelineNotePanel || !timelineNoteLine) throw new Error('Moontide: the Timeline note panel is missing from the page.');
+const timelineEditUi = createTimelineEditView({
+  document,
+  lanes: timelineLanes,
+  panel: timelineNotePanel,
+  line: timelineNoteLine,
+  rootFontPx: () => parseFloat(getComputedStyle(document.documentElement).fontSize),
+  // The pause that gathers the steps of a key or a button runs on the page's own timers.
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (handle) => clearTimeout(handle),
+  handlers: {
+    describe: (laneIndex, eventIndex) => describeTimelineNote(laneIndex, eventIndex),
+    // The view hands over one edit at a time and waits for its outcome, which is given back with the same id.
+    edit: (info, change, id) => {
+      chain = chain.then(() => editTimelineNote(info, change, id)).catch((err) => reportChainError('timeline edit', err));
+    },
+    // A gesture on a note the page cannot edit becomes a ready-made request in the Ask box; nothing is written or sent.
+    prepare: (info, change, point) => askAboutTimelineNote(info, timelineGestureOf(change), point),
+    ask: (info, point) => askAboutTimelineNote(info, undefined, point),
+    // A range of cycles on one lane opens the Ask box with the lane, the cycles and the notes in them.
+    range: (selection, point) => askAboutTimelineRange(selection, point),
+    // What the panel says of a range: the lane, the sections of its ends and how many notes start in it.
+    describeRange: (selection) => describeTimelineRange(selection),
+    // The keyboard cursor on a lane with no note on the page: the lane's own context at the cursor's cycle.
+    askLane: (laneIndex, cycle, point) => askAboutTimelineLane(laneIndex, cycle, point),
+  },
+});
+// A drag on the lanes ends with no write when the window loses focus.
+window.addEventListener('blur', () => timelineEditUi.cancelGesture());
 const jamViewEl = document.getElementById('jam-view');
 const instrumentsViewEl = document.getElementById('instruments-view');
 const editorArea = document.getElementById('editor-area');
@@ -900,7 +1026,11 @@ renderSessionIdentity(document, sessionLabel, (text) => console.error(text));
 // The Ask Claude box. Created before any code path that can call into it.
 const askUi = createAskView({
   document,
-  send: (message) => sendIfOpen(JSON.stringify(message)),
+  send: (message) => {
+    sendIfOpen(JSON.stringify(message));
+    // A sent request about a range of the Timeline is done with it: the wash goes.
+    if (message.type === 'ask' && message.context.kind === 'range') timelineEditUi.clearRange();
+  },
   reportError: showAskProblem,
   clearError: clearAskProblem,
   setTimer: (fn, ms) => setTimeout(fn, ms),
@@ -1114,6 +1244,23 @@ function buildViewButtons() {
 }
 buildViewButtons();
 
+// The names the top-bar view buttons show now: the Parts view is called Song while the code declares a song.
+const viewTitles = { ...VIEW_TITLES };
+
+/** Calls a view by `name` on its top-bar button (the visible name, the accessible name and the tooltip) and lets the bar
+ * fit again, since the name may have another width. The key and the view itself do not change. */
+function setViewTitle(view, name) {
+  if (viewTitles[view] === name) return;
+  viewTitles[view] = name;
+  const part = viewButtonParts(BUILT_VIEWS, viewTitles).find((candidate) => VIEW_KEYS[candidate.key] === view);
+  const button = viewButtonsEl.querySelector(`button[data-key="${part.key}"]`);
+  if (button === null) throw new Error(`Moontide: the top-bar button for the '${view}' view is missing.`);
+  button.querySelector('.view-name').textContent = part.name;
+  button.setAttribute('aria-label', part.label);
+  button.title = part.title;
+  topBarUi.fit();
+}
+
 // True once stopSoundLocally() has run and no successful evaluate has
 // restarted playback since. stopCount lets handleEvaluate detect a Stop that
 // landed while a set_code was still in flight. Declared here, ahead of refreshSoundState's
@@ -1139,6 +1286,47 @@ let pendingLaunch = null;
 // in place every frame without rebuilding the DOM (a card is only touched when a shown text
 // or width changes). Rebuilt on every renderParts() call (a new version, or a fresh view open).
 let partsCardRefs = [];
+
+// The reading the Song grid on screen was drawn from, or null while no grid is drawn: the live tick needs its shift and
+// lengths to tell which section plays.
+let songGridReading = null;
+// Whether the last live update found sound playing, so the grid scrolls the playing section into view once at Play.
+let songGridWasPlaying = false;
+// The section launch that waits for its line, `{ record, index, name, line, at }`: `record` is the takeover's waiting change,
+// `line` the cycle it takes over on. Null when none waits. Cleared when the record takes over or is dropped.
+let gridLaunch = null;
+// The change of a cell that waits for its line, `{ record, track, section, choice, at }`: `section` is the section's name (every
+// column of that name shows it), `choice` is `{ key }` or `{ rest: true }`, `at` the timing it waits on. Null when none waits.
+// Cleared when the record takes over or is dropped.
+let gridCellWait = null;
+// What the queued section header shows on this poll, `{ index, countdownText, line }`, or null. Computed once per poll of the
+// top bar from the same record and the same cycle as the bar's countdown, so the header and the bar always agree.
+let gridQueued = null;
+// True while a launch is being written and evaluated: nothing else reads the editor as "unevaluated typing" meanwhile.
+let gridBusy = false;
+// Why the last gesture on the Song grid was refused, as an id, or null (nothing was changed).
+let gridRefused = null;
+// A launch that needs no code change, `{ index, name, line }`: the section already starts on the line the person chose, so
+// nothing is written or waits in the takeover; the header counts down to the line until the scheduler reaches it.
+let gridAlready = null;
+// The sentence under the toolbar for this poll (the result of songLine), and whether the editor held text that was not
+// evaluated at the last poll that could tell.
+let gridLine = null;
+let gridDirty = false;
+
+// The song structure read from the code of the version that plays, `{ generation, code, reading }`, or null: read once
+// per version in onVersionPlaying (the Parts view uses it, the 250 ms tick never parses). structureNoteSent is true
+// while the last structure note sent to the server held lines, so a note that clears them is sent too.
+let songReading = null;
+let structureNoteSent = false;
+// The line the declared-against-played check gave for the version that plays, `{ generation, entry }` (entry is a line for
+// #song-notes, or null when what plays agrees with the declaration), or null while the check has not answered.
+let songCheck = null;
+// Whether the notes of each fixed variation fit the harmony of the sections it plays in, for the version that plays:
+// `{ generation, reading, answer }` with the answer of collectFit (variation to masks or reason) once the query has
+// answered. It is null while the query is pending, and for a version with no fixed variation: the grid then shows no fit
+// words at all.
+let songFit = null;
 
 // The history id of the code this page has loaded, and whether a version has ever
 // played in this page session — both feed versionIndicator(). Declared here, ahead of
@@ -1231,14 +1419,15 @@ async function runProgrammaticEvaluate(timing = NOW_TIMING) {
  * keeps trackHandEval from reporting each tick as a hand evaluation, which would record one
  * 'hand' version per tick.
  */
-async function runMixerEvaluate(code, autostart) {
+async function runMixerEvaluate(code, autostart, timing = NOW_TIMING) {
   programmaticEvalInFlight = true;
-  armRun(NOW_TIMING);
+  const run = armRun(timing);
   try {
     await editor.repl.evaluate(code, autostart);
   } finally {
     programmaticEvalInFlight = false;
   }
+  return run;
 }
 
 /**
@@ -1396,6 +1585,20 @@ function applyRig(rig) {
 // Tracks the current sound-state slot ('off' | 'silent' | 'playing').
 let currentSoundState = 'off';
 
+// The lights of the Mixer (page/lights.js holds their state, the Mixer view draws them). They are declared here, before
+// refreshSoundState first runs, because that function ends in syncLights. `lightsActive` is true while the loop runs: the Mixer
+// is open, the tab is visible and sound is playing. `lightsViewReady` stays false until the view state and the Mixer exist,
+// so nothing below touches them too early. `lightsMotion` is the motion the running lights were started with.
+const lights = createLights();
+let lightsActive = false;
+let lightsRafId = null;
+let lightsMotion = 'on';
+let lightsViewReady = false;
+let lightsBroken = false;
+// True while the tempo is not above 0: the loop runs and draws nothing. The warning about a missing output timestamp is said once.
+let lightsPaused = false;
+let lightsPairWarned = false;
+
 /** Applies versionIndicator()'s result — textContent and the hidden property only, never a data-accent (the indicator is never accented). */
 function renderVersionIndicator() {
   const { hidden, text } = versionIndicator({
@@ -1459,6 +1662,7 @@ function refreshSoundState() {
   const started = !!(editor.repl && editor.repl.state && editor.repl.state.started);
   currentSoundState = soundState({ audioRunning, started, stopped: pageStopped });
   renderSoundState();
+  syncLights();
 }
 
 renderConnectionState('connecting');
@@ -1593,6 +1797,7 @@ async function stopSoundLocally({ panicFirst = false } = {}) {
   pageStopped = true;
   stopCount++;
   pendingLaunch = null;
+  gridAlready = null;
   editor.repl.scheduler.stop();
   refreshSoundState();
   try {
@@ -1668,6 +1873,34 @@ async function reportHandEval(state, code = editor.repl.state.activeCode) {
   sendIfOpen(JSON.stringify({ type: 'hand-eval', ok: true, code }));
 }
 
+/**
+ * Play after Stop on a piece that declares a song: the scheduler's cycle count restarts at 0 at every Play, so a shift a
+ * launch (or a person) left in the code would start the music inside the structure. The shift literal of the editor text is
+ * written back to 0 before Play evaluates the text, which then records one hand edit like any other; with the shift already
+ * 0 nothing is written and Play records nothing new. Only the shift literal is ever replaced. Text that does not parse or
+ * does not read as a song plays as written (the evaluation says what is wrong with it); anything else that throws is
+ * reported on the console and Play goes on. Ctrl+Enter in the editor is an evaluation, not a Play, and does not come here.
+ */
+function resetSongShiftForPlay() {
+  if (!window.acorn || typeof window.acorn.parse !== 'function') return;
+  const text = editor.code;
+  try {
+    const reading = readSongOf(text);
+    if (reading.state !== 'read') return;
+    const edits = playResetEdit(reading);
+    if (edits === null) return;
+    const expected = applyEdits(text, edits);
+    editor.editor.dispatch({ changes: edits });
+    if (editor.code !== expected) {
+      editor.setCode(text);
+      console.error('Moontide: Play could not write shift 0 into the code; the code plays as written.');
+    }
+  } catch (err) {
+    if (err instanceof SyntaxError) return;
+    console.error('Moontide: Play could not reset the shift of the song; the code plays as written:', err);
+  }
+}
+
 // UI Consideration loading/transport-button: Stop is a synchronous local action — the sound
 // state flips to 'Stopped' the instant stopSoundLocally() sets pageStopped and calls
 // refreshSoundState(), with no network round trip awaited first. Not routed through the
@@ -1701,6 +1934,8 @@ transportButton.addEventListener('click', (event) => {
   if (typeof globalThis.getAudioContext === 'function') {
     globalThis.getAudioContext().resume().catch((err) => console.error('Moontide: AudioContext.resume() failed:', err));
   }
+  // Play after Stop starts a piece that declares a song from its first section.
+  if (pageStopped) resetSongShiftForPlay();
   Promise.resolve(editor.evaluate())
     .then(() => {
       // A failed evaluation leaves its error on the repl state (the error line shows it) and the word stays Stopped.
@@ -1778,6 +2013,25 @@ if (typeof navigator.requestMIDIAccess !== 'function') {
   }
 }
 
+// Every note learns which labeled track played it, and the note tag tells whoever subscribes (the lights).
+// Installed once, here, because the tag is added when a labeled statement is evaluated: it cannot be switched
+// on later for code that already ran. Without Web MIDI no note has a port timestamp.
+try {
+  installNoteTag(globalThis.Pattern, {
+    stampOf: typeof navigator.requestMIDIAccess === 'function' ? (hap) => midiOut.noteStampOf(hap) : () => null,
+  });
+} catch (err) {
+  console.error(err);
+}
+
+// Every note of a labeled track goes to the lights while they are active. Otherwise it is dropped at once, so notes played
+// while the Mixer is closed, the tab is hidden or the music is stopped never wait to be drawn later. A MIDI note carries the
+// time its port got; a browser sound carries the audio time it is due, which the lights map to when it is heard.
+subscribeNotes((event) => {
+  if (!lightsActive) return;
+  lights.noteSeen(event.key, event.stamp !== null ? { at: event.stamp + MIDI_LIGHT_OFFSET_MS } : { target: event.target });
+});
+
 // Start enabling Web MIDI at page start only when the browser already says the permission is
 // granted (no prompt can appear then). Otherwise the first evaluation whose code has a .midi( call
 // asks. Never awaited here: requestMIDIAccess can hang with some device drivers, and the WebSocket
@@ -1824,6 +2078,21 @@ document.addEventListener('strudel.log', (event) => {
   }
   sendRuntimeError(text);
 });
+
+/**
+ * Sends the lines the page read from the song structure of the code that plays (an empty list clears the last note),
+ * tagged with the evaluate id whose code was playing (`evaluateId`, which a late caller captured when its version started).
+ * The message shape is mirrored by hand from src/protocol.ts. Called from onVersionPlaying, which runs inside repl.evaluate,
+ * so the server has the note before the evaluated reply; the check of the declaration sends the version's full lines later.
+ */
+function sendStructureNote(lines, evaluateId = playingEvaluateId) {
+  const payload = { type: 'structure-note', lines };
+  if (evaluateId !== null) {
+    payload.evaluateId = evaluateId;
+  }
+  sendIfOpen(JSON.stringify(payload));
+  structureNoteSent = lines.length > 0;
+}
 
 /** Sends one runtime error to the server, tagged with the evaluate id whose code was playing. */
 function sendRuntimeError(text) {
@@ -1931,7 +2200,13 @@ const midiPreview = createPreviewSender({
   clearTimer: (timer) => clearTimeout(timer),
   now: () => performance.now(),
 });
-const mixerUi = createMixerView({ document, gesture: mixerGesture, midiPreview, onStripSelect: () => syncMixerLit({ reveal: true }) });
+const mixerUi = createMixerView({
+  document,
+  gesture: mixerGesture,
+  midiPreview,
+  onStripSelect: () => syncMixerLit({ reveal: true }),
+  onGroupFold: (key) => toggleSongFold(key),
+});
 mixerUi.setConnected(ws.readyState === ws.OPEN ? 'connected' : 'connecting');
 askUi.setConnected(ws.readyState === ws.OPEN ? 'connected' : 'connecting');
 
@@ -2081,9 +2356,7 @@ ws.addEventListener('message', (event) => {
               // does (this is the page's first evaluation attempt since (re)load, so
               // hasEvaluatedSuccessfully is still false and the revert target is always '').
               // Report it so the server (and Claude) learn playback is actually silent.
-              editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
-              const { errorText, line } = buildEvalErrorReport(evalError);
-              showEvalError(errorText);
+              const { errorText, line } = revertAndReport(evalError);
               const payload = { type: 'reconnect-eval-failed', error: errorText };
               if (line !== undefined) {
                 payload.line = line;
@@ -2237,6 +2510,20 @@ function buildEvalErrorReport(evalError) {
   return { errorText: String(evalError.message || evalError), line: evalErrorLine(evalError) };
 }
 
+/**
+ * The one place that takes a failed change back out of the editor: sets the text to the committed code (the music
+ * that is audible), or to nothing before any code has played, and shows the failed-change banner. Returns the
+ * report, so a caller that tells the server about the failure sends the same text and line. Every failed
+ * evaluation of code the page wrote or received ends here: Claude's change, the reconnect replay and the page's own
+ * rewrites.
+ */
+function revertAndReport(evalError) {
+  editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
+  const report = buildEvalErrorReport(evalError);
+  showEvalError(report.errorText);
+  return report;
+}
+
 async function handleEvaluate(msg) {
   // An unknown timing is refused before anything changes (the page mirrors src/protocol.ts by hand).
   let timing;
@@ -2279,9 +2566,7 @@ async function handleEvaluate(msg) {
     // still audible. Never call editor.evaluate() here: the previous pattern is still
     // playing, re-running it is unnecessary and risks re-triggering audio. A failed
     // evaluate leaves pageStopped and the silence unchanged.
-    editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
-    const { errorText, line } = buildEvalErrorReport(evalError);
-    showEvalError(errorText);
+    const { errorText, line } = revertAndReport(evalError);
     const payload = {
       type: 'evaluated',
       id: msg.id,
@@ -2386,6 +2671,41 @@ function sendMixerRecord(code, label) {
   ws.send(JSON.stringify({ type: 'mixer-record', code, label: clipMixerLabel(label) }));
 }
 
+// The one path through which the page changes the code by itself (page/page-rewrite.js): the Mixer and the
+// part launch call it, and each keeps its own wording for a refusal and its own message to the server.
+const pageRewrite = createPageRewrite({
+  editor: {
+    get code() {
+      return editor.code;
+    },
+    setCode(text) {
+      editor.setCode(text);
+    },
+    // The edit list changes the text in place, keeping the selection and the scroll.
+    dispatch(edits) {
+      editor.editor.dispatch({ changes: edits });
+    },
+  },
+  hasEvaluated: () => hasEvaluatedSuccessfully,
+  pending: () => takeover.pending(),
+  playingCode,
+  socketOpen: () => ws.readyState === ws.OPEN,
+  parserReady: () => Boolean(window.acorn) && typeof window.acorn.parse === 'function',
+  evaluate({ code, timing, autostart, flash }) {
+    return flash ? runProgrammaticEvaluate(timing) : runMixerEvaluate(code, autostart, timing);
+  },
+  evalError: () => editor.repl.state.evalError,
+  revertAndReport,
+  // A page-originated evaluation has no Claude evaluate id.
+  markPageOrigin() {
+    playingEvaluateId = null;
+  },
+  whenFinished: (record, fn) => takeover.whenFinished(record, fn),
+  markPageOriginAtTakeover() {
+    evaluateTag.fromTakeover(null);
+  },
+});
+
 /**
  * Applies ONE Mixer change to the playing code, immediately. Runs only inside the serial `chain`
  * (or from mixerGesture.flushDirect, itself called from inside it), so the editor cannot change
@@ -2395,40 +2715,29 @@ function sendMixerRecord(code, label) {
  * (the user's typing is never overwritten). A rewrite the mixer refuses is logged with its reason.
  */
 async function applyMixerChangeNow(change) {
-  if (!hasEvaluatedSuccessfully) {
-    console.error('Moontide: the mixer has nothing to change yet: no code has played.');
-    return null;
-  }
-  if (takeover.pending() !== null) {
-    // The waiting change must not be played or recorded by a move; the Mixer says so in its notice.
-    console.error('Moontide: the mixer change was not applied: a change is waiting for its bar line.');
-    return null;
-  }
-  if (ws.readyState !== ws.OPEN) {
-    console.error('Moontide: the mixer change was not applied: the socket is not open.');
-    return null;
-  }
-  if (!window.acorn || typeof window.acorn.parse !== 'function') {
-    console.error('Moontide: window.acorn is not available — cannot change the mixer.');
-    return null;
-  }
-  const activeCode = playingCode();
-  if (editor.code !== activeCode) {
-    // The authoritative guard against overwriting a hand edit that was not evaluated.
-    console.error('Moontide: the mixer change was not applied: the editor holds a hand edit that was not evaluated.');
-    // The poll only explains; this is the authoritative check, so it turns the notice on itself.
-    mixerUi.setDirty(true);
-    if (viewState.view === 'mixer') renderMixer();
-    return null;
-  }
-  let result;
+  // onVersionPlaying clears pendingLaunch on every live tick, but a mixer write never moves a
+  // part's offset: a launch still counting down must survive it (set back after the evaluation).
+  const launchBefore = pendingLaunch;
+  mixerTickInFlight = true;
+  let outcome;
+  let removed;
   try {
-    // A bus parameter is written on every track that sends to the bus, and a MIDI control on every track of its
-    // port and channel, in one edit list; every other change is one track's.
-    const parse = window.acorn.parse;
-    if (change.type === 'bus-param') result = writeBus(activeCode, change, { parse });
-    else if (change.type === 'midi-control') result = writeMidiControl(activeCode, change, { parse });
-    else result = writeTrack(activeCode, change.identity, change, { parse });
+    // A mixer move is not a request to play: never resumeAfterStop(), and no autostart while stopped.
+    outcome = await pageRewrite.apply({
+      autostart: !pageStopped,
+      build(activeCode) {
+        // A bus parameter is written on every track that sends to the bus, a MIDI control on every track of its
+        // port and channel, and a group's mute or solo on every track it reaches, in one edit list; every other change is one track's.
+        const parse = window.acorn.parse;
+        let result;
+        if (change.type === 'bus-param') result = writeBus(activeCode, change, { parse });
+        else if (change.type === 'midi-control') result = writeMidiControl(activeCode, change, { parse });
+        else if (change.type === 'group') result = writeTracks(activeCode, change.identities, { type: change.kind, on: change.on }, { parse });
+        else result = writeTrack(activeCode, change.identity, change, { parse });
+        removed = result.removed;
+        return result;
+      },
+    });
   } catch (err) {
     if (!(err instanceof MixerRewriteError)) {
       console.error('Moontide: the mixer could not read the playing code:', err);
@@ -2438,43 +2747,49 @@ async function applyMixerChangeNow(change) {
     showMixerProblem(err.message);
     if (viewState.view === 'mixer') renderMixer();
     return null;
-  }
-  if (result.code === activeCode) {
-    return { played: false, code: activeCode };
-  }
-  // The same edit list changes the text (keeping the selection and scroll) and lights the line.
-  editor.editor.dispatch({ changes: result.edits });
-  if (editor.code !== result.code) {
-    console.error('Moontide: the editor text does not match the mixer rewrite; reverting.');
-    editor.setCode(activeCode);
-    return null;
-  }
-  // onVersionPlaying clears pendingLaunch on every live tick, but a mixer write never moves a
-  // part's offset: a launch still counting down must survive it (set back after the evaluation).
-  const launchBefore = pendingLaunch;
-  mixerTickInFlight = true;
-  try {
-    // A mixer move is not a request to play: never resumeAfterStop(), and no autostart while stopped.
-    await runMixerEvaluate(result.code, !pageStopped);
   } finally {
     mixerTickInFlight = false;
   }
-  const evalError = editor.repl.state.evalError;
-  if (evalError) {
-    // launchPart's own revert-on-failure branch: the old code is still what plays.
-    editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
-    const { errorText } = buildEvalErrorReport(evalError);
-    showEvalError(errorText);
+  if (outcome.status === 'refused') {
+    switch (outcome.reason) {
+      case 'not-played':
+        console.error('Moontide: the mixer has nothing to change yet: no code has played.');
+        break;
+      case 'waiting':
+        // The waiting change must not be played or recorded by a move; the Mixer says so in its notice.
+        console.error('Moontide: the mixer change was not applied: a change is waiting for its bar line.');
+        break;
+      case 'closed':
+        console.error('Moontide: the mixer change was not applied: the socket is not open.');
+        break;
+      case 'no-parser':
+        console.error('Moontide: window.acorn is not available — cannot change the mixer.');
+        break;
+      case 'dirty':
+        // The authoritative guard against overwriting a hand edit that was not evaluated.
+        console.error('Moontide: the mixer change was not applied: the editor holds a hand edit that was not evaluated.');
+        // The poll only explains; this is the authoritative check, so it turns the notice on itself.
+        mixerUi.setDirty(true);
+        if (viewState.view === 'mixer') renderMixer();
+        break;
+      default:
+        console.error('Moontide: the editor text does not match the mixer rewrite; reverting.');
+    }
     return null;
   }
-  // A page-originated evaluation has no Claude evaluate id.
-  playingEvaluateId = null;
+  if (outcome.status === 'unchanged') {
+    return { played: false, code: outcome.code };
+  }
+  if (outcome.status === 'failed') {
+    // The old code is still what plays; the shared path already set the editor back and showed the banner.
+    return null;
+  }
   pendingLaunch = launchBefore;
-  updateBypassRecords(change, result.removed);
+  updateBypassRecords(change, removed);
   const playing = editor.repl.state.activeCode;
   // Mirrors src/protocol.ts's mixer-live by hand: get_code returns the code that plays now.
   sendIfOpen(JSON.stringify({ type: 'mixer-live', code: playing }));
-  flashMixerLines(result.edits);
+  flashMixerLines(outcome.edits);
   return { played: true, code: playing };
 }
 
@@ -2710,23 +3025,43 @@ function syncWaitingViews() {
   }
 }
 
+/**
+ * The song structure the Mixer draws groups from, for `code`: the reading made when this version took over when it belongs
+ * to the same text, else a new reading. Code the page cannot read counts as a piece without a song, so the Mixer stays flat.
+ */
+function mixerSongReading(code) {
+  if (songReading !== null && songReading.code === code) return songReading.reading;
+  if (code === '') return { state: 'none' };
+  try {
+    const parse = window.acorn.parse;
+    return readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+  } catch (err) {
+    console.error('Moontide: the mixer could not read the song structure:', err);
+    return { state: 'none' };
+  }
+}
+
 /** Draws the Mixer for the code that is playing now. */
 function renderMixer() {
   checkMixerDirty();
   if (!window.acorn || typeof window.acorn.parse !== 'function') {
     console.error('Moontide: window.acorn is not available — the mixer cannot read the code.');
     mixerUi.render({ status: 'unreadable', strips: [] });
+    lights.setLayout(lightLayout({ status: 'unreadable', strips: [] }, { webMidi: false }));
     syncMixerLit();
     return;
   }
+  const code = hasEvaluatedSuccessfully ? playingCode() : '';
   const model = buildMixerModel({
-    code: hasEvaluatedSuccessfully ? playingCode() : '',
+    code,
     parse: window.acorn.parse,
     colorOf: (identity) => trackColors.colorOf(identity),
     bypassRecords: mixerBypassRecords,
     busMemory: mixerBusMemory,
     keepBus: mixerUi.selectedBus(),
     rig: pageRig,
+    song: mixerSongReading(code),
+    folds: songFolds,
   });
   mixerBusMemory = model.busMemory;
   if (model.error) console.error('Moontide: the mixer could not read the playing code:', model.error);
@@ -2736,6 +3071,8 @@ function renderMixer() {
     if (!writeBypassRecords(storage, mixerBypassRecords)) reportStorageUnavailableOnce();
   }
   mixerUi.render(model);
+  // The lights learn which tracks the Mixer shows, which of them sound, and which groups hold them.
+  lights.setLayout(lightLayout(model, { webMidi: typeof navigator.requestMIDIAccess === 'function' }));
   // Every render moves the one light onto the selected strip's block (or clears it): the strip may have left the model.
   syncMixerLit();
 }
@@ -2761,7 +3098,7 @@ let storageUnavailableLogged = false;
 function reportStorageUnavailableOnce() {
   if (storageUnavailableLogged) return;
   storageUnavailableLogged = true;
-  console.error('Moontide: browser storage is unavailable; layout, view, motion, History display, Jam instrument, Jam chord tones and change timing will not be remembered.');
+  console.error('Moontide: browser storage is unavailable; layout, view, motion, History display, Jam instrument, Jam chord tones, change timing, the song launch choice and folded song groups will not be remembered.');
 }
 
 const initialPrefs = readViewPrefs(storage);
@@ -2770,6 +3107,14 @@ if (!initialPrefs.available) reportStorageUnavailableOnce();
 const initialBypass = readBypassRecords(storage);
 mixerBypassRecords = initialBypass.records;
 if (!initialBypass.available) reportStorageUnavailableOnce();
+// The groups of the Song grid that are folded, as group keys. A stored value that cannot be read is reported once and
+// ignored, so every group starts open.
+const initialFolds = readSongFolds(storage);
+if (!initialFolds.available) reportStorageUnavailableOnce();
+else if (initialFolds.rejected) console.error(SONG_FOLDS_COPY.badStored);
+let songFolds = new Set(initialFolds.value);
+// Whether the sentence for a fold that cannot be remembered was already logged in this page session.
+let notRememberedSaid = false;
 const reduceMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
 let viewState = initialViewState({ prefs: initialPrefs, prefersReducedMotion: reduceMotionQuery.matches });
 
@@ -2906,6 +3251,9 @@ layoutButtonsEl.addEventListener('click', onViewButtonClick);
 // version started playing (performance.now()), so refreshTimeline can wait out
 // TIMELINE_SETTLE_MS only when it is actually racing a version that just started.
 let timelineGeneration = 0;
+// The song check and the song reading belong to one version of the music, so they use their own token: only a new
+// version that plays bumps it, and closing the Timeline or Jam view (which bumps timelineGeneration) leaves them alone.
+let songVersion = 0;
 let versionPlayingAt = 0;
 
 // The current version's own tracks/code/parser, set once per refreshTimeline() call and read by
@@ -2913,6 +3261,11 @@ let versionPlayingAt = 0;
 let timelineTracks = null;
 let timelineCode = null;
 let timelineParse = null;
+// The strings of timelineCode with the scope of every track, made on the first note picked on the version and dropped with it.
+let timelineIndex = null;
+// Where tokens play, worked out on demand for the version drawn: the evaluated pattern of each track and the answer for each
+// token, both as promises, dropped with the version.
+let timelinePlaces = { patterns: new Map(), answers: new Map() };
 // One color per track identity, kept for the whole page session — never reset per version or
 // per Timeline open/close.
 const trackColors = createTrackColors();
@@ -2928,6 +3281,12 @@ let timelineCache = new Map();
 // pageStart -> { generation, promise } for every computePage() call running, so the Timeline, the
 // Jam view and a prefetch never start two queries for the same page.
 let timelinePending = new Map();
+// True while the lanes had the keyboard focus when the Timeline hid its body to compute again; any other element taking the focus
+// clears it.
+let timelineLanesWantFocus = false;
+document.addEventListener('focusin', (event) => {
+  if (event.target !== timelineLanes) timelineLanesWantFocus = false;
+});
 // The pageStart currently drawn in #timeline-lanes, or null while nothing has drawn yet.
 let timelineDrawnPageStart = null;
 // What the lanes on screen were drawn from: { pageStart, lanes: [{ track, midi, instrument, events }], version,
@@ -3068,6 +3427,12 @@ function resolveAskTarget(event) {
   if (target.closest('#history-view') !== null) return historyUi.askTarget(target) ?? session;
   if (target.closest('#mixer-view') !== null) return mixerUi.askTarget(target) ?? session;
   if (target.closest('#instruments-view') !== null) return instrumentsUi.askTarget(target) ?? session;
+  // The Song grid knows its own headers, cells, group rows and track names, and a cell is a more specific target than the
+  // header-like card around it, so it answers before the generic part match below. Anything else in the grid falls through.
+  if (target.closest('table.song-grid') !== null) {
+    const inGrid = songGridUi.askTarget(target);
+    if (inGrid !== null) return inGrid;
+  }
   const partEl = target.closest('.part-card[data-part], .section-span[data-part], .jam-row[data-part]');
   if (partEl !== null) {
     const owner = partEl.dataset.owner;
@@ -3100,6 +3465,172 @@ function resolveAskTarget(event) {
   return session;
 }
 
+/**
+ * Opens the Ask box for what `describeTarget()` finds, at `point`: the one place both the right-click and the grid's
+ * keyboard route go through. A target that cannot be resolved or described is a bug: it is said on the error line and in the
+ * console, and the box opens on the whole session. A descriptor with a `prefill` (a fixed variation whose notes do not fit)
+ * puts that request in the field; an existing draft is kept and the request follows it. Nothing is sent, evaluated or
+ * recorded here, and an open cell list is closed first. Gives false when the target could not be described (the box then holds the
+ * whole session and no request), true otherwise.
+ */
+function openAskFor(describeTarget, point) {
+  let descriptor;
+  let readable = true;
+  try {
+    descriptor = describeTarget();
+    describeContext(descriptor);
+  } catch (err) {
+    // A view could not resolve or describe what was right-clicked: say so on the error line and in the
+    // console, and still open the box on the whole session.
+    console.error('Moontide: could not describe what was right-clicked, using the whole session:', err);
+    descriptor = { kind: 'session' };
+    showAskContextProblem(err);
+    readable = false;
+  }
+  // This context reads fine: a stale "could not read" line would contradict the chip.
+  if (readable && errorLineIsAskContext) clearEvalError();
+  if (songGridUi.isListOpen()) songGridUi.closeList();
+  if (typeof descriptor.prefill === 'string') askUi.open(descriptor, point, { prefill: descriptor.prefill });
+  else askUi.open(descriptor, point);
+  return readable;
+}
+
+/** The gesture field of a request for a change of the Timeline's note panel: a pitch change, a rest or a velocity step. */
+function timelineGestureOf(change) {
+  switch (change.kind) {
+    case 'pitch':
+      return { kind: 'pitch', semitones: change.semitones };
+    case 'rest':
+      return { kind: 'rest' };
+    case 'velocity':
+      return { kind: 'velocity', direction: change.steps > 0 ? 'louder' : 'softer' };
+    default:
+      throw new Error(`Moontide: unknown kind of Timeline change ${String(change.kind)}`);
+  }
+}
+
+/**
+ * Opens the Ask box for one note of the Timeline, at `point`: the lane context with the moment taken where the note starts (so the
+ * note is among the moment's notes and the cycle of the text and of the moment are one number). With a `gesture` the box also
+ * holds the ready-made request for it and the gesture rides on the message; without one the field stays as it is. Nothing is
+ * written, evaluated or sent: only the person's Enter in the box sends. Gives false when nothing opened (the audio-unlock overlay
+ * shows, or the note could not be described), so the panel does not say a request is ready.
+ */
+function askAboutTimelineNote(info, gesture, point) {
+  if (!overlay.hidden) return false;
+  return openAskFor(() => {
+    if (timelineDrawn === null) throw new Error('Moontide: a note of the Timeline was asked about while no lanes are drawn.');
+    const lane = timelineDrawn.lanes[info.laneIndex];
+    const event = lane.events[info.eventIndex];
+    const moment = momentAt({
+      pageStart: timelineDrawn.pageStart,
+      fraction: (event.begin - timelineDrawn.pageStart) / PAGE_CYCLES,
+      lanes: timelineDrawn.lanes,
+      version: timelineDrawn.version,
+      focusTrack: lane.track,
+    });
+    const descriptor = { kind: 'lane', track: lane.track, cycle: moment.cycle, moment };
+    if (gesture === undefined) return descriptor;
+    return {
+      ...descriptor,
+      gesture,
+      prefill: timelineEditPrefill({ ...gesture, note: info.noteText, cycle: moment.cycle, beat: moment.beat, track: lane.track }),
+    };
+  }, point);
+}
+
+/**
+ * Opens the Ask box for a lane of the Timeline that has no note on the page, at `point`: the lane context with the moment taken at
+ * the start of `cycle`, as a right-click there gives it. The field stays as it is. Nothing is written, evaluated or sent: only the
+ * person's Enter in the box sends. Gives false when nothing opened.
+ */
+function askAboutTimelineLane(laneIndex, cycle, point) {
+  if (!overlay.hidden) return false;
+  return openAskFor(() => {
+    if (timelineDrawn === null) throw new Error('Moontide: a lane of the Timeline was asked about while no lanes are drawn.');
+    const lane = timelineDrawn.lanes[laneIndex];
+    if (lane === undefined) throw new Error(`Moontide: the Timeline draws no lane ${laneIndex} to ask about.`);
+    const moment = momentAt({
+      pageStart: timelineDrawn.pageStart,
+      fraction: (cycle - timelineDrawn.pageStart) / PAGE_CYCLES,
+      lanes: timelineDrawn.lanes,
+      version: timelineDrawn.version,
+      focusTrack: lane.track,
+    });
+    return { kind: 'lane', track: lane.track, cycle: moment.cycle, moment };
+  }, point);
+}
+
+/**
+ * The section of the first and of the last cycle of a range as `{ section, sectionTo }`, for a piece with a song: `section` is
+ * the section of the first cycle and `sectionTo` the section of the last only when it is another one. A piece without a song (or
+ * with only arrange()) gives `{}`.
+ */
+function timelineRangeSections(from, to) {
+  const reading = timelineSongReading();
+  if (reading.state !== 'read') return {};
+  const sectionAt = (cycle) => String(reading.sections[playingSection(reading, cycle).index].name);
+  const first = sectionAt(from);
+  const last = sectionAt(to);
+  return last === first ? { section: first } : { section: first, sectionTo: last };
+}
+
+/** The lane of a range of the lanes drawn, or a loud error when the range names none. */
+function timelineRangeLane(selection) {
+  if (timelineDrawn === null) throw new Error('Moontide: a range of the Timeline was asked about while no lanes are drawn.');
+  const lane = timelineDrawn.lanes[selection.laneIndex];
+  if (lane === undefined) throw new Error(`Moontide: the range names lane ${selection.laneIndex}, which is not drawn.`);
+  return lane;
+}
+
+/**
+ * What the note panel says of a range: `{ track, section, sectionTo, count }` (the sections only for a piece with a song, the
+ * count of the notes that start in the cycles). Reads the lanes and the code only.
+ */
+function describeTimelineRange(selection) {
+  const lane = timelineRangeLane(selection);
+  const { notes, more } = rangeNotes(lane, selection.from, selection.to);
+  const { section = null, sectionTo = null } = timelineRangeSections(selection.from, selection.to);
+  return { track: lane.track, section, sectionTo, count: notes.length + more };
+}
+
+/**
+ * The descriptor of a range of cycles on one lane of the lanes drawn: the lane's shown name, the first and last cycle, the section
+ * of each end when the playing code is a song (the second only when it differs), the notes of the lane that start in those cycles
+ * with the version drawn, and the cut when the pointer left the page. Reads the lanes and the code only.
+ */
+function timelineRangeDescriptor(selection) {
+  const lane = timelineRangeLane(selection);
+  const { notes, more } = rangeNotes(lane, selection.from, selection.to);
+  const descriptor = {
+    kind: 'range',
+    track: lane.track,
+    from: selection.from,
+    to: selection.to,
+    ...timelineRangeSections(selection.from, selection.to),
+    gesture: { kind: 'range', version: timelineDrawn.version, notes, more },
+  };
+  if (selection.cut !== null) descriptor.cut = selection.cut;
+  return descriptor;
+}
+
+/**
+ * Opens the Ask box for a range of cycles of the Timeline, at `point`, with an empty field (a draft in it is kept). Nothing is
+ * written, evaluated or sent: only the person's Enter in the box sends. Gives false when nothing opened.
+ */
+function askAboutTimelineRange(selection, point) {
+  if (!overlay.hidden) return false;
+  return openAskFor(() => timelineRangeDescriptor(selection), point);
+}
+
+// The Menu key and Shift+F10 on a control of the Song grid: the same box as a right-click, at the centre of the control. The
+// page's contextmenu listener leaves a Shift press to the browser, so the grid reports the key itself. The audio-unlock overlay
+// is a gate to start sound, not part of the page's work, so the key does nothing while it shows.
+songGridHandlers.ask = (descriptor, point) => {
+  if (!overlay.hidden) return;
+  openAskFor(() => descriptor, point);
+};
+
 // The one contextmenu listener of the page; no view module has its own. Shift + right-click keeps
 // the browser's own menu, and so does a right-click inside the box (the user can paste) or while the
 // audio-unlock overlay shows (it is a gate to start sound, not part of the page's work). The right-click
@@ -3112,22 +3643,7 @@ document.addEventListener('contextmenu', (event) => {
     problemUi.openMenu({ x: event.clientX, y: event.clientY });
     return;
   }
-  let descriptor;
-  let readable = true;
-  try {
-    descriptor = resolveAskTarget(event);
-    describeContext(descriptor);
-  } catch (err) {
-    // A view could not resolve or describe what was right-clicked: say so on the error line and in the
-    // console, and still open the box on the whole session.
-    console.error('Moontide: could not describe what was right-clicked, using the whole session:', err);
-    descriptor = { kind: 'session' };
-    showAskContextProblem(err);
-    readable = false;
-  }
-  // This context reads fine: a stale "could not read" line would contradict the chip.
-  if (readable && errorLineIsAskContext) clearEvalError();
-  askUi.open(descriptor, { x: event.clientX, y: event.clientY });
+  openAskFor(() => resolveAskTarget(event), { x: event.clientX, y: event.clientY });
 });
 
 // A right press outside the open box must not move focus out of its field: the contextmenu that follows
@@ -3266,12 +3782,16 @@ function renderViews() {
   // which starts the loop itself; a layout or motion change while it stays open must never
   // restart it (the loop already tracks the live clock on its own, every frame — see
   // timelineTick below). Parts has no async computation, so opening it starts the loop directly.
+  // A closed Timeline hands no edit over: steps and edits that wait are dropped, and the panel says so when it shows again.
+  if (wasTimelineOpen && !isTimelineOpen) timelineEditUi.close();
   if (isTimelineOpen && !wasTimelineOpen) {
     void refreshTimeline().catch((err) => {
       console.error('Moontide: failed to refresh the Timeline:', err);
       renderTimelineMessage(TIMELINE_COPY.failed, 'failed');
     });
   }
+  // A refusal ends when the view closes.
+  if (wasPartsOpen && !isPartsOpen) gridRefused = null;
   if (isPartsOpen) {
     renderParts();
     startTimelineLoop();
@@ -3306,17 +3826,238 @@ function renderViews() {
   // No timer: the view follows the events that already redraw the MIDI indicator (see renderMidiIndicator).
   if (isInstrumentsOpen) renderInstruments();
   else instrumentsUi.closed();
+  // Opening the Mixer, closing it and switching motion all change whether the lights run, and how.
+  syncLights();
 }
+
+/**
+ * Starts, stops or restarts the lights to match the page: they run only while the Mixer is open, the tab is visible and sound
+ * is playing. Starting (and a switch of motion while running) forgets every note and takes every light to unlit, so lights
+ * follow only the notes that come after; stopping does the same and ends the loop.
+ */
+function syncLights() {
+  if (!lightsViewReady) return;
+  // A failure ends the lights only until the music stops: the next Start tries again.
+  if (currentSoundState !== 'playing') lightsBroken = false;
+  const wanted = !lightsBroken && viewState.view === 'mixer' && document.visibilityState === 'visible' && currentSoundState === 'playing';
+  if (!wanted) {
+    stopLights();
+    return;
+  }
+  if (lightsActive && lightsMotion === viewState.motion) return;
+  lights.reset();
+  mixerUi.clearLights();
+  lightsMotion = viewState.motion;
+  lightsActive = true;
+  lightsPaused = false;
+  if (lightsRafId === null) lightsRafId = requestAnimationFrame(lightsTick);
+}
+
+/** Ends the loop and takes every light to unlit. Does nothing to the document when the lights were not running. */
+function stopLights() {
+  if (lightsRafId !== null) {
+    cancelAnimationFrame(lightsRafId);
+    lightsRafId = null;
+  }
+  if (!lightsActive) return;
+  lightsActive = false;
+  lights.reset();
+  mixerUi.clearLights();
+}
+
+/** One animation frame of the lights: the notes heard by now light their tracks, and only the lights that changed are written. */
+function lightsTick(ts) {
+  lightsRafId = null;
+  if (!lightsActive) return;
+  try {
+    const cps = editor.repl.scheduler.cps;
+    if (!usableTempo(cps)) {
+      // The tempo is 0 (or not a number) for now: draw nothing, take lit lights dark once and keep the loop for when it returns.
+      if (!lightsPaused) {
+        lightsPaused = true;
+        lights.reset();
+        mixerUi.clearLights();
+      }
+      lightsRafId = requestAnimationFrame(lightsTick);
+      return;
+    }
+    if (lightsPaused) {
+      // The tempo is back: notes queued while it was 0 are not worth a blink.
+      lightsPaused = false;
+      lights.reset();
+    }
+    // One read of the audio context's output timestamp serves every note of this frame.
+    const audio = globalThis.getAudioContext();
+    const pair = readOutputPair(audio);
+    if (pair === null && !lightsPairWarned) {
+      lightsPairWarned = true;
+      console.warn("Moontide: this browser has no getOutputTimestamp, so the Mixer lights time a note from the audio clock and the context's reported latencies.");
+    }
+    const toPerf = heardMapper({
+      pair,
+      currentTime: audio.currentTime,
+      baseLatency: audio.baseLatency,
+      outputLatency: audio.outputLatency,
+      perfNow: performance.now(),
+    });
+    const changes = lights.frame(ts, { motion: lightsMotion, cps, toPerf });
+    if (changes.length > 0) mixerUi.setLights(changes, lightsMotion);
+  } catch (err) {
+    // Once: the lights end here, and the music is not touched.
+    lightsBroken = true;
+    console.error('Moontide: the Mixer lights stopped:', err);
+    stopLights();
+    return;
+  }
+  lightsRafId = requestAnimationFrame(lightsTick);
+}
+
+// A hidden tab draws nothing and drops its notes; coming back, every light starts unlit.
+document.addEventListener('visibilitychange', () => syncLights());
 
 // The first render never came from a keydown (nothing changed relative to a prior viewState),
 // so it must be triggered explicitly — sets the initial data-layout/data-view/data-motion
 // attributes and opens the Timeline if a view was remembered from a previous session.
+// The lights may touch the view state and the Mixer from here on: both exist.
+lightsViewReady = true;
 renderViews();
+
+/**
+ * The lines #song-notes shows for a reading: none unless the song is read, else the helper line (when the helper is not the
+ * canonical text) and then the line of the check when this version has one. A line is a string, or `{ text, kind }`.
+ */
+function songNoteEntries(reading) {
+  if (reading.state !== 'read') return [];
+  const entries = [...songNoteLines(reading)];
+  if (songCheck !== null && songCheck.generation === songVersion && songCheck.entry !== null) entries.push(songCheck.entry);
+  return entries;
+}
+
+/** The line a finished check gives, or null when what plays agrees with the declaration. */
+function songCheckEntry(answer) {
+  if (answer.state === 'differs') return differsLine({ ...answer.first, more: answer.more });
+  if (answer.state === 'failed' || answer.state === 'too-slow') return { text: SONG_COPY.checkFailed, kind: 'check-failed' };
+  return null;
+}
+
+/**
+ * Checks, after the version has settled, what its tracks really play at the start of every section entry against what the
+ * song declares, without blocking the music and whether or not the Parts view is open. The answer of an overtaken version is
+ * dropped. A difference or a failed check is shown in #song-notes and sent to Claude with the helper line of the version;
+ * agreement says nothing. `evaluateId` is the evaluate id captured when the version started.
+ */
+async function runSongCheck(generation, code, reading, evaluateId) {
+  await sleep(TIMELINE_SETTLE_MS);
+  if (songVersion !== generation) return;
+  let answer;
+  try {
+    const parse = window.acorn.parse;
+    answer = await checkSections({
+      reading,
+      starts: sectionStarts(reading),
+      playedPattern: (track) => evaluateSolo(soloSource(code, track.index, { parse })),
+      declared: () => evaluateDeclared(expectedSource(code, reading, { parse })),
+      budgetMs: TIMELINE_BUDGET_MS,
+      clock: () => performance.now(),
+      yieldToPage: () => new Promise((resolve) => setTimeout(resolve, 0)),
+      isCancelled: () => songVersion !== generation,
+    });
+  } catch (err) {
+    answer = { state: 'failed', message: err instanceof Error ? err.message : String(err), ms: 0 };
+  }
+  if (answer.state === 'cancelled' || songVersion !== generation) return;
+  if (answer.state === 'failed') console.error('Moontide: the check of the song declaration failed:', answer.message);
+  if (answer.state === 'too-slow') console.error(`Moontide: the check of the song declaration ran over its ${TIMELINE_BUDGET_MS} ms budget (${Math.round(answer.ms)} ms).`);
+  const entry = songCheckEntry(answer);
+  songCheck = { generation, entry };
+  songNotesEl.dataset.check = answer.state === 'agrees' || answer.state === 'differs' ? answer.state : 'failed';
+  songNotesEl.dataset.checkMs = String(Math.round(answer.ms));
+  songUi.showNotes(songNoteEntries(reading));
+  if (entry !== null) {
+    sendStructureNote([...songNoteLines(reading), typeof entry === 'string' ? entry : entry.text], evaluateId);
+  }
+}
+
+/**
+ * Asks, after the song check of the same version has answered (so the two queries never run at once), which pitch classes
+ * each fixed variation plays in each of its first cycles, and keeps the answer for the grid. It reads the code's own
+ * constants and never calls its play() helper; a variation it cannot read, or reads too slowly, is a visible reason in the
+ * grid. The answer of an overtaken version is dropped. It changes nothing in the code or the music.
+ */
+async function runSongFit(generation, code, reading) {
+  if (songVersion !== generation) return;
+  const isCancelled = () => songVersion !== generation;
+  const pairs = fitPairs(reading);
+  let answer;
+  try {
+    const patterns = await evaluateFit(fitSource(code, reading, { parse: window.acorn.parse }));
+    if (isCancelled()) return;
+    answer = await collectFit({
+      patterns,
+      pairs,
+      cycles: Math.max(...reading.sections.map((section) => section.length)),
+      budgetMs: TIMELINE_BUDGET_MS,
+      clock: () => performance.now(),
+      yieldToPage: () => new Promise((resolve) => setTimeout(resolve, 0)),
+      isCancelled,
+    });
+  } catch (err) {
+    console.error('Moontide: the page could not read the notes of the fixed variations:', err);
+    answer = { state: 'ready', byPair: new Map(pairs.map((pair) => [pairKey(pair.track, pair.key), { reason: 'not-read' }])), failures: [] };
+  }
+  if (answer.state === 'cancelled' || isCancelled()) return;
+  for (const failure of answer.failures) {
+    console.error(`Moontide: the page could not read the notes of variation '${String(failure.key)}' of track '${String(failure.track)}': ${failure.message}`);
+  }
+  songFit = { generation, reading, answer: answer.byPair };
+  // The grid is drawn again once with the answer, when the Parts view shows the grid of this very reading.
+  if (viewState.view === 'parts' && songGridReading === reading) drawSongGrid();
+}
 
 /** Called from trackEvalSuccess right where hasEvaluatedSuccessfully becomes true —
  * every new version that plays bumps the generation and, if the Timeline is open, recomputes it. */
 function onVersionPlaying() {
   timelineGeneration++;
+  songVersion++;
+  // The song structure of the version that plays, read once; a code the parser cannot read counts as a piece without one.
+  songReading = null;
+  if (window.acorn && typeof window.acorn.parse === 'function') {
+    const code = playingCode();
+    try {
+      const parse = window.acorn.parse;
+      songReading = { generation: songVersion, code, reading: readStructure(code, { parse, tracks: extractTracks(code, { parse }) }) };
+    } catch (err) {
+      console.error('Moontide: failed to read the song structure of the playing code:', err);
+    }
+  }
+  const reading = songReading === null ? { state: 'none' } : songReading.reading;
+  // The Parts view is called Song while the code declares a song (readable or not), and Parts otherwise.
+  setViewTitle('parts', reading.state === 'none' ? VIEW_TITLES.parts : SONG_COPY.viewTitle);
+  if (reading.state !== 'none' || structureNoteSent) sendStructureNote(songNoteLines(reading));
+  // The old answer of the check goes with the old version; the new one is shown when it arrives.
+  songCheck = null;
+  if (reading.state === 'read') {
+    songNotesEl.dataset.check = 'pending';
+    delete songNotesEl.dataset.checkMs;
+  } else {
+    delete songNotesEl.dataset.check;
+    delete songNotesEl.dataset.checkMs;
+  }
+  songUi.showNotes(songNoteEntries(reading));
+  songFit = null;
+  if (reading.state === 'read') {
+    const generation = songVersion;
+    const { code } = songReading;
+    // The fit words come after the check of the declaration has answered, so the two queries never run at once.
+    const checked = runSongCheck(songVersion, songReading.code, reading, playingEvaluateId).catch((err) => {
+      console.error('Moontide: the check of the song declaration failed:', err);
+    });
+    if (fitPairs(reading).length > 0) {
+      void checked.then(() => runSongFit(generation, code, reading)).catch((err) => {
+        console.error('Moontide: the fit of the fixed variations failed:', err);
+      });
+    }
+  }
   // The shared reading belongs to one version: a new one empties the preparation, the page cache
   // and the pages in flight (the Jam view drops its reading and shows the reading message until the new one is built).
   readingVersion++;
@@ -3324,10 +4065,15 @@ function onVersionPlaying() {
   timelineTracks = null;
   timelineCode = null;
   timelineParse = null;
+  timelineIndex = null;
+  timelinePlaces = { patterns: new Map(), answers: new Map() };
   timelineCache = new Map();
   timelinePending = new Map();
   versionPlayingAt = performance.now();
   pendingLaunch = null;
+  // A new version can move the sections a countdown or a refusal counted on.
+  gridAlready = null;
+  gridRefused = null;
   if (viewState.view === 'timeline') {
     void refreshTimeline().catch((err) => {
       console.error('Moontide: failed to refresh the Timeline:', err);
@@ -3356,6 +4102,9 @@ function onVersionPlaying() {
  * playhead body — the shared shape for "nothing playing", "computing" and "failed" (never a
  * partial lane draw). */
 function renderTimelineMessage(text, state) {
+  // Hiding the body takes the keyboard focus away from the lanes; the lanes get it back when they are drawn again, so a person
+  // who edits a note with the keys can go on with the keys.
+  if (document.activeElement === timelineLanes) timelineLanesWantFocus = true;
   timelineView.dataset.state = state;
   delete timelineView.dataset.computeMs;
   delete timelineView.dataset.longestSliceMs;
@@ -3366,6 +4115,7 @@ function renderTimelineMessage(text, state) {
   timelineLanes.replaceChildren();
   timelineRuler.replaceChildren();
   timelineSections.replaceChildren();
+  timelineEditUi.onRedraw(null);
 }
 
 /** Builds the ruler's labeled cycle-number marks (every 4 cycles) for the page starting at
@@ -3450,10 +4200,8 @@ function renderSections(pageStart) {
  * `rect.event` per event, positioned/sized in cycle units against the 32-cycle page. Never
  * builds a node from an HTML string (track/part names can be Claude- or user-authored text). */
 const SVG_NS = 'http://www.w3.org/2000/svg';
-// Fraction of a lane's own SVG height (viewBox 0 0 32 1) a note mark occupies — Claude's
-// choice; a tick (no pitch)
-// always spans the full lane height instead.
-const NOTE_MARK_HEIGHT = 0.14;
+// A note mark occupies NOTE_MARK_HEIGHT of a lane's own SVG height (viewBox 0 0 32 1), the share page/timeline-gesture.js
+// also uses to find the note under a press; a tick (no pitch) always spans the full lane height instead.
 
 /** The MIDI tracks of the code the lanes were read from: `tags`, identity -> midiTag (the same formatter as
  * the Mixer strip, so the two views always agree), `midi`, the identities of every MIDI track even when its
@@ -3551,13 +4299,20 @@ function renderLanes(lanes, pageStart, tracks) {
     const known = drumUse !== undefined && drumUse.use.state === 'known' ? drumUse.use.map : null;
     const plan = known === null ? null : drumLane(lane.events, pageStart, known);
     // What a moment reads: the lane as shown (the name equals the right-click's lane context).
-    drawnLanes.push({
+    const drawnLane = {
       track: track.displayName ?? track.name,
       midi: midiIdentities.has(track.identity),
       instrument: tag === undefined ? null : tag.text,
       events: lane.events,
       drumMap: known === null ? null : { name: known.name, byNote: new Map(known.notes.map((entry) => [entry.note, entry.name])) },
-    });
+      // What the editable Timeline needs beside what a moment reads: the track the lane belongs to, the shapes the lane is drawn
+      // from (one for each event, in the order of the events) and the number of drum rows (null for a lane that is not drums).
+      index: track.index,
+      identity: track.identity,
+      shapes: plan === null ? laneShapes(lane.events, pageStart) : plan.shapes,
+      rowCount: plan === null ? null : plan.rows.length,
+    };
+    drawnLanes.push(drawnLane);
 
     const svg = document.createElementNS(SVG_NS, 'svg');
     svg.setAttribute('class', 'lane-events');
@@ -3581,7 +4336,7 @@ function renderLanes(lanes, pageStart, tracks) {
         svg.appendChild(rect);
       }
     }
-    for (const shape of plan === null ? laneShapes(lane.events, pageStart) : []) {
+    for (const shape of plan === null ? drawnLane.shapes : []) {
       const rect = document.createElementNS(SVG_NS, 'rect');
       rect.setAttribute('class', 'event');
       rect.setAttribute('data-kind', shape.kind);
@@ -3655,6 +4410,7 @@ function renderLanes(lanes, pageStart, tracks) {
   timelineLanes.dataset.pageStart = String(pageStart);
   timelineDrawn = { pageStart, lanes: drawnLanes, version: currentVersionId, generation: timelineGeneration };
   timelineLanes.replaceChildren(...laneNodes);
+  timelineEditUi.onRedraw(timelineDrawn);
 }
 
 /** Applies a computeTimeline() result: draws the lanes on 'ok'; shows the too-slow or failed
@@ -3670,6 +4426,10 @@ function renderTimelineResult(result, pageStart, tracks) {
     renderRuler(pageStart);
     renderSections(pageStart);
     renderLanes(result.lanes, pageStart, tracks);
+    if (timelineLanesWantFocus) {
+      timelineLanesWantFocus = false;
+      timelineLanes.focus({ preventScroll: true });
+    }
     return;
   }
   if (result.state === 'too-slow') {
@@ -3821,6 +4581,7 @@ function timelineTick() {
   }
   if (viewState.view === 'parts') {
     updatePartsLive();
+    updateSongGridLive();
   }
   timelineRafId = requestAnimationFrame(timelineTick);
 }
@@ -4087,10 +4848,20 @@ function renderJam() {
   }
   jamTempoErrorLogged = false; // a later bad tempo is said again
   try {
+    // A piece with sections shows the harmony of the section that plays (the first one while stopped, what Play starts
+    // with); any other piece is drawn as it always was.
+    const options = {};
+    if (songReading !== null && songReading.generation === songVersion && songReading.reading.state === 'read') {
+      const song = songReading.reading;
+      const index = playing ? playingSection(song, cycle).index : 0;
+      options.declaredOverride = sectionDeclared(song.sections[index], jamReading.reading.declared ?? { state: 'none' });
+      options.section = quoted(song.sections[index].name);
+    }
     jamUi.render(
       buildJamModel({
         position: readingAt(jamReading.reading, { cycle, cps, playing }),
         chordTones: viewState.jamChordTones === 'on',
+        ...options,
       }),
     );
   } catch (err) {
@@ -4226,6 +4997,8 @@ function buildPartsRow(arrangement, tracks, showLabel) {
 function renderParts() {
   if (!window.acorn || typeof window.acorn.parse !== 'function') {
     console.error('Moontide: window.acorn is not available — the pinned parser script did not load.');
+    songUi.clearNotes();
+    hideSongGrid();
     showPartsMessage(PARTS_COPY.cannotRead);
     askUi.setPartsAvailable(false);
     return;
@@ -4233,18 +5006,46 @@ function renderParts() {
   const parse = window.acorn.parse;
   const code = playingCode();
   let tracks;
+  let reading;
   let arrangements;
   let problems;
   let callCount;
   try {
     tracks = extractTracks(code, { parse });
-    ({ arrangements, problems, callCount } = readArrangements(code, { parse, tracks }));
+    // The reading made when this version took over, when it belongs to this code; else read it now.
+    reading =
+      songReading !== null && songReading.generation === songVersion && songReading.code === code
+        ? songReading.reading
+        : readStructure(code, { parse, tracks });
+    if (reading.state === 'none') ({ arrangements, problems, callCount } = readArrangements(code, { parse, tracks }));
   } catch (err) {
     console.error('Moontide: failed to parse the playing code for the Parts view:', err);
+    songUi.clearNotes();
+    hideSongGrid();
     showPartsMessage(PARTS_COPY.cannotRead);
     askUi.setPartsAvailable(false);
     return;
   }
+  if (reading.state === 'read') {
+    // A song takes the whole view: its grid replaces any arrange() rows, and the cards they had are gone.
+    partsMessage.hidden = true;
+    partsCardRefs = [];
+    songGridReading = reading;
+    drawSongGrid();
+    songUi.showNotes(songNoteEntries(reading));
+    askUi.setPartsAvailable(false);
+    return;
+  }
+  if (reading.state === 'unreadable') {
+    // One line with the reason, the same sentence Claude gets; no grid.
+    songUi.clearNotes();
+    hideSongGrid();
+    showPartsMessage(songMessageText(reading));
+    askUi.setPartsAvailable(false);
+    return;
+  }
+  songUi.clearNotes();
+  hideSongGrid();
   if (arrangements.length === 0) {
     if (problems.length === 0) {
       showPartsMessage(PARTS_COPY.none);
@@ -4322,6 +5123,781 @@ function updatePartsLive() {
   }
 }
 
+/** Draws the Song grid of the reading it shows, from the fold state, then hands it the live state. */
+function drawSongGrid() {
+  const wait = waitingCellEdit();
+  const cellWaiting = wait === null ? null : { track: wait.track, section: wait.section, choice: wait.choice, at: wait.at };
+  // The fit words come from the answer of the query of this very version and reading; until it answers there are none.
+  const fit =
+    songFit !== null && songFit.generation === songVersion && songFit.reading === songGridReading
+      ? fitLookup({ reading: songGridReading, byPair: songFit.answer })
+      : null;
+  songGridUi.render(buildSongGrid({ reading: songGridReading, folds: songFolds, launchChoice: viewState.songLaunch, cellWaiting, fit }));
+  refreshSongLine();
+  updateSongGridLive();
+}
+
+// One of the three launch buttons of the toolbar: when a launched section starts. The choice is remembered in this browser
+// (applyViewState stores it) and only the titles of the section headers change; the code is not touched.
+songGridHandlers.launchChoice = (value) => {
+  if (value === viewState.songLaunch) return;
+  applyViewState(setSongLaunch(viewState, value), ['songLaunch']);
+};
+
+// A click, Enter or Space on a group's fold button, in the Song grid or in the Mixer: the group folds or opens, the one
+// fold set both views read changes, the state is remembered in this browser, and the views that are on screen are drawn
+// again. Nothing is written to the code, sent to the server or evaluated.
+function toggleSongFold(key) {
+  const next = new Set(songFolds);
+  if (!next.delete(key)) {
+    next.add(key);
+    // A group the store would refuse (a name over 200 characters) still folds here; say once that a reload forgets it.
+    if (!isRememberable(key) && !notRememberedSaid) {
+      notRememberedSaid = true;
+      console.error(SONG_FOLDS_COPY.notRemembered);
+    }
+  }
+  songFolds = next;
+  if (!writeSongFolds(storage, [...songFolds])) reportStorageUnavailableOnce();
+  if (songGridReading !== null) drawSongGrid();
+  if (viewState.view === 'mixer') renderMixer();
+}
+songGridHandlers.fold = (key) => toggleSongFold(key);
+
+// A click, Enter or Space on a section header: the section is queued to start on the line the toolbar chose, a second click on
+// the queued one cancels it and a click on another header replaces it. What the person saw (the entry's place, name and
+// length) and the choice are taken now; the launch itself runs on the serial chain, so it never interleaves with Claude's
+// changes or a Mixer move.
+songGridHandlers.launch = (index) => {
+  const section = songGridReading === null ? undefined : songGridReading.sections[index];
+  if (section === undefined) throw new Error(`Moontide: the Song grid has no section ${String(index)} to launch.`);
+  const seen = { index, name: section.name, length: section.length, kind: viewState.songLaunch };
+  chain = chain.then(() => launchSection(seen)).catch((err) => reportChainError('section launch', err));
+};
+
+// A choice in the list that opens on a cell: the one string of the plan for that cell is rewritten, by the person's usual
+// hand-edit timing, and the choice is one history entry. What the person saw (the cell and its section) is taken now; the
+// change itself runs on the serial chain, so it never interleaves with Claude's changes or a Mixer move.
+songGridHandlers.choose = (seen, choice) => {
+  chain = chain.then(() => chooseCell(seen, choice)).catch((err) => reportChainError('cell change', err));
+};
+
+/** The structure of `code` as the reader gives it (throws when the parser cannot read the text). */
+function readSongOf(code) {
+  const parse = window.acorn.parse;
+  return readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+}
+
+/** The cycle the scheduler is at, never below 0. */
+function currentCycle() {
+  const raw = scheduler.now();
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+/** True while some version makes sound: the same test the takeover uses to decide whether a change has to wait. */
+function playsNow() {
+  return scheduler.started === true && !pageStopped && hasEvaluatedSuccessfully && !!scheduler.pattern;
+}
+
+/** The launch of the person's own that still waits in the takeover, or null (a stale one is dropped). */
+function waitingGridLaunch() {
+  if (gridLaunch !== null && takeover.pending() !== gridLaunch.record) gridLaunch = null;
+  return gridLaunch;
+}
+
+/**
+ * Puts the code that plays back in the editor after a launch of the grid ended without taking over. The launch wrote only
+ * the shift, so this happens only while the editor still holds exactly the text the launch wrote: text typed since (which
+ * the dirty line already reports) is never replaced, and the console says the editor was left alone.
+ */
+function putBackCanceledLaunch(record) {
+  const text = textAfterCanceledLaunch({ editorCode: editor.code, launchCode: record.code, playingCode: record.playingCode });
+  if (text !== null) {
+    editor.setCode(text);
+    return;
+  }
+  console.error('Moontide: the canceled launch left the editor alone: it holds text that was not evaluated.');
+}
+
+/** The change of a cell of the person's own that still waits in the takeover, or null (a stale one is dropped). */
+function waitingCellEdit() {
+  if (gridCellWait !== null && takeover.pending() !== gridCellWait.record) gridCellWait = null;
+  return gridCellWait;
+}
+
+/** Stops a cell change before anything is written: `reason` is an id of SONG_COPY.refusals. */
+class CellStop extends Error {
+  constructor(reason) {
+    super(`Moontide: the cell change stopped (${reason}).`);
+    this.reason = reason;
+  }
+}
+
+/**
+ * Changes the cell the person chose in the list. Runs only inside the serial `chain`. A pending Mixer gesture is recorded
+ * first and the touched-line overlay stops describing the text; the line under the toolbar is brought up to date when the
+ * gesture is over.
+ */
+async function chooseCell(seen, choice) {
+  await mixerGesture.flushDirect();
+  clearMixerFlash();
+  gridRefused = null;
+  gridBusy = true;
+  try {
+    await chooseCellNow(seen, choice);
+  } finally {
+    gridBusy = false;
+    refreshSongLine();
+    if (songGridReading !== null) updateSongGridLive();
+  }
+}
+
+/**
+ * The gesture itself: the playing code is read again, the cell is checked against what the person saw (section, cell and
+ * variation) and exactly one string of song.plan is rewritten through the shared path with the person's own hand-edit timing.
+ * Choosing what the cell holds writes, evaluates and records nothing. At once the change is recorded now; waiting, the grid
+ * shows the new name with the words for its line and the change is recorded when it takes over.
+ */
+async function chooseCellNow(seen, choice) {
+  const timing = parseTiming(viewState.changeTiming);
+  let outcome;
+  try {
+    outcome = await pageRewrite.apply({
+      timing,
+      // A cell change is an edit, not a request to play.
+      autostart: !pageStopped,
+      flash: false,
+      build(text) {
+        const reading = readSongOf(text);
+        if (reading.state !== 'read') throw new CellStop('section-gone');
+        const stale = checkCell(reading, seen, choice);
+        if (stale !== null) throw new CellStop(stale);
+        const { edits, changed } = cellEdit(reading, { index: seen.index, track: seen.track }, choice);
+        return { code: changed ? applyEdits(text, edits) : text, edits };
+      },
+    });
+  } catch (err) {
+    if (err instanceof CellStop) {
+      console.error(`Moontide: the cell was not changed (${err.reason}); the code changed since the click.`);
+      gridRefused = err.reason;
+      return;
+    }
+    if (err instanceof SongEditRefusal) {
+      console.error(`Moontide: the cell was not changed (${err.reason}).`);
+      gridRefused = err.reason;
+      return;
+    }
+    throw err;
+  }
+  if (outcome.status === 'refused') {
+    reportGridRefusal(outcome.reason, 'the cell was not changed');
+    return;
+  }
+  if (outcome.status === 'unchanged') return;
+  if (outcome.status === 'failed') {
+    // The old code is still what plays; the shared path set the editor back and showed the banner.
+    gridRefused = 'not-evaluated';
+    return;
+  }
+  const label = cellRecordLabel({ track: seen.track, section: seen.name, choice });
+  const record = outcome.run.deferred;
+  if (record === null || record === undefined) {
+    sendMixerRecord(editor.repl.state.activeCode, label);
+    flashMixerLines(outcome.edits);
+    return;
+  }
+  gridCellWait = { record, track: seen.track, section: seen.name, choice, at: timing.at };
+  takeover.whenFinished(record, () => {
+    if (gridCellWait !== null && gridCellWait.record === record) gridCellWait = null;
+    sendMixerRecord(typeof record.code === 'string' ? record.code : editor.repl.state.activeCode, label);
+    if (songGridReading !== null) drawSongGrid();
+  });
+  if (songGridReading !== null) drawSongGrid();
+}
+
+// --- the Timeline's note edits ---
+
+/** The strings of the code on screen, the song reading and the scope of every track, made once for the version drawn. */
+/** The song reading of the code the lanes were drawn from, or `{ state: 'none' }` when the page has read no song from that code. */
+function timelineSongReading() {
+  return songReading !== null && songReading.code === timelineCode ? songReading.reading : { state: 'none' };
+}
+
+function timelineNoteIndex() {
+  if (timelineIndex !== null && timelineIndex.code === timelineCode) return timelineIndex;
+  const index = indexCode(timelineCode, { parse: timelineParse });
+  const reading = timelineSongReading();
+  const scopes = timelineTracks.map((track) => trackScope({ track, reading }));
+  timelineIndex = { code: timelineCode, index, reading, scopes, readers: readerCounter(index, scopes) };
+  return timelineIndex;
+}
+
+/** The onset notes of a pattern over `from` to `to`, in the shape of the lane's own events (the places in the code kept). */
+function onsetEvents(pattern, from, to) {
+  const events = [];
+  for (const hap of pattern.queryArc(from, to)) {
+    if (hap.whole && hap.hasOnset()) events.push(toLaneEvent(hap));
+  }
+  return events;
+}
+
+/**
+ * Where the token of an editable note plays in a song the page has read: one query of the track's own pattern over one pass of
+ * the structure, from the first section's start, each note mapped to its section entry with the Song grid's own rule. The
+ * evaluated pattern is kept for the version and the track, and the answer for the token. Gives a promise of `{ count, sections,
+ * onPage: false, events }` (`events` are the notes of the pass, the read-back compares them), and `span`, the stretch queried.
+ */
+function timelinePlacesOf({ trackIndex, token, reading }) {
+  const cache = timelinePlaces;
+  const parse = timelineParse;
+  const code = timelineCode;
+  const from = ((reading.sections[0].start % reading.total) + reading.total) % reading.total;
+  const span = { from, to: from + reading.total };
+  const key = `${trackIndex}:${token.start}`;
+  if (!cache.answers.has(key)) {
+    if (!cache.patterns.has(trackIndex)) {
+      const pattern = evaluateSolo(soloSource(code, trackIndex, { parse }));
+      // A pattern that failed to evaluate is not kept: the next selection tries again.
+      pattern.catch(() => cache.patterns.delete(trackIndex));
+      cache.patterns.set(trackIndex, pattern);
+    }
+    const answer = cache.patterns.get(trackIndex).then((pattern) => {
+      const events = onsetEvents(pattern, span.from, span.to);
+      return { ...placesOf({ haps: events, token, reading }), onPage: false, events };
+    });
+    answer.catch(() => cache.answers.delete(key));
+    cache.answers.set(key, answer);
+  }
+  return { places: cache.answers.get(key), span };
+}
+
+/**
+ * What the panel needs to know of the note the person clicked (lane `laneIndex` of the lanes drawn, event `eventIndex` of the
+ * lane): where it is, what it plays, and whether the page can edit it with the reason when it cannot. Reads the code and the
+ * lanes only; nothing is written, evaluated or sent. For a note that can be edited `seen` holds what the edit needs of this
+ * moment: the code the note was read from, the lane as drawn and the place of the token in the code.
+ */
+function describeTimelineNote(laneIndex, eventIndex) {
+  if (timelineDrawn === null || timelineCode === null || timelineTracks === null) {
+    throw new Error('Moontide: a note was picked while no Timeline lanes are drawn.');
+  }
+  const lane = timelineDrawn.lanes[laneIndex];
+  const event = lane.events[eventIndex];
+  const { index, reading, scopes, readers } = timelineNoteIndex();
+  const scope = scopes.find((candidate) => candidate.index === lane.index);
+  const verdict = classifyNote({ code: timelineCode, index, event, scope, scopes, readers, midi: lane.midi === true });
+  // The cycle and beat the right-click names for the instant the note begins at: one rule for both.
+  const moment = momentAt({ pageStart: timelineDrawn.pageStart, fraction: (event.begin - timelineDrawn.pageStart) / PAGE_CYCLES, lanes: [], version: null });
+  const midi = pitchOf(event.value);
+  const drumNote = lane.drumMap === null ? null : drumNoteOf(event.value);
+  const info = {
+    laneIndex,
+    eventIndex,
+    track: lane.track,
+    cycle: moment.cycle,
+    beat: moment.beat,
+    section: reading.state === 'read' ? reading.sections[playingSection(reading, event.begin).index].name : null,
+    noteText: event.value.note ?? midi,
+    midi,
+    drum: drumNote !== null && lane.drumMap.byNote.has(drumNote) ? lane.drumMap.byNote.get(drumNote) : null,
+    velocity: velocityOf(event.value, lane.midi === true),
+    // The velocity is writable only where one number of a velocity string in the track holds it (page/note-locate.js).
+    velocityWritable: verdict.editable && verdict.velocity.writable,
+    editable: verdict.editable,
+    reason: verdict.editable ? null : verdict.reason,
+    seen: null,
+  };
+  if (verdict.editable) {
+    info.seen = {
+      code: timelineCode,
+      trackIndex: lane.index,
+      track: lane.track,
+      event,
+      events: lane.events,
+      token: verdict.token,
+      velocity: verdict.velocity,
+      pageStart: timelineDrawn.pageStart,
+      places: null,
+      placesWindow: null,
+      velocityPlaces: null,
+      velocityWindow: null,
+      perCycle: 0,
+    };
+    if (reading.state === 'read') {
+      // A song: the places are section entries. Over the count limit only the entries the drawn page holds are counted.
+      const placesOfToken = (token) =>
+        reading.total > PLACES_MAX_CYCLES
+          ? { places: { ...placesOf({ haps: lane.events, token, reading }), onPage: true }, span: null }
+          : timelinePlacesOf({ trackIndex: lane.index, token, reading });
+      const counted = placesOfToken(verdict.token);
+      info.seen.places = counted.places;
+      info.seen.placesWindow = counted.span;
+      // The number that holds the velocity can play in more places than the pitch token does (a variation used by several
+      // sections): they are counted for the velocity too, and a velocity edit is read back over all of them.
+      if (verdict.velocity.writable) {
+        const velocityCounted = placesOfToken(verdict.velocity.token);
+        info.seen.velocityPlaces = velocityCounted.places;
+        info.seen.velocityWindow = velocityCounted.span;
+      }
+    } else {
+      // No structure: only a token that draws several notes in one cycle is told.
+      info.seen.perCycle = perCycleCount({ events: lane.events, token: verdict.token, cycle: Math.floor(event.begin + 1e-9) });
+    }
+    info.places = info.seen.places;
+    info.velocityPlaces = info.seen.velocityPlaces;
+    info.perCycle = info.seen.perCycle;
+  }
+  return info;
+}
+
+// The edit of the person's own that waits for its line, `{ record }` (the takeover's waiting change), or null; the Timeline's
+// note panel keeps its edit controls off meanwhile and says so with the edit's own sentence.
+let timelineEditWait = null;
+// True while an edit of the Timeline runs on the serial chain: the editor legitimately differs from the playing code then.
+let timelineEditBusy = false;
+// What the editor held the last time nothing was in flight: true while it has text that was never evaluated.
+let timelineDirty = false;
+// The notice the note panel was last told (null, 'closed', 'waiting' or 'dirty'), so it is told again only when it changes.
+let timelineNoticeKind = null;
+
+/** Ends the wait of the person's own edit once its record is no longer the waiting change: it took over, or was dropped. */
+function syncTimelineWait() {
+  if (timelineEditWait === null) return;
+  const { record } = timelineEditWait;
+  if (takeover.pending() === record) return;
+  timelineEditWait = null;
+  timelineEditUi.finishWait({ tookOver: record.finished === true });
+}
+
+/**
+ * The notice that keeps the Timeline's edit controls off, by the Mixer's order: the socket is closed, another change waits for
+ * its line, or the editor holds text that was never evaluated. The person's own waiting edit is not a notice (it has its own
+ * sentence). The editor is compared with the playing code except while an evaluation is in flight, when it legitimately
+ * differs; then the last answer stands.
+ */
+function timelineNotice() {
+  if (ws.readyState !== ws.OPEN) return 'closed';
+  const waitingRecord = takeover.pending();
+  const ours = timelineEditWait !== null && waitingRecord === timelineEditWait.record ? timelineEditWait : null;
+  if (waitingRecord !== null && ours === null) return 'waiting';
+  if (hasEvaluatedSuccessfully && !programmaticEvalInFlight && !mixerTickInFlight && !timelineEditBusy) {
+    const code = ours !== null && typeof ours.record.code === 'string' ? ours.record.code : playingCode();
+    timelineDirty = editor.code !== code;
+  }
+  return timelineDirty ? 'dirty' : null;
+}
+
+/**
+ * The Timeline note panel's share of the 250 ms page poll, only while the Timeline is open: the wait of the person's own edit
+ * ends when its record is gone, and the panel is told of a notice only when its kind changes.
+ */
+function pollTimelineEdit() {
+  if (viewState.view !== 'timeline') return;
+  syncTimelineWait();
+  const kind = timelineNotice();
+  if (kind === timelineNoticeKind) return;
+  timelineNoticeKind = kind;
+  timelineEditUi.setNotice(kind);
+}
+
+/**
+ * Changes the note the person edited on the Timeline. Runs only inside the serial `chain`. A pending Mixer gesture is recorded
+ * first and the touched-line overlay stops describing the text. The edited track is read back before anything is written
+ * (page/note-edit.js), the write goes through the shared path with the person's usual hand-edit timing, and a written edit
+ * is one history entry. The panel is told what happened under the edit's `id`, so the outcome speaks for the edit's own note.
+ */
+async function editTimelineNote(info, change, id) {
+  const seen = info.seen;
+  let outcome;
+  let evaluated = null;
+  timelineEditBusy = true;
+  try {
+    // Inside the try, like the Mixer flush below: a missing parser or a pending Mixer gesture that fails to record is told in the
+    // panel like any other error of the edit, so every edit handed over ends in an outcome.
+    const parse = window.acorn.parse;
+    await mixerGesture.flushDirect();
+    clearMixerFlash();
+    outcome = await writeNoteEdit({
+      seen,
+      change,
+      deps: {
+        // The edited track alone, over the page the lanes show or over the stretch of the structure the places were counted on, in
+        // the shape of the lane's own events. The edited track is evaluated once for both.
+        async readBack(code, span) {
+          if (evaluated === null || evaluated.code !== code) evaluated = { code, pattern: evaluateSolo(soloSource(code, seen.trackIndex, { parse })) };
+          const pattern = await evaluated.pattern;
+          return span === undefined ? onsetEvents(pattern, seen.pageStart, seen.pageStart + PAGE_CYCLES) : onsetEvents(pattern, span.from, span.to);
+        },
+        apply: (request) => pageRewrite.apply(request),
+        timing: parseTiming(viewState.changeTiming),
+        // An edit is not a request to play.
+        autostart: !pageStopped,
+        record: sendMixerRecord,
+        whenFinished: (record, fn) => takeover.whenFinished(record, fn),
+        activeCode: () => editor.repl.state.activeCode,
+      },
+    });
+  } catch (err) {
+    if (err instanceof NoteEditStop) {
+      outcome = { kind: 'refused', reason: err.reason };
+    } else {
+      // An error nobody planned for is told in the panel as well as the console: the person is never left with a standing sentence
+      // and no word about the edit they asked for.
+      console.error('Moontide: the Timeline edit failed:', err);
+      outcome = { kind: 'refused', reason: 'error' };
+    }
+  } finally {
+    timelineEditBusy = false;
+  }
+  // An error the rewrite path gave back is reported here: at or after the write the edit's own code may have changed; an
+  // evaluation that threw and was taken back left the code as it was.
+  if (outcome.kind === 'refused' && outcome.reason === 'error' && outcome.error !== undefined) {
+    console.error(outcome.afterWrite === true ? 'Moontide: the Timeline edit failed after its write:' : 'Moontide: the Timeline edit failed, and its write was taken back:', outcome.error);
+  }
+  if (outcome.kind === 'refused' && (outcome.reason === 'stale' || outcome.reason === 'read-back')) {
+    console.error(`Moontide: the note was not changed (${outcome.reason}${outcome.why === undefined ? '' : `: ${outcome.why}`}).`);
+    if (outcome.error !== undefined) console.error('Moontide: the edited track could not be read back:', outcome.error);
+  }
+  timelineEditUi.showOutcome(id, outcome);
+  if (outcome.kind === 'waiting') {
+    // The panel keeps the edit controls off until the change takes over; it hears of the takeover (or of its being dropped).
+    timelineEditWait = { record: outcome.record };
+    takeover.whenFinished(outcome.record, () => syncTimelineWait());
+    syncTimelineWait();
+  }
+}
+
+/**
+ * Launches the section the person clicked on. Runs only inside the serial `chain`. A pending Mixer gesture is recorded
+ * first, as for a part launch, and the touched-line overlay stops describing the text. The line under the toolbar and the
+ * countdown of the header are brought up to date when the gesture is over.
+ */
+async function launchSection(seen) {
+  await mixerGesture.flushDirect();
+  clearMixerFlash();
+  gridRefused = null;
+  gridBusy = true;
+  try {
+    await launchSectionNow(seen);
+  } finally {
+    gridBusy = false;
+    syncGridQueued(currentSoundState === 'playing' ? currentCycle() : null);
+    refreshSongLine();
+    if (songGridReading !== null) updateSongGridLive();
+  }
+}
+
+/**
+ * The gesture itself. A click on the header of the launch that waits cancels it (nothing is recorded, the music keeps
+ * playing, the editor goes back to the playing code); a click on another header while ours waits replaces it, built on the
+ * waiting code; both only until the scheduler has queried past the line, after which a click changes nothing; a click on
+ * the header of a launch that needs no code change only hides its countdown. While the sound is stopped the piece starts at
+ * that section at once. Otherwise the shift that puts the section on the chosen line is written and evaluated with the
+ * takeover pinned to that line, and the server hears of it (one history entry) when the section takes over. The frontier is
+ * read, the line and the shift computed, the code written and the evaluation started in one turn:
+ * nothing is awaited between reading the frontier and the call that writes, which is what makes the line the takeover takes
+ * agree with the line the shift was written for.
+ */
+async function launchSectionNow(seen) {
+  if (!window.acorn || typeof window.acorn.parse !== 'function') {
+    console.error('Moontide: window.acorn is not available — cannot launch a section.');
+    return;
+  }
+  const ours = waitingGridLaunch();
+  // The countdown of a launch that needs no code change: a second click on its header hides it, nothing else is involved.
+  if (gridAlready !== null && gridAlready.index === seen.index && ours === null) {
+    gridAlready = null;
+    return;
+  }
+  if (ws.readyState !== ws.OPEN) {
+    console.error('Moontide: the section was not launched: the socket is not open.');
+    return;
+  }
+  if (!hasEvaluatedSuccessfully) {
+    console.error('Moontide: the section was not launched: no code has played yet.');
+    return;
+  }
+  const waiting = takeover.pending();
+  if (waiting !== null && (ours === null || waiting !== ours.record)) {
+    console.error('Moontide: the section was not launched: a change is waiting for its bar line.');
+    return;
+  }
+  // The code the gesture builds on, and the text the editor must still hold: while our launch waits that is the waiting
+  // code, which differs from the playing code in the shift alone. Typing that was never evaluated is never overwritten, and
+  // a cancel never discards it either.
+  const playing = playingCode();
+  const base = ours !== null ? ours.record.code : playing;
+  if (editor.code !== base) {
+    console.error('Moontide: the section was not launched: the editor holds a hand edit that was not evaluated.');
+    return;
+  }
+  let reading;
+  let baseReading;
+  try {
+    reading = readSongOf(playing);
+    baseReading = ours !== null ? readSongOf(base) : reading;
+  } catch (err) {
+    console.error('Moontide: failed to parse the code for a section launch:', err);
+    return;
+  }
+  if (reading.state !== 'read' || baseReading.state !== 'read' || checkSection(reading, seen) !== null) {
+    console.error('Moontide: the section to launch is gone; the code changed since the click.');
+    gridRefused = 'section-gone';
+    return;
+  }
+
+  // Once the scheduler has queried past the line, the notes of the new section are already scheduled: a cancel would let
+  // them sound and then put the old music back in the middle of the section, and a replacement would be built on a
+  // playing code that is no longer the one that plays. Nothing is changed; the launch takes over on its line.
+  if (ours !== null && ours.record.reached) {
+    console.error(`Moontide: the section '${ours.name}' is too close to its line to be canceled or replaced; it takes over.`);
+    return;
+  }
+
+  if (ours !== null && ours.index === seen.index) {
+    takeover.cancel('canceled');
+    return;
+  }
+
+  if (!playsNow()) {
+    await launchStoppedSection(seen, playing, reading);
+    return;
+  }
+
+  // Another launch replaces the countdown of one that needs no code change.
+  gridAlready = null;
+  let attempt = 0;
+  let from = base;
+  let fromReading = baseReading;
+  for (;;) {
+    attempt += 1;
+    // Read the frontier, compute the line and the shift, write and evaluate: no await until the call has started.
+    const { line, at } = launchLine({ kind: seen.kind, frontier: scheduler.lastEnd, cps: tempoGuard.playing(), reading, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
+    const shift = launchShift(reading, seen.index, line);
+    if (sameShift(shift, reading.shift, reading.total)) {
+      // The section already starts on that line: nothing is written. A launch of ours that waits (or the first try of
+      // this one, written for a line that moved) is dropped, and the header counts down to the line.
+      if (takeover.pending() !== null) takeover.cancel('canceled');
+      gridAlready = { index: seen.index, name: seen.name, line };
+      return;
+    }
+    const outcome = await pageRewrite.apply({
+      base: from,
+      timing: pinnedTiming(at, line),
+      // The sound plays (this loop runs only then), so the scheduler is started already. A Stop that lands while the
+      // change is prepared must not start it again: the evaluation only swaps the pattern.
+      autostart: false,
+      flash: false,
+      // A waiting change of ours is replaced by this one, so only a change of someone else's keeps it from running.
+      guards: from === playing ? undefined : { waiting: false },
+      build(text) {
+        const edits = shiftEdit(fromReading, shift);
+        return { code: applyEdits(text, edits), edits };
+      },
+    });
+    if (outcome.status === 'refused') {
+      if (takeover.pending() !== null && attempt > 1) takeover.cancel('canceled');
+      reportGridRefusal(outcome.reason);
+      return;
+    }
+    if (outcome.status === 'unchanged') return;
+    if (outcome.status === 'failed') {
+      // The old code is still what plays; the shared path set the editor back and showed the banner.
+      if (takeover.pending() !== null && attempt > 1) takeover.cancel('canceled');
+      gridRefused = 'not-evaluated';
+      return;
+    }
+    const record = outcome.run.deferred;
+    if (record === null || record === undefined) {
+      // The change took over at once (the music stopped while it was prepared, and the evaluation did not start the
+      // scheduler again): the code is the music that plays when Play comes, so the server hears of it all the same.
+      sendIfOpen(JSON.stringify({ type: 'part-launch', code: editor.repl.state.activeCode, part: partLaunchPart(seen.name) }));
+      // The server reads every launch as the sound playing, and the Stop's own report may have reached it before this one:
+      // saying the Stop again makes the last word the server hears the true one.
+      if (pageStopped) sendIfOpen(JSON.stringify({ type: 'user-stopped' }));
+      flashMixerLines(outcome.edits);
+      return;
+    }
+    if (record.canceled) {
+      // Stop, or a change of someone else's, canceled it while the evaluation ran. After a Stop its text would read as
+      // typing that was never evaluated: it goes back like any launch that ends without taking over.
+      if (record.cancelReason === 'stop') putBackCanceledLaunch(record);
+      return;
+    }
+    if (record.boundary === line) {
+      gridLaunch = { record, index: seen.index, name: seen.name, line, at };
+      takeover.whenFinished(record, () => {
+        if (gridLaunch !== null && gridLaunch.record === record) gridLaunch = null;
+        gridQueued = null;
+        sendIfOpen(JSON.stringify({ type: 'part-launch', code: editor.repl.state.activeCode, part: partLaunchPart(seen.name) }));
+        if (songGridReading !== null) {
+          updateSongGridLive();
+          songGridUi.scrollPlayingIntoView();
+        }
+      });
+      return;
+    }
+    // The takeover took another line than the one the shift was written for (the frontier moved while the code was
+    // prepared). The waiting code is written again for a fresh line, once; the newer change replaces it.
+    if (attempt >= 2) {
+      takeover.cancel('canceled');
+      console.error(`Moontide: the section launch could not be placed on its line (wanted cycle ${line}, the takeover took ${record.boundary}); it was canceled.`);
+      gridRefused = 'line-moved';
+      return;
+    }
+    from = record.code;
+    try {
+      fromReading = readSongOf(from);
+    } catch (err) {
+      takeover.cancel('canceled');
+      console.error('Moontide: failed to parse the waiting code for a section launch:', err);
+      return;
+    }
+  }
+}
+
+/**
+ * A click on a header while the sound is stopped: the piece starts at that section at once. The shift is written so the
+ * section starts at cycle 0 (the count restarts at 0 at every Play), the sound comes back, and the server hears of it. When
+ * the shift is already right the text stays as it is and is evaluated all the same, so the sound starts.
+ */
+async function launchStoppedSection(seen, playing, reading) {
+  const shift = launchShift(reading, seen.index, 0);
+  const unchanged = sameShift(shift, reading.shift, reading.total);
+  const outcome = await pageRewrite.apply({
+    base: playing,
+    autostart: true,
+    flash: false,
+    evaluateUnchanged: true,
+    build(text) {
+      const edits = unchanged ? [] : shiftEdit(reading, shift);
+      return { code: applyEdits(text, edits), edits };
+    },
+  });
+  if (outcome.status === 'refused') {
+    reportGridRefusal(outcome.reason);
+    return;
+  }
+  if (outcome.status === 'unchanged') return;
+  if (outcome.status === 'failed') {
+    gridRefused = 'not-evaluated';
+    return;
+  }
+  await resumeAfterStop();
+  sendIfOpen(JSON.stringify({ type: 'part-launch', code: editor.repl.state.activeCode, part: partLaunchPart(seen.name) }));
+  flashMixerLines(outcome.edits);
+}
+
+/**
+ * What a launch the shared path refused leaves behind. Most refusals are states the line under the toolbar already says
+ * (a waiting change, unevaluated typing, a closed socket); the console names them too, so none is silent.
+ */
+function reportGridRefusal(reason, subject = 'the section was not launched') {
+  switch (reason) {
+    case 'not-played':
+      console.error(`Moontide: ${subject}: no code has played yet.`);
+      break;
+    case 'waiting':
+      console.error(`Moontide: ${subject}: a change is waiting for its bar line.`);
+      break;
+    case 'closed':
+      console.error(`Moontide: ${subject}: the socket is not open.`);
+      break;
+    case 'no-parser':
+      console.error(`Moontide: window.acorn is not available — ${subject}.`);
+      break;
+    case 'dirty':
+      console.error(`Moontide: ${subject}: the editor holds a hand edit that was not evaluated.`);
+      break;
+    case 'write-mismatch':
+      console.error('Moontide: the editor text does not match the rewrite; the editor was set back.');
+      gridRefused = 'not-written';
+      break;
+    default:
+      console.error(`Moontide: ${subject} (${String(reason)}).`);
+  }
+}
+
+/**
+ * Works out the sentence under the toolbar for the state of the page now. The editor is compared with the code the grid
+ * works on (the waiting code while our launch waits, else the playing code) except while a gesture or any programmatic
+ * evaluation is in flight, when the editor legitimately differs; then the last answer stands. While the editor holds text
+ * that was never evaluated, the launch lines give way to the dirty one: no gesture could cancel or replace the launch
+ * without discarding that text, so every control is off and the line says why.
+ */
+function refreshSongLine() {
+  if (songGridReading === null || gridBusy) return;
+  const waitingRecord = takeover.pending();
+  const ours = gridLaunch !== null && waitingRecord === gridLaunch.record ? gridLaunch : null;
+  if (hasEvaluatedSuccessfully && !programmaticEvalInFlight && !mixerTickInFlight) {
+    gridDirty = editor.code !== (ours !== null ? ours.record.code : playingCode());
+  }
+  let launch = null;
+  if (!gridDirty) {
+    if (ours !== null) launch = { kind: 'queued', section: ours.name };
+    else if (gridAlready !== null) launch = { kind: 'already', section: gridAlready.name };
+  }
+  gridLine = songLine({
+    connected: ws.readyState === ws.OPEN,
+    launch,
+    waiting: waitingRecord !== null && (ours === null || waitingRecord !== ours.record),
+    dirty: gridDirty,
+    refused: gridRefused,
+  });
+}
+
+/**
+ * The Song grid's share of the 250 ms page poll: a launch that needed no code change ends when the scheduler reaches its
+ * line (the section it named plays then, and its column comes into view once); another change that starts to wait ends it
+ * too; then the sentence under the toolbar is brought up to date.
+ */
+function pollSongGrid() {
+  if (songGridReading === null || viewState.view !== 'parts') return;
+  let landed = false;
+  if (gridAlready !== null && (currentCycle() >= gridAlready.line || (takeover.pending() !== null && waitingGridLaunch() === null))) {
+    landed = currentCycle() >= gridAlready.line;
+    gridAlready = null;
+    gridQueued = null;
+  }
+  refreshSongLine();
+  if (landed) {
+    updateSongGridLive();
+    songGridUi.scrollPlayingIntoView();
+  }
+}
+
+/** Takes the Song grid off the screen (a piece without a readable song shows the Parts view or its message instead). */
+function hideSongGrid() {
+  songGridUi.hide();
+  songGridReading = null;
+}
+
+/**
+ * Hands the live state to the Song grid: which section plays now, only while the page makes sound. The grid writes only
+ * what changed, so calling this every animation frame touches no node while the state is the same.
+ */
+function updateSongGridLive() {
+  if (songGridReading === null) return;
+  const rawNow = editor.repl.scheduler.now();
+  const cycle = Number.isFinite(rawNow) && rawNow > 0 ? rawNow : 0;
+  const stopped = currentSoundState !== 'playing';
+  // For at most one poll after a takeover the reading can still describe the previous section: the reading is replaced when
+  // the finisher of the new version runs, a moment after the clock has moved on.
+  songGridUi.tick({ playing: stopped ? null : playingSection(songGridReading, cycle), stopped, motion: viewState.motion, queued: gridQueued, line: gridLine });
+  // The playing column scrolls into view once when the sound starts; after that the grid never follows it sideways.
+  if (!stopped && !songGridWasPlaying) songGridUi.scrollPlayingIntoView();
+  songGridWasPlaying = !stopped;
+}
+
+/** Ends a part launch before anything is written: the playing code cannot be read, or the part is gone. */
+class PartLaunchStop extends Error {
+  constructor(kind, cause) {
+    super(`Moontide: the part launch stopped (${kind}).`);
+    this.kind = kind;
+    this.cause = cause;
+  }
+}
+
 /**
  * Launches part `partIndex` of the arrangement whose rowSignature is `signature` — queued on the
  * serial `chain` by its own click handler (buildPartCard), so it never interleaves with Claude's
@@ -4333,64 +5909,71 @@ async function launchPart(signature, partIndex) {
   // recorded first (with the code that played), and the touched lines stop describing the text.
   await mixerGesture.flushDirect();
   clearMixerFlash();
-  if (takeover.pending() !== null) {
-    // A launch would play (and record) the waiting change; Parts says so in its message line.
-    console.error('Moontide: the part was not launched: a change is waiting for its bar line.');
-    if (viewState.view === 'parts') renderParts();
-    return;
-  }
-  if (!window.acorn || typeof window.acorn.parse !== 'function') {
-    console.error('Moontide: window.acorn is not available — cannot launch a part.');
-    return;
-  }
-  const parse = window.acorn.parse;
-  const code = playingCode();
-  let arrangements;
-  try {
-    const tracks = extractTracks(code, { parse });
-    arrangements = extractArrangements(code, { parse, tracks });
-  } catch (err) {
-    console.error('Moontide: failed to parse the playing code for a part launch:', err);
-    return;
-  }
-  const arrangement = arrangements.find((candidate) => rowSignature(candidate) === signature);
-  const section = arrangement && arrangement.sections[partIndex];
-  if (!section) {
-    console.error('Moontide: the part to launch is gone; the code changed since the click.');
-    if (viewState.view === 'parts') renderParts();
-    return;
-  }
-
   const wasStopped = pageStopped;
-  const rawNow = editor.repl.scheduler.now();
-  const now = Number.isFinite(rawNow) && rawNow > 0 ? rawNow : 0;
-  const target = launchTargetCycle({ now, cps: editor.repl.scheduler.cps, stopped: wasStopped });
-  const offset = launchOffset(target, section.start, arrangement.total);
-  const newCode = applyArrangeOffset(code, arrangement, offset);
-
-  if (newCode === code && !wasStopped) {
+  let section = null;
+  let target = 0;
+  let outcome;
+  try {
+    // This launch has always replaced the whole text, with the editor flashing, and never checked for typing that
+    // was not evaluated, nor for a closed socket or a first play: those three guards stay off so nothing changes.
+    // When the page is stopped, an unchanged text is still evaluated so the sound starts again.
+    outcome = await pageRewrite.apply({
+      write: 'replace',
+      flash: true,
+      guards: { played: false, socket: false, dirty: false },
+      evaluateUnchanged: wasStopped,
+      build(code) {
+        const parse = window.acorn.parse;
+        let arrangements;
+        try {
+          const tracks = extractTracks(code, { parse });
+          arrangements = extractArrangements(code, { parse, tracks });
+        } catch (err) {
+          throw new PartLaunchStop('unreadable', err);
+        }
+        const arrangement = arrangements.find((candidate) => rowSignature(candidate) === signature);
+        section = arrangement && arrangement.sections[partIndex];
+        if (!section) throw new PartLaunchStop('gone');
+        const rawNow = editor.repl.scheduler.now();
+        const now = Number.isFinite(rawNow) && rawNow > 0 ? rawNow : 0;
+        target = launchTargetCycle({ now, cps: editor.repl.scheduler.cps, stopped: wasStopped });
+        const offset = launchOffset(target, section.start, arrangement.total);
+        return { code: applyArrangeOffset(code, arrangement, offset), edits: null };
+      },
+    });
+  } catch (err) {
+    if (!(err instanceof PartLaunchStop)) throw err;
+    if (err.kind === 'unreadable') {
+      console.error('Moontide: failed to parse the playing code for a part launch:', err.cause);
+    } else {
+      console.error('Moontide: the part to launch is gone; the code changed since the click.');
+      if (viewState.view === 'parts') renderParts();
+    }
+    return;
+  }
+  if (outcome.status === 'refused') {
+    if (outcome.reason === 'waiting') {
+      // A launch would play (and record) the waiting change; Parts says so in its message line.
+      console.error('Moontide: the part was not launched: a change is waiting for its bar line.');
+      if (viewState.view === 'parts') renderParts();
+    } else {
+      console.error('Moontide: window.acorn is not available — cannot launch a part.');
+    }
+    return;
+  }
+  if (outcome.status === 'unchanged') {
     // Nothing changes (this part already starts at the target cycle): only record the pending
     // launch and re-render — never evaluate or send anything for a no-op rewrite.
     pendingLaunch = { signature, partIndex, targetCycle: target };
     if (viewState.view === 'parts') renderParts();
     return;
   }
-
-  editor.setCode(newCode);
-  await runProgrammaticEvaluate();
-  const evalError = editor.repl.state.evalError;
-  if (evalError) {
-    // handleEvaluate's own revert-on-failure branch, reused verbatim: the old code
-    // is still what's actually playing.
-    editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
-    const { errorText } = buildEvalErrorReport(evalError);
-    showEvalError(errorText);
+  if (outcome.status === 'failed') {
+    // The old code is still what is actually playing; the shared path set the editor back and showed the banner.
     pendingLaunch = null;
     if (viewState.view === 'parts') renderParts();
     return;
   }
-  // A page-originated evaluation has no Claude evaluate id.
-  playingEvaluateId = null;
   // onVersionPlaying (fired by the evaluate above, via trackEvalSuccess) already cleared
   // pendingLaunch — set the real value now that the evaluate has landed.
   pendingLaunch = { signature, partIndex, targetCycle: target };

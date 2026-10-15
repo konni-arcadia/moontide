@@ -24,6 +24,7 @@ n(run(4))
 - `cat(...patterns)` / `slowcat(...patterns)` — plays one whole pattern per cycle, cycling through the list (`cat` and `slowcat` are the same function).
 - `seq(...patterns)` / `fastcat(...patterns)` — plays each pattern in its own equal slice of one cycle (`seq` and `fastcat` are the same function).
 - `arrange(...[cycles, pattern])` — plays each pattern for the given number of cycles, in order, then repeats the whole list every total number of cycles (see reference/transitions.md "Sections over many cycles").
+- `arrange` takes patterns: it calls `.fast` on each item without turning it into a pattern, so a single-quoted string item throws when the code is evaluated.
 - The page's Parts view and Timeline section row show an `arrange()` call as parts only when each section is a `[length, pattern]` array whose length is a whole number above zero; the length is written as a number, as the name of a top-level `const` holding a number, or as arithmetic with `+ - * /` over those; a section may be the name of a top-level `const` holding one `[length, pattern]` array, and a spread of a top-level `const` holding such arrays is read as its sections; other `arrange()` calls still play but are not shown as parts, and the Parts view says why.
 - `polymeter(...patterns)` — like `{ }` mini-notation: several sequences of different lengths sharing one clock.
 

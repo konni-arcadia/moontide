@@ -33,6 +33,137 @@ export const TIMELINE_COPY = {
   drumNumbered: 'note {note}',
   drumMapUnknown: ' · drum map unknown',
   drumRowsMax: 8,
+  // The words of the note panel under the lanes: what it says about the selected note, what a change did and why a
+  // note cannot be edited. page/note-panel.js builds every sentence from these strings and nowhere else.
+  noteNone: 'No note selected',
+  noteEditable: 'Editable',
+  noteNotEditable: 'Not editable',
+  notePosition: ' · cycle {cycle}, beat {beat}',
+  noteSection: " · section '{section}'",
+  notePitchLabel: 'Pitch',
+  noteVelocityLabel: 'Velocity',
+  notePitchValue: '{note} · {midi}',
+  notePitchDrum: '{value} · {drum}',
+  noteVelocityUnknown: 'unknown',
+  notePitchDown: 'Pitch down',
+  notePitchDownName: 'Lower pitch by a semitone',
+  notePitchDownTitle: 'Lower pitch by a semitone (Down). Shift: an octave.',
+  notePitchUp: 'Pitch up',
+  notePitchUpName: 'Raise pitch by a semitone',
+  notePitchUpTitle: 'Raise pitch by a semitone (Up). Shift: an octave.',
+  noteVelocityDown: '−',
+  noteVelocityDownName: 'Lower velocity',
+  noteVelocityDownTitle: 'Lower velocity by 0.10',
+  noteVelocityUp: '+',
+  noteVelocityUpName: 'Raise velocity',
+  noteVelocityUpTitle: 'Raise velocity by 0.10',
+  noteVelocityFixed: 'fixed in the code',
+  noteMakeRest: 'Make a rest',
+  noteMakeRestName: 'Turn this note into a rest',
+  noteMakeRestTitle: 'Turn this note into a rest (Delete)',
+  noteAsk: 'Ask Claude',
+  noteAskName: 'Ask Claude about this note',
+  noteAskTitle: 'Opens the Ask box for this note.',
+  // What a gesture on a note the page cannot edit does: the sentence while it is dragged, and the one after it is released.
+  noteRefusedPreview: 'Release to ask Claude: {verb} this note by {amount}.',
+  noteRaise: 'raise',
+  noteLower: 'lower',
+  noteRequestReady: 'Request ready in the Ask box. Nothing is sent until you press Enter.',
+  noteHintNone: 'Click a note to edit it. Drag across an empty part of a lane to ask Claude about those cycles.',
+  noteHintEditable: 'Drag the note or press Up / Down: a semitone, with Shift an octave. Delete makes a rest. Each edit is one History entry.',
+  noteHintRefused: 'Up, Down, Make a rest, − and + prepare a request for Claude. Nothing is sent until you press Enter.',
+  noteHintRange: 'Press Enter or Ask Claude to ask about these cycles. Esc clears the range.',
+  // A range of cycles on one lane: the panel's identity line, built by page/note-panel.js, and what the Ask Claude button says then.
+  noteRangeWhere: 'Range · {lane}',
+  noteRangeCycles: ' · cycles {a} to {b}',
+  noteRangeCycle: ' · cycle {a}',
+  noteRangeSections: " · sections '{first}' to '{last}'",
+  noteRangeNotes: ' · {n} notes',
+  noteRangeOneNote: ' · 1 note',
+  noteRangeNoNotes: ' · no notes',
+  noteRangeAskName: 'Ask Claude about these cycles',
+  noteRangeAskTitle: 'Opens the Ask box for these cycles.',
+  // The keyboard cursor on a lane that has no note on the page: the panel's identity line, its hint and what Ask Claude says then.
+  noteCursorPosition: ' · no notes on this page',
+  noteHintCursor: 'Press Enter or Ask Claude to ask about this lane. Shift+Left or Shift+Right selects cycles.',
+  noteLaneAskName: 'Ask Claude about this lane',
+  noteLaneAskTitle: 'Opens the Ask box for this lane.',
+  // The name a screen reader gives the active note of the lanes (the lanes point at it with aria-activedescendant).
+  noteActiveName: '{lane}, cycle {cycle}, beat {beat}: note {note}, velocity {velocity}. {state}',
+  noteActiveEditable: 'Editable.',
+  noteActiveNotEditable: 'Not editable. {reason}',
+  noteActiveCursor: '{lane}, cycle {cycle}: no notes on this page.',
+  noteStanding: 'An edit rewrites one token in the code: {token}.',
+  // Where a token plays: the standing sentences, and the count the preview and the result repeat.
+  notePlaces: 'Plays in {n} places: sections {list}. An edit changes all of them.',
+  notePlacesOnPage:
+    'Plays in {n} places on this page: sections {list}. An edit changes every place it plays, on this page and after it.',
+  notePlacesPerCycle: 'This token draws {n} notes in each cycle. An edit changes all of them.',
+  notePlacesWords: ' in {n} places',
+  notePlacesPageWords: ' in {n} places on this page',
+  noteVelocityNotes: ', for {n} notes on this page',
+  noteVelocityNotesShort: ', for {n} notes',
+  noteSectionName: "'{name}'",
+  noteListAnd: '{first} and {last}',
+  noteListMore: '{first} and {n} more',
+  // The steps of a key or a button that were not written because the note they were aimed at is gone.
+  noteStepsDropped: 'The steps you pressed were not written: the note changed in the code. Select it again.',
+  noteStepsNotWritten: 'The steps you pressed were not written. Select the note and press them again.',
+  noteChangeDropped: 'The change was not written: the note changed in the code. Select it again.',
+  noteChangeNotWritten: 'The change you made was not written. Select the note and make it again.',
+  noteEditTimeout: 'The page did not answer this edit in time, so check the code.',
+  noteNamed: '{note} on {lane}: {text}',
+  noteChanged: 'Changed {from} to {to}{places}.',
+  noteChangedRest: 'Changed {from} to a rest{places}.',
+  noteVelocityNow: 'Velocity of {note} is now {v}{places}{notes}.',
+  noteWaitingBar: 'Waiting for the next bar — {from} becomes {to}.',
+  noteWaitingPhrase: 'Waiting for the next phrase — {from} becomes {to}.',
+  noteWaitingBarRest: 'Waiting for the next bar — {from} becomes a rest.',
+  noteWaitingPhraseRest: 'Waiting for the next phrase — {from} becomes a rest.',
+  noteWaitingBarVelocity: 'Waiting for the next bar — {note} velocity becomes {v}.',
+  noteWaitingPhraseVelocity: 'Waiting for the next phrase — {note} velocity becomes {v}.',
+  // The sentence while a note is dragged, and the size of the change in it.
+  notePreview: '{from} → {to} ({delta}){places}. Release to write.',
+  noteDeltaSemitone: '{sign}1 semitone',
+  noteDeltaSemitones: '{sign}{n} semitones',
+  noteDeltaOctave: '{sign}1 octave',
+  noteDeltaOctaves: '{sign}{n} octaves',
+  // The sentence while steps of a key or a button wait for the pause before they are written.
+  noteStepPreview: '{from} → {to} ({delta}){places}. Writing in a moment.',
+  noteVelocityPreview: 'Velocity {from} → {to}{places}{notes}. Writing in a moment.',
+  noteLowest: 'Already the lowest note.',
+  noteHighest: 'Already the highest note.',
+  noteVelocityLowest: 'Velocity is already at the lowest (0.10).',
+  noteVelocityHighest: 'Velocity is already at the highest (1.00).',
+  noteVelocityRefusal:
+    "The velocity of this note comes from something the page can't change here, like a signal or an option of .midi(). Ask Claude to change it.",
+  noteStale: 'That note changed in the code since you selected it. Nothing was changed. Select it again, or ask Claude.',
+  noteReadBack: "The page couldn't confirm this edit, so the code is as it was. Ask Claude to make it.",
+  noteEditError: 'The page ran into a problem before it changed this note, so the code is as it was. Ask Claude to make the change.',
+  noteEditErrorWritten: 'The page ran into a problem after it wrote this change, so check the code.',
+  noteNotEvaluated: 'The change did not evaluate, so the code is as it was. Ask Claude to make it.',
+  noteNoticeDisconnected: 'Disconnected — editing is off until Moontide reconnects.',
+  noteNoticeWaiting: 'A change is waiting for its bar line. Editing works again when it takes over.',
+  noteNoticeUnevaluated: 'The editor has changes that are not playing yet. Evaluate them first — editing works on the playing code.',
+  // The history entry of one written edit.
+  noteRecord: 'changed {track}: {from} to {to}{places}',
+  noteRecordRest: 'changed {track}: {from} to a rest{places}',
+  noteRecordVelocity: 'changed {track}: velocity of {note} to {v}{places}',
+  // Why a note cannot be edited, one sentence for each reason page/note-locate.js gives (NOTE_REASONS).
+  noteReasons: {
+    'no-token':
+      'Made by a function or by chance, or written in a single-quoted string, so no single place in the code holds this note. Ask Claude to change it.',
+    'no-pitch': 'This is a sample, not a pitched note, so there is no pitch to change. Ask Claude to change it.',
+    several:
+      'Shaped by several places in the code (an added note or a factor like *2), so no one place can be edited. Ask Claude to change it.',
+    degrees: "Written in degrees. The page doesn't edit those directly yet. Ask Claude to change it.",
+    escape:
+      "The string that holds this note has an escape sequence, so the page can't find the note in the code. Ask Claude to change it.",
+    shifted: 'The pitch you hear is not the pitch written: something adds to it or copies it. Ask Claude to change it.',
+    outside:
+      "Written outside this track's own code (its statement, or its variations in a song), so the page doesn't edit it here. Ask Claude to change it.",
+    shared: 'Comes from code shared by several tracks, so an edit here would change them too. Ask Claude to change it.',
+  },
 };
 
 /** Cycle count from which the next page starts computing in the background, while the current
@@ -85,6 +216,13 @@ export function rulerMarks(pageStart) {
 export const TRACK_COLOR_COUNT = 8;
 
 const NOTE_BASE_SEMITONE = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
+
+/**
+ * The spelling of a note name that Strudel itself plays: a letter in either case, lower-case accidentals (`#`, `s`, `b`, `f`) and an
+ * optional octave. noteNameToMidi reads a capital accidental too (`EB3`), which Strudel does not play, so a token is edited only when it
+ * matches this: the spelling the page edits and the one the sound engine plays are the same.
+ */
+export const NOTE_NAME_TOKEN = /^([a-gA-G])([#sbf]*)(-?\d+)?$/;
 const DEFAULT_NOTE_OCTAVE = 3;
 
 /**
@@ -93,7 +231,7 @@ const DEFAULT_NOTE_OCTAVE = 3;
  * (default 3, matching Strudel's own default). `null` for anything that doesn't parse as a
  * plain note name (a mini-notation pattern string, for example).
  */
-function noteNameToMidi(note) {
+export function noteNameToMidi(note) {
   const match = /^([a-g])((?:[#sbf])*)(-?\d+)?$/.exec(note.toLowerCase());
   if (!match) return null;
   const [, letter, accidentals, octaveText] = match;
@@ -341,6 +479,19 @@ function toEvent(hap) {
 }
 
 /**
+ * One event of a lane: the same fields as the real pattern's events, plus `locations`, plain copies of the places in the
+ * code the note was read from, `[{ start, end }]` offsets into the code that was evaluated, or null when the note has none
+ * (a value made by a function, a hap without a context such as a test double). The real pattern's events keep no
+ * locations, so the check that the lanes add up to the real pattern never looks at them. Exported so the page reads the
+ * edited track back into the same shape.
+ */
+export function toLaneEvent(hap) {
+  const raw = hap.context && Array.isArray(hap.context.locations) ? hap.context.locations : null;
+  const locations = raw === null ? null : raw.map((location) => ({ start: location.start, end: location.end }));
+  return { begin: hap.whole.begin.valueOf(), end: hap.whole.end.valueOf(), value: hap.value, locations };
+}
+
+/**
  * Queries the real pattern and every unmuted track's own solo pattern over `pageCycles`
  * cycles starting at `pageStart`, in slices of `sliceCycles` with a yield to the page between
  * slices, and proves the union of every track's events equals the real pattern's events
@@ -385,7 +536,7 @@ export async function computeTimeline({
         const pattern = trackPatterns[index];
         if (!pattern) return;
         for (const hap of pattern.queryArc(from, to)) {
-          if (hap.whole && hap.hasOnset()) laneEvents[index].push(toEvent(hap));
+          if (hap.whole && hap.hasOnset()) laneEvents[index].push(toLaneEvent(hap));
         }
       });
 
@@ -423,6 +574,12 @@ export const SIXTEENTHS_PER_CYCLE = BEATS_PER_CYCLE * 4;
  */
 export const MAX_MOMENT_NOTES = 32;
 
+/**
+ * The most cycles one range covers: the cycles of a page. Mirrors src/protocol.ts's MAX_RANGE_CYCLES by hand
+ * (test/ask.test.js checks both are 32).
+ */
+export const MAX_RANGE_CYCLES = 32;
+
 // Float noise allowed when an event edge is compared with the instant, in cycles.
 const MOMENT_EPSILON = 1e-9;
 
@@ -450,7 +607,7 @@ function round3(value) {
  * the event and is not seen here: such a note reads the default 0.9 (the reference documents
  * `.velocity()` on the pattern).
  */
-function velocityOf(value, midi) {
+export function velocityOf(value, midi) {
   const defaults = midi ? MIDI_LEVEL : BROWSER_LEVEL;
   const set = value && typeof value === 'object' ? value : {};
   const gain = set.gain === undefined ? defaults.gain : set.gain;
@@ -459,6 +616,15 @@ function velocityOf(value, midi) {
   if (typeof velocity !== 'number' || !Number.isFinite(velocity)) return undefined;
   const product = gain * velocity;
   return product < 0 ? undefined : Math.round(product * 100) / 100;
+}
+
+/**
+ * The gain of one event as the pinned bundle would apply it: the gain set on the event, else the default of a browser track
+ * (0.8) or a MIDI track (1). It may not be a number (a signal), which the caller must check.
+ */
+export function gainOf(value, midi) {
+  const set = value && typeof value === 'object' ? value : {};
+  return set.gain === undefined ? (midi ? MIDI_LEVEL : BROWSER_LEVEL).gain : set.gain;
 }
 
 function momentNote(lane, event, state) {
@@ -558,4 +724,31 @@ export function momentAt({ pageStart, fraction, lanes, version, focusTrack }) {
     notes: notes.slice(0, MAX_MOMENT_NOTES),
     more: Math.max(0, notes.length - MAX_MOMENT_NOTES),
   };
+}
+
+/**
+ * The notes of one lane that start in the whole cycles `from` to `to` (both included): `{ notes, more }`. A note counts when its
+ * start is at least `from` and before `to + 1`, so one that started earlier and still sounds is not in it, and one that starts
+ * exactly at `to + 1` is not either. `lane` is `{ track, midi, instrument, drumMap, events }` as `momentAt` takes it. Each
+ * note is shaped like a moment note (the same fields, built by the same code) without its state, in order of start and then of
+ * pitch, the lower first; at most MAX_MOMENT_NOTES are kept and `more` counts the rest. Bad input is a loud TypeError.
+ */
+export function rangeNotes(lane, from, to) {
+  if (lane === null || typeof lane !== 'object' || !Array.isArray(lane.events)) {
+    throw new TypeError(`rangeNotes: lane must hold an events array, got ${String(lane)}`);
+  }
+  if (!Number.isInteger(from) || from < 0) throw new TypeError(`rangeNotes: from must be a non-negative integer, got ${String(from)}`);
+  if (!Number.isInteger(to) || to < from || to - from >= MAX_RANGE_CYCLES) {
+    throw new TypeError(`rangeNotes: to must be an integer from ${from} to ${from + MAX_RANGE_CYCLES - 1}, got ${String(to)}`);
+  }
+  const inside = lane.events.filter((event) => event.begin >= from - MOMENT_EPSILON && event.begin < to + 1 - MOMENT_EPSILON);
+  const keyed = inside.map((event) => ({ event, pitch: pitchOf(event.value) }));
+  // A note without a pitch (a sample, a tick) sorts after the pitched notes that start with it.
+  keyed.sort((a, b) => a.event.begin - b.event.begin || (a.pitch ?? Infinity) - (b.pitch ?? Infinity) || 0);
+  const notes = keyed.slice(0, MAX_MOMENT_NOTES).map(({ event }) => {
+    const note = momentNote(lane, event, 'sounding');
+    delete note.state;
+    return note;
+  });
+  return { notes, more: Math.max(0, keyed.length - MAX_MOMENT_NOTES) };
 }

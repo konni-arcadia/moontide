@@ -10,6 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import WebSocket from 'ws';
 import { PAGE_LINE_PREFIX } from '../dist/start.js';
+import { STRUCTURE_TEMPLATE_INTRO } from '../dist/mcp.js';
 
 export const DIST_ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 export const PAGE_URL_PATTERN = /Moontide page: (http:\/\/localhost:(\d+))/;
@@ -332,6 +333,34 @@ export function withoutPageLine(text) {
   const at = indexes[0];
   lines.splice(at, 1);
   if (at === lines.length && at > 0 && lines[at - 1] === '') {
+    lines.pop();
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Removes the song structure template from a get_code reply text (the intro line and its fenced js block, plus the
+ * blank line that separated it), so an exact-text assertion keeps its strength while proving the template is there.
+ * Throws unless exactly one intro line is found, followed by one complete fenced block.
+ */
+export function withoutStructureTemplate(text) {
+  const lines = text.split('\n');
+  const indexes = lines.flatMap((line, i) => (line === STRUCTURE_TEMPLATE_INTRO ? [i] : []));
+  if (indexes.length !== 1) {
+    throw new Error(`Expected exactly one structure template, found ${indexes.length} in: ${JSON.stringify(text)}`);
+  }
+  const at = indexes[0];
+  if (lines[at + 1] !== '```js') {
+    throw new Error(`The structure template intro is not followed by a js fence in: ${JSON.stringify(text)}`);
+  }
+  const close = lines.indexOf('```', at + 2);
+  if (close === -1) {
+    throw new Error(`The structure template has no closing fence in: ${JSON.stringify(text)}`);
+  }
+  lines.splice(at, close - at + 1);
+  if (at < lines.length && lines[at] === '') {
+    lines.splice(at, 1);
+  } else if (at === lines.length && at > 0 && lines[at - 1] === '') {
     lines.pop();
   }
   return lines.join('\n');

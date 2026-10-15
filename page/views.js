@@ -30,7 +30,11 @@ export const JAM_INSTRUMENTS = ['piano', 'guitar'];
 /** The two values of the Jam "Chord tones" overlay: marks the notes of the chord sounding now, or not. */
 export const JAM_CHORD_TONES = ['on', 'off'];
 
-/** Browser-storage keys for the remembered layout, view, motion switch, History display, the two Jam preferences, the change timing of hand evaluations and the size of the view in layout a and in layout b. */
+/** When a section launched from the Song grid starts: at the end of the section that plays, on the next phrase or on the next bar. */
+export const SONG_LAUNCHES = ['section', 'phrase', 'bar'];
+export const DEFAULT_SONG_LAUNCH = 'section';
+
+/** Browser-storage keys for the remembered layout, view, motion switch, History display, the two Jam preferences, the change timing of hand evaluations, the Song grid's launch choice and the size of the view in layout a and in layout b. */
 export const STORAGE_KEYS = {
   layout: 'moontide.layout',
   view: 'moontide.view',
@@ -39,6 +43,7 @@ export const STORAGE_KEYS = {
   jamInstrument: 'moontide.jamInstrument',
   jamChordTones: 'moontide.jamChordTones',
   changeTiming: 'moontide.changeTiming',
+  songLaunch: 'moontide.songLaunch',
   splitA: 'moontide.split.a',
   splitB: 'moontide.split.b',
 };
@@ -92,17 +97,17 @@ export function applyKey(state, { key, focusInEditor, focusInTextEntry, ctrlKey,
 }
 
 /**
- * Reads the nine stored preferences from `storage` (a Storage-like object, or null). Each
+ * Reads the ten stored preferences from `storage` (a Storage-like object, or null). Each
  * value is validated against its closed set — layout in LAYOUTS; view 'none' or in
  * BUILT_VIEWS; motion 'on' or 'off'; historyMode in HISTORY_MODES; jamInstrument in
- * JAM_INSTRUMENTS; jamChordTones in JAM_CHORD_TONES; changeTiming in CHANGE_TIMINGS; splitA and splitB a plain number from 15 to 85 (page/split-model.js) — and
+ * JAM_INSTRUMENTS; jamChordTones in JAM_CHORD_TONES; changeTiming in CHANGE_TIMINGS; songLaunch in SONG_LAUNCHES; splitA and splitB a plain number from 15 to 85 (page/split-model.js) — and
  * becomes undefined when missing or invalid, so a stray/legacy value is never interpolated into selectors, HTML or code.
  * `rejected` lists the storage keys of the sizes that were stored but refused (a missing key is not
  * listed), so the page can say so once, loudly. Returns `available: false`, with every value undefined, when storage is
  * null or any read throws (private window, blocked storage).
  */
 export function readViewPrefs(storage) {
-  const UNAVAILABLE_PREFS = { layout: undefined, view: undefined, motion: undefined, historyMode: undefined, jamInstrument: undefined, jamChordTones: undefined, changeTiming: undefined, splitA: undefined, splitB: undefined, rejected: [], available: false };
+  const UNAVAILABLE_PREFS = { layout: undefined, view: undefined, motion: undefined, historyMode: undefined, jamInstrument: undefined, jamChordTones: undefined, changeTiming: undefined, songLaunch: undefined, splitA: undefined, splitB: undefined, rejected: [], available: false };
   if (!storage) {
     return { ...UNAVAILABLE_PREFS };
   }
@@ -114,6 +119,7 @@ export function readViewPrefs(storage) {
     const rawJamInstrument = storage.getItem(STORAGE_KEYS.jamInstrument);
     const rawJamChordTones = storage.getItem(STORAGE_KEYS.jamChordTones);
     const rawChangeTiming = storage.getItem(STORAGE_KEYS.changeTiming);
+    const rawSongLaunch = storage.getItem(STORAGE_KEYS.songLaunch);
     const rawSplitA = storage.getItem(STORAGE_KEYS.splitA);
     const rawSplitB = storage.getItem(STORAGE_KEYS.splitB);
     const splitA = parseStoredSplit(rawSplitA);
@@ -129,6 +135,7 @@ export function readViewPrefs(storage) {
       jamInstrument: JAM_INSTRUMENTS.includes(rawJamInstrument) ? rawJamInstrument : undefined,
       jamChordTones: JAM_CHORD_TONES.includes(rawJamChordTones) ? rawJamChordTones : undefined,
       changeTiming: CHANGE_TIMINGS.includes(rawChangeTiming) ? rawChangeTiming : undefined,
+      songLaunch: SONG_LAUNCHES.includes(rawSongLaunch) ? rawSongLaunch : undefined,
       splitA,
       splitB,
       rejected,
@@ -156,7 +163,7 @@ export function writeViewPref(storage, key, value) {
 /**
  * The page's state at first render, before any keypress: the stored layout/view/motion/historyMode and
  * Jam preferences, else the defaults (layout 'a', view 'none', motion following the OS reduce-motion
- * setting, history 'list', Jam instrument 'piano', Jam chord tones 'off', change timing 'now').
+ * setting, history 'list', Jam instrument 'piano', Jam chord tones 'off', change timing 'now', Song launch 'section').
  * motionChosen is true only when a motion value was actually stored — while false, the motion
  * value keeps following the OS live (see motionAfterOsChange).
  */
@@ -170,6 +177,7 @@ export function initialViewState({ prefs, prefersReducedMotion }) {
     jamInstrument: prefs.jamInstrument ?? 'piano',
     jamChordTones: prefs.jamChordTones ?? 'off',
     changeTiming: prefs.changeTiming ?? 'now',
+    songLaunch: prefs.songLaunch ?? DEFAULT_SONG_LAUNCH,
   };
 }
 
@@ -205,19 +213,28 @@ export function setChangeTiming(state, value) {
   return { ...state, changeTiming: value };
 }
 
+/** Sets when a section launched from the Song grid starts: 'section', 'phrase' or 'bar'. Throws on a value outside SONG_LAUNCHES (a loud error). */
+export function setSongLaunch(state, value) {
+  if (!SONG_LAUNCHES.includes(value)) {
+    throw new Error(`Moontide: unknown song launch '${String(value)}' (expected one of ${SONG_LAUNCHES.join(', ')})`);
+  }
+  return { ...state, songLaunch: value };
+}
+
 /**
  * The view buttons of the top bar as an ordered list, listing only the given built views in key order (1..6)
  * whatever order `builtViews` lists them in. Each part is { key, digit, name, label, title }: `key` is the digit the
  * button sends to applyKey, `name` the view title, `label` the accessible name `{digit} {Name}` (it contains the
  * visible text at every fit step) and `title` the tooltip `{Name} (key {digit})`. A view without a fixed key
- * (VIEW_KEYS) is ignored.
+ * (VIEW_KEYS) is ignored. `titles` replaces VIEW_TITLES, so a view can be called by another name (the Parts view is called
+ * Song while the code declares a song); the key and the view itself never change.
  */
-export function viewButtonParts(builtViews = BUILT_VIEWS) {
+export function viewButtonParts(builtViews = BUILT_VIEWS, titles = VIEW_TITLES) {
   return Object.entries(VIEW_KEYS)
     .filter(([, view]) => builtViews.includes(view))
     .sort(([a], [b]) => Number(a) - Number(b))
     .map(([digit, view]) => {
-      const name = VIEW_TITLES[view];
+      const name = titles[view];
       return { key: digit, digit, name, label: `${digit} ${name}`, title: `${name} (key ${digit})` };
     });
 }

@@ -77,6 +77,23 @@ export function bpmOf(cps) {
 }
 
 /**
+ * The timing of a change that must take over on one given line: a section launch writes a shift for that very line, so
+ * the takeover has to take the same one. `at` is 'section' (the end of the section that plays), 'bar' or 'phrase', and
+ * `atCycle` is the line, a finite cycle number. Returns a frozen { at, lineLength, atCycle }: `lineLength` (1 for a
+ * section end and a bar, the phrase length for a phrase) is the line the takeover falls back to when the pinned one has
+ * come too close. CHANGE_TIMINGS is not extended: it is the closed set of the stored setting and of the server's schema.
+ */
+export function pinnedTiming(at, atCycle) {
+  if (at !== 'section' && at !== 'bar' && at !== 'phrase') {
+    throw new Error(`Moontide: a pinned change timing is 'section', 'bar' or 'phrase', got '${String(at)}'.`);
+  }
+  if (typeof atCycle !== 'number' || !Number.isFinite(atCycle)) {
+    throw new Error(`Moontide: a pinned change timing needs a finite line, got ${String(atCycle)}.`);
+  }
+  return Object.freeze({ at, lineLength: at === 'phrase' ? DEFAULT_PHRASE_CYCLES : 1, atCycle });
+}
+
+/**
  * The cycle a timed change takes over on: the first multiple of `lineLength` strictly after the scheduler
  * frontier `frontier` (the cycle the scheduler has already queried up to), moved one line further while
  * the lead at `cps` (cycles per second) is below `minLeadSeconds`. Lines are multiples on the scheduler's
@@ -111,6 +128,7 @@ export const CHANGE_COPY = Object.freeze({
   countdownOneBeat: 'in 1 beat',
   countdownTitleBar: 'A code change is waiting. It takes over on the next bar.',
   countdownTitlePhrase: 'A code change is waiting. It takes over on the next phrase.',
+  countdownTitleSection: 'A code change is waiting. It takes over at the end of the section.',
   // The Edits timing group of the Settings card: three buttons. The visible word of each, and its accessible name.
   timingNow: 'now',
   timingBar: 'next bar',
@@ -121,6 +139,7 @@ export const CHANGE_COPY = Object.freeze({
   timingTitle: "When your edits (Ctrl+Enter) take over: now, on the next bar or on the next phrase. Claude's changes choose their own timing.",
   queuedBar: 'Change waiting: it takes over on the next bar.',
   queuedPhrase: 'Change waiting: it takes over on the next phrase.',
+  queuedSection: 'Change waiting: it takes over at the end of the section.',
   canceled: 'Change canceled.',
   settingNow: 'Your edits now take over: now.',
   settingBar: 'Your edits now take over: on the next bar.',
@@ -167,11 +186,12 @@ export function countdownParts(beatsLeft) {
   return { lead, rest: CHANGE_COPY.countdownOneBeat };
 }
 
-/** The hover title of the countdown for a change waiting on 'bar' or 'phrase'. */
+/** The hover title of the countdown for a change waiting on 'bar', 'phrase' or (a section launch) 'section'. */
 export function countdownTitle(at) {
   if (at === 'bar') return CHANGE_COPY.countdownTitleBar;
   if (at === 'phrase') return CHANGE_COPY.countdownTitlePhrase;
-  throw new Error(`Moontide: a waiting change has the timing 'bar' or 'phrase', got '${String(at)}'.`);
+  if (at === 'section') return CHANGE_COPY.countdownTitleSection;
+  throw new Error(`Moontide: a waiting change has the timing 'bar', 'phrase' or 'section', got '${String(at)}'.`);
 }
 
 /**
@@ -188,11 +208,12 @@ export function timingOptions() {
   return CHANGE_TIMINGS.map((value) => Object.freeze({ value, label: copy[value][0], name: copy[value][1] }));
 }
 
-/** The spoken line for a change that just started to wait, for 'bar' or 'phrase'. */
+/** The spoken line for a change that just started to wait, for 'bar', 'phrase' or 'section'. */
 export function queuedLine(at) {
   if (at === 'bar') return CHANGE_COPY.queuedBar;
   if (at === 'phrase') return CHANGE_COPY.queuedPhrase;
-  throw new Error(`Moontide: a waiting change has the timing 'bar' or 'phrase', got '${String(at)}'.`);
+  if (at === 'section') return CHANGE_COPY.queuedSection;
+  throw new Error(`Moontide: a waiting change has the timing 'bar', 'phrase' or 'section', got '${String(at)}'.`);
 }
 
 /** The spoken line after a press of the setting button, for the value it now has. */

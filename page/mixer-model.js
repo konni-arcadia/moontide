@@ -6,7 +6,9 @@
 import { readProgram } from './mixer-rewrite.js';
 import { controlsByCc, controlsText, defaultOf, faderControl, midiTag, readMidiTracks, sweepKey } from './midi-controls.js';
 import { fill } from './midi-plan.js';
-import { parseLabel } from './tracks.js';
+import { groupActions, mixerLayout } from './mixer-groups.js';
+import { SONG_COPY, countText, displayName, quoted } from './structure.js';
+import { labelKey, parseLabel } from './tracks.js';
 import { BUSES, BUS_IDS, DEFAULT_POSTGAIN, EFFECTS, EFFECT_IDS, MOVE_SHAPES, PARAM_STEPS, SENDS, busParamById, effectById, fixedValueOf, formatDisplayNumber, formatNumber, gainToPosition, normalizeStoredCall, valueToPosition } from './mixer-registry.js';
 
 /** Page-visible copy for the Mixer view. `notSaved` is shown
@@ -32,7 +34,9 @@ export const MIXER_COPY = {
   mute: 'Mute',
   solo: 'Solo',
   soloByName: 'Starts with a capital S — Strudel plays this track alone.',
-  soloNeedsLabel: 'Solo needs a label — ask Claude to name this track.',
+  soloNeedsLabel: 'Solo and the light need a label — ask Claude to name this track.',
+  lightTrackTitle: 'Blinks when {name} plays a note',
+  lightGroupTitle: 'Blinks when any track of {group} plays a note',
   addEffect: 'Add effect',
   off: 'off',
   moving: 'moving',
@@ -86,6 +90,26 @@ export const MIXER_COPY = {
   },
   // A strip built from shared code (a declared constant or function) shows this muted line; the mixer reads only the track's own chain.
   sharedRoot: 'Built from shared code',
+  // The accessible name of a group's frame; the group name is cut to 40 code points like every name in a sentence.
+  groupLabel: 'Group {group}',
+  // Mute and solo on a group: the accessible names, the hover texts, the count line and the notes. {tracks} is '1 track' or
+  // '{count} tracks'; {k} of {n} counts the reachable tracks that are muted (or soloed), {j} the soloed ones in the both-partial line.
+  groupMuteName: 'Mute {group}',
+  groupMuteNamePartial: 'Mute {group}, {k} of {n} tracks muted',
+  groupSoloName: 'Solo {group}',
+  groupSoloNamePartial: 'Solo {group}, {k} of {n} tracks soloed',
+  groupMuteTitle: 'Mute {tracks}',
+  groupUnmuteTitle: 'Unmute {tracks}',
+  groupMutePartialTitle: '{k} of {n} tracks muted. A click mutes all {n}.',
+  groupSoloTitle: 'Solo {tracks}',
+  groupEndSoloTitle: 'End the solo of {tracks}',
+  groupSoloPartialTitle: '{k} of {n} tracks soloed. A click solos all {n}.',
+  groupCountMuted: '{k} of {n} muted',
+  groupCountSolo: '{k} of {n} solo',
+  groupCountBoth: '{k} of {n} muted, {j} of {n} solo',
+  groupSkipOne: "Skips 1 track the mixer can't change.",
+  groupSkipMany: "Skips {n} tracks the mixer can't change.",
+  groupEmpty: 'No track of this group is in the code.',
   sharedRootTitle: 'The mixer shows and changes only what this track writes after the shared code.',
   // The fader of a MIDI track sets the instrument's own volume (CC7), written in the .midi() options.
   midiFaderLine: 'instrument volume',
@@ -171,7 +195,7 @@ export function clipMixerLabel(text) {
  * 'add-effect' | 'remove' | 'remove-effect' | 'bypass' | 'restore', name, effect }` (`effect` an effect id, written by
  * its plain name lower-cased), `{ kind: 'param', name, effect, param, value }` (`param` a parameter
  * id of the effect, written by its plain name lower-cased) or `{ kind: 'param-default', name, effect,
- * param }` or `{ kind: 'move', name, effect, from, to, over }` (a filter move) or `{ kind: 'send', name, bus, value }`
+ * param }` or `{ kind: 'group-mute' | 'group-solo', group, on }` (a group's mute or solo, named by the group alone) or `{ kind: 'move', name, effect, from, to, over }` (a filter move) or `{ kind: 'send', name, bus, value }`
  * (`bus` 'reverb' or 'delay') or `{ kind: 'bus-param', bus, param, value }` (a bus is one thing: no track name). An
  * unknown kind throws (a loud error), so a new kind cannot forget its label. A MIDI control is
  * `{ kind: 'midi-control', name, control, value }` or `{ kind: 'midi-control-default', name, control }` (`control` the
@@ -186,6 +210,12 @@ export function mixerHistoryLabel(action) {
   }
   if (action && action.kind === 'solo') {
     return `mixer: ${action.name} solo ${action.on ? 'on' : 'off'}`;
+  }
+  if (action && action.kind === 'group-mute') {
+    return `mixer: group ${displayName(action.group)} ${action.on ? 'muted' : 'unmuted'}`;
+  }
+  if (action && action.kind === 'group-solo') {
+    return `mixer: group ${displayName(action.group)} solo ${action.on ? 'on' : 'off'}`;
   }
   if (action && action.kind === 'add-effect') {
     return `mixer: ${action.name} added ${effectById(action.effect).name.toLowerCase()}`;
@@ -664,6 +694,11 @@ function sendRowsFor(strip, memory) {
  * all three are false or null for any other strip). A browser strip whose track plays MIDI without a MIDI strip (its
  * `.midi()` is in shared code or off its own chain) has `playsMidi` (true, else false) and its own reason line: no add list,
  * no sends, no place on a bus and no editing of its effects, because MIDI output never plays them; its gain, mute and solo still work.
+ * Every strip also has `lightKey`, the key the notes of its track are reported under (see lightKeysOf), or null for a track without
+ * a label, which has no light. Every strip also has `index`, its track's index in the code (the index the song reading gives the same track). `song` (the
+ * result of readStructure for this code; default `{ state: 'none' }`) and `folds` (a Set of the keys of folded groups; default
+ * empty) give a ready model its `layout`: null when the song is not read or names no group, else mixerLayout's tree with the
+ * words of each group (see groupLayout).
  */
 export function buildMixerModel(input) {
   try {
@@ -744,12 +779,12 @@ function midiChipFor(state, trackName) {
 }
 
 /**
- * The group of every MIDI track whose port and channel the page can read, `Map<identity, member[]>`: the tracks of
- * the same read that play the same port on the same channel (the port stands in for the instrument, so a file's
+ * The channel mates of every MIDI track whose port and channel the page can read, `Map<identity, mate[]>`: the tracks
+ * of the same read that play the same port on the same channel (the port stands in for the instrument, so a file's
  * instrument and its port are the same key), in code order, the track itself and muted ones included. A track whose
- * channel or port cannot be read is in no group (its channel is unknown), so it is alone.
+ * channel or port cannot be read has no channel mates (its channel is unknown), so it is alone.
  */
-function midiGroups(midiTracks) {
+function channelMates(midiTracks) {
   const byKey = new Map();
   for (const track of midiTracks.values()) {
     const { port, channel } = track.spine;
@@ -758,16 +793,16 @@ function midiGroups(midiTracks) {
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key).push(track);
   }
-  const groups = new Map();
-  for (const members of byKey.values()) for (const member of members) groups.set(member.identity, members);
-  return groups;
+  const mates = new Map();
+  for (const members of byKey.values()) for (const member of members) mates.set(member.identity, members);
+  return mates;
 }
 
 /**
- * The controls written on any member of a group, `Map<id, number>`: the first member in code order that writes a
+ * The controls written on any of the tracks on one port and channel, `Map<id, number>`: the first one in code order that writes a
  * control gives its value (the evaluation refuses two different values of one control on one channel, so they agree).
  */
-function groupControls(members) {
+function channelControls(members) {
   const written = new Map();
   for (const member of members) {
     for (const [id, value] of member.spine.controls) if (!written.has(id)) written.set(id, value);
@@ -775,9 +810,15 @@ function groupControls(members) {
   return written;
 }
 
-/** The shared-code facts of a strip: `sharedRoot` from the read, and the muted line with its hover (null when the track is not built from shared code). */
-function sharedRootFacts(read) {
-  const sharedRoot = read.ok && read.sharedRoot === true;
+/**
+ * The shared-code facts of a strip: `sharedRoot` from the read, and the muted line with its hover (null when the track is not
+ * built from shared code). `canonicalPlay` is true when the piece's play() is the song helper the page knows (the song
+ * reading says its helper is the canonical text).
+ */
+function sharedRootFacts(read, canonicalPlay) {
+  // A track written with play(...) starts from the song's own helper, so it shows no shared-code line. When the helper was
+  // changed, or play is some other function, that line is the warning the user needs and stays.
+  const sharedRoot = read.ok && read.sharedRoot === true && !(read.playRoot === true && canonicalPlay);
   return {
     sharedRoot,
     sharedRootText: sharedRoot ? MIXER_COPY.sharedRoot : null,
@@ -792,20 +833,20 @@ function sharedRootFacts(read) {
  * chips (every declared control except the volume, in model order; none while the controls are off) and
  * `midi.controls` the states they and the inspector rows are drawn from.
  */
-function midiStrip(track, read, midiTrack, colorOf, sweepsRead, members) {
+function midiStrip(track, read, midiTrack, colorOf, sweepsRead, members, canonicalPlay) {
   const instrument = midiTrack.instrument;
   const control = instrument === null ? null : faderControl(instrument);
-  // A member whose controls cannot be written (a rewrite writes every member or nothing) turns the whole group off with its reason.
-  const groupReason = members.map((member) => member.reason).find((candidate) => candidate !== null) ?? null;
-  const ownReason = midiTrack.reason ?? groupReason;
+  // A channel mate whose controls cannot be written (a rewrite writes every track on the channel or none) turns all of them off with its reason.
+  const channelReason = members.map((member) => member.reason).find((candidate) => candidate !== null) ?? null;
+  const ownReason = midiTrack.reason ?? channelReason;
   // A valid file whose model has no volume control: the strip says so, and the fader is off.
   const reason = ownReason === null && instrument !== null && control === null ? 'noVolume' : ownReason;
   // The other controls work for every reason but the ones that hide the instrument; a model with no volume still has them.
   const controlsOk = instrument !== null && (reason === null || reason === 'noVolume');
   const name = track.displayName ?? track.name;
   const sweeps = midiSweepsFor(midiTrack, sweepsRead);
-  // A channel has one value per control: what the group writes, not only what this track writes.
-  const written = groupControls(members);
+  // A channel has one value per control: what all its tracks write, not only what this track writes.
+  const written = channelControls(members);
   const others = members.filter((member) => member !== midiTrack).map((member) => member.name);
   const sharedText = others.length === 0 ? '' : fill(MIXER_COPY.midiShared, { names: others.join(', ') });
   const states = controlsOk ? midiControlStates(instrument, written, sweeps) : [];
@@ -832,10 +873,11 @@ function midiStrip(track, read, midiTrack, colorOf, sweepsRead, members) {
     sounding: !track.muted,
     ...muteSoloModel(track),
     color: colorOf(track.identity),
+    index: track.index,
     editable: read.ok,
     reason: read.ok ? null : read.reason,
     reasonText: read.ok ? null : reasonTextFor(read.reason),
-    ...sharedRootFacts(read),
+    ...sharedRootFacts(read, canonicalPlay),
     midi,
     busHidden: false,
     playsMidi: false,
@@ -849,7 +891,26 @@ function midiStrip(track, read, midiTrack, colorOf, sweepsRead, members) {
   };
 }
 
-function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new Map(), keepBus = null, rig = { setup: 'absent' } }) {
+/**
+ * The key each track's light listens for, `Map<identity, key | null>`: for a plain label, the key the note tag reports (the
+ * label without its mute underscore and solo marker, the same for `hats` and a muted copy `hats_`, where the identity of the
+ * second one gets a number to stay unique), `$` and the number of the statement for a `$` label (the n-th one in code order that a
+ * leading or trailing underscore does not silence, counted from 0, as the tag counts them), null for a track without a label,
+ * which Strudel never reports. A `$` statement an underscore silences never plays, so it keeps its identity, a key no note names.
+ */
+function lightKeysOf(tracks) {
+  const keys = new Map();
+  let dollars = 0;
+  for (const track of tracks) {
+    if (track.kind !== 'label') keys.set(track.identity, null);
+    else if (!track.label.includes('$')) keys.set(track.identity, labelKey(track.label));
+    else if (track.label.startsWith('_') || track.label.endsWith('_')) keys.set(track.identity, track.identity);
+    else keys.set(track.identity, `$${dollars++}`);
+  }
+  return keys;
+}
+
+function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new Map(), keepBus = null, rig = { setup: 'absent' }, song = { state: 'none' }, folds = new Set() }) {
   if (typeof code !== 'string' || code.trim() === '') return { status: 'empty', strips: [], buses: [], busMemory };
   let program;
   try {
@@ -859,18 +920,20 @@ function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new 
   }
   if (program.tracks.length === 0) return { status: 'empty', strips: [], buses: [], busMemory };
   const staleRecords = [];
+  // The song reading knows whether play() is the canonical helper (an unreadable song still says so); with no structure it is not.
+  const canonicalPlay = (song.state === 'read' || song.state === 'unreadable') && song.helper === 'canonical';
   // One read of the MIDI tracks per render; code that does not parse reads as no MIDI strips (it is unreadable above anyway).
   const midiRead = readMidiTracks(code, { parse, rig });
   const midiTracks = midiRead.ok ? midiRead.tracks : new Map();
   const sweepsRead = midiRead.ok ? { sweeps: midiRead.sweeps, sweepsUnknown: midiRead.sweepsUnknown } : { sweeps: new Map(), sweepsUnknown: new Set() };
-  // The groups come first: a folded track still belongs to its port and channel, so a kept strip names it.
-  const groups = midiGroups(midiTracks);
+  // The channel mates come first: a folded track still belongs to its port and channel, so a kept strip names it.
+  const mates = channelMates(midiTracks);
   const buildStrip = (track, read, midiTrack) => {
     // A track that sets its own orbit or bus values off its own chain hides its real bus: it gets no bus facts, so no bus strip counts it and its sends are off.
     const busHidden = read.ok && read.busHidden === true;
     // A browser track that plays MIDI has no MIDI strip: MIDI output never plays its effects or its sends, so none of them is offered and it feeds no bus.
     const playsMidi = read.ok && read.playsMidi === true;
-    if (midiTrack !== undefined) return midiStrip(track, read, midiTrack, colorOf, sweepsRead, groups.get(track.identity) ?? [midiTrack]);
+    if (midiTrack !== undefined) return midiStrip(track, read, midiTrack, colorOf, sweepsRead, mates.get(track.identity) ?? [midiTrack], canonicalPlay);
     const own = read.ok ? bypassRecords.filter((record) => record.identity === track.identity) : [];
     // The code wins: a record whose effect is back in the code is stale and the caller drops it.
     const kept = [];
@@ -884,10 +947,11 @@ function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new 
       sounding: !track.muted,
       ...muteSoloModel(track),
       color: colorOf(track.identity),
+      index: track.index,
       editable: read.ok,
       reason: read.ok ? null : read.reason,
       reasonText: read.ok ? (playsMidi ? MIXER_COPY.playsMidi : null) : reasonTextFor(read.reason),
-      ...sharedRootFacts(read),
+      ...sharedRootFacts(read, canonicalPlay),
       midi: null,
       playsMidi,
       fader: faderModel(read),
@@ -903,6 +967,7 @@ function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new 
       busHidden,
     };
   };
+  const lightKeys = lightKeysOf(program.tracks);
   const noNotes = [];
   const strips = [];
   for (const track of program.tracks) {
@@ -912,7 +977,9 @@ function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new 
       noNotes.push({ identity: track.identity, name: track.displayName ?? track.name, tagText: midiTag(midiTrack)?.text ?? null, silent: track.muted });
       continue;
     }
-    strips.push(buildStrip(track, read, midiTrack));
+    const strip = buildStrip(track, read, midiTrack);
+    strip.lightKey = lightKeys.get(track.identity) ?? null;
+    strips.push(strip);
   }
   const { buses, busMemory: nextMemory } = busEntries(strips, busMemory, keepBus);
   for (const strip of strips) strip.sends = sendRowsFor(strip, nextMemory);
@@ -923,7 +990,83 @@ function buildModel({ code, parse, colorOf, bypassRecords = [], busMemory = new 
     })
     .join(', ');
   const noNotesText = noNotes.length === 0 ? null : fill(MIXER_COPY.noNotes, { list });
-  return { status: 'ready', strips, staleRecords, buses, busMemory: nextMemory, noNotes, noNotesText };
+  const layout = groupLayout(mixerLayout({ reading: song, strips, folds }), strips);
+  return { status: 'ready', strips, staleRecords, buses, busMemory: nextMemory, noNotes, noNotesText, layout };
+}
+
+/**
+ * The layout of mixerLayout (null stays null) with the words each group frame shows: `text` and `title` (the name cut
+ * to 40 code points, and the whole name), `label` (the frame's accessible name), `foldTitle` (the grid's words, the
+ * name in single quotes), `count` and `countText` (the strips below the group at any depth), then what the head's mute
+ * and solo buttons need (see groupControls): `mute` and `solo`, `countText` and `countTitle` (the plain count, or the
+ * partial forms) and `noteText`.
+ */
+function groupLayout(layout, strips) {
+  if (layout === null) return null;
+  const stripsByIdentity = new Map(strips.map((strip) => [strip.identity, strip]));
+  for (const group of layout.groups) {
+    group.text = displayName(group.name);
+    group.title = group.name;
+    group.label = fill(MIXER_COPY.groupLabel, { group: displayName(group.name) });
+    group.foldTitle = fill(group.open ? SONG_COPY.foldTitle : SONG_COPY.openTitle, { group: quoted(group.name) });
+    group.count = group.members.length;
+    group.countText = countText(group.count, SONG_COPY.trackOne, SONG_COPY.trackMany);
+    Object.assign(group, groupControls(group, groupActions(group, stripsByIdentity)));
+  }
+  return layout;
+}
+
+/** `n` tracks as a sentence part: '1 track' or '3 tracks'. */
+function tracksText(n) {
+  return countText(n, SONG_COPY.trackOne, SONG_COPY.trackMany);
+}
+
+/**
+ * The mute and solo of one group head, from groupActions: for each, `{ pressed, on, identities, disabled, name, title }`
+ * (`pressed` true, false or 'mixed'; `on` what a click writes; `identities` the tracks it writes; `disabled` when no
+ * track can be reached; `name` the accessible name and `title` the hover text), the group's `countText` and `countTitle`
+ * (the plain count, or what is partly muted or soloed) and `noteText` (the group has no strip, else how many tracks
+ * the buttons skip, else null).
+ */
+function groupControls(group, actions) {
+  const who = displayName(group.name);
+  const button = (kind, action) => {
+    const mute = kind === 'mute';
+    const mixed = action.pressed === 'mixed';
+    const copy = mute
+      ? { name: MIXER_COPY.groupMuteName, partial: MIXER_COPY.groupMuteNamePartial, off: MIXER_COPY.groupMuteTitle, all: MIXER_COPY.groupUnmuteTitle, some: MIXER_COPY.groupMutePartialTitle, none: MIXER_COPY.mute }
+      : { name: MIXER_COPY.groupSoloName, partial: MIXER_COPY.groupSoloNamePartial, off: MIXER_COPY.groupSoloTitle, all: MIXER_COPY.groupEndSoloTitle, some: MIXER_COPY.groupSoloPartialTitle, none: MIXER_COPY.solo };
+    const values = { group: who, k: action.k, n: action.n, tracks: tracksText(action.n) };
+    let title = copy.none;
+    if (mixed) title = fill(copy.some, values);
+    else if (action.n > 0) title = fill(action.pressed === true ? copy.all : copy.off, values);
+    return {
+      pressed: action.pressed,
+      on: action.on,
+      identities: action.identities,
+      disabled: action.n === 0,
+      name: fill(mixed ? copy.partial : copy.name, values),
+      title,
+    };
+  };
+  const mute = button('mute', actions.mute);
+  const solo = button('solo', actions.solo);
+  const partMuted = mute.pressed === 'mixed';
+  const partSolo = solo.pressed === 'mixed';
+  let countLine = group.countText;
+  if (partMuted && partSolo && actions.mute.n === actions.solo.n) {
+    countLine = fill(MIXER_COPY.groupCountBoth, { k: actions.mute.k, n: actions.mute.n, j: actions.solo.k });
+  } else if (partMuted || partSolo) {
+    // The two buttons can reach different numbers of tracks (an unlabeled track mutes but cannot solo), so each part names its own.
+    const parts = [];
+    if (partMuted) parts.push(fill(MIXER_COPY.groupCountMuted, { k: actions.mute.k, n: actions.mute.n }));
+    if (partSolo) parts.push(fill(MIXER_COPY.groupCountSolo, { k: actions.solo.k, n: actions.solo.n }));
+    countLine = parts.join(', ');
+  }
+  let noteText = null;
+  if (group.members.length === 0) noteText = MIXER_COPY.groupEmpty;
+  else if (actions.skipped > 0) noteText = fill(actions.skipped === 1 ? MIXER_COPY.groupSkipOne : MIXER_COPY.groupSkipMany, { n: actions.skipped });
+  return { mute, solo, countText: countLine, countTitle: countLine, noteText };
 }
 
 // --- The inspector: one effect's parameters ---

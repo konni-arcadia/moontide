@@ -6,6 +6,7 @@ import {
   MAX_ASK_CONTEXT_LENGTH,
   askMessage,
   askTextProblem,
+  cellFitPrefill,
   counterText,
   createAskStatus,
   cutText,
@@ -345,6 +346,10 @@ test('every chip and string field is at most 200 units for 1000-character inputs
     { kind: 'lane', track: big, cycle: 3 },
     { kind: 'note', note: big, role: 'scale', scale: big },
     { kind: 'warning', chord: big, outside: big, avoid: big, seconds: 3, scale: big },
+    { kind: 'cell', section: big, track: big, variation: big, fit: 'does-not-fit', outside: big },
+    { kind: 'cell', section: big, track: big, variation: big, fit: 'fits' },
+    { kind: 'cell', section: big, track: big, rest: true },
+    { kind: 'group', name: big, parent: big },
   ];
   for (const descriptor of descriptors) {
     const { context, chip } = describeContext(descriptor);
@@ -407,6 +412,18 @@ test('every ASK_COPY string equals its pinned text exactly', () => {
     shiftRightClickTitle: "Shift + right-click keeps the browser's own menu.",
     errorChipLead: 'Failed change',
     errorPrefillLead: 'The last change failed with this error:',
+    cellFitRequest: "Fit variation '{variation}' of track '{track}' to the harmony of section '{section}' ({harmony}). It has notes outside it: {notes}.",
+    raiseRequest: "Raise note {note} at cycle {cycle}, beat {beat} of '{track}' by {amount}.",
+    lowerRequest: "Lower note {note} at cycle {cycle}, beat {beat} of '{track}' by {amount}.",
+    restRequest: "Turn note {note} at cycle {cycle}, beat {beat} of '{track}' into a rest.",
+    softerRequest: "Play note {note} at cycle {cycle}, beat {beat} of '{track}' softer.",
+    louderRequest: "Play note {note} at cycle {cycle}, beat {beat} of '{track}' louder.",
+    semitoneAmount: '1 semitone',
+    semitonesAmount: '{n} semitones',
+    octaveAmount: '1 octave',
+    octavesAmount: '{n} octaves',
+    rangeCut: 'Cut to the page shown — cycles {a} to {b}.',
+    rangeCutOne: 'Cut to the page shown — cycle {a}.',
   });
 });
 
@@ -471,6 +488,137 @@ test('askMessage shows at most one line, in the order disconnected, counter, not
   );
   assert.equal(askMessage({ connected: false, length: 5, notSent: false, tokenRefused: false, lineTooLong: true }), ASK_COPY.disconnected);
   assert.doesNotMatch(ASK_COPY.lineTooLong, /2000/);
+});
+
+test('the range cut line comes last: it shows only when nothing above it applies', () => {
+  const cut = { from: 40, to: 63 };
+  assert.equal(askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false, rangeCut: cut }), 'Cut to the page shown — cycles 40 to 63.');
+  assert.equal(askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false, rangeCut: { from: 63, to: 63 } }), 'Cut to the page shown — cycle 63.');
+  assert.equal(askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false, rangeCut: null }), null);
+  assert.equal(askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false }), null);
+  assert.equal(askMessage({ connected: false, length: 5, notSent: false, tokenRefused: false, rangeCut: cut }), ASK_COPY.disconnected);
+  assert.equal(askMessage({ connected: true, length: 1900, notSent: false, tokenRefused: false, rangeCut: cut }), '1900 / 2000');
+  assert.equal(askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false, lineTooLong: true, rangeCut: cut }), ASK_COPY.lineTooLong);
+  assert.equal(askMessage({ connected: true, length: 5, notSent: true, tokenRefused: false, rangeCut: cut }), ASK_COPY.notSent);
+  assert.equal(askMessage({ connected: true, length: 5, notSent: true, tokenRefused: true, rangeCut: cut }), ASK_COPY.notSentToken);
+  for (const bad of [{ from: 5, to: 4 }, { from: 1.5, to: 3 }, { from: -1, to: 3 }, {}, 'x']) {
+    assert.throws(() => askMessage({ connected: true, length: 5, notSent: false, tokenRefused: false, rangeCut: bad }), /Moontide: a cut range/, JSON.stringify(bad));
+  }
+});
+
+/** The notes of a range as the Timeline hands them over: moment notes without a state. */
+function sampleRangeNotes(count = 3) {
+  return Array.from({ length: count }, (_, at) => ({ track: 't1', note: 'c3', velocity: 0.8, start: 2 + at, end: 2.25 + at }));
+}
+
+/** A range descriptor as page/main.js builds it. */
+function rangeDescriptor(overrides = {}, gesture = {}) {
+  return {
+    kind: 'range',
+    track: 't1',
+    from: 2,
+    to: 5,
+    gesture: { kind: 'range', version: 4, notes: sampleRangeNotes(), more: 0, ...gesture },
+    ...overrides,
+  };
+}
+
+test('describeContext range gives the range context, the range chip and the gesture, without a moment', () => {
+  const described = describeContext(rangeDescriptor());
+  assert.deepEqual(described.context, { kind: 'range', track: 't1', from: 2, to: 5 });
+  assert.equal(described.chip, 'Range · t1 · cycles 2 to 5 · 3 notes');
+  assert.deepEqual(described.gesture, { kind: 'range', version: 4, notes: sampleRangeNotes(), more: 0 });
+  assert.ok(Object.isFrozen(described.gesture));
+  assert.deepEqual(Object.keys(described), ['context', 'chip', 'gesture']);
+  // A cut rides next to them for the box, never in the context.
+  const cut = describeContext(rangeDescriptor({ cut: { from: 2, to: 5 } }));
+  assert.deepEqual(cut.rangeCut, { from: 2, to: 5 });
+  assert.deepEqual(Object.keys(cut), ['context', 'chip', 'gesture', 'rangeCut']);
+  assert.deepEqual(cut.context, { kind: 'range', track: 't1', from: 2, to: 5 });
+  assert.equal(Object.hasOwn(describeContext(rangeDescriptor({ cut: null })), 'rangeCut'), false);
+});
+
+test('the range chip reads cycle for one, no notes and 1 note, the sections in double quotes, and the count includes more', () => {
+  const chipOf = (overrides, gesture) => describeContext(rangeDescriptor(overrides, gesture)).chip;
+  assert.equal(chipOf({ from: 2, to: 2 }, { notes: [] }), 'Range · t1 · cycle 2 · no notes');
+  assert.equal(chipOf({ from: 2, to: 2 }, { notes: sampleRangeNotes(1) }), 'Range · t1 · cycle 2 · 1 note');
+  assert.equal(chipOf({ section: 'y' }), 'Range · t1 · cycles 2 to 5 · section "y" · 3 notes');
+  assert.equal(chipOf({ section: 'x', sectionTo: 'y' }), 'Range · t1 · cycles 2 to 5 · sections "x" to "y" · 3 notes');
+  assert.equal(chipOf({}, { notes: sampleRangeNotes(32), more: 8 }), 'Range · t1 · cycles 2 to 5 · 40 notes');
+  const described = describeContext(rangeDescriptor({ section: 'x', sectionTo: 'y' }));
+  assert.deepEqual(described.context, { kind: 'range', track: 't1', from: 2, to: 5, section: 'x', sectionTo: 'y' });
+  // Without a section the context has neither key.
+  assert.deepEqual(Object.keys(describeContext(rangeDescriptor()).context), ['kind', 'track', 'from', 'to']);
+});
+
+test('a 200-character lane name is cut first in the range chip; the cycles, the sections and the notes stay', () => {
+  const long = 'n'.repeat(200);
+  const { chip, context } = describeContext(rangeDescriptor({ track: long, from: 40, to: 63, section: 'verse', sectionTo: 'chorus' }, { notes: sampleRangeNotes(32), more: 8 }));
+  const tail = 'cycles 40 to 63 · sections "verse" to "chorus" · 40 notes';
+  assert.ok(chip.endsWith(` · ${tail}`), chip);
+  assert.ok(chip.length <= MAX_ASK_CONTEXT_LENGTH);
+  assert.ok(chip.startsWith('Range · nnnn') && chip.includes('\u2026 · cycles'), chip);
+  assert.equal(context.track, long, 'the context keeps the whole name');
+  // Long section names are cut in the chip (40 characters each) but not in the context.
+  const sections = describeContext(rangeDescriptor({ track: long, section: 's'.repeat(200), sectionTo: 'e'.repeat(200) }));
+  assert.ok(sections.chip.length <= MAX_ASK_CONTEXT_LENGTH);
+  assert.ok(sections.chip.endsWith(`sections "${'s'.repeat(39)}\u2026" to "${'e'.repeat(39)}\u2026" · 3 notes`), sections.chip);
+  assert.equal(sections.context.section, 's'.repeat(200));
+  assert.equal(sections.context.sectionTo, 'e'.repeat(200));
+});
+
+test('a range of 32 notes with long names on a 200-character lane gives notes up to more until the line is at most 8192 bytes, and the chip keeps its cycles', () => {
+  const name = (letter) => letter.repeat(150);
+  const notes = Array.from({ length: 32 }, (_, at) => ({ track: name('t'), instrument: name('i'), note: name('n'), sound: name('s'), velocity: 0.9, start: 40 + at / 10, end: 40.5 + at / 10 }));
+  const described = describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, section: 'verse', sectionTo: 'chorus' }, { notes }));
+  assert.ok(described.chip.endsWith('cycles 40 to 71 · sections "verse" to "chorus" · 32 notes'), described.chip);
+  const fields = { id: 'ask-1', text: 'what is here?', context: described.context, chip: described.chip, current: 4, gesture: described.gesture };
+  assert.ok(ask.requestLineBytes(fields) > 8192, 'the long names push the whole range over one line');
+  const fitted = ask.fitGestureToLine(fields);
+  assert.ok(ask.requestLineBytes({ ...fields, gesture: fitted }) <= 8192);
+  assert.ok(fitted.notes.length > 0 && fitted.notes.length < 32);
+  assert.equal(fitted.notes.length + fitted.more, 32, 'the notes left out are counted, none is lost');
+  assert.equal(ask.requestFitsLine(fields), true);
+  // The chip counted the notes before the cut and still reads the same after it: notes and more are one count.
+  assert.equal(describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, section: 'verse', sectionTo: 'chorus' }, { notes: fitted.notes, more: fitted.more })).chip, described.chip);
+});
+
+test('describeContext throws for a range the server would refuse or the page got wrong', () => {
+  for (const [bad, pattern] of [
+    [rangeDescriptor({ track: '' }), /track/],
+    [rangeDescriptor({ from: -1 }), /from/],
+    [rangeDescriptor({ from: 1.5 }), /from/],
+    [rangeDescriptor({ to: 1 }), /to/],
+    [rangeDescriptor({ from: 0, to: 32 }), /at most 32 cycles/],
+    [rangeDescriptor({ sectionTo: 'y' }), /sectionTo/],
+    [rangeDescriptor({ section: 'x', sectionTo: 'x' }), /sectionTo/],
+    [rangeDescriptor({ moment: sampleMoment() }), /cannot carry a moment/],
+    [rangeDescriptor({ cut: { from: 5, to: 2 } }), /cut range/],
+    [{ ...rangeDescriptor(), gesture: undefined }, /range gesture/],
+    [{ ...rangeDescriptor(), gesture: { kind: 'rest' } }, /range gesture/],
+    [rangeDescriptor({}, { version: 0 }), /version/],
+    [rangeDescriptor({}, { version: undefined }), /version/],
+    [rangeDescriptor({}, { notes: sampleRangeNotes(33) }), /at most 32 range notes/],
+    [rangeDescriptor({}, { notes: 'x' }), /range notes/],
+    [rangeDescriptor({}, { more: -1 }), /count of more/],
+    [rangeDescriptor({}, { notes: [{ track: 't1', start: 1 }] }), /range note 1/],
+    [rangeDescriptor({}, { notes: [{ track: '', start: 1, end: 2 }] }), /range note 1/],
+  ]) {
+    assert.throws(() => describeContext(bad), pattern, JSON.stringify(bad).slice(0, 90));
+  }
+  // A range gesture on a lane with a moment is the wrong pairing.
+  assert.throws(
+    () => describeContext({ kind: 'lane', track: 'lead', cycle: 34, moment: sampleMoment(), gesture: { kind: 'range', version: 1, notes: [], more: 0 } }),
+    /range gesture goes only with a range context/,
+  );
+});
+
+test('a range note keeps the named keys without a state, and cuts its strings at the context limit', () => {
+  const note = { track: 'x'.repeat(300), instrument: 'i', note: 'c3', drum: 'Kick', sound: 's', velocity: 0.5, start: 1, end: 2, state: 'sounding', stray: 1 };
+  const [kept] = describeContext(rangeDescriptor({}, { notes: [note] })).gesture.notes;
+  assert.deepEqual(Object.keys(kept), ['track', 'instrument', 'sound', 'note', 'drum', 'velocity', 'start', 'end']);
+  assert.equal(kept.track.length, MAX_ASK_CONTEXT_LENGTH);
+  assert.ok(!('state' in kept) && !('stray' in kept));
 });
 
 /** A manual clock and timer list for the status machine: timers fire in time order. */
@@ -787,6 +935,82 @@ test('describeContext lane with a moment gives the moment chip and returns the m
   });
 });
 
+// --- describeContext with a gesture, and the ready-made requests of the Timeline ---
+
+test('describeContext gives the gesture of a lane that carries a moment, as a frozen copy of the named keys only', () => {
+  const moment = sampleMoment();
+  for (const gesture of [{ kind: 'pitch', semitones: 2 }, { kind: 'rest' }, { kind: 'velocity', direction: 'louder' }]) {
+    const described = describeContext({ kind: 'lane', track: 'lead', cycle: 34, moment, gesture: { ...gesture, extra: 'dropped' } });
+    assert.deepEqual(described.gesture, gesture);
+    assert.ok(Object.isFrozen(described.gesture));
+    assert.deepEqual(Object.keys(described), ['context', 'chip', 'moment', 'gesture']);
+  }
+  // Without a gesture the described context has no such key.
+  assert.equal(Object.hasOwn(describeContext({ kind: 'lane', track: 'lead', cycle: 34, moment }), 'gesture'), false);
+});
+
+test('describeContext throws for a gesture that rides on anything but a lane with a moment, or that is out of bounds', () => {
+  const gesture = { kind: 'rest' };
+  assert.throws(() => describeContext({ kind: 'lane', track: 'lead', cycle: 34, gesture }), /cannot carry a gesture/);
+  assert.throws(() => describeContext({ kind: 'lane', track: 'lead', gesture }), /cannot carry a gesture/);
+  assert.throws(() => describeContext({ kind: 'session', moment: sampleMoment(), gesture }), /cannot carry a gesture/);
+  assert.throws(() => describeContext({ kind: 'part', name: 'verse', moment: sampleMoment(), gesture }), /cannot carry a gesture/);
+  assert.throws(() => describeContext({ kind: 'track', track: 'lead', gesture }), /cannot carry a gesture/);
+  for (const bad of [
+    { kind: 'pitch', semitones: 0 },
+    { kind: 'pitch', semitones: 128 },
+    { kind: 'pitch', semitones: 1.5 },
+    { kind: 'pitch' },
+    { kind: 'velocity', direction: 'loud' },
+    { kind: 'drag' },
+    'rest',
+    null,
+  ]) {
+    assert.throws(() => describeContext({ kind: 'lane', track: 'lead', cycle: 34, moment: sampleMoment(), gesture: bad }), /gesture/, JSON.stringify(bad));
+  }
+});
+
+test('timelineEditPrefill writes the ready-made request of each gesture, with the amount in semitones or octaves', () => {
+  const at = { note: 'c3', cycle: 12, beat: 3, track: 't2' };
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'pitch', semitones: 1 }), "Raise note c3 at cycle 12, beat 3 of 't2' by 1 semitone.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'pitch', semitones: 2 }), "Raise note c3 at cycle 12, beat 3 of 't2' by 2 semitones.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'pitch', semitones: 12 }), "Raise note c3 at cycle 12, beat 3 of 't2' by 1 octave.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'pitch', semitones: -24 }), "Lower note c3 at cycle 12, beat 3 of 't2' by 2 octaves.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'pitch', semitones: -13 }), "Lower note c3 at cycle 12, beat 3 of 't2' by 13 semitones.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'rest' }), "Turn note c3 at cycle 12, beat 3 of 't2' into a rest.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'velocity', direction: 'softer' }), "Play note c3 at cycle 12, beat 3 of 't2' softer.");
+  assert.equal(ask.timelineEditPrefill({ ...at, kind: 'velocity', direction: 'louder' }), "Play note c3 at cycle 12, beat 3 of 't2' louder.");
+  // A note written as a number reads as the number.
+  assert.equal(ask.timelineEditPrefill({ ...at, note: 36, kind: 'rest' }), "Turn note 36 at cycle 12, beat 3 of 't2' into a rest.");
+});
+
+test('timelineEditPrefill cleans and cuts the names, and throws on anything it cannot write', () => {
+  const at = { note: 'c3', cycle: 12, beat: 3, track: 't2', kind: 'rest' };
+  const long = ask.timelineEditPrefill({ ...at, track: `${'x'.repeat(300)}\u202e` });
+  assert.ok(long.includes(`${'x'.repeat(199)}\u2026`), 'the track is cut at the context limit');
+  assert.ok(!long.includes('\u202e'));
+  for (const bad of [
+    { ...at, track: undefined },
+    { ...at, track: '' },
+    { ...at, note: '' },
+    { ...at, note: undefined },
+    { ...at, cycle: -1 },
+    { ...at, cycle: 1.5 },
+    { ...at, beat: 0 },
+    { ...at, beat: 5 },
+    { ...at, kind: 'drag' },
+    { ...at, kind: 'range' },
+    { ...at, kind: 'pitch' },
+    { ...at, kind: 'pitch', semitones: 0 },
+    { ...at, kind: 'pitch', semitones: 200 },
+    { ...at, kind: 'velocity' },
+    { ...at, kind: 'velocity', direction: 'quiet' },
+  ]) {
+    assert.throws(() => ask.timelineEditPrefill(bad), /Moontide:/, JSON.stringify(bad));
+  }
+  assert.throws(() => ask.timelineEditPrefill(null), /Moontide:/);
+});
+
 test('the moment chip counts every note: no notes, 1 note, N notes and the rest in more', () => {
   const chipOf = (moment) => describeContext({ kind: 'lane', track: 'lead', cycle: 34, moment }).chip;
   assert.equal(chipOf(sampleMoment({ notes: [] })), 'Lane lead · cycle 34, beat 3 · no notes');
@@ -975,4 +1199,91 @@ test('status: the render callback also receives the short form as a second argum
   assert.deepEqual(calls[2], ['Claude received it', 'Received']);
   advance(5000);
   assert.deepEqual(calls[calls.length - 1], [null], 'hiding passes no text and no short form');
+});
+
+test('describeContext cell: a fixed variation says its fit at the end, a rest says rest, and no fit gives no suffix', () => {
+  assert.deepEqual(describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb' }), {
+    context: { kind: 'cell', section: 'y', track: 'bass', variation: 'vb' },
+    chip: 'Cell "y" \u00B7 bass \u00B7 vb',
+  });
+  assert.deepEqual(describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb', fit: 'does-not-fit', outside: 'F#, A' }), {
+    context: { kind: 'cell', section: 'y', track: 'bass', variation: 'vb', fit: 'does-not-fit', outside: 'F#, A' },
+    chip: 'Cell "y" \u00B7 bass \u00B7 vb \u00B7 does not fit (F#, A)',
+  });
+  assert.equal(describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb', fit: 'fits' }).chip, 'Cell "y" \u00B7 bass \u00B7 vb \u00B7 fits');
+  assert.equal(describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb', fit: 'cannot-check' }).chip, 'Cell "y" \u00B7 bass \u00B7 vb \u00B7 cannot check');
+  assert.deepEqual(describeContext({ kind: 'cell', section: 'y', track: 'bass', rest: true }), {
+    context: { kind: 'cell', section: 'y', track: 'bass', rest: true },
+    chip: 'Cell "y" \u00B7 bass \u00B7 rest',
+  });
+});
+
+test('describeContext cell: a prefill on the descriptor, and a null fit, are not part of the context', () => {
+  const described = describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb', fit: null, prefill: 'text' });
+  assert.deepEqual(described.context, { kind: 'cell', section: 'y', track: 'bass', variation: 'vb' });
+  assert.equal(Object.hasOwn(described, 'prefill'), false);
+});
+
+test('describeContext cell throws loudly for both variation and rest, for neither, and for a fit the grid does not have', () => {
+  const cell = (extra) => () => describeContext({ kind: 'cell', section: 'y', track: 'bass', ...extra });
+  const loud = /^Error: Moontide: ask context cell needs/;
+  assert.throws(cell({ variation: 'vb', rest: true }), loud);
+  assert.throws(cell({}), loud);
+  assert.throws(cell({ rest: false }), loud);
+  assert.throws(cell({ variation: 'vb', fit: 'maybe' }), loud);
+  assert.throws(cell({ rest: true, fit: 'fits' }), loud);
+  assert.throws(cell({ variation: 'vb', fit: 'fits', outside: 'F#' }), loud);
+  assert.throws(cell({ variation: 'vb', outside: 'F#' }), loud);
+  assert.throws(() => describeContext({ kind: 'cell', track: 'bass', variation: 'vb' }), /^Error: Moontide:.*cell.*section/);
+  assert.throws(() => describeContext({ kind: 'cell', section: 'y', variation: 'vb' }), /^Error: Moontide:.*cell.*track/);
+  assert.throws(() => describeContext({ kind: 'cell', section: 'y', track: 'bass', variation: 'vb', moment: {} }), /cannot carry a moment/);
+});
+
+test('describeContext cell: a 200-character section name is cut in the chip, never the fit part', () => {
+  const section = 's'.repeat(200);
+  const described = describeContext({ kind: 'cell', section, track: 'bass', variation: 'vb', fit: 'does-not-fit', outside: 'F#, A' });
+  assert.ok(described.chip.length <= MAX_ASK_CONTEXT_LENGTH);
+  assert.ok(described.chip.endsWith(' \u00B7 does not fit (F#, A)'), described.chip);
+  assert.equal(described.context.section, section);
+  const rest = describeContext({ kind: 'cell', section, track: 't'.repeat(200), rest: true });
+  assert.ok(rest.chip.endsWith(' \u00B7 rest') && rest.chip.length <= MAX_ASK_CONTEXT_LENGTH, rest.chip);
+  // A very long list of outside notes is cut in the chip but the base keeps room.
+  const crowded = describeContext({ kind: 'cell', section, track: 'bass', variation: 'vb', fit: 'does-not-fit', outside: 'n'.repeat(200) });
+  assert.ok(crowded.chip.length <= MAX_ASK_CONTEXT_LENGTH && crowded.chip.startsWith('Cell "ssss'), crowded.chip);
+  assert.equal(crowded.context.outside.length, 200);
+});
+
+test('describeContext group: a name, and a parent for a nested group', () => {
+  assert.deepEqual(describeContext({ kind: 'group', name: 'drums' }), { context: { kind: 'group', name: 'drums' }, chip: 'Group "drums"' });
+  assert.deepEqual(describeContext({ kind: 'group', name: 'drums', parent: 'rhythm' }), {
+    context: { kind: 'group', name: 'drums', parent: 'rhythm' },
+    chip: 'Group "drums" \u00B7 in "rhythm"',
+  });
+  assert.throws(() => describeContext({ kind: 'group' }), /^Error: Moontide:.*group.*name/);
+  assert.throws(() => describeContext({ kind: 'group', name: '' }), /^Error: Moontide:.*group.*name/);
+});
+
+test('cellFitPrefill fills every slot, names as written, and a missing value throws', () => {
+  const values = { variation: 'vb', track: 'bass', section: 'y', harmony: 'C3:major', notes: 'F#, A' };
+  assert.equal(
+    cellFitPrefill(values),
+    "Fit variation 'vb' of track 'bass' to the harmony of section 'y' (C3:major). It has notes outside it: F#, A.",
+  );
+  for (const field of Object.keys(values)) {
+    assert.throws(() => cellFitPrefill({ ...values, [field]: undefined }), new RegExp(`needs a non-empty ${field}`));
+    assert.throws(() => cellFitPrefill({ ...values, [field]: '' }), new RegExp(`needs a non-empty ${field}`));
+  }
+  assert.throws(() => cellFitPrefill(null), /needs a non-empty/);
+  // A value that looks like a slot is text, filled once.
+  assert.match(cellFitPrefill({ ...values, track: '{notes}' }), /of track '\{notes\}'/);
+});
+
+test('cellFitPrefill cuts long names and hides hidden characters, and stays within the Ask text limit', () => {
+  const big = 'z'.repeat(1000);
+  const text = cellFitPrefill({ variation: big, track: big, section: big, harmony: big, notes: big });
+  assert.ok(text.length <= ask.MAX_ASK_TEXT_LENGTH, `${text.length} characters`);
+  assert.ok(text.includes(`'${cutText(big)}'`));
+  const clean = cellFitPrefill({ variation: 'a\nb', track: 'bass', section: 'y', harmony: 'C3:major', notes: 'F#' });
+  assert.ok(!clean.includes('\n'));
+  assert.ok(clean.includes("variation 'a b'"));
 });

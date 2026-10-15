@@ -14,13 +14,18 @@ import { BUS_IDS, GAIN_STEPS, MOVE_OVER_MAX, MOVE_OVER_MIN, PARAM_STEPS, SENDS, 
  * MIDI fader while it is dragged and the last value at its release, with no evaluation.
  * `onStripSelect()` (optional) is called after the user selects or clears a track strip (a click on its name, or a
  * primary-button pointer-down inside it); a render never calls it. The caller reads `selectedStrip()` then.
+ * `onGroupFold(key)` is called when a group's fold button is pressed; the caller changes the fold state both views share
+ * and draws the Mixer again (the view itself never folds anything).
  */
-export function createMixerView({ document, gesture, midiPreview, onStripSelect = null }) {
+export function createMixerView({ document, gesture, midiPreview, onStripSelect = null, onGroupFold }) {
   if (!midiPreview || typeof midiPreview.move !== 'function' || typeof midiPreview.flush !== 'function') {
     throw new Error('Moontide: the Mixer view needs a midiPreview with move and flush.');
   }
   if (onStripSelect !== null && typeof onStripSelect !== 'function') {
     throw new Error('Moontide: the Mixer view needs onStripSelect to be a function.');
+  }
+  if (typeof onGroupFold !== 'function') {
+    throw new Error('Moontide: the Mixer view needs onGroupFold to be a function.');
   }
   const mixerView = document.getElementById('mixer-view');
   const mixerNotice = document.getElementById('mixer-notice');
@@ -37,6 +42,10 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
   const refs = new Map();
   // One entry per bus strip, keyed `${orbit}:${bus}`: { el, titleEl, chipsEl, fedByEl, warningEl, chips, current }.
   const busRefs = new Map();
+  // One entry per group frame, keyed by the group's key: { el, foldEl, chevronEl, nameEl, countEl, muteEl, soloEl, noteEl, bodyEl, current, stale }.
+  const groupRefs = new Map();
+  // Counts the bodies built, so each group body has an id of its own for the fold button's aria-controls.
+  let groupBodies = 0;
 
   // The inspector's own state: the selected chip's key, the shape of the rows drawn, the rows by
   // parameter id, the model it shows, whether More parameters is open, and whether a control kept its
@@ -70,6 +79,14 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     for (const ref of refs.values()) {
       for (const control of ref.el.querySelectorAll('[data-writes="true"]')) {
         control.disabled = !writable || !ref.current.editable || control.dataset.controlDisabled === 'true';
+      }
+    }
+    // A group head's own buttons (never the frame's querySelectorAll: a frame holds its strips' controls too). They are off
+    // while a notice is up and when the group has no track they can reach; the fold button is never one of them.
+    // A frame the model no longer has (kept only because a held strip is inside) is off too: its tracks are out of date.
+    for (const groupRef of groupRefs.values()) {
+      for (const control of [groupRef.muteEl, groupRef.soloEl]) {
+        control.disabled = !writable || groupRef.stale === true || control.dataset.controlDisabled === 'true';
       }
     }
     // The inspector's writing controls follow the same rule; a bypassed effect is read-only.
@@ -157,6 +174,19 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     const { identity, name } = ref.current;
     const on = !ref.current[kind].pressed;
     gesture.discrete({ identity, type: kind, on }, mixerHistoryLabel({ kind, name, on }));
+  }
+
+  /**
+   * A press of a group's M or S: one discrete change for every track the button reaches, applied and recorded at once, one
+   * history version. The direction is the one the model drew: a group with none or some of its tracks pressed presses them
+   * all, a group with every track pressed lets them all go.
+   */
+  function pressGroup(ref, kind) {
+    // The buttons of a frame the model no longer has are disabled; this keeps a press that still arrives from writing old names.
+    if (ref.stale === true) return;
+    const { name } = ref.current;
+    const { on, identities } = ref.current[kind];
+    gesture.discrete({ type: 'group', kind, on, identities, group: name }, mixerHistoryLabel({ kind: kind === 'mute' ? 'group-mute' : 'group-solo', group: name, on }));
   }
 
   /** Scrolls the strips area sideways, instantly, by the smallest amount that puts `stripEl` wholly in
@@ -502,6 +532,148 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     });
   }
 
+  /** Sets an element's text only when it changed, so drawing the same model again writes nothing. */
+  function setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
+  }
+
+  /** Sets an attribute only when its value changed. */
+  function setAttr(el, name, value) {
+    if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+  }
+
+  /**
+   * A light: a ring with a fill inside it. The fill is the part that changes (page/lights.js says how bright it is); the
+   * whole light is decoration for the eye and is never announced, since a note would otherwise speak every time it plays.
+   */
+  function createLight() {
+    const el = document.createElement('span');
+    el.className = 'mx-light';
+    el.setAttribute('aria-hidden', 'true');
+    const fillEl = document.createElement('span');
+    fillEl.className = 'mx-light-fill';
+    el.append(fillEl);
+    return { el, fillEl };
+  }
+
+  /**
+   * The frame of one group: a head (the fold button with its chevron and name, then the count line) and a body that holds
+   * the group's strips and sub-groups. Names reach the page only through textContent, title and setAttribute.
+   */
+  function createGroupFrame(item) {
+    const el = document.createElement('div');
+    el.className = 'mx-group';
+    el.setAttribute('role', 'group');
+    const head = document.createElement('div');
+    head.className = 'mx-group-head';
+    const titleRow = document.createElement('div');
+    titleRow.className = 'mx-group-title';
+    const foldEl = document.createElement('button');
+    foldEl.type = 'button';
+    foldEl.className = 'mx-fold';
+    const chevronEl = document.createElement('span');
+    chevronEl.className = 'mx-fold-chevron';
+    chevronEl.setAttribute('aria-hidden', 'true');
+    const nameEl = document.createElement('span');
+    nameEl.className = 'mx-fold-name';
+    foldEl.append(chevronEl, nameEl);
+    const light = createLight();
+    titleRow.append(light.el, foldEl);
+    const line = document.createElement('div');
+    line.className = 'mx-group-line';
+    const countEl = document.createElement('span');
+    countEl.className = 'mx-group-count';
+    const muteEl = createToggle('mx-mute', 'M', MIXER_COPY.mute);
+    const soloEl = createToggle('mx-solo', 'S', MIXER_COPY.solo);
+    line.append(countEl, muteEl, soloEl);
+    // The one muted line that says why a button reaches fewer tracks, or that the group has none.
+    const noteEl = document.createElement('p');
+    noteEl.className = 'mx-group-note';
+    noteEl.toggleAttribute('hidden', true);
+    head.append(titleRow, line, noteEl);
+    const bodyEl = document.createElement('div');
+    bodyEl.className = 'mx-group-body';
+    groupBodies += 1;
+    bodyEl.id = `mx-group-body-${groupBodies}`;
+    foldEl.setAttribute('aria-controls', bodyEl.id);
+    el.append(head, bodyEl);
+    const ref = { el, foldEl, chevronEl, nameEl, lightEl: light.el, lightFillEl: light.fillEl, countEl, muteEl, soloEl, noteEl, bodyEl, current: item };
+    // Only the caller changes the fold state: this view just says which group was pressed.
+    // A frame the model no longer has (ref.stale) folds nothing: its group is not in the code any more.
+    foldEl.addEventListener('click', () => {
+      if (ref.stale !== true) onGroupFold(ref.current.key);
+    });
+    muteEl.addEventListener('click', () => pressGroup(ref, 'mute'));
+    soloEl.addEventListener('click', () => pressGroup(ref, 'solo'));
+    return ref;
+  }
+
+  function updateGroupFrame(ref, item) {
+    ref.current = item;
+    ref.stale = false;
+    const { el } = ref;
+    setAttr(el, 'aria-label', item.label);
+    setAttr(el, 'data-group', item.key);
+    setAttr(el, 'data-folded', String(!item.open));
+    if (item.deep) setAttr(el, 'data-deep', 'true');
+    else if (el.hasAttribute('data-deep')) el.removeAttribute('data-deep');
+    setText(ref.chevronEl, item.open ? '\u25be' : '\u25b8');
+    setText(ref.nameEl, item.text);
+    setAttr(ref.nameEl, 'title', item.title);
+    setAttr(ref.foldEl, 'aria-expanded', String(item.open));
+    setAttr(ref.foldEl, 'title', item.foldTitle);
+    // A function as the replacement keeps a `$` in a name from being read as a pattern.
+    setAttr(ref.lightEl, 'title', MIXER_COPY.lightGroupTitle.replace('{group}', () => item.text));
+    setText(ref.countEl, item.countText);
+    setAttr(ref.countEl, 'title', item.countTitle);
+    for (const [button, kind] of [[ref.muteEl, 'mute'], [ref.soloEl, 'solo']]) {
+      const control = item[kind];
+      setAttr(button, 'aria-label', control.name);
+      setAttr(button, 'aria-pressed', String(control.pressed));
+      setAttr(button, 'title', control.title);
+      setAttr(button, 'data-control-disabled', String(control.disabled));
+    }
+    const noteText = item.noteText;
+    setText(ref.noteEl, noteText ?? '');
+    if (noteText === null) {
+      if (ref.noteEl.hasAttribute('title')) ref.noteEl.removeAttribute('title');
+    } else {
+      setAttr(ref.noteEl, 'title', noteText);
+    }
+    if (ref.noteEl.hasAttribute('hidden') !== (noteText === null)) ref.noteEl.toggleAttribute('hidden', noteText === null);
+    if (ref.bodyEl.hasAttribute('hidden') === item.open) ref.bodyEl.toggleAttribute('hidden', !item.open);
+  }
+
+  /**
+   * Puts `desired` (elements) as the children of `parent`, in that order, moving only what is not already in place.
+   * `held` holds the elements that must not be moved or removed (a strip whose fader the hand holds): they stay where
+   * they are, and `misplaced` collects those that are not where the model wants them, so a later draw puts them right.
+   */
+  function place(parent, desired, held, misplaced) {
+    const wanted = new Set(desired);
+    for (const child of [...parent.children]) {
+      if (wanted.has(child) || held.has(child)) continue;
+      // A frame that still holds a held strip stays until the strip is let go.
+      if (held.size > 0 && [...held].some((heldEl) => child.contains(heldEl))) continue;
+      child.remove();
+    }
+    let next = null;
+    for (let i = desired.length - 1; i >= 0; i--) {
+      const el = desired[i];
+      if (el.parentNode === parent && el.nextSibling === next) {
+        next = el;
+        continue;
+      }
+      if (held.has(el) && el.parentNode !== null) {
+        misplaced.add(el);
+        if (el.parentNode === parent) next = el;
+        continue;
+      }
+      parent.insertBefore(el, next);
+      next = el;
+    }
+  }
+
   function createStrip(strip) {
     const el = document.createElement('div');
     el.className = 'mx-strip';
@@ -510,6 +682,11 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     nameEl.type = 'button';
     nameEl.className = 'mx-name';
     nameEl.setAttribute('aria-pressed', 'false');
+    // The light sits before the name; the row keeps both on one line. A strip with no label has no light (updateStrip hides it).
+    const nameRowEl = document.createElement('div');
+    nameRowEl.className = 'mx-name-row';
+    const light = createLight();
+    nameRowEl.append(light.el, nameEl);
     // Present only for a strip the mixer cannot edit: the one muted line that says why.
     const reasonEl = document.createElement('div');
     reasonEl.className = 'mx-reason';
@@ -581,11 +758,11 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     sharedEl.toggleAttribute('hidden', true);
     if (midi) {
       el.dataset.midi = 'true';
-      el.append(nameEl, tagEl, rootNoteEl, midiChipsEl, midiNoteEl, section, sharedEl, msEl, noteEl);
+      el.append(nameRowEl, tagEl, rootNoteEl, midiChipsEl, midiNoteEl, section, sharedEl, msEl, noteEl);
     } else {
-      el.append(nameEl, rootNoteEl, chainEl, sendsEl, section, msEl, noteEl);
+      el.append(nameRowEl, rootNoteEl, chainEl, sendsEl, section, msEl, noteEl);
     }
-    const ref = { midi, el, nameEl, rootNoteEl, sharedEl, tagEl, tagNameEl, tagChannelEl, reasonEl, faderEl, readoutEl, lineEl, section, muteEl, soloEl, noteEl, chainEl, addEl, addListEl, sendsEl, sendRows: [], chips: new Map(), midiChipsEl, midiNoteEl, midiChips: new Map(), addOpen: false, addKey: null, current: strip, pointerDown: false };
+    const ref = { midi, el, nameEl, lightEl: light.el, lightFillEl: light.fillEl, rootNoteEl, sharedEl, tagEl, tagNameEl, tagChannelEl, reasonEl, faderEl, readoutEl, lineEl, section, muteEl, soloEl, noteEl, chainEl, addEl, addListEl, sendsEl, sendRows: [], chips: new Map(), midiChipsEl, midiNoteEl, midiChips: new Map(), addOpen: false, addKey: null, current: strip, pointerDown: false };
     for (const bus of BUS_IDS) {
       const row = createSendRow(ref, bus);
       ref.sendRows.push(row);
@@ -647,6 +824,9 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     ref.el.dataset.color = String(strip.color);
     ref.nameEl.textContent = strip.name;
     ref.nameEl.title = strip.name;
+    const hasLight = strip.lightKey !== null && strip.lightKey !== undefined;
+    if (ref.lightEl.hasAttribute('hidden') === hasLight) ref.lightEl.toggleAttribute('hidden', !hasLight);
+    setAttr(ref.lightEl, 'title', MIXER_COPY.lightTrackTitle.replace('{name}', () => strip.name));
     const tag = strip.midi === null ? null : strip.midi.tag;
     ref.tagEl.toggleAttribute('hidden', tag === null);
     ref.tagNameEl.textContent = tag === null ? '' : tag.name;
@@ -1863,6 +2043,7 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
       mixerNoNotes.textContent = '';
       refs.clear();
       busRefs.clear();
+      groupRefs.clear();
       selectedStrip = null;
       mixerStrips.replaceChildren();
       renderInspector();
@@ -1878,7 +2059,12 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     else mixerNoNotes.title = MIXER_COPY.noNotesTitle;
     mixerNoNotes.hidden = noNotesText === null;
     const seen = new Set();
-    model.strips.forEach((strip, index) => {
+    // The strips placed in the DOM whose fader the hand holds: they are not moved or removed until it lets go.
+    const held = new Set();
+    for (const ref of refs.values()) {
+      if (ref.el.parentNode !== null && isHeld(ref)) held.add(ref.el);
+    }
+    model.strips.forEach((strip) => {
       seen.add(strip.identity);
       let ref = refs.get(strip.identity);
       if (ref && ref.midi !== (strip.midi !== null)) {
@@ -1897,14 +2083,11 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
         refs.set(strip.identity, ref);
       }
       updateStrip(ref, strip);
-      // Move nodes only when the order changed, so a node the user is dragging is never re-attached.
-      if (mixerStrips.children[index] !== ref.el) {
-        mixerStrips.insertBefore(ref.el, mixerStrips.children[index] || null);
-      }
     });
     // The bus strips come after the tracks, in the model's order (orbit, then reverb before delay).
     const seenBuses = new Set();
-    model.buses.forEach((entry, index) => {
+    const busEls = [];
+    model.buses.forEach((entry) => {
       seenBuses.add(entry.key);
       let busRef = busRefs.get(entry.key);
       if (!busRef) {
@@ -1912,9 +2095,59 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
         busRefs.set(entry.key, busRef);
       }
       updateBusStrip(busRef, entry);
-      const position = model.strips.length + index;
-      if (mixerStrips.children[position] !== busRef.el) mixerStrips.insertBefore(busRef.el, mixerStrips.children[position] || null);
+      busEls.push(busRef.el);
     });
+    // Where every element goes: a flat Mixer is its strips then its buses; a structured piece nests the strips in group
+    // frames (the frames are walked with a stack, never by recursion). Each parent gets the order it should have.
+    const topEls = [];
+    const plans = [{ parent: mixerStrips, desired: topEls }];
+    const seenGroups = new Set();
+    if (model.layout === null || model.layout === undefined) {
+      for (const strip of model.strips) {
+        const ref = refs.get(strip.identity);
+        if (ref !== undefined) topEls.push(ref.el);
+      }
+    } else {
+      const work = [{ items: model.layout.items, desired: topEls }];
+      while (work.length > 0) {
+        const { items, desired } = work.pop();
+        for (const item of items) {
+          if (item.kind === 'strip') {
+            const ref = refs.get(item.identity);
+            if (ref !== undefined) desired.push(ref.el);
+            continue;
+          }
+          // Two frames with one key would share one element and hide strips, so a repeated key stops the render.
+          if (seenGroups.has(item.key)) throw new Error(`Moontide: the Mixer got the group ${item.key} twice.`);
+          seenGroups.add(item.key);
+          let groupRef = groupRefs.get(item.key);
+          if (groupRef === undefined) {
+            groupRef = createGroupFrame(item);
+            groupRefs.set(item.key, groupRef);
+          }
+          updateGroupFrame(groupRef, item);
+          desired.push(groupRef.el);
+          const inner = [];
+          plans.push({ parent: groupRef.bodyEl, desired: inner });
+          work.push({ items: item.items, desired: inner });
+        }
+      }
+    }
+    for (const el of busEls) topEls.push(el);
+    const misplaced = new Set();
+    for (const { parent, desired } of plans) place(parent, desired, held, misplaced);
+    // A frame the model no longer has goes, with the frames nested in it. One that still holds a held strip stays until the
+    // strip is let go, marked stale: its buttons are off and hasStale asks for a draw after the release.
+    for (const [key, groupRef] of [...groupRefs]) {
+      if (seenGroups.has(key)) continue;
+      if (groupRef.el.parentNode !== null && [...held].some((heldEl) => groupRef.el.contains(heldEl))) {
+        groupRef.stale = true;
+        continue;
+      }
+      groupRef.el.remove();
+      groupRefs.delete(key);
+    }
+    for (const ref of refs.values()) ref.misplaced = misplaced.has(ref.el);
     for (const [key, busRef] of [...busRefs]) {
       if (seenBuses.has(key)) continue;
       busRef.el.remove();
@@ -1959,6 +2192,15 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
         const busRef = busRefs.get(`${busEl.dataset.orbit}:${busEl.dataset.bus}`);
         return busRef === undefined ? null : busStripTarget(element, busRef);
       }
+      // A group's head or frame (a strip inside it was answered above): the group, with its parent group when it is nested.
+      // The names come from the model's entry for the frame, never from the shown (cut) text.
+      const groupEl = element.closest('.mx-group[data-group]');
+      if (groupEl !== null) {
+        const groupRef = groupRefs.get(groupEl.dataset.group);
+        if (groupRef === undefined) return null;
+        const { name, path } = groupRef.current;
+        return path.length > 1 ? { kind: 'group', name, parent: path[path.length - 2] } : { kind: 'group', name };
+      }
       return null;
     },
     /** The identity of the selected track strip, or null: the editor lights that track's block. */
@@ -1979,10 +2221,37 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     /** True when a fader kept its own value while held and is free to take the model's now. */
     hasStale() {
       for (const ref of refs.values()) {
-        if (ref.stale && !isHeld(ref)) return true;
+        if ((ref.stale || ref.misplaced === true) && !isHeld(ref)) return true;
+      }
+      // A frame kept for a strip that has been let go since: the next draw removes it.
+      for (const groupRef of groupRefs.values()) {
+        if (groupRef.stale === true && !gesture.hasPending() && ![...refs.values()].some((ref) => ref.pointerDown && groupRef.el.contains(ref.el))) return true;
       }
       // An inspector control kept its own value while it was held: free to take the model's now.
       return insp.stale && !gesture.hasPending() && ![...insp.rows.values()].some((r) => r.pointerDown);
+    },
+    /**
+     * Draws the lights that changed (page/lights.js frame): `[{ kind: 'track' | 'group', id, value }]`, `value` from 0 to 1.
+     * With motion 'on' the fill's own opacity is the brightness; with motion 'off' a light is only lit or unlit, which the
+     * stylesheet shows through `data-lit`, and no opacity is ever written. A light this view does not hold is skipped.
+     */
+    setLights(changes, motion) {
+      if (motion !== 'on' && motion !== 'off') {
+        throw new Error(`Moontide: the lights need motion 'on' or 'off', got ${String(motion)}.`);
+      }
+      for (const change of changes) {
+        const ref = change.kind === 'group' ? groupRefs.get(change.id) : refs.get(change.id);
+        if (ref === undefined) continue;
+        if (motion === 'on') ref.lightFillEl.style.opacity = String(change.value);
+        else ref.lightEl.dataset.lit = String(change.value > 0);
+      }
+    },
+    /** Takes every light back to unlit: no inline opacity and no lit mark, in both forms. */
+    clearLights() {
+      for (const ref of [...refs.values(), ...groupRefs.values()]) {
+        if (ref.lightFillEl.style.opacity !== '') ref.lightFillEl.style.opacity = '';
+        if (ref.lightEl.dataset.lit !== undefined) delete ref.lightEl.dataset.lit;
+      }
     },
     /** 'connected' | 'connecting' | 'disconnected' (the same states the History view gets). */
     setConnected(state) {

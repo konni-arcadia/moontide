@@ -67,7 +67,7 @@ export const CYCLIST_FIELDS = Object.freeze([
 // at: MIDI follows the clock, with no offset toward the browser's own sounds.
 const STRUDEL_LATENCY_MS = 34;
 // An output-timestamp pair is fresh while its performance time is this recent (measured in the spike).
-const FRESH_PAIR_MAX_AGE_MS = 100;
+export const FRESH_PAIR_MAX_AGE_MS = 100;
 // A pair whose offset differs from the alignment by more than this is an outlier; a run of this many outliers
 // resets the alignment (measured in the spike).
 const OUTLIER_MS = 20;

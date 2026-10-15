@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parse } from 'acorn';
 import { extractTracks, trackNodes, PARSE_OPTIONS } from '../page/tracks.js';
-import { MixerRewriteError, REFUSAL_REASONS, applyEdits, touchedRanges, readProgram, writeBus, writeTrack } from '../page/mixer-rewrite.js';
+import { MixerRewriteError, REFUSAL_REASONS, applyEdits, touchedRanges, readProgram, writeBus, writeTrack, writeTracks } from '../page/mixer-rewrite.js';
 
 /** Writes a volume on track `identity` and returns the new code. */
 const write = (code, identity, value) => writeTrack(code, identity, { identity, type: 'gain', value }, { parse }).code;
@@ -204,6 +204,16 @@ test('a root that is a top-level variable, destructured name, function or class 
   }
 });
 
+test('a track whose own statement starts with play() reads as play-rooted, and its shared-code fact stays', () => {
+  const code = "const play = (name, track) => track.va;\nconst t1 = { va: note('c3') };\nconst base = note('d3');\nt1: play('t1', t1).gain(0)\nkick: base.fast(2)\nhats: s('hh')";
+  const { reads } = readProgram(code, { parse });
+  assert.equal(reads.get('label:t1').playRoot, true);
+  assert.equal(reads.get('label:t1').sharedRoot, true);
+  assert.equal(reads.get('label:kick').playRoot, false);
+  assert.equal(reads.get('label:kick').sharedRoot, true);
+  assert.equal(reads.get('label:hats').playRoot, false);
+});
+
 test('a track built from a constant keeps a trailing semicolon and comment after the new call', () => {
   const code = 'const bass = s("bd")\ndrums: bass.lpf(300);  // kept\nhats: s("hh")';
   assert.equal(write(code, 'label:drums', 0.5), 'const bass = s("bd")\ndrums: bass.lpf(300).postgain(0.5);  // kept\nhats: s("hh")');
@@ -301,6 +311,7 @@ test('readProgram reports refusals per track and never throws for one bad track'
     },
     label: { raw: 'drums', mutedByLabel: false, core: 'drums', solo: null, soloInert: false, base: 'drums', safe: true },
     sharedRoot: false,
+    playRoot: false,
     playsMidi: false,
     innerPostgain: false,
     busHidden: false,
@@ -1492,4 +1503,108 @@ test('a bus change never counts or touches a track whose shared code sets its or
   // The kick would be read as a sender of orbit 1, and written there; it is left out.
   assert.equal(busCode(code, { bus: 'reverb', param: 'size', value: 4 }), "const beat = s(\"bd\").orbit(2).room(0.4)\nkick: beat\nhats: s(\"hh\").room(0.2).roomsize(4)");
   assert.throws(() => bus("const beat = s(\"bd\").room(0.4)\nkick: beat", { bus: 'reverb', param: 'size', value: 4 }), /no track sends to the reverb bus on orbit 1/);
+});
+
+// --- one change on many tracks ---
+
+const THREE = 't1: s("bd")\nt2: s("hh")\nt3: s("cp")\nother: s("sd")';
+const idsOf = (...names) => names.map((name) => `label:${name}`);
+
+test('writeTracks mutes three labels in one edit list and leaves every other byte alone', () => {
+  const muted = writeTracks(THREE, idsOf('t1', 't2', 't3'), { type: 'mute', on: true }, { parse });
+  assert.equal(muted.code, '_t1: s("bd")\n_t2: s("hh")\n_t3: s("cp")\nother: s("sd")');
+  assert.equal(muted.edits.length, 3);
+  const back = writeTracks(muted.code, idsOf('t1', 't2', 't3'), { type: 'mute', on: false }, { parse });
+  assert.equal(back.code, THREE);
+});
+
+test('writeTracks throws for an empty list or for a list that is not made of identities', () => {
+  for (const bad of [[], undefined, null, 'label:t1', [1], ['label:t1', null]]) {
+    assert.throws(() => writeTracks(THREE, bad, { type: 'mute', on: true }, { parse }), (err) => err instanceof MixerRewriteError && /^Moontide: a group change needs at least one track\.$/.test(err.message), String(bad));
+  }
+});
+
+test('writeTracks gives the same text whatever order the tracks are listed in, and writes a repeated track once', () => {
+  const forward = writeTracks(THREE, idsOf('t1', 't2', 't3'), { type: 'solo', on: true }, { parse });
+  const reversed = writeTracks(THREE, idsOf('t3', 't2', 't1'), { type: 'solo', on: true }, { parse });
+  assert.equal(forward.code, 'S_t1: s("bd")\nS_t2: s("hh")\nS_t3: s("cp")\nother: s("sd")');
+  assert.equal(reversed.code, forward.code);
+  const twice = writeTracks(THREE, idsOf('t2', 't1', 't2'), { type: 'mute', on: true }, { parse });
+  assert.equal(twice.code, '_t1: s("bd")\n_t2: s("hh")\nt3: s("cp")\nother: s("sd")');
+  assert.equal(twice.edits.length, 2);
+});
+
+test('writeTracks solo writes the marker on every member, and ending the solo writes the base back', () => {
+  const on = writeTracks(THREE, idsOf('t1', 't2'), { type: 'solo', on: true }, { parse });
+  assert.equal(on.code, 'S_t1: s("bd")\nS_t2: s("hh")\nt3: s("cp")\nother: s("sd")');
+  const off = writeTracks(on.code, idsOf('t1', 't2'), { type: 'solo', on: false }, { parse });
+  assert.equal(off.code, THREE);
+});
+
+test('writeTracks keeps mute and solo exclusive on each member: a muted track becomes soloed, a soloed track becomes muted', () => {
+  const code = '_t1: s("bd")\nS_t2: s("hh")\nt3: s("cp")';
+  assert.equal(writeTracks(code, idsOf('t1', 't2', 't3'), { type: 'solo', on: true }, { parse }).code, 'S_t1: s("bd")\nS_t2: s("hh")\nS_t3: s("cp")');
+  assert.equal(writeTracks(code, idsOf('t1', 't2', 't3'), { type: 'mute', on: true }, { parse }).code, '_t1: s("bd")\n_t2: s("hh")\n_t3: s("cp")');
+});
+
+test('writeTracks leaves a member muted by .hush() alone when muting, and drops its .hush() when unmuting', () => {
+  const code = 't1: s("bd").hush()\nt2: s("hh")';
+  const muted = writeTracks(code, idsOf('t1', 't2'), { type: 'mute', on: true }, { parse });
+  assert.equal(muted.code, 't1: s("bd").hush()\n_t2: s("hh")');
+  assert.equal(muted.edits.length, 1);
+  assert.equal(writeTracks(muted.code, idsOf('t1', 't2'), { type: 'mute', on: false }, { parse }).code, 't1: s("bd")\nt2: s("hh")');
+});
+
+test('writeTracks writes a MIDI track by the same label edit as any other track', () => {
+  const code = "t1: note(\"c\").midi('Port A')\nt2: s(\"hh\")";
+  assert.equal(writeTracks(code, idsOf('t1', 't2'), { type: 'mute', on: true }, { parse }).code, "_t1: note(\"c\").midi('Port A')\n_t2: s(\"hh\")");
+  assert.equal(writeTracks(code, idsOf('t1', 't2'), { type: 'solo', on: true }, { parse }).code, "S_t1: note(\"c\").midi('Port A')\nS_t2: s(\"hh\")");
+});
+
+test('writeTracks writes nothing when one member cannot be written: a label another statement holds, an unlabeled solo', () => {
+  const shared = 't1: s("bd")\n_t1: s("hh")\nt2: s("cp")';
+  assert.throws(
+    () => writeTracks(shared, ['label:t2', 'label:t1'], { type: 'mute', on: true }, { parse }),
+    (err) => err instanceof MixerRewriteError && err.reason === 'unsupported-change' && /^Moontide: /.test(err.message),
+  );
+  assert.throws(() => writeTracks('stack(s("bd"), s("hh"))', ['s:hh', 's:bd'], { type: 'solo', on: true }, { parse }), (err) => err instanceof MixerRewriteError && /without a label cannot be soloed/.test(err.message));
+  assert.throws(() => writeTracks(THREE, ['label:t1', 'label:gone'], { type: 'mute', on: true }, { parse }), (err) => err instanceof MixerRewriteError && err.reason === 'track-gone');
+  assert.throws(() => writeTracks(THREE, idsOf('t1'), { type: 'gain', on: true }, { parse }), (err) => err instanceof MixerRewriteError);
+  assert.throws(() => writeTracks(THREE, idsOf('t1'), { type: 'mute', on: 'yes' }, { parse }), (err) => err instanceof MixerRewriteError);
+});
+
+test('writeTracks over statements on adjacent lines writes each track once, with no overlap', () => {
+  const code = 't1: s("bd")\n  .hush()\nt2: s("hh")\n  .hush()\nt3: s("cp")\n  .hush()';
+  const soloed = writeTracks(code, idsOf('t3', 't1', 't2'), { type: 'solo', on: true }, { parse });
+  assert.equal(soloed.code, 'S_t1: s("bd")\nS_t2: s("hh")\nS_t3: s("cp")');
+  assert.equal(soloed.edits.length, 6);
+  const unmuted = writeTracks(code, idsOf('t1', 't2', 't3'), { type: 'mute', on: false }, { parse });
+  assert.equal(unmuted.code, 't1: s("bd")\nt2: s("hh")\nt3: s("cp")');
+});
+
+test('writeTracks over the tracks of a parent and its sub-group, listed with repeats, writes every label once', () => {
+  const identities = [...idsOf('t1', 't2'), ...idsOf('t3'), ...idsOf('t2', 't3')];
+  const result = writeTracks(THREE, identities, { type: 'mute', on: true }, { parse });
+  assert.equal(result.code, '_t1: s("bd")\n_t2: s("hh")\n_t3: s("cp")\nother: s("sd")');
+  assert.equal(result.edits.length, 3);
+});
+
+test('writeTracks in the same direction twice changes nothing the second time', () => {
+  const first = writeTracks(THREE, idsOf('t1', 't2'), { type: 'mute', on: true }, { parse });
+  const second = writeTracks(first.code, idsOf('t1', 't2'), { type: 'mute', on: true }, { parse });
+  assert.equal(second.code, first.code);
+  assert.deepEqual(second.edits, []);
+  const soloed = writeTracks(THREE, idsOf('t1', 't2'), { type: 'solo', on: true }, { parse });
+  assert.deepEqual(writeTracks(soloed.code, idsOf('t1', 't2'), { type: 'solo', on: true }, { parse }).edits, []);
+});
+
+test('writeTracks writes a group of 40 tracks in under 500 ms', () => {
+  const names = Array.from({ length: 40 }, (_, i) => `t${i + 1}`);
+  const code = names.map((name) => `${name}: s("bd hh").lpf(300).gain(0.5)`).join('\n');
+  const started = performance.now();
+  const result = writeTracks(code, names.map((name) => `label:${name}`), { type: 'mute', on: true }, { parse });
+  const elapsed = performance.now() - started;
+  assert.equal(result.edits.length, 40);
+  assert.ok(result.code.startsWith('_t1: ') && result.code.endsWith('.gain(0.5)'));
+  assert.ok(elapsed < 500, `took ${elapsed.toFixed(0)} ms`);
 });

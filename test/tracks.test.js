@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parse } from 'acorn';
-import { SOLO_MARKER, extractTracks, parseLabel, soloSource, trackRange } from '../page/tracks.js';
+import { SOLO_MARKER, extractTracks, labelKey, parseLabel, soloPrelude, soloSource, trackRange } from '../page/tracks.js';
 
 const PACKAGE_JSON_PATH = fileURLToPath(new URL('../package.json', import.meta.url));
 const HTML_PATH = fileURLToPath(new URL('../page/index.html', import.meta.url));
@@ -98,6 +98,21 @@ test('soloSource for the second track wraps its shared const string, drops setcp
   assert.ok(!source.includes('setcpm'), 'setcpm must never appear in a solo program');
   assert.match(source, /const low = m\("<c2 g2>", \d+\)/);
   assert.match(source, /return \(note\(low\)\.s\(m\("sawtooth", \d+\)\)\.gain\(0\)\);$/);
+});
+
+test('soloPrelude is the text every solo program starts with, for a labeled piece and for a stack() piece', () => {
+  const labeled = FOUR_TRACK_PROGRAM;
+  const stacked = 'const low = "<c2 g2>"\nsetcpm(120)\nstack(note(low).s("sawtooth"), note("e4").s("sine"))';
+  for (const code of [labeled, stacked]) {
+    const prelude = soloPrelude(code, { parse });
+    assert.ok(prelude.startsWith('"use strict";\n'));
+    assert.ok(prelude.includes('const low = m("<c2 g2>", '), 'a declaration keeps its string rewrite');
+    assert.ok(!prelude.includes('setcpm'), 'a statement that is not a declaration is dropped');
+    assert.ok(!prelude.includes('return'), 'the prelude holds no return line');
+    assert.ok(prelude.endsWith('\n'));
+    assert.ok(soloSource(code, 0, { parse }).startsWith(prelude), 'soloSource builds on the prelude');
+    assert.ok(soloSource(code, 1, { parse }).startsWith(prelude), 'soloSource builds on the prelude for every track');
+  }
 });
 
 test('a single-quoted string stays unwrapped', () => {
@@ -540,6 +555,17 @@ test('parseLabel: the marker, the underscore, the S name and the labels the mixe
   assert.equal(parseLabel('_9x').safe, false);
   assert.equal(parseLabel('a__').safe, false);
   assert.equal(parseLabel('drums').safe, true);
+});
+
+test('labelKey: a mute underscore and a solo marker never change the key, a label the mixer cannot rewrite keeps its raw text', () => {
+  for (const label of ['t1', '_t1', 't1_', 'S_t1', '_S_t1']) assert.equal(labelKey(label), 'label:t1', label);
+  assert.equal(labelKey('_9x'), 'label:_9x');
+  assert.equal(labelKey('a__'), 'label:a__');
+  assert.equal(labelKey('S_'), 'label:S_');
+  // The mixer's identities are the same rule, for every label without a dollar sign.
+  for (const label of ['t1', '_t1', 't1_', 'S_t1', '_S_t1', 'Snare', 'drums']) {
+    assert.equal(extractTracks(`${label}: s("bd")`, { parse })[0].identity, labelKey(label), label);
+  }
 });
 
 // trackRange: the block of one track in the text, from its label to the end of its statement.

@@ -114,6 +114,13 @@ rule is said twice, on purpose: "call `get_midi_instruments` before writing MIDI
 instructions and opens that tool's description, because a guessed port, channel or sound can send
 notes to the wrong channel of a real instrument (a test pins both).
 
+The standing rule that every new piece declares its song structure (see "Every new piece declares a
+song structure") takes one sentence of 119 characters. To keep the margin, the sentence about acting on
+a vague request moved into the `set_code` description, and the duty to say which sound replaced a failed
+one moved to the end of the three failed-sound notices, where Claude meets it. The text is pinned at its
+exact length, which leaves 162 characters under the limit. A failed-sound notice names at most seven
+sounds, so the longer notice stays under the 500 characters the server keeps.
+
 ## What the two tokens protect
 
 The request channel has two secrets, and they protect different things.
@@ -736,7 +743,7 @@ Four fixes that came from real sessions with tracks that Claude wrote with their
   bottom of the Mixer, with its instrument and channel, instead of getting a strip with a fader that does
   nothing. The reading is static and uses a closed list of names, so anything unknown keeps the strip: an
   instrument is never hidden by a guess. Folding changes only the display: the track still sends its
-  controls and program changes, and it stays in its channel's group, so a strip on the same channel
+  controls and program changes, and it stays with the other tracks of its channel, so a strip on the same channel
   still names it under "Shared with". The line marks a track that does not sound as silent, and its hover
   says the Mixer cannot mute, solo or edit these tracks (ask Claude): keeping their channel controls
   reachable would need an inspector entry per folded track. `npm run probe:midi` checks both the line and the bytes sent.
@@ -793,6 +800,105 @@ Four fixes that came from real sessions with tracks that Claude wrote with their
 - **Known limit.** A note that began on the previous 32-cycle page is not in a moment at the very start of
   the next page, because each page holds only the notes that begin on it; a velocity written only in the
   `.midi()` options is not seen and such a note reads the default 0.9.
+
+## The Timeline edits literal notes and asks Claude about the rest
+
+- **Which notes it edits.** A note is edited only when exactly one double-quoted note string in the track's own code
+  holds it, the code at that place is the bare token, and the pitch you hear is that token's own pitch. Every other
+  note is refused, with one reason in plain words, and the first that applies is the one given: made by a function or
+  by chance, or written in a single-quoted string (no one place holds it); a sample, not a pitched note; shaped by
+  several places (an added note, a factor like `*2`); written in degrees; held in a string with an escape sequence;
+  shifted (something adds to the pitch or copies it); written outside the track's own code (its statement, or the
+  variations of a song); or coming from code shared by several tracks. The page cannot see which of these a note is
+  by guessing, only by the offsets Strudel keeps, so a note it cannot trace is never edited "close enough".
+- **The edit is read back before it is written.** The edited code is tried first and read back: it must give the same
+  note at the same place with the new value, and nothing else may change. If it does not, nothing is written and the
+  page says so instead of guessing; "Ask Claude" then carries the same change as a ready-made request. When the page
+  runs into a problem after it has written the change, it says to check the code and does not offer the change to
+  Claude, who would make it a second time. An evaluation that throws and whose text the page took back wrote nothing:
+  it is told as a problem before the change, and offered to Claude.
+- **The places sentence.** Before any write, a note that plays in several places says so ("Plays in 3 places: sections
+  'x' and 'z'"), and the other notes of the same token on the page get a dotted ring, because one edit changes all of
+  them. A place is a time a section that holds the token starts, counted from the song's section entries and repeats
+  over at most 1024 cycles. Past that limit the count is of the drawn page only and the sentence says "on this page".
+  In a piece with no song, a token is told only when it draws several notes in one cycle; a plain loop that repeats
+  every cycle is not counted, because the loop marks already show it. A velocity number that plays in several places
+  (a variation used by several sections) is counted the same way: the sentence names them, and the edit is read back over
+  all of them, so a section that would play another velocity there refuses the edit.
+- **Velocity only where one written number holds it.** The shown velocity is gain times velocity, which is what Claude
+  receives. The two buttons change it by a tenth, between 0.10 and 1.00, and only when one written number, in the
+  track's own code, gives the velocity. A number that several notes of the page share is fine: one step changes
+  them all, and the sentence says "for 4 notes on this page". Otherwise (a signal, an option of `.midi()`, a string
+  shared by several tracks, or a value that is not one written number) they are off, the panel says "fixed in the
+  code", and pressing one says so and leaves the step to Claude. Because the shown value includes the gain, a step on a
+  browser lane with a gain below 1 can write a number above 1.
+- **The edit timing and the history entry.** An edit takes over with the user's usual hand-edit timing (now, the next
+  bar or the next phrase), with no new setting, and is one history entry with the hand-edit notice for Claude. Steps
+  from the keys or the buttons gather: 0.6 seconds after the last one the page writes once, so a run of presses is
+  one entry, and a step of the other kind (pitch after velocity) starts an entry of its own. Steps that wait are
+  written for their note first when the selection moves to another note, a range or a cursor, or when the lanes are
+  drawn again; only Escape drops them on purpose.
+- **One edit at a time, in order.** Every edit (a burst of steps, a rest, a drag release) waits its turn in one queue.
+  The page writes one at a time: the next goes only after the answer of the one before and the lanes that answer
+  draws, and it is aimed at its note as those lanes show it, so fast presses on several notes are all written, each on
+  the code the edit before it left. A note is found by its lane, its time and its rank among the notes that begin with it, in
+  the order of their tokens in the code, which an edit of a token never changes; its pitch is only a check: when the note at that
+  rank does not have the pitch the page expects, nothing is written. A lane is found by its name, or, for a track written without
+  one, by its place among the tracks, because the strings such a track is known by change with every edit. A rest takes a note
+  out of its chord, so the other notes of that chord are found again only from the lanes drawn after the rest: those lanes must
+  show the chord without the rested note (and without any copy a layered track drew of it), the other notes with the same
+  pitches, in the same order and at the same places in the code. Their edits wait until then. When the rest did not take over,
+  ended in an error at or after the write or with no answer, or those lanes show anything else, the page does not guess: their
+  edits are dropped and the panel says they were not written, naming the note, and a redraw selects none of them. A rest the
+  page refused or could not evaluate wrote nothing, so the notes beside it are found as before. So between the Timeline's own
+  edits, an edit in a chord does not land on another note, even one that has or had the same pitch. When other code takes over
+  in between (a change by Claude that plays at once), the ranks counted before are applied to the new code, and only the pitch
+  check stands between an edit and another note. A burst or a drag on a note whose earlier edit
+  still waits or is on its way is shown, and held at the ends of the range, from the value that edit will write, because that is
+  what it is written on. The read-back then decides as for any edit; a note that is no
+  longer there is named, with a sentence that its change was not written. Each answer belongs to its own note: when
+  the selection has moved on, the sentence names that note ("c3 on t1: ...") and leaves the selected note's panel and
+  "Ask Claude" alone. An answer that does not come within ten seconds is said to be late, with a sentence to check the
+  code. The page may still be running that edit, so the next one waits for its answer up to ten seconds more and only
+  then goes on; past that second wait it can be refused, because the late edit may have changed the code after all.
+  When the page cannot write (a notice came on, a change is waiting for its line), when the Timeline closes or when
+  its page turns, the steps and edits that wait are dropped and the panel says they were not written. The edit
+  already handed to the page is not taken back: it is still written, even after the Timeline closed, its answer is
+  told, and the next edit waits for it. Nothing new is handed over while the Timeline is closed. A late answer that
+  says the change waits for its line keeps the edits made after it. They go when that wait ends, whether the change took over
+  or not, aimed at the code that plays then. When the late answer came after the second wait, the queue has already gone on: the
+  edits that still wait go while the change waits, and the page refuses them because a change is waiting for its line. The edits of the notes beside a rest are the
+  exception told above: when the rest does not take over, they are dropped. While stopped, an edit rewrites and evaluates the code without
+  starting the sound. When a change is waiting for its bar line, the editor has text that is not playing, or the
+  socket is closed, the edit controls are off with one sentence saying why.
+- **Prepared requests are never sent for the user.** A drag, a key or a button on a note the page cannot edit moves
+  nothing and writes nothing; it opens the Ask box with a ready-made request ("Raise note c3 at cycle 4, beat 1 of 't1' by 2 semitones.") and the
+  note's moment, and only the user's Enter sends it: a fresh press, so a held key that opened the box sends nothing.
+  A draft already in the field is kept. The `ask` message carries
+  the change in a `gesture` field, bounded and closed to four kinds, so Claude reads the intent instead of parsing text.
+- **A range is one lane, whole cycles, inside the page shown.** Dragging across an empty part of one lane, or sideways from
+  a note, or Shift with Left or Right from a note, selects whole cycles of that lane, never more than the 32 cycles on
+  the page; a pointer that leaves the lane is held at the first or last cycle and the box says it was cut. The request
+  names the lane, the cycles, the section of each end (the first and the last only, not those between) and at most 32 of
+  the lane's notes in them, with a count of the rest; it is cut from the end until the whole line is at most 8192 bytes,
+  as the right-click moment is. A range on a lane with no notes is valid.
+- **The numbers of the hand.** A press that moves less than a quarter of a rem is a click. A note is hit within half a
+  rem in both directions, the nearest wins and equal distances go to the lower pitch. A drag changes the pitch by one
+  semitone for each half rem of travel, up is higher, and the dominant axis decides: up or down on a note is a pitch drag,
+  sideways is a range, and on empty area any direction is a range. All sizes are in rem, so they grow with the window.
+- **The keyboard does all of it.** The lanes are one Tab stop that selects nothing. Left and Right walk the notes of a
+  lane (by start, then pitch, stopping at the first and last note of the page), Home and End go to its ends, and Page
+  Up and Page Down change lane keeping the cycle; a lane with no notes on the page gets a cursor, and the panel then
+  offers only "Ask Claude". Up, Down, Delete and Backspace change a note only when one is selected. Escape steps back one
+  thing at a time: the Ask box, steps not yet written, a range, the selection, and only with nothing left does it close
+  the view. The note in focus is told to screen readers through one element the lanes point at, and the sentence slot is
+  the Timeline's only live region.
+- **Left out on purpose.** Notes in degrees, adding or lengthening a note, and a range over more than one lane stay
+  requests for Claude. Claude's reference was not changed to steer how notes are written (for example toward
+  double-quoted notes the Timeline can edit): that would tint every piece toward one way of writing.
+- **Known limits.** A page that turns while a note is selected clears the selection; a range that crosses a repeat of the
+  song names the section of its first and last cycle only. The look and feel of the gestures, and how the edits sound,
+  are judged by hand and by ear, not by a check.
 
 ## The Instruments view changes only what the user clicks
 
@@ -939,7 +1045,9 @@ was picked from sketches before the build. These choices are settled.
   track, and Strudel plays it.
 - **Not a comment.** Nothing reads a comment, so it can lie. A constant can be read by the patterns of the
   piece, so the declaration can be the real harmony.
-- **One harmony for the whole piece.** A harmony per part is left for later.
+- **One default harmony for the piece, and optionally one per section.** The constant is the piece's
+  default. A song declares a harmony of its own as the third entry of a section (see "Every new piece
+  declares a song structure"). The Jam view still shows the piece's default only.
 - **Accepted values:** a scale string, a chord pattern written as text, or a chord call with one string.
   The page reads only written text. Anything else (a number, an array, a computed value) shows as not
   readable, with one of seven reasons.
@@ -988,6 +1096,198 @@ was picked from sketches before the build. These choices are settled.
   it plays (for example `.slow()`) is read with the lengths as written, while Strudel plays it stretched.
   A guard with its own reason was weighed and left out. This stays a known wrong read.
 - **Member patterns are not given section names.**
+- **A song takes the place of the rows.** A piece that declares a song structure gets its sections and
+  tracks in the Parts view instead of the `arrange()` rows (a list at first, the Song grid since; see
+  "The Song grid launches sections, edits cells and says whether notes fit"). A piece that uses
+  `arrange()` is read and shown as before, and so is a piece with neither.
+
+## Every new piece declares a song structure
+
+- **The form.** One top-level `const song` holds a shift, the sections with their lengths in cycles, a
+  plan that gives every track a cell in every section, and optional groups. A cell is the name of one of
+  the track's variations, or `'-'` for a rest. Groups are data and change nothing in what plays. Three
+  helper statements (`total`, `clock`, `play`) are written as they are and turn the declaration into one
+  shared section clock and one lookup per track. Each track has one `const` holding only its variations;
+  its statement is `name: play('name', name)`, so the label, the play name and the constant agree. The
+  page reads the text of the code and evaluates nothing to read it, and the same code plays in plain
+  Strudel.
+- **Harmony.** The piece's own `const harmony` is the default; a section can carry its own as a third
+  entry. A variation in degrees is a function of its section's harmony; a fixed variation carries the
+  harmony it was written for.
+- **One clock, restarted at each use.** The shared clock picks each track's variation for the section it
+  names and starts it at its first cycle every time the section comes round, also when a name returns. A
+  note held across a section line is cut at the line and not struck again. This keeps a section sounding
+  the same each time, whatever came before it. It was measured in real Chrome before it was chosen.
+- **One standing rule, and the rest in the places Claude looks.** The server instructions say in one
+  sentence that every new piece declares its structure once at the top. The form lives in a reference
+  topic named `structure`, which states facts and shapes only: placeholder names, three shapes that
+  differ, no section role, no style and no advice. `get_code` shows the topic's first block as a
+  template whenever nothing plays yet, before the start included, because the first `get_code` of a
+  fresh session comes before the start.
+- **The new-piece reply line.** A `set_code` that plays a new piece without a top-level `const song`
+  carries one plain line saying so. The call never fails because of it and the music plays as written.
+  A piece is new when the code before it is empty, has no line of 8 or more characters, or keeps fewer
+  than half of those lines. This is a text match; the server never parses the code. `edit_code` and
+  `restore_version` never carry the line, and an older piece is not restructured: a small request is made
+  in place.
+- **What the page says.** A structure the page cannot read gets one sentence naming the cause, in the
+  Parts view, and the same sentence reaches Claude with its next tool reply, led by the fixed phrase
+  "Song structure". There is no banner. When the helper differs from the written text, or is missing,
+  the page says it cannot vouch for what the structure declares; it never rewrites the code.
+- **Declared against played.** After a version plays, the page compares, for every unmuted track made by
+  `play()`, the first cycle of each section entry with what the song declares: the number of onsets,
+  where each whole begins and ends (a declared whole that runs past the end of its section counts as cut
+  there), and every key the declaration holds. Extra keys on the played side and function values are
+  ignored, and onsets pair one to one. The declared side is built by the page from the code's own
+  constants and not through the code's `play()`, so a changed helper shows as a difference instead of
+  hiding itself. A difference gives one line naming the first place in section order and then track
+  order, and how many others there are. The check starts after the page has settled, yields to the page
+  between tracks, stops at 2 seconds, and is dropped when a newer version takes over. A check that fails
+  or runs out of time says so in a muted line; it is never silent. The answer reaches Claude with the
+  next reply.
+- **One copy of the helper.** The helper text lives in a page module. The probes and the topic are tied
+  to it by a test and by a claim of `npm run check:reference`, so they cannot drift.
+- **How it was tried.** The teaching was tried on headless Claude sessions, one per plain request with no
+  style, tempo, instrument or part named, each against a scratch Moontide server of its own: a port the
+  system picks, a temporary data folder and a headless browser with a fresh profile. Only the Moontide
+  tools were allowed, no other server or setting was loaded, and each session was bounded by a cost cap,
+  a turn cap and a time limit, run one after the other. The harness and its results stay in private notes.
+  In that trial all six first pieces declared a structure the page reads, and a small request on an older
+  piece changed only the asked line. The shapes differed in length and in number of sections, but the
+  section names repeated from session to session; the topic names none, so they come from Claude. How
+  the sections feel is judged by ear.
+- **Editing the song from the page** came later, with the Song grid (see the section named above).
+
+## The Song grid launches sections, edits cells and says whether notes fit
+
+- **Where it lives.** For a piece that declares a readable song, the grid replaces the Parts list in the
+  same view. The view keeps its key (4) and its id; only the name in the top bar reads Song instead of
+  Parts. A piece without a song keeps the `arrange()` rows as they were, and a song the page cannot read
+  keeps its one sentence and shows no grid.
+- **A launch pins its line.** A click on a section header reads the scheduler's frontier once, works out
+  the line from the launch point the toolbar holds (the end of the section that plays, the next phrase or
+  the next bar), writes the shift that puts that section on that line, and pins the takeover to the very
+  same line. All of it happens in one turn, so the frontier cannot move between the maths and the write.
+  An evaluation can still take real time (samples, MIDI), and then the takeover may find a different
+  line; the page recomputes once, and if the line still moves it cancels the launch and says so in a
+  sentence. It never lets the shift and the line disagree.
+- **A launch that needs no change.** When the section already starts on that line, nothing is written and
+  nothing is evaluated: the header only shows its countdown, and a second click hides it.
+- **Cancel and replace.** A second click on the queued header cancels the launch and puts the editor back
+  to the code that plays; nothing is recorded. A click on another header replaces the queued one and is
+  built on the waiting code. Typing in the editor that was never evaluated switches every control off with
+  one sentence saying why; the grid never discards that text.
+- **Play after Stop starts from the first section.** Play after a Stop writes shift 0 into the code before
+  it evaluates, so a structured piece starts from its first section (the count restarts at 0 at every
+  Play); that is one history entry, and none when the shift is already 0. Ctrl+Enter is left as it is: it
+  evaluates the text as written, shift included. A header clicked while the sound is stopped starts the
+  piece at that section at once.
+- **A cell edit follows the user's hand-edit timing.** A cell opens a list of the track's variations and a
+  rest. Choosing one replaces exactly one string of the plan and takes over by the timing the person set
+  for their own edits (now, next bar or next phrase); until the line the cell shows what was chosen with
+  the words that say it is not playing yet. It is one history entry, recorded through the same message the
+  Mixer uses. A section name used twice shares one cell, so the change shows in every column of that name
+  and the list says so. The page refuses with a sentence, and writes nothing, when another change waits,
+  when the editor holds unevaluated typing, or when the cell changed since the click.
+- **The fit check compares notes, never blocks.** For a fixed variation the page asks the code's own
+  constants (through a query, the same way the declared-side check does, never through the code's `play()`)
+  which pitch classes it plays in the first cycles of the section, and compares them with the section's
+  scale over the nine scales the Jam view knows. A note within a quarter of a semitone of a pitch counts as
+  that pitch; one farther off is left out. The grid says only `fits`, `does not fit (F#, A)` or `cannot
+  check` with one reason, in the muted colour. Nothing is drawn while the answer is pending, a query that
+  fails says `cannot check` and never `fits`, and the check changes no code, no music and no launch.
+- **Jam follows the section.** The Jam view's Declared line shows the harmony of the section that plays
+  (its own, else the piece's) and names the section; while stopped it shows the first section. A piece
+  without sections shows the line as before.
+- **Asking Claude from the grid.** A right-click on a section header gives a part context, on a track name
+  a track context, on a cell a cell context (the section, the track, the variation or a rest, and the fit
+  word the cell showed at that moment), and on a group row a group context (with the group it sits in).
+  The most specific target wins, and the toolbar, the corner and empty space mean the whole session. The
+  page's single right-click listener leaves a Shift press to the browser, so the Menu key and Shift+F10 on
+  a focused control are handled by the grid and open the same box at the middle of the control.
+- **A ready-made request only for a cell that does not fit.** Its text is put in the Ask field with the
+  caret at the end and is never sent for the user: they read it, may change it and press Enter. A draft
+  already in the field is kept and the request follows it after a blank line. A cell that fits, or that
+  cannot be checked, adds nothing.
+- **The old Parts launch is unchanged.** A launch from an `arrange()` row still replaces unevaluated
+  typing, as it always did; only the grid keeps that text.
+
+## The Mixer shows the song's groups
+
+- **Frames follow the song.** For a piece that declares a readable song with groups, the Mixer draws one
+  frame per group, at any depth, with the strips of its tracks inside, then the tracks no group names, then
+  the bus strips. A piece with no song, an unreadable song or a song that names no group keeps the flat
+  Mixer, every control working. The structure only places strips: for the same code, every strip is the same
+  with and without it, so a song never makes the Mixer refuse a track it would otherwise handle. A MIDI
+  track sits in its frame like any other, with its instrument tag, its channel and its controls.
+- **Folding is shared with the Song grid.** A frame folds with its fold button (click, Enter or Space) and
+  hides its strips; the strips keep their state in the code. The folded groups are one stored value in this
+  browser, read by both views, so folding in one folds in the other. A fold writes no code and records no
+  version, and it works even when the group's other buttons are off. An unreadable stored value is ignored
+  and every group starts open. Arrow keys, Home and End do nothing on a group's buttons, as in the grid;
+  Tab goes fold, M, S, then the strips of an open group.
+- **A group's M and S are one change.** One click on M mutes every track below the group, sub-groups
+  included, and the next click unmutes them; S does the same with the solo marker. It is one rewrite of the
+  code, one evaluation and one history version, built from the same per-track rules as a strip's own
+  buttons. If any track cannot be written, nothing is written and the usual failure line says why. A group
+  with only some of its tracks muted or soloed shows a dashed button, a count line ("2 of 3 muted") and a
+  hover sentence, and one click then mutes or solos all. A track the Mixer cannot change (an unlabeled
+  track for solo, a label it does not own) is left as it is, kept out of the counts and named in a short
+  note under the group; a group with no track it can change has its buttons off and says so.
+- **No group fader.** Plain Strudel has no gain for a group of tracks, and MIDI output ignores a post-gain,
+  so a group fader would be a lie for the tracks that matter most. The group has mute and solo only; levels
+  stay on the strips.
+- **A track written with `play()` no longer says it is built from shared code.** The helper the song
+  structure puts in the code is the same for every track, so the line told the user nothing. A track built
+  from any other constant still shows the line.
+- **Asking Claude about a group.** A right-click on a group's head or frame opens the Ask box with a group
+  context (with the group it sits in when it is nested); a right-click on a strip inside the frame still
+  asks about that track. The right-click only reads: nothing is evaluated or recorded. There is no keyboard
+  route to the box from a group yet.
+
+## Mixer lights follow the moment a note is heard
+
+- **A light is a blink tied to a note.** Every labeled track strip and every group head has a small light
+  before its name. With motion on, the light goes to full in the first frame at or after the moment one of
+  the track's notes is heard and falls to dark in a straight line over 180 ms; a note that comes while it
+  fades starts it over. A group's light shows the brightest of the tracks below it, at any depth, folded or
+  open. With motion off nothing blinks: a light stays lit while a note was heard within the last cycle. The
+  lights run only while the Mixer is open, the tab is visible and sound is playing; Stop, a hidden tab,
+  opening the Mixer and switching motion take every light to dark, and a muted track, or a track another
+  track's solo silences, never lights.
+- **When a note is heard.** A browser sound is due at a time on the audio clock; the page moves it to the
+  page clock through the audio context's output timestamp, which already counts the output delay the browser
+  knows about, and reads that timestamp once per animation frame. A MIDI note is heard at the timestamp its
+  port got, the same one that leaves with the message. The note's track comes from a tag the page puts on
+  every labeled statement, so the light needs no guess about which track played.
+- **The skew that remains.** The lights are right to within a frame, not to the sample:
+  - A browser that reports no output latency draws the light early by that latency. The page falls back to
+    the context's own latencies when the timestamp is stale, and to nothing when they are not reported.
+  - MIDI notes sit about 34 ms after the browser's target time (the decision above) and about 5 ms after
+    the heard browser sound, so a MIDI light sits about 5 ms after a browser light for notes struck together.
+  - The synth's own delay after the timestamp is not known to the page, so a slow instrument sounds a little
+    after its light.
+  - A light changes on whole frames: up to about 17 ms late at 60 Hz.
+  - The two offsets (one for browser sounds, one for MIDI notes) start at 0 and the fade at 180 ms. They are
+    named constants in `page/lights.js`, to be tuned by ear on real hardware.
+- **Strips with no light.** A strip of a program with no label has a hidden light and says so in its note:
+  no label means no way to know which track played a note. A bus strip is not a track and has none. A
+  `.midi()` track in a browser without Web MIDI makes no sound, so its light stays dark.
+- **Blinks without a sound.** Two cases blink a light for a note nobody hears: a `.midi()` note to a port
+  that is not connected, and a `.midi()` track after the browser refused MIDI access. The light follows the
+  note the page sent, not what the instrument did with it.
+- **Tracks written with `$:`.** They have no name, so the page numbers them in code order, and the number
+  restarts with each evaluation. While a change waits for the bar line, the new code is already numbered
+  and the old code still plays, so for the notes heard right after such a change a `$` track's light may
+  blink on the wrong `$` strip. Named tracks are not affected.
+- **Cost.** The light state is plain data, with no document access. A frame writes only the lights whose
+  brightness changed in one of 64 steps. With 40 tracks in 8 groups it costs well under 0.2 ms of
+  JavaScript a frame, and 40 silent tracks playing 320 notes a second with the Mixer open drop no more frames
+  than the same piece with the Mixer closed.
+
+Pins: `npm run test` holds the light state with fake time, `npm run probe:page -- --only mixer` the
+lights in the real Mixer against the heard moment and the cost at 40 tracks, and `npm run probe:midi --
+--only mixer` a `.midi()` track's light against the timestamp its port got.
 
 ## Moontide starts on demand
 

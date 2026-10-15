@@ -11,6 +11,19 @@
 // network as scripts/probe-page.mjs (the pinned Strudel bundle comes from unpkg). It reuses that
 // script's helpers through plain exports. Exit codes: 0 all checks passed, 1 a check failed,
 // 2 the probe could not run.
+//
+// Song structure: the checks of songMidiBlocks() prove that a .midi() track built by the in-code helper of a structured
+// piece plays on its port only in the sections where it plays, and what happens to .midi() options that differ between
+// variations. They run once before the final verdict of a full run, or alone with `--only song`.
+//
+// Mixer groups: the checks of mixerMidiBlocks() prove that a MIDI track inside a group of a structured piece keeps its place in the
+// group's frame with its tag and controls, that the group's M silences it by the same rewrite as a track's own M, and that its
+// light, and its group's light, blink at the timestamp its port got for each note. They run
+// once before the final verdict of a full run, or alone with `--only mixer`.
+//
+// Timeline edits: the check of timelineMidiBlocks() proves that a drum note of a rhythm lane is selected and dragged like any note,
+// with its ring on its row and the drums named in the sentence. It runs once before the final verdict of a full run, or alone with
+// `--only timeline`. These three are the only groups this script can run alone.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -62,6 +75,13 @@ import {
   removeTempDirs,
   sleep,
   spawnBrowser,
+  MIXER_LIGHT_WATCH_START,
+  MIXER_LIGHT_WATCH_STOP,
+  SONG_HELPER_TEXT,
+  SONG_NOTE_LISTEN_START,
+  SONG_NOTE_LISTEN_STOP,
+  songHelperCode,
+  songMidiOf,
   startServerAndClient,
   stopMusic,
   waitConnected,
@@ -185,10 +205,501 @@ function noteOns(entries, port) {
   );
 }
 
+/**
+ * Song structure checks over the fake MIDI device. `setScenario` reloads the page with a fresh fake device (and a fresh log),
+ * `dataDir` is the server's data folder (an instruments.json written there is read when the page reloads).
+ */
+export async function songMidiBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir } = context;
+  const midiLog = () => evaluateExpr(cdp, 'window.__midiLog');
+  const stateWord = () => evaluateExpr(cdp, `(() => { const el = document.querySelector('#sound-state .state-label'); return el ? el.textContent : null; })()`);
+  const soundsAt = (entry) => (typeof entry.ts === 'number' ? entry.ts : entry.t);
+
+  // The note-ons of one port grouped into bursts: a silence of more than a second starts a new one.
+  const burstsOf = (entries, port) => {
+    const ons = noteOns(entries, port).sort((a, b) => soundsAt(a) - soundsAt(b));
+    const bursts = [];
+    for (const entry of ons) {
+      const last = bursts.at(-1);
+      if (last !== undefined && soundsAt(entry) - last.at.at(-1) <= 1000) {
+        last.pitches.push(entry.bytes[1]);
+        last.at.push(soundsAt(entry));
+      } else {
+        bursts.push({ pitches: [entry.bytes[1]], at: [soundsAt(entry)] });
+      }
+    }
+    return bursts;
+  };
+  const countOf = (list, pitch) => list.filter((value) => value === pitch).length;
+
+  // A track built by the helper that ends with .midi() sends notes only in the sections where it plays. Its sections
+  // are 3 cycles in E minor, 5 cycles in C major and a rest of 7 cycles; the clock runs at 2 cycles a second.
+  await setScenario({ permission: 'granted' });
+  let marker = (await midiLog()).length;
+  await callTool(client, 'set_code', { code: songHelperCode({ midi: true, cps: 2 }), label: 'probe:midi song helper' });
+  await sleep(19000);
+  const playedEntries = (await midiLog()).slice(marker);
+  const bursts = burstsOf(playedEntries, 'Fake Synth A');
+  const middle = bursts[1] ?? { pitches: [], at: [] };
+  const xPitches = middle.pitches.slice(0, 12);
+  const yPitches = middle.pitches.slice(12);
+  const silences = bursts.slice(1).map((burst, index) => Math.round(burst.at[0] - bursts[index].at.at(-1)));
+  report(
+    'song: a .midi() track built by the helper plays on its port in its sections and is silent in its rest',
+    bursts.length >= 3 &&
+      middle.pitches.length === 32 &&
+      countOf(xPitches, 62) === 3 &&
+      countOf(xPitches, 48) === 0 &&
+      countOf(yPitches, 48) === 5 &&
+      countOf(yPitches, 62) === 0 &&
+      silences.every((gap) => gap >= 3000 && gap <= 4500) &&
+      noteOns(playedEntries, 'Fake Synth B').length === 0,
+    JSON.stringify({ burstSizes: bursts.map((burst) => burst.pitches.length), silencesMs: silences, middleBurstFirst12: xPitches.length, pitch62InFirst12: countOf(xPitches, 62), pitch48InLast20: countOf(yPitches, 48) }),
+  );
+  await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi song helper done' });
+
+  // The page's note tag names the notes of a .midi() track, and the port still receives every note. The page carries the tag for
+  // every evaluation, so there is no run without it; the proof that nothing moved is in the last complete burst of 32 note-ons
+  // of the port: the notes the listener names for t2 have the same 32 pitches in order, each carries a stamp equal to the
+  // timestamp the port logged for the same note, and the target times are spaced the way the port timestamps are.
+  await setScenario({ permission: 'granted' });
+  const lightPiece = songHelperCode({ midi: true, cps: 2 });
+  // The sizes of all bursts the run sent, kept for the report, so a missing complete burst shows what was sent instead.
+  const burstSizes = {};
+  const playForCycles = async (code, label) => {
+    await evaluateExpr(cdp, 'window.__midiLog.length = 0');
+    await evaluateExpr(cdp, 'window.__noteSeen.seen.length = 0');
+    await callTool(client, 'set_code', { code, label });
+    const active = await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode === ${JSON.stringify(code)} ? true : null`, 8000);
+    if (active !== true) throw new ProbeCouldNotRun(`the page did not start running the code of ${label} within 8 seconds`);
+    const startedAt = await evaluateExpr(cdp, `document.getElementById('repl').editor.repl.scheduler.now()`);
+    const reached = await waitFor(cdp, `document.getElementById('repl').editor.repl.scheduler.now() >= ${startedAt + 24} ? true : null`, 60000);
+    if (reached !== true) throw new ProbeCouldNotRun(`the scheduler did not run 24 cycles within 60 seconds in ${label}`);
+    const bursts = burstsOf(await midiLog(), 'Fake Synth A');
+    burstSizes[label] = bursts.map((burst) => burst.pitches.length);
+    return bursts.filter((burst) => burst.pitches.length === 32).at(-1);
+  };
+  let lightFacts = { burstSizes };
+  let lightOk = false;
+  try {
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_START);
+    const portBurst = await playForCycles(lightPiece, 'probe:midi song note tag');
+    const everything = await evaluateExpr(cdp, 'window.__noteSeen.seen.map((e) => ({ key: e.key, wb: e.wb, target: e.target, stamp: e.stamp, note: e.note }))');
+    const seen = everything.filter((e) => e.key === 'label:t2').sort((a, b) => a.wb - b.wb);
+    // The listener's notes of t2 in bursts of the same shape: a rest of the track is 7 cycles, so a gap of 4 cycles starts a new one.
+    const namedBursts = [];
+    for (const e of seen) {
+      const last = namedBursts.at(-1);
+      if (last !== undefined && e.wb - last.at(-1).wb <= 4) last.push(e);
+      else namedBursts.push([e]);
+    }
+    const seenBurst = namedBursts.filter((burst) => burst.length === 32).at(-1);
+    const unkeyed = everything.filter((e) => typeof e.key !== 'string' || e.key === '').length;
+    lightFacts = { burstSizes, namedBurstSizes: namedBursts.map((burst) => burst.length), unkeyed };
+    if (portBurst !== undefined && seenBurst !== undefined) {
+      const seenPitches = seenBurst.map((e) => songMidiOf(e.note));
+      // The port's burst lists note-on timestamps in time order, the listener's in whole-begin order: the same order for one track.
+      const stampDiffs = seenBurst.map((e, index) => (typeof e.stamp === 'number' ? Math.abs(e.stamp - portBurst.at[index]) : Infinity));
+      const targetSpacing = seenBurst.map((e) => (e.target - seenBurst[0].target) * 1000);
+      const portSpacing = portBurst.at.map((value) => value - portBurst.at[0]);
+      const spacingDiffs = targetSpacing.map((value, index) => Math.abs(value - portSpacing[index]));
+      lightFacts = {
+        burstSizes,
+        portNotes: portBurst.pitches.length,
+        seenNotes: seenBurst.length,
+        seenEqualPort: seenPitches.filter((pitch, index) => pitch === portBurst.pitches[index]).length,
+        maxStampDifferenceMs: Math.round(Math.max(...stampDiffs) * 100) / 100,
+        maxSpacingDifferenceMs: Math.round(Math.max(...spacingDiffs) * 100) / 100,
+        unkeyed,
+      };
+      lightOk =
+        lightFacts.seenNotes === 32 &&
+        lightFacts.seenEqualPort === 32 &&
+        lightFacts.maxStampDifferenceMs < 1 &&
+        lightFacts.maxSpacingDifferenceMs < 1 &&
+        unkeyed === 0;
+    }
+  } finally {
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_STOP);
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi song note tag done' });
+  }
+  report("song: the page's note tag names every note of a .midi() track, and each carries the timestamp the port got", lightOk, JSON.stringify(lightFacts));
+
+  // Options that differ between variations: two sounds asked of one channel are refused when the code is evaluated; on two
+  // channels each sound goes out once when the code is evaluated and no section change sends another.
+  const rigFile = path.join(dataDir, 'instruments.json');
+  fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth B' }] }));
+  try {
+    await setScenario({ permission: 'granted' });
+    const optionsCode = (channelA, channelB) =>
+      [
+        'setcps(2)',
+        "const harmony = 'C3:major'",
+        "const song = { shift: 0, sections: [['x', 3], ['y', 5], ['z', 7]], plan: { x: { t4: 'va' }, y: { t4: 'vb' }, z: { t4: 'va' } } };",
+        SONG_HELPER_TEXT,
+        `const t4 = { va: note("c3 e3").midi('Fake Synth B', { midichannel: ${channelA}, sound: 'Str Sect 1' }), vb: note("g3 b3").midi('Fake Synth B', { midichannel: ${channelB}, sound: 'Harpsi 2' }) };`,
+        "t4: play('t4', t4)",
+      ].join('\n');
+    let refusal = '';
+    try {
+      await callTool(client, 'set_code', { code: optionsCode(3, 3), label: 'probe:midi song one channel two sounds' });
+    } catch (err) {
+      refusal = (err instanceof Error ? err.message : String(err)).split('\n\n')[0];
+    }
+    const stateAfterRefusal = await stateWord();
+    marker = (await midiLog()).length;
+    await callTool(client, 'set_code', { code: optionsCode(3, 4), label: 'probe:midi song two channels' });
+    await sleep(17000);
+    const optionEntries = (await midiLog()).slice(marker).filter((entry) => entry.port === 'Fake Synth B');
+    const programs = optionEntries.filter((entry) => entry.bytes.length === 2 && (entry.bytes[0] & 0xf0) === 0xc0).map((entry) => entry.bytes.join('-'));
+    // Runs of notes of the same variation: every change of variation is a section change that reached the port.
+    const variationOf = (entry) => (entry.bytes[1] === 48 || entry.bytes[1] === 52 ? 'a' : 'b');
+    const runs = [];
+    for (const entry of noteOns(optionEntries, 'Fake Synth B').sort((a, b) => soundsAt(a) - soundsAt(b))) {
+      if (runs.at(-1) !== variationOf(entry)) runs.push(variationOf(entry));
+    }
+    report(
+      'song: .midi() options that differ between variations go out once per evaluation, never at a section change (two sounds on one channel are refused)',
+      refusal.includes('mt32 channel 3 is asked for two different sounds: "Str Sect 1" and "Harpsi 2"') &&
+        stateAfterRefusal === 'Playing' &&
+        programs.length === 2 &&
+        programs.includes('194-48') &&
+        programs.includes('195-17') &&
+        runs.length >= 4,
+      JSON.stringify({ refusal, stateAfterRefusal, programChanges: programs, variationRuns: runs.join('') }),
+    );
+  } finally {
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi song options done' });
+    fs.rmSync(rigFile, { force: true });
+  }
+}
+
+/**
+ * Mixer group checks over the fake MIDI device: a MIDI track of a structured piece sits in its group's frame, and the group's M
+ * mutes it. `setScenario` reloads the page with a fresh fake device (and a fresh log), `dataDir` is the server's data folder.
+ */
+export async function mixerMidiBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir } = context;
+  const midiLog = () => evaluateExpr(cdp, 'window.__midiLog');
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const historyRows = async () => {
+    const reply = String(await callTool(client, 'list_history', {}));
+    return reply
+      .split('\n')
+      .filter((row) => /^#\d+ /.test(row))
+      .map((row) => ({ id: Number(/^#(\d+) /.exec(row)[1]), label: /"([^"]*)"/.exec(row)?.[1] ?? row }));
+  };
+  const rigFile = path.join(dataDir, 'instruments.json');
+  fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth A' }] }));
+  try {
+    await setScenario({ permission: 'granted' });
+    // The instrument of the rig declares channels 2 to 10, so the track names channel 3.
+    const code = songHelperCode({ midi: true, cps: 2 }).replace(".midi('Fake Synth A')", ".midi('Fake Synth A', { midichannel: 3 })");
+    await callTool(client, 'set_code', { code, label: 'probe:midi mixer group' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of the Mixer group check within 8 seconds');
+    }
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, '3');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'mixer' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Mixer did not open');
+    }
+    const frame = `.mx-group[data-group='["g1"]']`;
+    const strip = `${frame} .mx-strip[data-track="label:t2"][data-midi="true"]`;
+    const stripFacts = await waitFor(
+      cdp,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(strip)});
+        if (el === null) return null;
+        const tag = el.querySelector('.mx-tag');
+        const chips = [...el.querySelectorAll('.mx-midi-chip')].map((chip) => chip.dataset.param);
+        return tag === null || tag.hidden || chips.length === 0 ? null : { tag: tag.textContent, chips, fader: !el.querySelector('.mx-fader').disabled, ownFrame: el.closest('.mx-group').dataset.group };
+      })()`,
+      6000,
+    );
+    // The piece is heard on the port before the group is muted.
+    const heardBefore = await waitFor(cdp, `window.__midiLog.some((e) => e.port === 'Fake Synth A' && e.bytes.length === 3 && e.bytes[0] >= 0x90 && e.bytes[0] <= 0x9f && e.bytes[2] > 0) ? true : null`, 10000);
+    const historyBefore = (await historyRows())[0].id;
+    await clickElement(cdp, `${frame} > .mx-group-head .mx-mute`);
+    const mutedCode = await waitFor(cdp, `(() => { const code = ${replState}.activeCode; return /^_t1:/m.test(code) && /^_t2:/m.test(code) ? code : null; })()`, 15000);
+    const mutedRows = await historyRows();
+    // The new code is running; notes that were already scheduled ahead of it may still leave, so the window starts a moment
+    // later. The window is longer than one run of the song (15 cycles, 7.5 seconds), so a track that still played would be heard.
+    await sleep(1500);
+    const quietFrom = (await midiLog()).length;
+    await sleep(9000);
+    const heardWhileMuted = (await midiLog()).slice(quietFrom).filter((e) => e.port === 'Fake Synth A' && e.bytes.length === 3 && e.bytes[0] >= 0x90 && e.bytes[0] <= 0x9f && e.bytes[2] > 0).length;
+    const mutedStrip = await evaluateExpr(cdp, `(() => { const el = document.querySelector(${JSON.stringify(strip)}); return el === null ? null : el.querySelector('.mx-mute').getAttribute('aria-pressed'); })()`);
+    const backFrom = (await midiLog()).length;
+    await clickElement(cdp, `${frame} > .mx-group-head .mx-mute`);
+    const unmutedCode = await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 15000);
+    const heardAfter = await waitFor(cdp, `window.__midiLog.slice(${backFrom}).some((e) => e.port === 'Fake Synth A' && e.bytes.length === 3 && e.bytes[0] >= 0x90 && e.bytes[0] <= 0x9f && e.bytes[2] > 0) ? true : null`, 12000);
+    const finalRows = await historyRows();
+    const mutedLines = mutedCode === null ? [] : mutedCode.split('\n');
+    report(
+      "mixer: a MIDI track in a group keeps its instrument controls and the group's M mutes it with the same rewrite",
+      stripFacts !== null &&
+        stripFacts.ownFrame === '["g1"]' &&
+        stripFacts.tag.length > 0 &&
+        stripFacts.chips.length > 0 &&
+        stripFacts.fader === true &&
+        heardBefore === true &&
+        mutedCode !== null &&
+        mutedLines.some((line) => /^t3: /.test(line)) &&
+        mutedRows[0].id === historyBefore + 1 &&
+        mutedRows[0].label === 'mixer: group g1 muted' &&
+        mutedStrip === 'true' &&
+        heardWhileMuted === 0 &&
+        unmutedCode === true &&
+        heardAfter === true &&
+        finalRows[0].id === historyBefore + 2 &&
+        finalRows[0].label === 'mixer: group g1 unmuted',
+      JSON.stringify({ stripFacts, heardBefore, historyBefore, mutedRows: mutedRows.slice(0, 2), mutedStrip, heardWhileMuted, unmutedCode, heardAfter, finalRows: finalRows.slice(0, 3) }),
+    );
+  } finally {
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi mixer group done' });
+    fs.rmSync(rigFile, { force: true });
+  }
+
+  // The light of a .midi() track lights in the first frame at or after the timestamp its port got for each note, and the light of
+  // its group in the same frame. The piece runs at one cycle a second; its .midi() track plays four notes a cycle in 8 of 15 cycles,
+  // and its other track is a silent browser track in the same group. The watch records each time a light's fill turns to full
+  // strength (from a MutationObserver), the note listener keeps the stamp the page read for every note, and the port's own log
+  // holds the timestamps the notes are compared with.
+  const frameStats = '(() => { const state = window.__frameGaps; state.on = false; const gaps = state.gaps.slice().sort((a, b) => a - b); return { count: gaps.length, median: gaps.length === 0 ? null : gaps[Math.floor(gaps.length / 2)] }; })()';
+  let listening = false;
+  let watching = false;
+  try {
+    await setScenario({ permission: 'granted' });
+    const lightCode = songHelperCode({ midi: true, cps: 1 });
+    await callTool(client, 'set_code', { code: lightCode, label: 'probe:midi mixer light' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(lightCode)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of the Mixer light check within 8 seconds');
+    }
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) !== 'mixer') await pressKey(cdp, '3');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'mixer' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Mixer did not open');
+    }
+    const lightOf = `.mx-strip[data-track="label:t2"][data-midi="true"] .mx-light`;
+    const groupLightOf = `.mx-group[data-group='["g1"]'] > .mx-group-head .mx-group-title > .mx-light`;
+    if ((await waitFor(cdp, `document.querySelector(${JSON.stringify(lightOf)}) !== null && document.querySelector(${JSON.stringify(groupLightOf)}) !== null ? true : null`, 6000)) !== true) {
+      throw new ProbeCouldNotRun('the Mixer did not draw the light of the .midi() track and of its group');
+    }
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_START);
+    listening = true;
+    await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START({ t2: lightOf, g1: groupLightOf }, ['label:t2']));
+    watching = true;
+    // The frame interval of this run, measured while the lights run.
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        const state = (window.__frameGaps = { on: true, last: null, gaps: [] });
+        const step = (t) => {
+          if (!state.on) return;
+          if (state.last !== null) state.gaps.push(t - state.last);
+          state.last = t;
+          requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      })()`,
+    );
+    await evaluateExpr(cdp, 'window.__midiLog.length = 0');
+    const startedAt = await evaluateExpr(cdp, 'performance.now()');
+    await sleep(16500);
+    const endedAt = await evaluateExpr(cdp, 'performance.now()');
+    const frames = await evaluateExpr(cdp, frameStats);
+    const watch = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+    watching = false;
+    const seen = await evaluateExpr(cdp, 'window.__noteSeen.seen.map((e) => ({ key: e.key, stamp: e.stamp }))');
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_STOP);
+    listening = false;
+    const log = await midiLog();
+    const frameMs = frames.median === null ? 17 : frames.median;
+    // A note whose timestamp is in the last 100 ms of the window may light after the watch ended, so it is left out.
+    const sent = noteOns(log, 'Fake Synth A')
+      .map((entry) => (typeof entry.ts === 'number' ? entry.ts : entry.t))
+      .filter((at) => at >= startedAt && at <= endedAt - 100);
+    const litAt = (name) => watch.events[name].filter((event) => event.opacity === '1').map((event) => event.t);
+    const t2Lit = litAt('t2');
+    const g1Lit = litAt('g1');
+    const gaps = sent.map((at) => {
+      const lit = t2Lit.find((t) => t >= at - 1);
+      return lit === undefined ? null : lit - at;
+    });
+    const inTime = gaps.filter((gap) => gap !== null && gap >= -1 && gap <= frameMs + 20);
+    const gapsMs = gaps.filter((gap) => gap !== null).sort((a, b) => a - b);
+    const round = (value) => Math.round(value * 10) / 10;
+    const mean = gapsMs.length === 0 ? null : round(gapsMs.reduce((sum, gap) => sum + gap, 0) / gapsMs.length);
+    const p95 = gapsMs.length === 0 ? null : round(gapsMs[Math.min(gapsMs.length - 1, Math.ceil(gapsMs.length * 0.95) - 1)]);
+    const tagged = seen.filter((entry) => entry.key === 'label:t2');
+    const unstamped = tagged.filter((entry) => typeof entry.stamp !== 'number').length;
+    // The group is lit in a track's frame when its latest write at or before that moment (give or take 1 ms) is full strength: the
+    // group's other track may have lit it a frame earlier, and then there is no new write for the second note.
+    const g1Writes = watch.events.g1;
+    const groupMissed = t2Lit.filter((t) => {
+      const latest = g1Writes.filter((event) => event.t <= t + 1).at(-1);
+      return latest === undefined || latest.opacity !== '1';
+    }).length;
+    report(
+      "mixer: a .midi() track's light lights at the timestamp its port got, and its group's light with it",
+      sent.length >= 24 &&
+        inTime.length >= Math.ceil(sent.length * 0.95) &&
+        tagged.length >= sent.length &&
+        unstamped === 0 &&
+        t2Lit.length >= sent.length &&
+        groupMissed === 0,
+      JSON.stringify({ portNotes: sent.length, inTime: inTime.length, gapMeanMs: mean, gapP95Ms: p95, gapMaxMs: gapsMs.length === 0 ? null : round(gapsMs.at(-1)), frameMs: round(frameMs), frames: frames.count, taggedNotes: tagged.length, unstamped, t2Lit: t2Lit.length, g1Lit: g1Lit.length, groupMissed }),
+    );
+  } finally {
+    if (watching) await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+    if (listening) await evaluateExpr(cdp, SONG_NOTE_LISTEN_STOP);
+    await evaluateExpr(cdp, `(() => { if (window.__frameGaps) window.__frameGaps.on = false; })()`);
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi mixer light done' });
+  }
+}
+
+/**
+ * Timeline edit checks over the fake MIDI device: a drum note of a rhythm lane (the rig puts the channel on its rhythm role) is
+ * selected and dragged like any note. `setScenario` reloads the page with a fresh fake device, `dataDir` is the server's data
+ * folder. The pieces use made-up neutral notes and are not heard: the fake port only records.
+ */
+export async function timelineMidiBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const rigFile = path.join(dataDir, 'instruments.json');
+  fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth A' }] }));
+  try {
+    await setScenario({ permission: 'granted' });
+    const code = `drums: note("36 38 42 38").midi('Fake Synth A', { midichannel: 10 })`;
+    await callTool(client, 'set_code', { code, label: 'probe:midi timeline drum drag' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of the Timeline drum check within 8 seconds');
+    }
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, '2');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'timeline' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Timeline did not open');
+    }
+    const drawn = await waitFor(
+      cdp,
+      `(() => { const lane = document.querySelector('#timeline-lanes .lane[data-track="label:drums"]'); return document.getElementById('timeline-view').dataset.state === 'ok' && lane !== null && lane.dataset.drumRows !== undefined ? true : null; })()`,
+      10000,
+    );
+    if (drawn !== true) throw new ProbeCouldNotRun('the Timeline did not draw the drum lane of this check within 10 seconds');
+    const historyTop = async () => {
+      const match = /^#(\d+) (.*)$/m.exec(String(await callTool(client, 'list_history', {})));
+      if (match === null) throw new ProbeCouldNotRun('list_history shows no numbered row');
+      return { id: Number(match[1]), row: match[2] };
+    };
+    // The note panel under the lanes keeps one height, so a short window leaves the lanes no room: the check uses a taller window.
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1366, height: 900, deviceScaleFactor: 1, mobile: false });
+    await sleep(400);
+    const remPx = await evaluateExpr(cdp, `parseFloat(getComputedStyle(document.documentElement).fontSize)`);
+    // The first mark of the bass drum's row (the labels run from the top row to the bottom one).
+    const bass = await evaluateExpr(
+      cdp,
+      `(() => {
+        const lane = document.querySelector('#timeline-lanes .lane[data-track="label:drums"]');
+        const labels = [...lane.querySelectorAll('.drum-row-label')].map((el) => el.textContent);
+        const row = labels.indexOf('Acoustic Bass Drum');
+        const mark = lane.querySelector('rect.event[data-row="' + row + '"]');
+        if (row === -1 || mark === null) return null;
+        mark.scrollIntoView({ block: 'nearest' });
+        const r = mark.getBoundingClientRect();
+        return { labels, row, x: r.x + r.width / 2, y: r.y + r.height / 2, box: [r.left, r.top, r.width, r.height] };
+      })()`,
+    );
+    if (bass === null) throw new ProbeCouldNotRun('the drum lane draws no mark on the row of the bass drum');
+    const mouse = (type, point, buttons) => cdp('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: 'left', buttons, clickCount: 1 });
+    const READ = `(() => ({
+      pitch: [...document.querySelectorAll('#timeline-note .tl-value')][0].textContent,
+      state: document.querySelector('#timeline-note .tl-note-state').textContent,
+      line: document.getElementById('timeline-note-line').textContent,
+      rings: document.querySelectorAll('#timeline-lanes .tl-ring').length,
+      ghosts: document.querySelectorAll('#timeline-lanes .tl-ghost').length,
+      dragging: document.getElementById('timeline-lanes').getAttribute('data-dragging'),
+      code: ${replState}.activeCode,
+    }))()`;
+    const historyBefore = await historyTop();
+    await mouse('mousePressed', bass, 1);
+    await mouse('mouseReleased', bass, 0);
+    const selected = await waitFor(cdp, `(() => { const read = ${READ}; return read.state !== '' ? read : null; })()`, 3000);
+    const ringBox = await evaluateExpr(
+      cdp,
+      `(() => {
+        const ring = document.querySelector('#timeline-lanes .tl-ring');
+        if (ring === null) return null;
+        const r = ring.getBoundingClientRect();
+        const style = getComputedStyle(ring);
+        return { box: [r.left, r.top, r.width, r.height], outlineOffset: style.outlineOffset };
+      })()`,
+    );
+    // Up two steps in small moves, the button held.
+    const target = { x: bass.x, y: bass.y - 1.1 * remPx };
+    await mouse('mousePressed', bass, 1);
+    const steps = Math.ceil((1.1 * remPx) / 3);
+    for (let i = 1; i <= steps; i++) await mouse('mouseMoved', { x: bass.x, y: bass.y - ((1.1 * remPx) * i) / steps }, 1);
+    const held = await evaluateExpr(cdp, READ);
+    const ghostBox = await evaluateExpr(
+      cdp,
+      `(() => {
+        const ghost = document.querySelector('#timeline-lanes .tl-ghost');
+        if (ghost === null) return null;
+        const r = ghost.getBoundingClientRect();
+        return [r.left, r.top, r.width, r.height];
+      })()`,
+    );
+    const heldHistory = await historyTop();
+    await mouse('mouseReleased', target, 0);
+    const edited = code.replace('36', '38');
+    const written = await waitFor(cdp, `${replState}.activeCode !== ${JSON.stringify(code)} ? ${replState}.activeCode : null`, 8000);
+    const after = await waitFor(cdp, `(() => { const read = ${READ}; return read.line === 'Changed 36 to 38.' && read.rings === 1 ? read : null; })()`, 8000);
+    const historyAfter = await historyTop();
+    // A very narrow mark gets a mark a half rem wide (the floor of the ring and the ghost); otherwise the box is the note's.
+    const sits = (a, b) => {
+      const width = Math.max(b[2], 0.5 * remPx);
+      return Math.abs(a[0] - b[0]) <= 1.5 && Math.abs(a[1] - b[1]) <= 1.5 && Math.abs(a[3] - b[3]) <= 1.5 && Math.abs(a[2] - width) <= 1.5;
+    };
+    report(
+      'timeline: a drum note on a rhythm lane is selected and dragged like any note, its ring sits on its row, the preview names the drum, and the edit writes a note number',
+      selected !== null &&
+        selected.pitch === '36 \u00b7 Acoustic Bass Drum' &&
+        selected.state === 'Editable' &&
+        ringBox !== null &&
+        sits(ringBox.box, bass.box) &&
+        Math.abs(Number.parseFloat(ringBox.outlineOffset) - 0.25 * remPx) <= 1 &&
+        held.dragging === 'pitch' &&
+        held.ghosts === 1 &&
+        held.line === '36 Acoustic Bass Drum \u2192 38 Acoustic Snare Drum (+2 semitones). Release to write.' &&
+        held.code === code &&
+        ghostBox !== null &&
+        Math.abs(ghostBox[0] - bass.box[0]) <= 1.5 &&
+        Math.abs(ghostBox[2] - Math.max(bass.box[2], 0.5 * remPx)) <= 1.5 &&
+        Math.abs(ghostBox[1] - (bass.box[1] - 2 * 0.5 * remPx)) <= 1.5 &&
+        heldHistory.id === historyBefore.id &&
+        written === edited &&
+        after !== null &&
+        after.pitch === '38 \u00b7 Acoustic Snare Drum' &&
+        after.ghosts === 0 &&
+        historyAfter.id === historyBefore.id + 1 &&
+        historyAfter.row.includes('changed drums: 36 to 38'),
+      JSON.stringify({ labels: bass.labels, selected, ringBox, bassBox: bass.box, held, ghostBox, written: written === edited, after, historyBefore: historyBefore.id, historyAfter }),
+    );
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi timeline done' });
+    fs.rmSync(rigFile, { force: true });
+  }
+}
+
 async function main() {
   let args;
   try {
     args = parseArgs(process.argv.slice(2));
+    if (args.only !== null && args.only !== 'song' && args.only !== 'mixer' && args.only !== 'timeline') {
+      throw new ProbeCouldNotRun(`probe:midi runs one group alone only with --only song, --only mixer or --only timeline (got ${JSON.stringify(args.only)})`);
+    }
   } catch (err) {
     console.error(`probe:midi COULD NOT RUN: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 2;
@@ -291,6 +802,37 @@ async function main() {
     function report(name, pass, detail) {
       checks.push({ name, pass, detail });
       console.log(`probe:midi ${pass ? 'PASS' : 'FAIL'}: ${name}: ${detail}`);
+    }
+
+    // The verdict line and the exit code, shared by the full run and the `--only` lanes.
+    function summarize() {
+      const passCount = checks.filter((check) => check.pass).length;
+      const failCount = checks.length - passCount;
+      if (failCount > 0) {
+        console.log(`probe:midi FAILED: ${failCount} of ${checks.length} checks failed`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(
+        `probe:midi OK: ${passCount} checks passed in the real page (${path.basename(browserPath)}, ${args.headful ? 'headful' : 'headless'})`,
+      );
+      process.exitCode = 0;
+    }
+
+    if (args.only === 'song') {
+      await songMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'mixer') {
+      await mixerMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'timeline') {
+      await timelineMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
     }
 
     // The permission stays unanswered for 400 ms, so a late enable would lose the first notes.
@@ -5610,17 +6152,11 @@ async function main() {
     fs.rmSync(rigFile, { force: true });
     await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi instruments removed' });
 
-    const passCount = checks.filter((check) => check.pass).length;
-    const failCount = checks.length - passCount;
-    if (failCount > 0) {
-      console.log(`probe:midi FAILED: ${failCount} of ${checks.length} checks failed`);
-      process.exitCode = 1;
-      return;
-    }
-    console.log(
-      `probe:midi OK: ${passCount} checks passed in the real page (${path.basename(browserPath)}, ${args.headful ? 'headful' : 'headless'})`,
-    );
-    process.exitCode = 0;
+    await songMidiBlocks({ cdp, client, report, setScenario, dataDir });
+    await mixerMidiBlocks({ cdp, client, report, setScenario, dataDir });
+    await timelineMidiBlocks({ cdp, client, report, setScenario, dataDir });
+
+    summarize();
   } catch (err) {
     if (err instanceof ProbeCouldNotRun) {
       console.error(`probe:midi COULD NOT RUN: ${err.message}`);

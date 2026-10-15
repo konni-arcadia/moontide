@@ -721,6 +721,16 @@ export function createMidiOut({
     });
   }
 
+  // The timestamp the port got for each note (the hap), so a light can blink when the note is heard. The page clock is
+  // not asked a second time: it keeps state.
+  const noteStamps = new WeakMap();
+
+  /** The timestamp the port got for this note, or null when it went out without one. */
+  function noteStampOf(hap) {
+    if (hap === null || typeof hap !== 'object') return null;
+    return noteStamps.get(hap) ?? null;
+  }
+
   /**
    * Wraps one trigger function of Strudel's `.midi()`. With a timestamp from the page clock for the hap's target
    * time (its 4th argument), the trigger runs with its target moved so that its sends fire NOTE_AHEAD_MS before
@@ -752,6 +762,7 @@ export function createMidiOut({
       }
       // A note whose time has passed goes out at once and keeps its length.
       const ts = Math.max(stamp, now);
+      if (args[0] !== null && typeof args[0] === 'object') noteStamps.set(args[0], ts);
       const shifted = getAudioContext().currentTime + Math.max(0, ts - now - NOTE_AHEAD_MS) / 1000;
       const proxies = webMidi.outputs.map((output) => outputProxy(output, ts, now));
       // The real webmidi keeps `outputs` as a getter on its prototype; a fake may keep an own property: the own
@@ -2608,5 +2619,6 @@ export function createMidiOut({
     resync,
     setActive,
     installNoteStamps,
+    noteStampOf,
   };
 }

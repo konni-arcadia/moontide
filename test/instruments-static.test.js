@@ -153,7 +153,7 @@ test('isTextEntryFocused in page/main.js counts any control inside .instrument-e
   assert.match(body, /closest\('\.instrument-editor'\)/);
 });
 
-test('STORAGE_KEYS is unchanged: the view adds no remembered setting', () => {
+test('STORAGE_KEYS has no setting of the Instruments view: the Song grid adds one remembered launch choice and nothing else', () => {
   assert.deepEqual(STORAGE_KEYS, {
     layout: 'moontide.layout',
     view: 'moontide.view',
@@ -162,6 +162,8 @@ test('STORAGE_KEYS is unchanged: the view adds no remembered setting', () => {
     jamInstrument: 'moontide.jamInstrument',
     jamChordTones: 'moontide.jamChordTones',
     changeTiming: 'moontide.changeTiming',
+    // The Song grid's launch choice; the Instruments view adds none.
+    songLaunch: 'moontide.songLaunch',
     // The two sizes of the border between the editor and the view; the Instruments view adds none.
     splitA: 'moontide.split.a',
     splitB: 'moontide.split.b',

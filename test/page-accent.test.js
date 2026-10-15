@@ -272,6 +272,46 @@ test('no instrument tag or MIDI chip selector uses a reserved color', () => {
   }
 });
 
+// A group frame of the Mixer, its head, its fold button and its count line are neutral outlines and plain text; none of them
+// takes a reserved color (accent: live now, accent-2: structural, destructive: removal), so a fold never looks like a state. The
+// lights are the same: a ring and a fill in the text colors, so a blink is never read as the live accent or as a warning.
+test('no Mixer group selector uses a reserved color', () => {
+  const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...stripped.matchAll(/([^{}]+)\{([^}]*)\}/g)].map((match) => ({ selectors: match[1].split(',').map((raw) => raw.trim().replace(/\s+/g, ' ')), body: match[2] }));
+  const selectors = ['.mx-group', '.mx-group-head', '.mx-group-title', '.mx-fold', '.mx-fold-chevron', '.mx-fold-name', '.mx-group-line', '.mx-group-count', '.mx-group-body', '.mx-name-row', '.mx-light', '.mx-light-fill'];
+  const reserved = ['var(--accent)', 'var(--accent-2)', 'var(--destructive)'];
+  for (const selector of selectors) {
+    const own = new RegExp(`(^|[^\\w-])${selector.replace('.', '\\.')}(?![\\w-])`);
+    const matching = rules.filter((rule) => rule.selectors.some((candidate) => own.test(candidate)));
+    assert.ok(matching.length > 0, `page/style.css has no rule for ${selector}`);
+    for (const rule of matching) {
+      for (const color of reserved) assert.ok(!rule.body.includes(color), `${rule.selectors.join(', ')} must not use ${color}`);
+      assert.ok(!/transition|animation/.test(rule.body), `${rule.selectors.join(', ')} does not animate`);
+    }
+  }
+});
+
+// The note panel under the Timeline lanes, its buttons and the marks on the lanes (the ring, the ghost, the other places of a
+// token, the range) are outlines, a wash and plain text in the text colors. None takes a reserved color: a selection is not
+// "live now", a refusal is information and an edit can be undone from the history, so nothing here looks like the accent, the
+// structural accent, a removal or a Jam hue. Nothing animates.
+test('no selector of the note panel or the marks on the Timeline lanes uses a reserved color', () => {
+  const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...stripped.matchAll(/([^{}]+)\{([^}]*)\}/g)].map((match) => ({ selectors: match[1].split(',').map((raw) => raw.trim().replace(/\s+/g, ' ')), body: match[2] }));
+  const selectors = ['.tl-ring', '.tl-ghost', '.tl-same', '.tl-range', '#timeline-note', '.tl-btn', '#timeline-note-line'];
+  const reserved = ['var(--accent)', 'var(--accent-2)', 'var(--destructive)', 'var(--jam-avoid)', 'var(--jam-outside)'];
+  for (const selector of selectors) {
+    const own = new RegExp(`(^|[^\\w-])${selector.replace('.', '\\.')}(?![\\w-])`);
+    const matching = rules.filter((rule) => rule.selectors.some((candidate) => own.test(candidate)));
+    assert.ok(matching.length > 0, `page/style.css has no rule for ${selector}`);
+    for (const rule of matching) {
+      for (const color of reserved) assert.ok(!rule.body.includes(color), `${rule.selectors.join(', ')} must not use ${color}`);
+      assert.ok(!/transition|animation/.test(rule.body), `${rule.selectors.join(', ')} does not animate`);
+      assert.ok(!rule.selectors.some((candidate) => candidate.includes('data-motion')), `${rule.selectors.join(', ')} does not depend on the motion mode`);
+    }
+  }
+});
+
 // The drum rows, their labels and tooltip bands are plain text and
 // neutral marks; none takes a reserved color, and nothing about a drum lane moves, fades or animates.
 test('no Timeline drum selector uses --accent, --accent-2 or --destructive', () => {

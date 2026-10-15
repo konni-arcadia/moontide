@@ -38,9 +38,10 @@ change.
   of a second, without stopping the music.
 - The code is always visible and editable. Every version that played is kept, and Claude can
   bring any of them back.
-- Around the code, the page shows the music in several views: the named tracks on a timeline,
-  the parts of a piece, the history as a list or a tree, a mixer whose moves rewrite the code,
-  and a jam view with the scale on a piano or a guitar.
+- Around the code, the page shows the music in several views: the named tracks on a timeline
+  where you can edit notes, the Song grid with the sections of a piece, the history as a list
+  or a tree, a mixer with groups and lights whose moves rewrite the code, and a jam view with
+  the scale on a piano or a guitar.
 - A right-click on anything in the page sends Claude a request with that context.
 - The same code can play real MIDI instruments from the page, through Web MIDI.
 
@@ -254,9 +255,9 @@ permissions section of the Claude Code documentation. Do not allow broad `node` 
 ## Musical reference
 
 Claude gets a factual reference of the exact Strudel version the page runs, through the
-`get_strudel_reference` tool (also offered as MCP resources), covering eight topics: Strudel
+`get_strudel_reference` tool (also offered as MCP resources), covering nine topics: Strudel
 vs TidalCycles, mini-notation, pattern functions, effects and sound controls, the sound
-palette, music theory in Strudel, transitions, and MIDI output. It holds facts only: what
+palette, music theory in Strudel, transitions, song structure, and MIDI output. It holds facts only: what
 exists and how to write it. Moontide ships no mood vocabulary, no style material and no model
 pieces; Claude translates your words with its own knowledge of music theory, then tells you in
 one line what it chose. Ask for a surprise in your own words: there is no menu command for it.
@@ -272,6 +273,41 @@ Claude can change a few lines of a long piece without sending it again, through 
 The code can say which harmony it means with one top-level line, for example
 `const harmony = 'C:minor'`, placed above the patterns. It plays nothing and is never a
 track. The Jam view then shows two lines, "Declared:" and "Heard:", side by side.
+
+## Song structure
+
+Every new piece Claude writes starts with one `const song` at the top. It names the sections
+with their lengths in cycles, says which version (variation) of each track plays in each section
+or that the track rests, and may put tracks into groups. It is still ordinary Strudel, and the
+same code plays in plain Strudel. A small request on an older piece is made in place and does not
+restructure it. A piece without a song plays and looks as before.
+
+For a piece with a song, the Parts view is called **Song**. The Song grid shows the tracks under
+foldable groups, with one column per section and the playing section marked.
+
+- Click a section header to launch that section on the next line the toolbar names: the end of
+  the playing section, the next phrase or the next bar. Click again to cancel.
+- Click a cell to pick another variation for that track and section, or a rest. It takes over
+  with your usual hand-edit timing.
+- A fixed variation says whether its notes fit the section's harmony: fits, does not fit, or
+  cannot check. It only says; it never blocks.
+- Play after Stop starts from the first section. The Jam view's Declared line follows the
+  playing section.
+
+The **Mixer** draws the groups as frames that fold together with the grid. One click on a
+group's M or S mutes or solos every track below it, as one change. There is no group fader,
+because plain Strudel has no gain for a group. A small light on each strip and each group blinks
+when its note is heard. With motion off in the Session drawer, a light stays lit while notes come.
+
+On the **Timeline**, click a note to select it. Drag it up or down, or press the Up and Down
+keys, to change its pitch by semitones. Delete, Backspace or "Make a rest" turns it into a rest.
+Two buttons change its velocity by a tenth. The page checks an edit before it writes it, says
+first when one edit changes the note in several places, and uses your hand-edit timing. A note
+the page cannot edit says why. Your gesture then opens the Ask box with a ready-made request,
+and it goes to Claude only when you press Enter. Drag across one lane, or hold Shift and press
+Left or Right, to select a range of whole cycles, and use "Ask Claude" to send it.
+
+A right-click on a section, a track, a cell or a group asks Claude about that thing.
 
 ## History
 

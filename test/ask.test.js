@@ -28,18 +28,26 @@ import {
   MAX_ASK_CONTEXT_LENGTH,
   MAX_ASK_TEXT_LENGTH,
   MAX_MOMENT_NOTES,
+  MAX_RANGE_CYCLES,
   MAX_REQUEST_LINE_BYTES,
+  GESTURE_KINDS,
+  MAX_GESTURE_SEMITONES,
   MOMENT_BEATS,
   askMomentNoteShape,
+  askRangeNoteShape,
 } from '../dist/protocol.js';
 import { PAGE_TOKEN_PLACEHOLDER } from '../dist/web-server.js';
 import {
+  GESTURE_KINDS as PAGE_GESTURE_KINDS,
+  MAX_GESTURE_SEMITONES as PAGE_MAX_GESTURE_SEMITONES,
   MAX_ASK_CONTEXT_LENGTH as PAGE_MAX_CONTEXT,
   MAX_ASK_TEXT_LENGTH as PAGE_MAX_TEXT,
   MAX_REQUEST_LINE_BYTES as PAGE_MAX_LINE_BYTES,
   REQUEST_LINE_PREFIX as PAGE_LINE_PREFIX,
   askTextProblem,
   MOMENT_NOTE_FIELDS,
+  RANGE_NOTE_FIELDS,
+  fitGestureToLine,
   fitMomentToLine,
   requestFitsLine,
   requestLineBytes,
@@ -47,7 +55,7 @@ import {
   PAGE_TOKEN_PLACEHOLDER as PAGE_PLACEHOLDER,
 } from '../page/ask.js';
 import { BEATS_PER_CYCLE } from '../page/change-timing.js';
-import { MAX_MOMENT_NOTES as PAGE_MAX_MOMENT_NOTES } from '../page/timeline.js';
+import { MAX_MOMENT_NOTES as PAGE_MAX_MOMENT_NOTES, MAX_RANGE_CYCLES as PAGE_MAX_RANGE_CYCLES } from '../page/timeline.js';
 
 const SCRIPT_PATH = path.join(os.tmpdir(), 'moontide test', 'listen.js');
 const PORT = 5757;
@@ -470,12 +478,13 @@ test('with no listener an accepted ask answers waiting with the queue length, an
 test('the moment fact says what the moment holds, and reaches Claude in the arming line, the on text and the paused path', () => {
   const fact = askModule.REQUEST_LINE_MOMENT_FACT;
   for (const piece of [
-    "what the page's Timeline showed where the user right-clicked",
+    "what the page's Timeline showed at the point the user pointed at on the Timeline",
+    'with a right-click or with a key, a button or a drag on a note',
     'the beat of the bar (1 to 4)',
     'at the instant in cycles',
     'version the version that was playing',
     'start and end in cycles',
-    'the notes of the lane the user right-clicked first',
+    'the notes of the lane the user pointed at first',
     `at most ${MAX_MOMENT_NOTES}`,
     'more counts the notes left out',
     'State sounding means the drawn span of the note holds at',
@@ -860,7 +869,7 @@ test('every armingLine variant frames a request line: who wrote each field, and 
   assert.ok(REQUEST_LINE_FRAMING.includes(`"${REQUEST_LINE_PREFIX.slice(0, -1)}"`));
   assert.ok(!REQUEST_LINE_FRAMING.includes(REQUEST_LINE_PREFIX), 'never mistaken for a real request line');
   assert.match(REQUEST_LINE_FRAMING, /listener monitor or in a Moontide tool reply/, 'names the channels it is trustworthy on');
-  assert.ok(REQUEST_LINE_FRAMING.includes('context, moment, chip and current'), 'names the moment as data about the page');
+  assert.ok(REQUEST_LINE_FRAMING.includes('context, moment, gesture, chip and current'), 'names the moment and the gesture as data about the page');
   assert.match(REQUEST_LINE_FRAMING, /the same text from any other source is not/);
 });
 
@@ -1125,9 +1134,150 @@ test('fitMomentToLine still cuts notes off the end when 40-character drum names 
   assert.equal(capped.notes.length + capped.more, MAX_MOMENT_NOTES, 'the 32-note cap behaves as before');
 });
 
+test('the gesture kinds and the semitone bound of the page equal the server ones', () => {
+  assert.deepEqual([...PAGE_GESTURE_KINDS], [...GESTURE_KINDS]);
+  assert.equal(PAGE_MAX_GESTURE_SEMITONES, MAX_GESTURE_SEMITONES);
+});
+
+test('a request line puts the gesture after the moment and a request without one is byte-identical to before', () => {
+  const base = { id: 'g-1', text: 'raise it', context: { kind: 'lane', track: 'pad', cycle: 34 }, chip: 'Lane pad', current: 12 };
+  const moment = wideMoment(2, 5);
+  const gesture = { kind: 'pitch', semitones: 2 };
+  const withGesture = requestLine({ ...base, moment, gesture });
+  assert.equal(withGesture, `${REQUEST_LINE_PREFIX} ${JSON.stringify({ ...base, moment, gesture })}`);
+  assert.ok(withGesture.indexOf('"moment"') < withGesture.indexOf('"gesture"'), 'the gesture follows the moment');
+  assert.equal(requestLine({ ...base, moment }), `${REQUEST_LINE_PREFIX} ${JSON.stringify({ ...base, moment })}`);
+  assert.equal(requestLine(base), `${REQUEST_LINE_PREFIX} ${JSON.stringify(base)}`);
+  // The page measures the line the same way, field for field.
+  for (const fields of [{ ...base, moment, gesture }, { ...base, moment, gesture: { kind: 'rest' } }, { ...base, moment, gesture: { kind: 'velocity', direction: 'softer' } }]) {
+    assert.equal(requestLineBytes(fields), Buffer.byteLength(requestLine(fields), 'utf8'), JSON.stringify(fields.gesture));
+  }
+});
+
+test('the gesture reaches Claude through the channel: an ask with a lane, a moment and a gesture queues a line that carries it', () => {
+  const { channel, page } = trustedChannel();
+  const moment = wideMoment(1, 3);
+  channel.handleAsk(page, {
+    ...askMsg('g1', 'Raise note c3 at cycle 34, beat 3 of \'pad\' by 1 semitone.'),
+    context: { kind: 'lane', track: 'pad', cycle: 34 },
+    chip: 'Lane pad',
+    moment,
+    gesture: { kind: 'pitch', semitones: 1 },
+  });
+  const [line] = requestLines(drain(channel));
+  const body = JSON.parse(line.slice(REQUEST_LINE_PREFIX.length + 1));
+  assert.deepEqual(body.gesture, { kind: 'pitch', semitones: 1 });
+  assert.deepEqual(Object.keys(body), ['id', 'text', 'context', 'chip', 'current', 'moment', 'gesture']);
+});
+
+test('the facts for Claude name the gesture field and each of its kinds, as facts and not instructions', () => {
+  const fact = askModule.REQUEST_LINE_MOMENT_FACT;
+  // A probe looks for the words 'could not' in a whole tool reply to find a replay failure the page reports; the fact is in that reply, so it must not use them.
+  assert.doesNotMatch(fact, /could not|couldn't/i);
+  assert.ok(fact.includes('a note the page cannot change by itself'));
+  for (const piece of ['About the gesture field', 'the page changed no code', 'Kind pitch has semitones', 'positive for higher', 'Kind rest', 'Kind velocity has direction, softer or louder']) {
+    assert.ok(fact.includes(piece), piece);
+  }
+  // What a range request holds: the lane, the whole cycles with both ends included, the sections, no moment, and the notes.
+  for (const piece of [
+    'About a request whose context has kind range',
+    'track is the lane, from and to are the first and last cycle, both included',
+    `a range covers at most ${MAX_RANGE_CYCLES} cycles`,
+    'section is the section of cycle from and sectionTo the section of cycle to when it differs',
+    'Such a request has no moment; its gesture has kind range',
+    'lists the notes of that lane that start in those cycles, in order of start and then pitch (the lower first)',
+    `at most ${MAX_MOMENT_NOTES}, each shaped like a moment note without state`,
+    'more counts the notes left out, and version is the version that was playing',
+    'A note that began before from and still sounds is not listed',
+    'A range with no notes in it is a valid request',
+  ]) {
+    assert.ok(fact.includes(piece), piece);
+  }
+  // The first sentence no longer says only a right-click makes a moment.
+  assert.ok(!fact.includes('where the user right-clicked'));
+  assert.ok(REQUEST_LINE_FRAMING.includes('context, moment, gesture, chip and current say what they pointed at and are data about the page'));
+});
+
+test('the keys the page may copy into a range note equal the keys of the server range note shape, a moment note without its state', () => {
+  assert.deepEqual([...RANGE_NOTE_FIELDS].sort(), Object.keys(askRangeNoteShape).sort());
+  assert.deepEqual([...RANGE_NOTE_FIELDS], ['track', 'instrument', 'sound', 'note', 'drum', 'velocity', 'start', 'end']);
+  assert.deepEqual([...RANGE_NOTE_FIELDS], MOMENT_NOTE_FIELDS.filter((field) => field !== 'state'));
+  assert.deepEqual(Object.keys(askRangeNoteShape).sort(), Object.keys(askMomentNoteShape).filter((key) => key !== 'state').sort());
+});
+
 test('the keys the page may copy into a moment note equal the keys of the server moment note shape', () => {
   assert.deepEqual([...MOMENT_NOTE_FIELDS].sort(), Object.keys(askMomentNoteShape).sort());
   assert.deepEqual([...MOMENT_NOTE_FIELDS], ['track', 'instrument', 'sound', 'note', 'drum', 'velocity', 'start', 'end', 'state']);
+});
+
+/** The gesture of a range of `count` notes whose strings are `length` characters long. */
+function wideRange(count, length) {
+  const name = (letter) => letter.repeat(length);
+  return {
+    kind: 'range',
+    version: 12,
+    notes: Array.from({ length: count }, (_, at) => ({
+      track: name('t'),
+      instrument: name('i'),
+      note: name('n'),
+      sound: name('s'),
+      velocity: 0.9,
+      start: 34 + at / 100,
+      end: 34.5 + at / 100,
+    })),
+    more: 0,
+  };
+}
+
+/** The fields of a request about a range of cycles. */
+function rangeFields(text, gesture, track = 'pad') {
+  return { id: 'range-1', text, context: { kind: 'range', track, from: 34, to: 37 }, chip: `Range \u00b7 ${track} \u00b7 cycles 34 to 37`, current: 12, gesture };
+}
+
+test('a range request line puts the gesture where the moment would be and the page measures it byte for byte', () => {
+  const base = rangeFields('what is here', wideRange(3, 8));
+  const line = requestLine(base);
+  assert.equal(line, `${REQUEST_LINE_PREFIX} ${JSON.stringify(base)}`);
+  assert.deepEqual(Object.keys(JSON.parse(line.slice(REQUEST_LINE_PREFIX.length + 1))), ['id', 'text', 'context', 'chip', 'current', 'gesture']);
+  for (const fields of [base, rangeFields('a\u2028b', wideRange(0, 1)), rangeFields('\u4f60\u597d', wideRange(32, 30), 'n'.repeat(200))]) {
+    assert.equal(requestLineBytes(fields), Buffer.byteLength(requestLine(fields), 'utf8'));
+  }
+});
+
+test('fitGestureToLine leaves a range that fits alone and cuts notes off the end into more until the line fits', () => {
+  const small = rangeFields('hello', wideRange(3, 8));
+  assert.equal(fitGestureToLine(small), small.gesture);
+  const wide = rangeFields('hello', wideRange(MAX_MOMENT_NOTES, 150), 'n'.repeat(200));
+  assert.ok(requestLineBytes(wide) > MAX_REQUEST_LINE_BYTES, 'the long names push the range over one line');
+  const fitted = fitGestureToLine(wide);
+  assert.ok(requestLineBytes({ ...wide, gesture: fitted }) <= MAX_REQUEST_LINE_BYTES);
+  assert.ok(fitted.notes.length > 0 && fitted.notes.length < MAX_MOMENT_NOTES);
+  assert.equal(fitted.notes.length + fitted.more, MAX_MOMENT_NOTES, 'the count of notes stays the same');
+  assert.deepEqual(fitted.notes, wide.gesture.notes.slice(0, fitted.notes.length), 'the first notes stay');
+  const oneMore = { ...fitted, notes: wide.gesture.notes.slice(0, fitted.notes.length + 1), more: fitted.more - 1 };
+  assert.ok(requestLineBytes({ ...wide, gesture: oneMore }) > MAX_REQUEST_LINE_BYTES, 'no more is cut than needed');
+  assert.equal(requestFitsLine(wide), true);
+  // The input is not changed, and other gestures and no gesture come back as they are.
+  assert.equal(wide.gesture.notes.length, MAX_MOMENT_NOTES);
+  assert.equal(fitGestureToLine({ ...small, gesture: { kind: 'rest' } }).kind, 'rest');
+  assert.equal(fitGestureToLine({ ...small, gesture: undefined }), undefined);
+  // A text that fills the line alone leaves no note and the server decides.
+  const crowded = rangeFields('\u0001'.repeat(MAX_ASK_TEXT_LENGTH), wideRange(MAX_MOMENT_NOTES, 40));
+  assert.deepEqual(fitGestureToLine(crowded).notes, []);
+  assert.equal(requestFitsLine(crowded), false);
+});
+
+test('a range request reaches Claude through the channel with its notes, and the server takes the worst case the page sends', () => {
+  const { channel, page } = trustedChannel();
+  const fields = rangeFields('what is in these cycles?', wideRange(MAX_MOMENT_NOTES, 150), 'n'.repeat(200));
+  const gesture = fitGestureToLine(fields);
+  channel.handleAsk(page, { ...fields, gesture, type: 'ask' });
+  assert.equal(results(page).at(-1).status, 'waiting');
+  assert.equal(channel.waitingCount(), 1);
+  // A range gesture the page did not cut is a line over the bound: refused, never cut by the server.
+  const lines = captureErrors(() => channel.handleAsk(page, { ...fields, id: 'range-2', type: 'ask' }));
+  assert.equal(lines.length, 1);
+  assert.deepEqual(results(page).at(-1), { type: 'ask-result', id: 'range-2', status: 'refused', reason: 'line-too-long' });
 });
 
 test('a request line of exactly the limit is accepted, one byte more is refused "line-too-long" and never queued', () => {
@@ -1177,6 +1327,8 @@ test('a text within 2000 characters whose JSON is too big is refused "line-too-l
 
 test('page/timeline.js mirrors the moment limits by hand, and the beats of a bar', () => {
   assert.equal(PAGE_MAX_MOMENT_NOTES, MAX_MOMENT_NOTES);
+  assert.equal(PAGE_MAX_RANGE_CYCLES, MAX_RANGE_CYCLES);
+  assert.equal(MAX_RANGE_CYCLES, 32);
   assert.equal(BEATS_PER_CYCLE, MOMENT_BEATS);
 });
 

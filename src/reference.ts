@@ -74,6 +74,13 @@ export const REFERENCE_TOPICS = [
       'how one change can unfold over several cycles and keep running across later changes with .timeline(id): sweeps, fades, parts that enter later, sections and crossfades',
   },
   {
+    id: 'structure',
+    file: 'structure.md',
+    title: 'Song structure',
+    summary:
+      'the song declaration at the top of a piece: sections and lengths, a variation or a rest per track and section, nested groups, harmony per piece and per section, and the play() helper',
+  },
+  {
     id: 'midi',
     file: 'midi.md',
     title: 'MIDI output',
@@ -129,4 +136,22 @@ export function referenceToolDescription(): string {
     `facts about what exists and how to write it, not what to choose. Topics: ${ids}. Call it without a topic for ` +
     'the index. Strudel is JavaScript, not TidalCycles: read tidal-differences before writing Strudel from Tidal habits.'
   );
+}
+
+const FIRST_JS_BLOCK_RE = /```js\n([\s\S]*?)\n```/;
+
+/**
+ * The template get_code shows when nothing plays yet: the body of the first js block of the structure topic, a
+ * complete song structure to start a new piece from. The block is read at call time, so the topic and the template
+ * cannot drift apart. A missing block, or a block that declares no song, throws: an empty reply would hide the
+ * mistake from Claude.
+ */
+export function structureTemplateText(dir: string = referenceDir()): string {
+  const topic = readReferenceTopic('structure', dir);
+  const match = FIRST_JS_BLOCK_RE.exec(topic);
+  const body = match?.[1];
+  if (body === undefined || !/^const song\b/m.test(body)) {
+    throw new Error('Moontide: the structure topic has no template block (its first js block must hold const song).');
+  }
+  return body;
 }

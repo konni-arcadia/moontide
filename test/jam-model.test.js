@@ -52,6 +52,7 @@ test('JAM_COPY holds exactly the fixed sentences', () => {
     heardLabel: 'Heard:',
     noFitDeclared: 'The notes fit none of the nine scales.',
     heardUnclearLabel: 'The heard scale is not clear.',
+    declaredSection: 'section {section}',
     declaredReasons: {
       'not-const': 'Not readable: harmony is declared with let or var; the page reads only const.',
       computed: 'Not readable: harmony is computed ({source}); the page reads only written text.',
@@ -1045,4 +1046,46 @@ test('buildJamModel: a declaration changes nothing that is heard for a clear sca
   assert.equal(differ.declared.text, 'C major');
   assert.equal(differ.scale.text, 'D Dorian');
   assert.deepEqual({ ...agree.declared, text: '', title: '' }, { ...differ.declared, text: '', title: '' });
+});
+
+// --- the section the Declared line follows ---
+
+test('buildJamModel without an override and a section is today\'s model, with a section field of null', () => {
+  const plain = modelOf(TIE_PADS, scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }));
+  assert.equal(plain.section, null);
+  const { section, ...rest } = plain;
+  const again = buildJamModel({ position: atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64, declared: scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }) }), 1, 0.5), declaredOverride: undefined, section: null });
+  assert.deepEqual(again, plain);
+  assert.equal('section' in rest, false);
+});
+
+test('buildJamModel: a declared override replaces the declaration of the reading and a section names it', () => {
+  const position = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64, declared: scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }) }), 1, 0.5);
+  const out = buildJamModel({ position, declaredOverride: scaleDeclared('Eb:major', { rootPc: 3, modeId: 'ionian' }), section: "'y'" });
+  assert.deepEqual(out.declared, { kind: 'scale', text: 'Eb major', title: 'harmony = Eb:major' });
+  assert.equal(out.section, "section 'y'");
+});
+
+test('buildJamModel: a none override hides the Declared line and leaves declared mode', () => {
+  const position = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64, declared: scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }) }), 1, 0.5);
+  const out = buildJamModel({ position, declaredOverride: { state: 'none' }, section: "'x'" });
+  assert.equal(out.declared, null);
+  assert.ok(out.scale.text.startsWith('No clear scale: the notes fit '));
+  assert.equal(out.section, "section 'x'");
+});
+
+test('buildJamModel: two sections with the same harmony give the same Declared line and only the name changes', () => {
+  const position = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64 }), 1, 0.5);
+  const same = scaleDeclared('G:major', { rootPc: 7, modeId: 'ionian' });
+  const first = buildJamModel({ position, declaredOverride: same, section: "'x'" });
+  const second = buildJamModel({ position, declaredOverride: same, section: "'y'" });
+  assert.deepEqual(first.declared, second.declared);
+  assert.notEqual(first.section, second.section);
+});
+
+test('buildJamModel: an unreadable override says why in the usual sentence', () => {
+  const position = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64 }), 1, 0.5);
+  const out = buildJamModel({ position, declaredOverride: { state: 'unreadable', reason: 'empty', source: null }, section: "'z'" });
+  assert.equal(out.declared.kind, 'unreadable');
+  assert.equal(out.declared.text, 'Not readable: harmony is empty.');
 });

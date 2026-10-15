@@ -49,6 +49,7 @@ import {
   readReferenceTopic,
   referenceIndexText,
   referenceToolDescription,
+  structureTemplateText,
 } from './reference.js';
 
 export const NOTHING_PLAYING_MESSAGE = 'Nothing is playing yet.';
@@ -66,6 +67,15 @@ export const HAND_EDIT_KEPT_NOTE =
 // The page's text is authoritative, as for set_code; when it differs from the composed program the reply says so.
 export const EDIT_OTHER_TEXT_NOTE =
   'Note: the page confirmed a text that differs from the edited code, so the lines above may not match what plays; get_code returns what plays.';
+// The line above the song structure template get_code shows when nothing plays yet.
+export const STRUCTURE_TEMPLATE_INTRO =
+  'A song structure to start a new piece from (the structure topic of get_strudel_reference explains it):';
+
+/** The intro line and the template in a js fence, read from the structure topic at call time (a missing block throws). */
+function structureTemplateBlock(): string {
+  return `${STRUCTURE_TEMPLATE_INTRO}\n\`\`\`js\n${structureTemplateText()}\n\`\`\``;
+}
+
 export const GETTIME_ANCHOR_NOTE =
   'Note: this code reads getTime(); an anchor taken from it restarts every time a later change re-sends this code, ' +
   'while a transition anchored with .timeline(id) keeps running across changes (see the transitions topic).';
@@ -113,6 +123,45 @@ export function whenFlagLines(code: string): string[] {
     if (flagConsts.has(match[1] as string)) return [FLAG_STRING_NOTE];
   }
   return [];
+}
+
+// The reply line a set_code of a new piece carries when the piece declares no song structure. One plain line, fixed
+// text: it holds no code and no page text. The music plays as written; nothing is refused, blocked or rewritten.
+export const NO_STRUCTURE_NOTE =
+  'Note: this new piece declares no song structure; every new piece declares one once at the top (see the structure topic of get_strudel_reference). It plays as written.';
+
+// A text match only, like GETTIME_CALL_RE: the code is never parsed, evaluated or changed on the server, and a match
+// inside a comment or a string counts too, by design. Anchored at a line start with [ \t]* (never \s*, so a run of blank
+// lines cannot make the scan quadratic) and ended on a word boundary, so `const songs`, `const song2`, `let song` and a
+// commented-out line are not a structure. The m flag only: no global flag, so test() keeps no lastIndex.
+const SONG_CONST_RE = /^[ \t]*const[ \t]+song\b/m;
+
+/** The shortest line, in characters after trimming, that counts when telling a new piece from a changed one. */
+const NEW_PIECE_MIN_LINE = 8;
+
+/**
+ * True when `code` is a new piece compared with `previous`: the previous code is empty, holds no line of
+ * NEW_PIECE_MIN_LINE or more characters, or `code` keeps fewer than half of those lines (kept * 2 < total, so keeping
+ * exactly half is not new). Lines are compared trimmed, through a Set, so the cost is linear in the two texts.
+ */
+function isNewPiece(previous: string, code: string): boolean {
+  const longLines = previous
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length >= NEW_PIECE_MIN_LINE);
+  if (longLines.length === 0) return true;
+  const kept = new Set(code.split('\n').map((line) => line.trim()));
+  let keptCount = 0;
+  for (const line of longLines) {
+    if (kept.has(line)) keptCount += 1;
+  }
+  return keptCount * 2 < longLines.length;
+}
+
+/** The note when `code` replaces `previousCode` as a new piece and declares no song structure, empty otherwise. */
+export function newPieceWithoutStructureLines(previousCode: string, code: string): string[] {
+  if (SONG_CONST_RE.test(code)) return [];
+  return isNewPiece(previousCode, code) ? [NO_STRUCTURE_NOTE] : [];
 }
 
 export function waitingForClickMessage(pageUrl: string): string {
@@ -320,15 +369,12 @@ export const SERVER_INSTRUCTIONS = [
   // underscore and never lets it solo. The solo-label claim of scripts/check-reference.mjs reads
   // this string from the source, so it stays one single-quoted line.
   'A label longer than one character that starts with a capital S plays alone, unless it also ends with an underscore, which silences it instead: while a label that plays alone exists, every other label is silent.',
+  // The standing rule for song structure, kept to one short sentence: the full form is the structure topic and the
+  // template get_code shows when nothing plays yet, so only the duty and the place to look are said here. No example
+  // and no section names: any example would suggest a style.
+  'Every new piece declares its song structure once at the top; the structure topic of get_strudel_reference has the form.',
   // Read before editing.
   "Before changing the music, call get_code: it includes the user's hand edits.",
-  // Act on a vague request. How to explain a change and when to ask before a rewrite
-  // are in the set_code description. No example line: any example would suggest a style.
-  'When a request is vague, act on your own reading of it instead of asking first.',
-  // Guidance, not structure. The reply that reports a failed sound says which sound
-  // and that it plays nothing. Moontide never blocks, rewrites or refuses code because a sound failed;
-  // naming a replacement would steer the palette.
-  'If you replace a sound that failed to load, tell the user which one and what replaced it, never silently.',
   // A session frame applies to every change, surprises included, until lifted, and a
   // gradual frame means each change, surprises and small edits included, arrives through a transition,
   // not only as a smaller step. No variety rule; nothing says how a surprise should sound.
@@ -391,7 +437,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
   server.registerTool('get_code', {
     description:
       "Reads the Strudel code currently playing in the Moontide page, i.e. the last code the page confirmed, " +
-      "including edits the user evaluated by hand; returns 'Nothing is playing yet.' before anything played. " +
+      "including edits the user evaluated by hand; returns 'Nothing is playing yet.' before anything played, with a template of a song structure to start from. " +
       'Before Moontide is started it says so and starts nothing; after the start its reply also names the page address, the port and the tab title. ' +
       'Call it before every change.',
     annotations: { readOnlyHint: true },
@@ -400,10 +446,11 @@ export function createMcpServer(options: { session: Session; starter: Starter })
     // notices wait for the next reply.
     const server = starter.current();
     if (server === null) {
-      throw new Error(NOT_STARTED_MESSAGE);
+      // The first get_code of a fresh session comes before the start, and nothing plays yet either way.
+      throw new Error(`${NOT_STARTED_MESSAGE}\n\n${structureTemplateBlock()}`);
     }
     const code = session.getCode();
-    const text = code === '' ? NOTHING_PLAYING_MESSAGE : code;
+    const text = code === '' ? `${NOTHING_PLAYING_MESSAGE}\n\n${structureTemplateBlock()}` : code;
     const { lines } = session.drainNotices();
     // STOPPED_NOTE first when both apply, then HAND_EDIT_NOTE, then the version line, then the page line, then drained lines.
     const notices: string[] = [];
@@ -462,7 +509,9 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       'Double-quoted and backtick strings are parsed as mini-notation wherever they appear, helpers included, while single-quoted strings stay plain JavaScript (see the tidal-differences topic). ' +
       `When Moontide is not started yet, set_code starts it first: its page opens in a new browser tab and the call waits up to ${PAGE_WAIT_MS / 1000} seconds for that page to connect. ` +
       'Before changing existing music, call get_code and build on what it returns, including hand edits. Keep what the user said matters; if a small request ' +
-      'needs a full rewrite and the user said what matters, ask first, otherwise rewrite and say so. Returns ' +
+      'needs a full rewrite and the user said what matters, ask first, otherwise rewrite and say so. ' +
+      // Moved here from the server instructions (CLIENT_INSTRUCTIONS_LIMIT): Claude meets it where it writes the code.
+      'When a request is vague, act on your own reading of it instead of asking first. Returns ' +
       'the code as confirmed by the page. Pass a short label saying what changed; every version that plays is ' +
       'kept in the history. Then tell the user in one line what you chose: the musical terms, plus a short ' +
       'image in plain words.',
@@ -487,6 +536,8 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       // The first change of the music starts Moontide and waits for the page of the tab it opens.
       await starter.ensureStarted();
       await starter.waitForPage();
+      // What played before this call, read before the page changes it: the new-piece note compares the two.
+      const previousCode = session.getCode();
       const outcome = await session.evaluate(code, { label, at, phraseCycles });
       const { lines, hadRuntimeErrors } = session.drainNotices();
       // Claude must never be told "ok, playing" when something went wrong —
@@ -498,13 +549,15 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       // BPM: the tempo line first when it changed; the at-once note when a requested line was skipped
       // because nothing played (both from changeNoteLines, shared with edit_code).
       const notices = outcome.replacedHandEdit ? [HAND_EDIT_REPLACED_NOTE] : [];
-      // The t/f flag note comes right before the getTime() note. The getTime() warn note, when
-      // present, is always the last line.
+      // Order of the reply lines: the change notes, the hand-edit note, the drained notices (structure notes included),
+      // the t/f flag note, the new-piece note, then the getTime() warn note, which is always the last line. The new-piece
+      // note is for set_code only: edit_code changes part of a piece and restore_version brings an older one back.
       const text = withNoticeLines(`${status}\n\n${outcome.code}`, [
         ...changeNoteLines(outcome, at),
         ...notices,
         ...lines,
         ...whenFlagLines(outcome.code),
+        ...newPieceWithoutStructureLines(previousCode, outcome.code),
         ...getTimeAnchorLines(outcome.code),
       ]);
       return { content: [{ type: 'text' as const, text }] };

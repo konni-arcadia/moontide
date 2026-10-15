@@ -21,6 +21,7 @@ import {
   countdownTitle,
   fillChange,
   parseTiming,
+  pinnedTiming,
   queuedLine,
   settingLine,
   timingOptions,
@@ -219,6 +220,29 @@ test('the spoken lines and the titles', () => {
   assert.equal(countdownTitle('bar'), 'A code change is waiting. It takes over on the next bar.');
   assert.equal(countdownTitle('phrase'), 'A code change is waiting. It takes over on the next phrase.');
   assert.throws(() => countdownTitle('now'), /^Error: Moontide:/);
+  assert.equal(queuedLine('section'), 'Change waiting: it takes over at the end of the section.');
+  assert.equal(countdownTitle('section'), 'A code change is waiting. It takes over at the end of the section.');
+  assert.throws(() => queuedLine('later'), /^Error: Moontide:/);
+  assert.throws(() => countdownTitle(undefined), /^Error: Moontide:/);
+});
+
+test('pinnedTiming: a change written for one given line, frozen, with the line length it falls back to', () => {
+  const section = pinnedTiming('section', 18);
+  assert.deepEqual({ ...section }, { at: 'section', lineLength: 1, atCycle: 18 });
+  assert.equal(Object.isFrozen(section), true);
+  assert.deepEqual({ ...pinnedTiming('bar', 4) }, { at: 'bar', lineLength: 1, atCycle: 4 });
+  assert.deepEqual({ ...pinnedTiming('phrase', 8) }, { at: 'phrase', lineLength: DEFAULT_PHRASE_CYCLES, atCycle: 8 });
+  assert.deepEqual({ ...pinnedTiming('section', -2.5) }, { at: 'section', lineLength: 1, atCycle: -2.5 });
+  assert.throws(() => pinnedTiming('now', 1), /^Error: Moontide: /);
+  assert.throws(() => pinnedTiming(undefined, 1), /^Error: Moontide: /);
+  assert.throws(() => pinnedTiming('bar', Number.NaN), /^Error: Moontide: /);
+  assert.throws(() => pinnedTiming('bar', '4'), /^Error: Moontide: /);
+  assert.throws(() => pinnedTiming('bar', Number.POSITIVE_INFINITY), /^Error: Moontide: /);
+});
+
+test('CHANGE_TIMINGS stays the closed set of the stored setting: a pinned section end is not one of them', () => {
+  assert.deepEqual(CHANGE_TIMINGS, ['now', 'bar', 'phrase']);
+  assert.throws(() => parseTiming('section'), /^Error: Moontide: unknown change timing/);
 });
 
 test('fillChange: a placeholder without a value throws, and every template fills with its documented values', () => {

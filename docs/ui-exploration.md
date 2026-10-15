@@ -25,9 +25,9 @@ mockup. Some of it already exists in the page. Only the entries in
 | View | What it shows |
 |---|---|
 | History | Snapshots of the code over the session, with restore |
-| Timeline | The music itself over time, one lane per track, read-only first |
-| Mixer | Per-track signal flow, effects with their parameters, shared buses |
-| Parts | Sections to launch, each showing where it is |
+| Timeline | The music itself over time, one lane per track; literal notes can be edited |
+| Mixer | Per-track signal flow, effects with their parameters, shared buses, the song's groups, a light per strip |
+| Parts | Sections to launch, each showing where it is (the Song grid for a piece with a song) |
 | Jam | The scale, what to avoid, what is coming, on a piano or a guitar |
 
 - **History.** A snapshot appears after a short pause once something stops changing (a fader
@@ -35,10 +35,14 @@ mockup. Some of it already exists in the page. Only the entries in
 - **Timeline.** Everything loops, so the view unrolls the loops: 32 cycles, sections
   (`arrange()`), the chord loop repeating, each track's own loop length, and slow filter
   movements as curves with their own periods that drift apart. It should come from a query of
-  the real pattern over a time range. Editing is for later.
+  the real pattern over a time range. Editing has started: a note that one place in the code
+  holds can be moved by semitones, turned into a rest or given another velocity, and anything
+  else becomes a ready-made request to Claude. Wider editing is still open.
 - **Parts.** Parts are `arrange()` sections. The playing part shows its position (3/8 cycles)
   and a progress bar, a queued part counts down and starts at the next cycle, idle parts show
-  their length.
+  their length. For a piece that declares a song, the Parts view is called Song and shows
+  the sections as columns with the tracks, in foldable groups, as rows; a click launches a
+  section or changes a cell.
 - **Jam.** The scale stays constant ("D Dorian"). The status says "all safe" or names the
   note to avoid while a chord leaves the scale, and a short list gives the next warnings and
   part changes with a countdown. Chord names are secondary.

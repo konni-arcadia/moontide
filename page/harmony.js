@@ -157,6 +157,19 @@ export function readHarmony(code, { parse }) {
   return { state: 'none' };
 }
 
+/**
+ * Reads one harmony text, as written in a section of a song or in a fixed variation: `{ kind: 'scale' | 'chords', scale }`
+ * with `scale` `{ rootPc, modeId }` only when the whole text is one scale token whose name is one of the nine scales (else
+ * null), or null when the text is neither a scale nor chords (nothing left to read, too long, a plain word). The same
+ * reading as a top-level declaration: readHarmony calls the same checks.
+ */
+export function readHarmonyText(text) {
+  if (text.length > MAX_HARMONY_TEXT) return null;
+  const found = classify(text);
+  if (found === null || found === 'empty') return null;
+  return { kind: found, scale: found === 'scale' ? scaleOf(text.trim()) : null };
+}
+
 function unreadable(reason, source = null) {
   return { state: 'unreadable', reason, source };
 }

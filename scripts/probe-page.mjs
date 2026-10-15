@@ -30,6 +30,19 @@
 // Identity: the checks of identityBlocks() prove in real Chrome that the tab title and the Session card name the folder and
 // the port of the server, that the replies say the same, and that a long folder name wraps without clipping; they run
 // once before the final summary of a full run, or alone with `--only identity`.
+// Song structure: the checks of songBlocks() prove in real Chrome the Strudel facts the song structure relies on (its section
+// clock, its helper, harmony across sections, launches, Play after Stop, note attribution for the lights and note locations);
+// they run once before the final summary of a full run, or alone with `--only song`.
+// Song grid: the checks of gridBlocks() prove in real Chrome the Song grid that replaces the Parts list for a piece with a song
+// (tracks by sections, groups that fold, the playing section, the launch choice, the keyboard, the sizes); they run once
+// after the song checks in a full run, or alone with `--only grid`.
+// Mixer groups: the checks of mixerGroupBlocks() prove in real Chrome that the Mixer draws the groups of a song as nested,
+// foldable frames around the strips of their tracks, with the fold state shared with the Song grid; they run once after the
+// grid checks in a full run, or alone with `--only mixer`.
+// Timeline edits: the checks of timelineBlocks() prove in real Chrome that a click on a note of a Timeline lane selects it, that the
+// panel under the lanes says whether the page can edit it and why not, and that Up and Down rewrite exactly the token of a note
+// the page can edit, after reading the edited track back; they run once after the Mixer checks in a full run, or alone with
+// `--only timeline`.
 // Every probe that stops the music calls stopMusic(), which refuses to click unless the state word says Playing.
 
 import fs from 'node:fs';
@@ -44,18 +57,25 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { BUILD_MISMATCH_COPY, CONNECTION_LABELS, QUERY_ERROR_LEAD, SERVER_UPDATED_COPY, SOUND_LABELS, VCSL_SAMPLE_BASE } from '../page/ui-state.js';
 import { MIDI_COPY, fill } from '../page/midi-plan.js';
 import { INSTRUMENTS_COPY } from '../page/instruments-model.js';
-import { TIMELINE_COPY } from '../page/timeline.js';
+import { TIMELINE_BUDGET_MS, TIMELINE_COPY } from '../page/timeline.js';
+import { stepPitch } from '../page/note-edit.js';
 import { VIEW_KEYS, layoutButtonParts, viewButtonParts } from '../page/views.js';
 import { MIXER_COPY } from '../page/mixer-model.js';
 import { arrangementPosition, PARTS_COPY, partsEmptyText, partsSkippedText } from '../page/parts.js';
-import { ASK_COPY, PAGE_REQUESTS_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, errorAskPrefill, waitingShortText } from '../page/ask.js';
+import { HELPER_TEXT, differsLine, songMessageText } from '../page/structure.js';
+import { declaredLine } from '../page/jam-model.js';
+import { fitOf, fitText, sectionHarmony } from '../page/song-fit.js';
+import { readHarmonyText } from '../page/harmony.js';
+import { ASK_COPY, PAGE_REQUESTS_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, waitingShortText } from '../page/ask.js';
 import { QUERY_REFUSAL_LEAD } from '../page/query-check.js';
 import { BAR_COPY, stripModel, tempoText } from '../page/bar-model.js';
-import { CHANGE_COPY, countdownParts, queuedLine, settingLine, timingOptions } from '../page/change-timing.js';
+import { CHANGE_COPY, DEFAULT_PHRASE_CYCLES, countdownParts, queuedLine, settingLine, timingOptions } from '../page/change-timing.js';
 import { ACCENT_EXEMPT_TODAY, BAR_INVENTORY, BAR_WIDTHS, SHOT_LAYOUTS, SHOT_SIZES, SHOT_SKIPPED, SHOT_STATES, SIZED_CONTROLS, WORST_CASE, shotFileNames } from '../test/bar-inventory.js';
 import { STILL_PLAYING_TAIL, STILL_STOPPED_TAIL, loadFailureNote } from '../dist/session.js';
+import { HAND_EDIT_NOTE, STOPPED_NOTE } from '../dist/mcp.js';
 import { sessionLabel } from '../dist/session-label.js';
 import { LOAD_FAILURE_COPY } from '../page/load-failure.js';
+import { structureTemplateText } from '../dist/reference.js';
 
 const DIST_ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const PAGE_URL_PATTERN = /Moontide page: (http:\/\/localhost:(\d+))/;
@@ -103,8 +123,11 @@ export function shotsFolder(env = process.env) {
 
 /** --headful (real window instead of headless), --browser <path> (skip discovery), --only <group> (run only one
  * group of checks after the clock check; the groups are "bar", the top bar invariants, "harmony", the harmony
- * declaration checks, "load-failure", the notice for a page whose scripts did not load, and "identity", the tab
- * title and the Session card row that name the session, each about a minute instead of nine: `npm run probe:page -- --only bar`).
+ * declaration checks, "load-failure", the notice for a page whose scripts did not load, "identity", the tab
+ * title and the Session card row that name the session, "song", the Strudel facts the song structure relies on, and
+ * "grid", the Song grid in the Parts view, "mixer", the groups in the Mixer, and "timeline", the notes you edit on the Timeline,
+ * each about a minute instead of nine:
+ * `npm run probe:page -- --only bar`).
  * `only` is null for a full run. */
 export function parseArgs(argv) {
   const result = { headful: false, browserPath: null, only: null };
@@ -118,8 +141,8 @@ export function parseArgs(argv) {
       result.browserPath = value;
     } else if (arg === '--only') {
       const value = argv[++i];
-      if (value !== 'bar' && value !== 'harmony' && value !== 'load-failure' && value !== 'identity') {
-        throw new ProbeCouldNotRun(`--only needs a group name; the groups are "bar", "harmony", "load-failure" and "identity" (got ${JSON.stringify(value ?? null)})`);
+      if (value !== 'bar' && value !== 'harmony' && value !== 'load-failure' && value !== 'identity' && value !== 'song' && value !== 'grid' && value !== 'mixer' && value !== 'timeline') {
+        throw new ProbeCouldNotRun(`--only needs a group name; the groups are "bar", "harmony", "load-failure", "identity", "song", "grid", "mixer" and "timeline" (got ${JSON.stringify(value ?? null)})`);
       }
       result.only = value;
     } else {
@@ -534,6 +557,7 @@ export const PROBE_VIEWPORT = Object.freeze({ width: 1366, height: 469, deviceSc
 export function makeCdp(ws, { baseViewport = null } = {}) {
   let nextId = 0;
   const pending = new Map();
+  const eventListeners = new Set();
   ws.addEventListener('message', (event) => {
     let msg;
     try {
@@ -541,14 +565,19 @@ export function makeCdp(ws, { baseViewport = null } = {}) {
     } catch {
       return;
     }
-    if (typeof msg.id !== 'number' || !pending.has(msg.id)) return; // a CDP event, not a reply
+    if (typeof msg.id !== 'number') {
+      // A CDP event, not a reply: whoever asked to hear events (cdp.onEvent) gets it.
+      for (const listener of eventListeners) listener(msg);
+      return;
+    }
+    if (!pending.has(msg.id)) return;
     const { resolve, reject, timer } = pending.get(msg.id);
     clearTimeout(timer);
     pending.delete(msg.id);
     if (msg.error) reject(new Error(`CDP error (${msg.error.code}): ${msg.error.message}`));
     else resolve(msg.result);
   });
-  return function cdp(method, params = {}) {
+  function cdp(method, params = {}) {
     if (baseViewport !== null && method === 'Emulation.clearDeviceMetricsOverride') {
       method = 'Emulation.setDeviceMetricsOverride';
       params = baseViewport;
@@ -562,7 +591,13 @@ export function makeCdp(ws, { baseViewport = null } = {}) {
       pending.set(id, { resolve, reject, timer });
       ws.send(JSON.stringify({ id, method, params }));
     });
+  }
+  /** Calls `listener(message)` for every CDP event (a message with a method and no id) until the returned function is called. */
+  cdp.onEvent = (listener) => {
+    eventListeners.add(listener);
+    return () => eventListeners.delete(listener);
   };
+  return cdp;
 }
 
 /** Runs `expression` in the page via Runtime.evaluate (returnByValue, awaitPromise) and returns
@@ -1141,7 +1176,7 @@ async function readArc(cdp, from, to) {
   );
 }
 
-/** Maps a printable key, an arrow (up, down, left, right), PageUp, PageDown, Home, End, Enter, Space, Tab or 'Escape' to the CDP key-event fields dispatchKeyEvent needs. */
+/** Maps a printable key, an arrow (up, down, left, right), PageUp, PageDown, Home, End, Delete, Backspace, Enter, Space, Tab or 'Escape' to the CDP key-event fields dispatchKeyEvent needs. */
 function keyInfo(key) {
   if (key === 'Escape') return { code: 'Escape', windowsVirtualKeyCode: 27 };
   if (key === 'Tab') return { code: 'Tab', windowsVirtualKeyCode: 9 };
@@ -1153,6 +1188,8 @@ function keyInfo(key) {
   if (key === 'PageDown') return { code: 'PageDown', windowsVirtualKeyCode: 34 };
   if (key === 'End') return { code: 'End', windowsVirtualKeyCode: 35 };
   if (key === 'Home') return { code: 'Home', windowsVirtualKeyCode: 36 };
+  if (key === 'Delete') return { code: 'Delete', windowsVirtualKeyCode: 46 };
+  if (key === 'Backspace') return { code: 'Backspace', windowsVirtualKeyCode: 8 };
   if (key === 'Enter') return { code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' };
   if (key === ' ') return { code: 'Space', windowsVirtualKeyCode: 32, text: ' ' };
   if (/^[0-9]$/.test(key)) return { code: `Digit${key}`, windowsVirtualKeyCode: key.charCodeAt(0), text: key };
@@ -1163,20 +1200,21 @@ function keyInfo(key) {
 }
 
 /** Dispatches a real keydown+keyup for `key` via Input.dispatchKeyEvent (with Shift held when `shift` is
- * true: modifiers 8 on both events), exactly the fields a
+ * true: modifiers 8 on both events, and Control held when `ctrl` is true: modifiers 2), exactly the fields a
  * real browser keyboard event carries (key, code, windowsVirtualKeyCode, and text for a
  * printable key) — the same event shape page/main.js's document keydown listener reads.
  *
  * There is no nativeVirtualKeyCode, on purpose: on macOS, Chrome sends a key event that carries one
  * and that the page does not consume (Escape with no view open) back to the page as a new keydown,
  * again and again. Thousands of keydowns a second starve the page's timers and every CDP call. */
-export async function pressKey(cdp, key, { shift = false } = {}) {
+export async function pressKey(cdp, key, { shift = false, ctrl = false } = {}) {
   const info = keyInfo(key);
+  const modifiers = (shift ? 8 : 0) | (ctrl ? 2 : 0);
   const base = {
     key,
     code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode,
-    ...(shift ? { modifiers: 8 } : {}),
+    ...(modifiers === 0 ? {} : { modifiers }),
   };
   await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...base, ...(info.text ? { text: info.text } : {}) });
   await cdp('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
@@ -6006,9 +6044,9 @@ async function splitNeighborsBlocks(context) {
 }
 
 /** Writes the PNG of what the page shows now into the screenshots folder. The name is built only from the fixed constants
- * of the matrix (never from page text) and joined to the folder that shotsFolder() validated. Returns the file name. */
-async function saveShot(cdp, folder, state, width, height, layout) {
-  const file = `bar-${state}-${width}x${height}-layout-${layout}.png`;
+ * of the matrix and the prefix the caller passes as a constant (never from page text) and joined to the folder that shotsFolder() validated. Returns the file name. */
+async function saveShot(cdp, folder, state, width, height, layout, prefix = 'bar') {
+  const file = `${prefix}-${state}-${width}x${height}-layout-${layout}.png`;
   const shot = await cdp('Page.captureScreenshot', { format: 'png' });
   fs.writeFileSync(path.join(folder, file), Buffer.from(shot.data, 'base64'));
   return file;
@@ -7592,6 +7630,8014 @@ export async function identityBlocks(context) {
   }
 }
 
+/** Note names for `count` consecutive semitones from `first` (a midi number): every variation of a song piece gets
+ * pitches of its own, so the step that sounds can be read back from the note. */
+const SONG_SEMITONE_NAMES = ['c', 'c#', 'd', 'd#', 'e', 'f', 'f#', 'g', 'g#', 'a', 'a#', 'b'];
+function songNotes(first, count) {
+  const names = [];
+  for (let m = first; m < first + count; m++) names.push(`${SONG_SEMITONE_NAMES[m % 12]}${Math.floor(m / 12) - 1}`);
+  return names;
+}
+
+/** A silent song piece: the sections declared once, one clock built from them, and one track whose variations are
+ * alternations of notes (one step per cycle). `variations` maps a variation name to its notes, `plan` maps a section
+ * name to the variation it plays; `shift` moves the whole structure later by that many cycles. */
+function songPieceCode({ sections, shift = 0, variations, plan }) {
+  const lookup = [...new Set(sections.map(([name]) => name))].map((name) => `${name}: t1.${plan[name]}`);
+  return [
+    `const song = { shift: ${shift}, sections: ${JSON.stringify(sections).replace(/"/g, "'")} };`,
+    `const total = song.sections.reduce((a, [, n]) => a + n, 0);`,
+    `const clock = timeCat(...song.sections.map(([name, n]) => [n, pure(name)])).slow(total).late(song.shift);`,
+    `const t1 = { ${Object.entries(variations).map(([key, notes]) => `${key}: note("<${notes.join(' ')}>")`).join(', ')} };`,
+    `t1: clock.pickRestart({ ${lookup.join(', ')} }).gain(0)`,
+  ].join('\n');
+}
+
+/** The onsets of the playing program over [0, until) as { at, note }, read from the page. */
+async function songOnsets(cdp, until) {
+  return evaluateExpr(
+    cdp,
+    `(() => {
+      const repl = document.getElementById('repl').editor.repl;
+      return repl.state.pattern.queryArc(0, ${until}).filter((h) => h.hasOnset()).map((h) => ({ at: h.whole.begin.valueOf(), note: h.value.note }));
+    })()`,
+  );
+}
+
+/** For each section use (the sections laid end to end from `shift`, `passes` times): the step of its variation that
+ * sounds at its first cycle and at its last cycle, and how many onsets of the whole run are not the step expected
+ * when every use starts its variation at step 0. */
+function songStartReadings({ sections, shift = 0, variations, plan }, onsets, passes) {
+  const total = sections.reduce((a, [, n]) => a + n, 0);
+  const uses = [];
+  for (let pass = 0; pass < passes; pass++) {
+    let at = shift + pass * total;
+    for (const [name, length] of sections) {
+      uses.push({ name, pass, start: at, end: at + length });
+      at += length;
+    }
+  }
+  const stepAt = (use, from, to) => {
+    const hit = onsets.find((o) => o.at >= from && o.at < to);
+    return hit === undefined ? null : variations[plan[use.name]].indexOf(hit.note);
+  };
+  let unexpected = 0;
+  for (const o of onsets) {
+    const use = uses.find((u) => o.at >= u.start && o.at < u.end);
+    if (use === undefined) continue;
+    const notes = variations[plan[use.name]];
+    if (notes.indexOf(o.note) !== (Math.floor(o.at) - use.start) % notes.length) unexpected++;
+  }
+  return {
+    starts: uses.map((u) => stepAt(u, u.start, u.start + 1)),
+    lasts: uses.map((u) => stepAt(u, u.end - 1, u.end)),
+    cycles: uses.map((u) => u.start),
+    unexpected,
+  };
+}
+
+/** Plays a song piece with set_code, waits until the page runs it and reads where each of its section uses starts and ends. */
+async function playSongPiece(context, piece, label, passes) {
+  const { cdp, client } = context;
+  const code = songPieceCode(piece);
+  await callTool(client, 'set_code', { code, label });
+  await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode === ${JSON.stringify(code)} ? true : null`, 8000);
+  const total = piece.sections.reduce((a, [, n]) => a + n, 0);
+  return songStartReadings(piece, await songOnsets(cdp, (piece.shift ?? 0) + passes * total), passes);
+}
+
+/** The helper a structured piece carries in its own code: the page's canonical text, so the probes play exactly what the
+ * page recognises. */
+export const SONG_HELPER_TEXT = HELPER_TEXT;
+
+/** Sections x (3 cycles, its own harmony), y (5) and z (7); which variation each track plays in each section ('-' is a rest). */
+export const SONG_HELPER_SECTIONS = [['x', 3, 'E3:minor'], ['y', 5], ['z', 7]];
+export const SONG_HELPER_PLAN = {
+  x: { t1: 'va', t2: 'va', t3: 'va' },
+  y: { t1: 'vb', t2: 'va', t3: '-' },
+  z: { t1: 'va', t2: '-', t3: 'va' },
+};
+const SONG_T1_STEPS = { va: ['c3', 'd3', 'e3'], vb: ['g3', 'a3', 'b3', 'c4', 'd4'] };
+const SONG_T3_STEPS = ['d4', 'f4', 'a4'];
+const SONG_DEGREES = [0, 2, 4, 6];
+const SONG_DEFAULT_HARMONY = 'C3:major';
+const SONG_SCALE_STEPS = { major: [0, 2, 4, 5, 7, 9, 11], minor: [0, 2, 3, 5, 7, 8, 10], dorian: [0, 2, 3, 5, 7, 9, 10] };
+
+/** The midi number of a note value (a note name or a number), or null. */
+export function songMidiOf(note) {
+  if (typeof note === 'number') return note;
+  const m = /^([a-g])([#bs]?)(-?\d+)$/i.exec(String(note));
+  if (m === null) return null;
+  const accidental = m[2] === '#' || m[2].toLowerCase() === 's' ? 1 : m[2] === 'b' ? -1 : 0;
+  return (Number(m[3]) + 1) * 12 + { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 }[m[1].toLowerCase()] + accidental;
+}
+
+/** The midi number of a scale degree in a harmony written like "E3:minor". */
+function songDegreeNote(harmony, degree) {
+  const [root, scale] = harmony.split(':');
+  const steps = SONG_SCALE_STEPS[scale];
+  return songMidiOf(root.toLowerCase()) + steps[((degree % steps.length) + steps.length) % steps.length] + 12 * Math.floor(degree / steps.length);
+}
+
+/**
+ * A structured piece with the helper: t1 plays plain patterns, t2 a variation written in degrees as a function of the
+ * harmony, t3 a fixed variation that declares its harmony. `shift` moves every section later, `cps` speeds the clock,
+ * `midi` sends t2 to the fake port instead of muting it, `t1Tail` ends t1's statement.
+ */
+export function songHelperCode({ shift = 0, plan = SONG_HELPER_PLAN, cps = null, midi = false, t1Tail = '.velocity(0).postgain(0.5)' } = {}) {
+  const sections = SONG_HELPER_SECTIONS.map(([name, n, own]) => `['${name}', ${n}${own ? `, '${own}'` : ''}]`).join(', ');
+  const planText = Object.entries(plan)
+    .map(([section, cells]) => `${section}: { ${Object.entries(cells).map(([track, key]) => `${track}: '${key}'`).join(', ')} }`)
+    .join(', ');
+  return [
+    ...(cps === null ? [] : [`setcps(${cps})`]),
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    `const song = { shift: ${shift}, sections: [${sections}], groups: { g1: ['t1', 't2'], g2: { g3: ['t3'] } }, plan: { ${planText} } };`,
+    SONG_HELPER_TEXT,
+    `const t1 = { va: note("<${SONG_T1_STEPS.va.join(' ')}>"), vb: note("<${SONG_T1_STEPS.vb.join(' ')}>") };`,
+    `const t2 = { va: (h) => n("${SONG_DEGREES.join(' ')}").scale(h) };`,
+    `const t3 = { va: ['D3:dorian', note("<${SONG_T3_STEPS.join(' ')}>")] };`,
+    `t1: play('t1', t1)${t1Tail}`,
+    midi ? `t2: play('t2', t2).midi('Fake Synth A')` : `t2: play('t2', t2).gain(0)`,
+    `t3: play('t3', t3).gain(0)`,
+  ].join('\n');
+}
+
+/** The midi numbers a helper-piece track should play in cycle `offset` of a section: a rest gives none. */
+function songExpectedNotes(track, section, offset, plan) {
+  const key = plan[section[0]][track];
+  if (key === '-') return [];
+  if (track === 't1') return [songMidiOf(SONG_T1_STEPS[key][offset % SONG_T1_STEPS[key].length])];
+  if (track === 't2') return SONG_DEGREES.map((degree) => songDegreeNote(section[2] ?? SONG_DEFAULT_HARMONY, degree)).sort((a, b) => a - b);
+  return [songMidiOf(SONG_T3_STEPS[offset % SONG_T3_STEPS.length])];
+}
+
+/** Every hap of one track of `code` alone (the page's own per-track path), over [from, to], as plain data: the start and end of
+ * its whole and of its part, whether it carries the onset, its note, n and post-gain. */
+async function songTrackHaps(cdp, code, trackIndex, from, to) {
+  return evaluateExpr(
+    cdp,
+    `(async () => {
+      const { soloSource } = await import('/tracks.js');
+      const { evaluateSolo } = await import('/timeline.js');
+      const pattern = await evaluateSolo(soloSource(${JSON.stringify(code)}, ${trackIndex}, { parse: window.acorn.parse }));
+      const num = (x) => (x === undefined || x === null ? null : Number(x.valueOf()));
+      return pattern.queryArc(${from}, ${to}).map((h) => ({
+        onset: h.hasOnset(),
+        wholeBegin: num(h.whole && h.whole.begin),
+        wholeEnd: num(h.whole && h.whole.end),
+        partBegin: num(h.part.begin),
+        partEnd: num(h.part.end),
+        note: h.value.note ?? null,
+        n: h.value.n ?? null,
+        postgain: h.value.postgain ?? null,
+      }));
+    })()`,
+  );
+}
+
+/** The onset haps of the playing program (trackIndex null) or of one track alone over [from, to], each with the raw code
+ * locations of its context: its start, its note and the list of { start, end } offsets into the code that was evaluated. */
+async function songNoteLocations(cdp, code, trackIndex, from, to) {
+  return evaluateExpr(
+    cdp,
+    `(async () => {
+      let pattern;
+      if (${trackIndex === null}) {
+        pattern = document.getElementById('repl').editor.repl.state.pattern;
+      } else {
+        const { soloSource } = await import('/tracks.js');
+        const { evaluateSolo } = await import('/timeline.js');
+        pattern = await evaluateSolo(soloSource(${JSON.stringify(code)}, ${trackIndex === null ? 0 : trackIndex}, { parse: window.acorn.parse }));
+      }
+      return pattern.queryArc(${from}, ${to}).filter((h) => h.hasOnset()).map((h) => ({
+        wholeBegin: Number(h.whole.begin.valueOf()),
+        note: h.value.note ?? null,
+        locations: h.context && h.context.locations ? JSON.parse(JSON.stringify(h.context.locations)) : [],
+      }));
+    })()`,
+  );
+}
+
+/** The onsets of one track of `code` alone over [0, until) as { at, note, postgain }. */
+async function songTrackOnsets(cdp, code, trackIndex, until) {
+  return (await songTrackHaps(cdp, code, trackIndex, 0, until))
+    .filter((hap) => hap.onset)
+    .map((hap) => ({ at: hap.wholeBegin, note: hap.note, postgain: hap.postgain }));
+}
+
+/** For each track of a helper piece: how many whole cycles from `shift` on were checked and how many play other notes than
+ * the plan says (a rest must play none). The piece runs for two passes of 15 cycles after its shift. */
+async function songHelperDisagreements(cdp, code, shift, plan) {
+  const out = {};
+  for (const [index, track] of ['t1', 't2', 't3'].entries()) {
+    const onsets = await songTrackOnsets(cdp, code, index, shift + 30);
+    let checked = 0;
+    let wrong = 0;
+    for (let pass = 0; pass < 2; pass++) {
+      let at = shift + pass * 15;
+      for (const section of SONG_HELPER_SECTIONS) {
+        for (let offset = 0; offset < section[1]; offset++) {
+          const cycle = at + offset;
+          const got = onsets.filter((o) => o.at >= cycle && o.at < cycle + 1).map((o) => songMidiOf(o.note)).sort((a, b) => a - b);
+          checked++;
+          if (got.join(',') !== songExpectedNotes(track, section, offset, plan).join(',')) wrong++;
+        }
+        at += section[1];
+      }
+    }
+    out[track] = { checked, wrong };
+  }
+  return out;
+}
+
+/** set_code's answer without throwing: { failed, text } with the first paragraph only (the rest of an error reply names a local path). */
+async function songSetCode(client, code, label) {
+  try {
+    return { failed: false, text: (await callTool(client, 'set_code', { code, label })).split('\n\n')[0] };
+  } catch (err) {
+    return { failed: true, text: (err instanceof Error ? err.message : String(err)).split('\n\n')[0] };
+  }
+}
+
+/** Opens the Parts view with its key and waits until the view shows. */
+async function songOpenParts(cdp) {
+  if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) === 'parts') return;
+  await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  await pressKey(cdp, '4');
+  if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'parts' ? true : null`, 3000)) !== true) {
+    throw new ProbeCouldNotRun('the Parts view did not open');
+  }
+}
+
+/**
+ * Waits until the check of the declaration answered for the version that plays (its data-check leaves pending) and returns
+ * what #song-notes holds: the check word, the measured time, whether it is hidden and the text of each line.
+ */
+async function songCheckAnswer(cdp, timeoutMs = 10000) {
+  const answered = await waitFor(
+    cdp,
+    `(() => {
+      const el = document.getElementById('song-notes');
+      const check = el.dataset.check ?? null;
+      if (check === null || check === 'pending') return null;
+      return { check, ms: Number(el.dataset.checkMs), hidden: el.hidden, lines: [...el.children].map((line) => line.textContent), kinds: [...el.children].map((line) => line.getAttribute('data-kind')) };
+    })()`,
+    timeoutMs,
+  );
+  if (answered === null) throw new ProbeCouldNotRun(`the check of the song declaration did not answer within ${timeoutMs} ms`);
+  return answered;
+}
+
+/**
+ * A structured piece of many sections and tracks with plain note variations silenced by gain(0): section i lasts
+ * lengths[i] cycles, every track plays one of two variations, and some cells are rests. `groups` is the text of the
+ * song's groups object, or null for a piece without groups.
+ */
+function songBigCode(trackCount, lengths, { groups = null } = {}) {
+  const names = lengths.map((_, i) => `s${i + 1}`);
+  const sections = names.map((name, i) => `['${name}', ${lengths[i]}]`).join(', ');
+  const cellOf = (track, section) => ((track + section) % 7 === 0 ? '-' : (track + section) % 2 === 0 ? 'va' : 'vb');
+  const plan = names
+    .map((name, section) => `${name}: { ${Array.from({ length: trackCount }, (_, track) => `t${track + 1}: '${cellOf(track, section)}'`).join(', ')} }`)
+    .join(', ');
+  const variations = Array.from({ length: trackCount }, (_, track) => `const t${track + 1} = { va: note("c${3 + (track % 3)} e3 g3"), vb: note("<d3 f3 a3>") };`);
+  const statements = Array.from({ length: trackCount }, (_, track) => `t${track + 1}: play('t${track + 1}', t${track + 1}).gain(0)`);
+  return [
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    `const song = { shift: 0, sections: [${sections}], ${groups === null ? '' : `groups: ${groups}, `}plan: { ${plan} } };`,
+    SONG_HELPER_TEXT,
+    ...variations,
+    ...statements,
+  ].join('\n');
+}
+
+/**
+ * What the Song grid of the Parts view shows, as plain data, or null when there is no grid: the corner summary, each
+ * section header as [name, length, harmony] (the length of a playing header is read from "Playing n/length"), and the
+ * rows nested by their aria-level as groups, tracks (their cell texts) and statements outside the song plan.
+ */
+const SONG_LIST_READ = `(() => {
+  const grid = document.querySelector('#parts-rows .song-grid');
+  if (!grid) return null;
+  const length = (head) => {
+    const state = head.querySelector('.part-state').textContent;
+    const playing = /^Playing \\d+\\/(\\d+)$/.exec(state);
+    return playing ? playing[1] + ' cycles' : state;
+  };
+  const root = [];
+  const open = [];
+  for (const tr of grid.querySelectorAll('tbody > tr')) {
+    const level = Number(tr.getAttribute('aria-level'));
+    const items = level === 1 ? root : open[level - 2].items;
+    if (tr.classList.contains('song-group-row')) {
+      const group = { group: tr.querySelector('.song-fold-name').textContent, items: [] };
+      items.push(group);
+      open[level - 1] = group;
+    } else {
+      items.push({ track: tr.querySelector('.song-rowhead').textContent, cells: [...tr.querySelectorAll('.song-cell .song-variation')].map((el) => el.textContent) });
+    }
+  }
+  return {
+    summary: grid.querySelector('.song-corner').textContent,
+    sections: [...grid.querySelectorAll('thead .song-head')].map((head) => [head.querySelector('.part-name').textContent, length(head), head.querySelector('.song-harmony').textContent]),
+    tracks: root,
+  };
+})()`;
+
+/** What the song grid shows for the helper piece of songHelperCode. */
+const SONG_HELPER_LIST = {
+  summary: '3 sections, 15 cycles',
+  sections: [
+    ['x', '3 cycles', 'harmony E3:minor'],
+    ['y', '5 cycles', 'harmony C3:major (from the piece)'],
+    ['z', '7 cycles', 'harmony C3:major (from the piece)'],
+  ],
+  tracks: [
+    {
+      group: 'g1',
+      items: [
+        { track: 't1', cells: ['va', 'vb', 'va'] },
+        { track: 't2', cells: ['va', 'va', 'rest'] },
+      ],
+    },
+    {
+      group: 'g2',
+      items: [{ group: 'g3', items: [{ track: 't3', cells: ['va', 'rest', 'va'] }] }],
+    },
+  ],
+};
+
+/** `text` as a regular expression that matches it literally. */
+function songLiteralPattern(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** A piece with the helper and one track `t1` that plays the same variation (given as code text) in every section; `sections` as in SONG_HELPER_SECTIONS. */
+function songSingleTrackCode(sections, variation) {
+  const text = sections.map(([name, n, own]) => `['${name}', ${n}${own ? `, '${own}'` : ''}]`).join(', ');
+  const plan = sections.map(([name]) => `${name}: { t1: 'va' }`).join(', ');
+  return [
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    `const song = { shift: 0, sections: [${text}], plan: { ${plan} } };`,
+    SONG_HELPER_TEXT,
+    `const t1 = { va: ${variation} };`,
+    "t1: play('t1', t1).gain(0)",
+  ].join('\n');
+}
+
+// ---- launches ---------------------------------------------------------------------------------------------------------
+
+/** Where each section of the helper piece starts while its shift is 0, and how long the whole structure is. */
+export const SONG_LAUNCH_STARTS = { x: 0, y: 3, z: 8 };
+export const SONG_LAUNCH_TOTAL = 15;
+const SONG_LAUNCH_SHIFT_HOLE = '@@SHIFT@@';
+const SONG_LAUNCH_VERSION_HOLE = '@@VERSION@@';
+
+/**
+ * The text of a launch piece: the helper piece (sections x 3, y 5 and z 7 cycles, tracks t1 to t3, all silent) plus a track
+ * named mark that plays nothing and writes one line into a log of the window at each trigger: the version of the code, the
+ * section it sits in, the cycle where the trigger begins and its target time. The first line of a new version is where the
+ * new code is heard. The shift and the version are holes that songLaunchFill fills, so a launch rewrites the shift and the
+ * version and nothing else.
+ */
+export function songLaunchTemplate({ cps = 1 } = {}) {
+  const plan = Object.fromEntries(Object.entries(SONG_HELPER_PLAN).map(([section, cells]) => [section, { ...cells, mark: `m${section}` }]));
+  return [
+    songHelperCode({ shift: SONG_LAUNCH_SHIFT_HOLE, plan, cps, t1Tail: '.gain(0)' }),
+    `const logAt = (section) => (hap, now, cps, target) => { (window.__songLaunchLog = window.__songLaunchLog || []).push({ v: ${SONG_LAUNCH_VERSION_HOLE}, section, begin: hap.whole.begin.valueOf(), target }); };`,
+    `const mark = { mx: s("hh").onTrigger(logAt('x'), true), my: s("hh").onTrigger(logAt('y'), true), mz: s("hh").onTrigger(logAt('z'), true) };`,
+    "mark: play('mark', mark)",
+  ].join('\n');
+}
+
+/** A launch piece with its shift and version filled in. */
+export function songLaunchFill(template, shift, version) {
+  return template.replace(SONG_LAUNCH_SHIFT_HOLE, String(shift)).replace(SONG_LAUNCH_VERSION_HOLE, String(version));
+}
+
+export const songLaunchLogReset = (cdp) => evaluateExpr(cdp, `(() => { window.__songLaunchLog = []; })()`);
+export const songLaunchLogRead = (cdp) =>
+  evaluateExpr(cdp, `(window.__songLaunchLog || []).map((e) => ({ v: e.v, section: e.section, begin: Number(e.begin), target: Number(e.target) }))`);
+
+/** Page-side text: waits until the scheduler's cycle count reaches `untilCycle` (a number), or not at all (null). It gives up with an error after 20 seconds. */
+const songLaunchWait = (untilCycle) => `
+    const until = ${untilCycle === null ? 'null' : Number(untilCycle)};
+    const untilDeadline = performance.now() + 20000;
+    if (until !== null) while (scheduler.now() < until) {
+      if (performance.now() > untilDeadline) throw new Error('the scheduler did not reach cycle ' + until + ' within 20 seconds');
+      await pause(2);
+    }`;
+
+/**
+ * Page-side text: waits until the scheduler's frontier is just above the point where the lead of the next line turns under the
+ * page's minimum (within `edgeSeconds` above it), the moment a line computed now is the most likely to move before the
+ * change is armed, then `edgeDelayMs` more so the frontier is read late in its step. Nothing when `edgeSeconds` is null.
+ */
+const songLaunchEdge = (edgeSeconds, lineLength, edgeDelayMs = 0) =>
+  edgeSeconds === null
+    ? ''
+    : `
+    const spinUntil = performance.now() + 8000;
+    for (;;) {
+      const f = scheduler.lastEnd;
+      const lead = ((Math.floor(f / ${lineLength} + 1e-9) + 1) * ${lineLength} - f) / scheduler.cps;
+      if ((lead >= MIN_TAKEOVER_LEAD_SECONDS && lead < MIN_TAKEOVER_LEAD_SECONDS + ${edgeSeconds}) || performance.now() > spinUntil) break;
+      await pause(1);
+    }
+    await pause(${Number(edgeDelayMs)});`;
+
+/**
+ * Page-side expression of a hand launch: the way the Parts view launches today. Optionally it waits for a cycle, then it
+ * reads the scheduler's frontier, computes the line of the hand timing (`lineLength` 1 for the next bar, 4 for the next
+ * phrase) with the page's own function, computes the shift that puts the section starting at `start` on that line, writes
+ * the piece with that shift and the version and evaluates it. It answers the frontier and the line it computed, the shift,
+ * how long the evaluation took, and the line it would compute once the evaluation is over.
+ */
+export function songLaunchHandExpression({ template, lineLength, start, version, untilCycle = null, edgeSeconds = null, edgeDelayMs = 0 }) {
+  return `(async () => {
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const { boundaryCycle, MIN_TAKEOVER_LEAD_SECONDS } = await import('/change-timing.js');
+    const { launchOffset } = await import('/parts.js');
+    const editor = document.getElementById('repl').editor;
+    const scheduler = editor.repl.scheduler;${songLaunchWait(untilCycle)}${songLaunchEdge(edgeSeconds, lineLength, edgeDelayMs)}
+    const nowAtStart = scheduler.now();
+    const frontier = scheduler.lastEnd;
+    const cps = scheduler.cps;
+    const lineOf = (from) => boundaryCycle({ frontier: from, cps, lineLength: ${lineLength}, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
+    const line = lineOf(frontier);
+    const shift = launchOffset(line, ${start}, ${SONG_LAUNCH_TOTAL});
+    const code = ${JSON.stringify(template)}.replace(${JSON.stringify(SONG_LAUNCH_SHIFT_HOLE)}, String(shift)).replace(${JSON.stringify(SONG_LAUNCH_VERSION_HOLE)}, String(${version}));
+    const startedAt = performance.now();
+    editor.setCode(code);
+    await editor.evaluate();
+    const evaluateMs = performance.now() - startedAt;
+    const frontierAfter = scheduler.lastEnd;
+    return { nowAtStart, frontier, cps, line, shift, evaluateMs, frontierAfter, lineAfter: lineOf(frontierAfter) };
+  })()`;
+}
+
+/** Page-side expression that only computes a launch: the same reading and line as songLaunchHandExpression, nothing written. */
+export function songLaunchLineExpression({ lineLength, start, untilCycle = null, edgeSeconds = null, edgeDelayMs = 0 }) {
+  return `(async () => {
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const { boundaryCycle, MIN_TAKEOVER_LEAD_SECONDS } = await import('/change-timing.js');
+    const { launchOffset } = await import('/parts.js');
+    const scheduler = document.getElementById('repl').editor.repl.scheduler;${songLaunchWait(untilCycle)}${songLaunchEdge(edgeSeconds, lineLength, edgeDelayMs)}
+    const frontier = scheduler.lastEnd;
+    const cps = scheduler.cps;
+    const line = boundaryCycle({ frontier, cps, lineLength: ${lineLength}, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
+    return { nowAtStart: scheduler.now(), frontier, cps, line, shift: launchOffset(line, ${start}, ${SONG_LAUNCH_TOTAL}) };
+  })()`;
+}
+
+/** Page-side expression: the line the page would compute right now for a line length. */
+export function songLaunchLineNowExpression(lineLength) {
+  return `(async () => {
+    const { boundaryCycle, MIN_TAKEOVER_LEAD_SECONDS } = await import('/change-timing.js');
+    const scheduler = document.getElementById('repl').editor.repl.scheduler;
+    return boundaryCycle({ frontier: scheduler.lastEnd, cps: scheduler.cps, lineLength: ${lineLength}, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
+  })()`;
+}
+
+/**
+ * Page-side expression of a launch for the end of the current section. The page has no such timing yet, so the line is
+ * computed here: the first start of a section of the playing structure (its shift is `currentShift`) that is at least the
+ * page's minimum lead ahead of the frontier. The new piece is built without taking over, as the stack of the solo patterns
+ * of its tracks (the way the Timeline reads a track), wrapped in the page's own takeover gate for that line and handed to the
+ * scheduler. It answers the line, the shift and the section that was playing at the frontier; what the gate's hooks did is kept in window.__songLaunchHooks.
+ */
+export function songLaunchEndExpression({ template, currentShift, start, version, trackCount, untilCycle = null }) {
+  return `(async () => {
+    const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const { MIN_TAKEOVER_LEAD_SECONDS } = await import('/change-timing.js');
+    const { arrangementPosition, launchOffset } = await import('/parts.js');
+    const { gatePattern } = await import('/takeover.js');
+    const { soloSource } = await import('/tracks.js');
+    const { evaluateSolo } = await import('/timeline.js');
+    const scheduler = document.getElementById('repl').editor.repl.scheduler;${songLaunchWait(untilCycle)}
+    const starts = ${JSON.stringify(Object.values(SONG_LAUNCH_STARTS))};
+    const names = ${JSON.stringify(Object.keys(SONG_LAUNCH_STARTS))};
+    const total = ${SONG_LAUNCH_TOTAL};
+    const nowAtStart = scheduler.now();
+    const frontier = scheduler.lastEnd;
+    const cps = scheduler.cps;
+    const position = arrangementPosition(frontier, ${currentShift}, total);
+    const playing = names[starts.filter((s) => s <= position).length - 1];
+    let line = null;
+    for (let pass = Math.floor((frontier - ${currentShift}) / total) - 1; line === null; pass++) {
+      for (const s of starts) {
+        const cycle = ${currentShift} + pass * total + s;
+        if (cycle > frontier && (cycle - frontier) / cps >= MIN_TAKEOVER_LEAD_SECONDS) {
+          line = cycle;
+          break;
+        }
+      }
+    }
+    const shift = launchOffset(line, ${start}, total);
+    const code = ${JSON.stringify(template)}.replace(${JSON.stringify(SONG_LAUNCH_SHIFT_HOLE)}, String(shift)).replace(${JSON.stringify(SONG_LAUNCH_VERSION_HOLE)}, String(${version}));
+    const patterns = [];
+    for (let index = 0; index < ${trackCount}; index++) patterns.push(await evaluateSolo(soloSource(code, index, { parse: window.acorn.parse })));
+    const hooks = { lead: 0, reached: 0, errors: [] };
+    window.__songLaunchHooks = hooks;
+    const gate = gatePattern(scheduler.pattern, globalThis.stack(...patterns), line, {
+      TimeSpan: globalThis.TimeSpan,
+      leadCycles: 0.3 * cps,
+      onLead: () => { hooks.lead += 1; },
+      onReached: () => { hooks.reached += 1; },
+      onError: (text) => { hooks.errors.push(String(text)); },
+    });
+    const startedAt = performance.now();
+    await scheduler.setPattern(gate, true);
+    return { nowAtStart, frontier, cps, position, playing, line, shift, setMs: performance.now() - startedAt, hooks };
+  })()`;
+}
+
+/**
+ * Where a launched piece is heard: waits for the first line of the log with the version, then reads that line (the cycle
+ * the new code started at), the section it sits in, the step the launched track t1 plays there, and the lines of an older
+ * version at or after it (there must be none: the old music ends where the new begins). When no line of the version shows up
+ * within 30 seconds the answer is `{ landing: null, neverPlayed: true, versionsLogged }`, so the check reports a failure.
+ */
+export async function songLaunchLanding(cdp, { template, version, shift }) {
+  const deadline = Date.now() + 30000;
+  let entries = await songLaunchLogRead(cdp);
+  while (!entries.some((e) => e.v === version) && Date.now() < deadline) {
+    await sleep(100);
+    entries = await songLaunchLogRead(cdp);
+  }
+  await sleep(300);
+  entries = await songLaunchLogRead(cdp);
+  const news = entries.filter((e) => e.v === version);
+  // A launch the page never plays is a failed check, not an environment problem: answer what the log did hold so the row says so.
+  if (news.length === 0) return { landing: null, neverPlayed: true, versionsLogged: [...new Set(entries.map((e) => e.v))] };
+  const first = news.reduce((best, e) => (e.begin < best.begin ? e : best));
+  const landing = first.begin;
+  const position = (((landing - shift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+  const names = Object.keys(SONG_LAUNCH_STARTS);
+  const sectionHere = names[Object.values(SONG_LAUNCH_STARTS).filter((s) => s <= position).length - 1];
+  const t1 = (await songTrackHaps(cdp, songLaunchFill(template, shift, version), 0, landing, landing + 1)).filter((hap) => hap.onset);
+  const steps = SONG_T1_STEPS[SONG_HELPER_PLAN[sectionHere].t1];
+  return {
+    landing,
+    markSection: first.section,
+    sectionHere,
+    intoSection: position - SONG_LAUNCH_STARTS[sectionHere],
+    t1Note: t1.length === 1 ? t1[0].note : null,
+    t1Step: t1.length === 1 ? steps.indexOf(t1[0].note) : null,
+    oldAtOrAfter: entries.filter((e) => e.v < version && e.begin >= landing).length,
+    newBefore: news.filter((e) => e.begin < landing).length,
+  };
+}
+
+/**
+ * Page-side text that listens to the page's own note tag: it subscribes through the same module the page uses and stores every
+ * note a labeled track triggers as { key, wb, target, stamp, note }. The key is the track's Mixer identity (or `$n` for an
+ * anonymous track), wb the note's whole begin in cycles, target the audio time it is due, stamp the timestamp its port got (null
+ * for a browser sound) and note its pitch. The check never installs a tag and never touches `Pattern.prototype.p`: the page
+ * carries the tag for every evaluation. It refuses to run twice, so a check that forgot to stop cannot hide behind another one.
+ */
+export const SONG_NOTE_LISTEN_START = `(async () => {
+  if (window.__noteSeen) throw new Error('the note listener is already running');
+  const state = (window.__noteSeen = { seen: [], stop: null });
+  try {
+    const { subscribe } = await import('/note-tag.js');
+    state.stop = subscribe((event) => {
+      const value = event.hap.value && typeof event.hap.value === 'object' ? event.hap.value : {};
+      state.seen.push({
+        key: event.key,
+        wb: Number(event.hap.whole.begin),
+        target: Number(event.target),
+        stamp: event.stamp,
+        note: value.note !== undefined ? value.note : value.n !== undefined ? value.n : null,
+      });
+    });
+  } catch (err) {
+    delete window.__noteSeen;
+    throw err;
+  }
+  return true;
+})()`;
+
+/** Page-side text that stops the listener again and forgets what it saw. */
+export const SONG_NOTE_LISTEN_STOP = `(() => {
+  const state = window.__noteSeen;
+  if (!state) return false;
+  if (typeof state.stop === 'function') state.stop();
+  delete window.__noteSeen;
+  return true;
+})()`;
+
+/**
+ * Page-side text that watches lights in the Mixer. `lights` maps a name to the CSS selector of one .mx-light element; `keys`
+ * lists the note keys whose notes are recorded. For every watched light it records each change of the fill's inline style or
+ * of data-lit as { t, opacity, lit } (t from performance.now() when the change was seen), and for every recorded note the moment
+ * it is heard, worked out here from the audio context's output timestamp (or the port's timestamp for a MIDI note), apart from the
+ * page's own light code. It listens through the page's note tag and refuses to run twice.
+ */
+export const MIXER_LIGHT_WATCH_START = (lights, keys) => `(async () => {
+  if (window.__lightWatch) throw new Error('the light watch is already running');
+  const spec = ${JSON.stringify(lights)};
+  const keys = ${JSON.stringify(keys)};
+  const state = (window.__lightWatch = { events: {}, notes: [], observers: [], stop: null });
+  try {
+    for (const [name, selector] of Object.entries(spec)) {
+      const light = document.querySelector(selector);
+      if (light === null) throw new Error('no light matches ' + selector);
+      const fill = light.querySelector('.mx-light-fill');
+      state.events[name] = [];
+      const observer = new MutationObserver(() => {
+        state.events[name].push({ t: performance.now(), opacity: fill.style.opacity, lit: light.dataset.lit === undefined ? null : light.dataset.lit });
+      });
+      observer.observe(fill, { attributes: true, attributeFilter: ['style'] });
+      observer.observe(light, { attributes: true, attributeFilter: ['data-lit'] });
+      state.observers.push(observer);
+    }
+    const { subscribe } = await import('/note-tag.js');
+    state.stop = subscribe((event) => {
+      if (!keys.includes(event.key)) return;
+      const audio = getAudioContext();
+      const pair = audio.getOutputTimestamp();
+      const now = performance.now();
+      const fresh = pair.contextTime > 0 && pair.performanceTime > 0 && now - pair.performanceTime < 100;
+      const heard =
+        event.stamp !== null
+          ? event.stamp
+          : fresh
+            ? pair.performanceTime + (event.target - pair.contextTime) * 1000
+            : now + (event.target - audio.currentTime) * 1000 + ((audio.baseLatency || 0) + (audio.outputLatency || 0)) * 1000;
+      state.notes.push({ key: event.key, heard, seenAt: now });
+    });
+  } catch (err) {
+    for (const observer of state.observers) observer.disconnect();
+    delete window.__lightWatch;
+    throw err;
+  }
+  return true;
+})()`;
+
+/** Page-side text that stops the watch and returns { events, notes } (see MIXER_LIGHT_WATCH_START). */
+export const MIXER_LIGHT_WATCH_STOP = `(() => {
+  const state = window.__lightWatch;
+  if (!state) return null;
+  if (typeof state.stop === 'function') state.stop();
+  for (const observer of state.observers) observer.disconnect();
+  delete window.__lightWatch;
+  return { events: state.events, notes: state.notes };
+})()`;
+
+/**
+ * For each note of `noteKey` the first moment the light named `name` was seen at full strength (opacity 1) at or after the note
+ * was heard, and the first moment after that it was seen at 0. Returns rows { heard, litAfter, fadeMs }, with null where the light
+ * did not lie within `windowMs` of the note.
+ */
+export function lightRows(watch, name, noteKey, windowMs) {
+  const lit = watch.events[name].filter((event) => event.opacity === '1').map((event) => event.t);
+  const dark = watch.events[name].filter((event) => event.opacity === '0').map((event) => event.t);
+  return watch.notes
+    .filter((note) => note.key === noteKey)
+    .map((note) => {
+      const litAt = lit.find((t) => t >= note.heard - 1 && t <= note.heard + windowMs);
+      const darkAt = litAt === undefined ? undefined : dark.find((t) => t > litAt);
+      return { heard: note.heard, litAfter: litAt === undefined ? null : litAt - note.heard, fadeMs: darkAt === undefined ? null : darkAt - litAt };
+    });
+}
+
+/**
+ * Song structure checks: the Strudel facts the song structure relies on, proven in the live page. They play silent
+ * neutral pieces with set_code and read the notes of the playing program.
+ */
+export async function songBlocks(context) {
+  const { report } = context;
+
+  // One clock for the whole piece, built from the sections declared once, picks each track's variation with
+  // pickRestart; a variation that is several cycles long must start at its own first step in every section.
+  const longRead = await playSongPiece(
+    context,
+    {
+      sections: [['x', 8], ['y', 16], ['z', 8]],
+      variations: { va: songNotes(48, 8), vb: songNotes(56, 16) },
+      plan: { x: 'va', y: 'vb', z: 'va' },
+    },
+    'probe song section clock',
+    2,
+  );
+  report(
+    'song: a shared section clock with pickRestart starts each variation at its own first cycle (sections of 8, 16 and 8 cycles, two passes)',
+    longRead.starts.length === 6 &&
+      longRead.starts.every((step) => step === 0) &&
+      longRead.lasts.join(',') === '7,15,7,7,15,7' &&
+      longRead.unexpected === 0,
+    JSON.stringify(longRead),
+  );
+
+  // A short section whose variation does not divide its length, passed through twice, and a section name used twice
+  // in one pass: every use starts the variation again at its first step, where arrange() would keep counting.
+  const repeatedRead = await playSongPiece(
+    context,
+    {
+      sections: [['p', 3], ['q', 5], ['p', 3]],
+      variations: { va: songNotes(48, 2), vb: songNotes(52, 3) },
+      plan: { p: 'va', q: 'vb' },
+    },
+    'probe song repeated section',
+    2,
+  );
+  report(
+    'song: a 3-cycle section restarts its variation on its second pass and on a second use of its name',
+    repeatedRead.starts.length === 6 &&
+      repeatedRead.starts.every((step) => step === 0) &&
+      repeatedRead.lasts.join(',') === '0,1,0,0,1,0' &&
+      repeatedRead.unexpected === 0,
+    JSON.stringify(repeatedRead),
+  );
+
+  // The shift is written on the clock alone: every section starts 5 cycles later and its variation still begins at
+  // its first step, with variations whose length does not divide the section.
+  const shiftedRead = await playSongPiece(
+    context,
+    {
+      sections: [['x', 8], ['y', 16], ['z', 8]],
+      shift: 5,
+      variations: { va: songNotes(48, 3), vb: songNotes(52, 5) },
+      plan: { x: 'va', y: 'vb', z: 'va' },
+    },
+    'probe song shifted clock',
+    2,
+  );
+  report(
+    "song: a shift written on the section clock moves every section start and keeps each variation's first cycle",
+    shiftedRead.cycles.join(',') === '5,13,29,37,45,61' &&
+      shiftedRead.starts.every((step) => step === 0) &&
+      shiftedRead.lasts.join(',') === '1,0,1,1,0,1' &&
+      shiftedRead.unexpected === 0,
+    JSON.stringify(shiftedRead),
+  );
+
+  const { cdp, client } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  // The checks below read the code they wrote, so the page must be running that code first; a page that is not is an error, not a pass.
+  const waitActive = async (code) => {
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of this check within 8 seconds');
+    }
+  };
+  const stateWord = () => evaluateExpr(cdp, `(() => { const el = document.querySelector('#sound-state .state-label'); return el ? el.textContent : null; })()`);
+
+  // The helper in the piece's own code plays a plain pattern, a variation in degrees, a fixed variation that declares its
+  // harmony and an explicit rest, in every cycle of every section, over two passes; a shift written in the song declaration
+  // moves every track by the same cycles.
+  const helperCode = songHelperCode({ t1Tail: '.gain(0)' });
+  await callTool(client, 'set_code', { code: helperCode, label: 'probe song helper' });
+  await waitActive(helperCode);
+  const helperRead = await songHelperDisagreements(cdp, helperCode, 0, SONG_HELPER_PLAN);
+  const shiftedCode = songHelperCode({ shift: 4, t1Tail: '.gain(0)' });
+  await callTool(client, 'set_code', { code: shiftedCode, label: 'probe song helper shifted' });
+  await waitActive(shiftedCode);
+  const shiftedHelperRead = await songHelperDisagreements(cdp, shiftedCode, 4, SONG_HELPER_PLAN);
+  const allAsDeclared = (read) => Object.values(read).every((track) => track.checked === 30 && track.wrong === 0);
+  report(
+    'song: the in-code helper plays a pattern variation, a degree variation, a fixed variation and an explicit rest as declared',
+    allAsDeclared(helperRead) && allAsDeclared(shiftedHelperRead),
+    JSON.stringify({ unshifted: helperRead, shiftedBy4: shiftedHelperRead }),
+  );
+
+  // A wrong variation name, a missing cell and a misspelled rest are all refused when the code is evaluated, whichever
+  // section they sit in, with the section and the track named; the music that played keeps playing.
+  await callTool(client, 'set_code', { code: helperCode, label: 'probe song helper back' });
+  await waitActive(helperCode);
+  const { t3: _removed, ...zWithoutT3 } = SONG_HELPER_PLAN.z;
+  const refusals = {};
+  for (const [name, plan] of [
+    ['wrong name in the last section', { ...SONG_HELPER_PLAN, z: { ...SONG_HELPER_PLAN.z, t1: 'vz' } }],
+    ['missing cell in the last section', { ...SONG_HELPER_PLAN, z: zWithoutT3 }],
+  ]) {
+    const answer = await songSetCode(client, songHelperCode({ plan }), `probe song ${name}`);
+    const clockBefore = await readSchedulerNow(cdp);
+    await sleep(1000);
+    refusals[name] = {
+      reply: answer.text,
+      failed: answer.failed,
+      previousCodeStillActive: (await evaluateExpr(cdp, `${replState}.activeCode`)) === helperCode,
+      state: await stateWord(),
+      clockAdvances: (await readSchedulerNow(cdp)) - clockBefore >= 0.2,
+    };
+  }
+  const wrongName = refusals['wrong name in the last section'];
+  const missingCell = refusals['missing cell in the last section'];
+  report(
+    'song: a wrong variation name in the last section fails at evaluation, names the section and the track, and the music that played keeps playing',
+    [wrongName, missingCell].every((r) => r.failed && r.previousCodeStillActive && r.state === 'Playing' && r.clockAdvances) &&
+      wrongName.reply.includes('section z, track t1: no variation vz') &&
+      missingCell.reply.includes('section z has no cell for track t3'),
+    JSON.stringify(refusals),
+  );
+
+  // The Parts view lists a structured piece: its sections and its tracks under their groups. A length written as arithmetic
+  // is not a plain number: the view gives one line with the reason and no list, and Claude's reply carries the same sentence.
+  const structuredCode = songHelperCode({ t1Tail: '.gain(0)' });
+  await callTool(client, 'set_code', { code: structuredCode, label: 'probe song parts list' });
+  await waitActive(structuredCode);
+  await songOpenParts(cdp);
+  const listRead = await waitFor(cdp, SONG_LIST_READ, 5000);
+  const arithmeticCode = structuredCode.replace("['y', 5]", "['y', 2 + 3]");
+  const arithmeticReply = await callTool(client, 'set_code', { code: arithmeticCode, label: 'probe song parts arithmetic length' });
+  await waitActive(arithmeticCode);
+  const arithmeticSentence = songMessageText({ state: 'unreadable', reason: 'length-not-plain-number', section: 'y', track: null, group: null, variation: null, source: '2 + 3', helper: 'canonical' });
+  const arithmeticLine = await waitFor(cdp, `(() => { const el = document.getElementById('parts-message'); return el.hidden ? null : el.textContent; })()`, 5000);
+  const arithmeticState = await evaluateExpr(cdp, `({ list: ${SONG_LIST_READ}, rows: document.getElementById('parts-rows').children.length, notesHidden: document.getElementById('song-notes').hidden })`);
+  const sentenceInReply = new RegExp(`Song structure in #\\d+: ${songLiteralPattern(arithmeticSentence)}`).test(arithmeticReply);
+  report(
+    "song: the Parts view lists a structured piece's sections and tracks, and a length written as arithmetic gives one line whose sentence is also in the set_code reply",
+    JSON.stringify(listRead) === JSON.stringify(SONG_HELPER_LIST) &&
+      arithmeticLine === arithmeticSentence &&
+      arithmeticState.list === null &&
+      arithmeticState.rows === 0 &&
+      arithmeticState.notesHidden === true &&
+      sentenceInReply,
+    JSON.stringify({ listRead, arithmeticLine, arithmeticState, sentenceInReply }),
+  );
+
+  // What the Parts view and its lines show right now, as plain data.
+  const readParts = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const text = (id) => { const el = document.getElementById(id); return el.hidden ? null : el.textContent; };
+        const notes = document.getElementById('song-notes');
+        return {
+          list: ${SONG_LIST_READ},
+          message: text('parts-message'),
+          notes: notes.hidden ? null : [...notes.children].map((line) => line.textContent),
+          rows: document.getElementById('parts-rows').children.length,
+          cards: document.querySelectorAll('#parts-rows .part-card:not(.song-head)').length,
+          askOffered: !document.getElementById('parts-ask').hidden,
+        };
+      })()`,
+    );
+  /** Polls readParts until `done` accepts it, up to 5 seconds, and returns the last reading either way. */
+  const partsWhen = async (done) => {
+    let last = await readParts();
+    for (let waited = 0; !done(last) && waited < 5000; waited += 100) {
+      await sleep(100);
+      last = await readParts();
+    }
+    return last;
+  };
+  const sameList = (read) => JSON.stringify(read) === JSON.stringify(SONG_HELPER_LIST);
+  const songReplyLines = (reply) => reply.split('\n').filter((line) => line.startsWith('Song structure'));
+
+  // A helper that was changed keeps the grid and adds one line; the same line goes to Claude; the canonical text takes it away.
+  const changedHelperCode = structuredCode.replace('  return clock.pickRestart(cells);', '  return clock.pickRestart(cells).gain(1);');
+  const changedReply = await callTool(client, 'set_code', { code: changedHelperCode, label: 'probe song changed helper' });
+  await waitActive(changedHelperCode);
+  const changedParts = await partsWhen((read) => read.notes !== null);
+  const restoredReply = await callTool(client, 'set_code', { code: structuredCode, label: 'probe song helper restored' });
+  await waitActive(structuredCode);
+  const restoredParts = await partsWhen((read) => read.notes === null);
+  const helperSentence = 'The play() helper was changed, so the page cannot vouch for what plays.';
+  report(
+    'song: a changed play() helper keeps the grid, adds the helper line in the Parts view and in the set_code reply, and the line goes away when the helper is restored',
+    sameList(changedParts.list) &&
+      JSON.stringify(changedParts.notes) === JSON.stringify([helperSentence]) &&
+      changedParts.message === null &&
+      songReplyLines(changedReply).length === 1 &&
+      new RegExp(`^Song structure in #\\d+: ${songLiteralPattern(helperSentence)}$`).test(songReplyLines(changedReply)[0]) &&
+      sameList(restoredParts.list) &&
+      restoredParts.notes === null &&
+      songReplyLines(restoredReply).length === 0,
+    JSON.stringify({ changedParts, restoredParts, changedLines: songReplyLines(changedReply), restoredLines: songReplyLines(restoredReply) }),
+  );
+
+  // A statement that changes its timing after play() is a difference between what plays and what the song declares: one line names
+  // the first section and the track, and the next tool reply carries the same sentence. The tail speeds t1 up, so it differs in
+  // all three sections (the first and two more places).
+  const slowedCode = songHelperCode({ t1Tail: '.fast(2).velocity(0).postgain(0.5)' });
+  await callTool(client, 'set_code', { code: slowedCode, label: 'probe song timing changed after play' });
+  await waitActive(slowedCode);
+  const slowedAnswer = await songCheckAnswer(cdp);
+  const slowedSentence = differsLine({ section: 'x', track: 't1', more: 2 });
+  const slowedGetCode = await callTool(client, 'get_code', {});
+  report(
+    'song: a track whose statement changes its timing after play() gives one line naming the first section and the track, and the next tool reply carries the same sentence',
+    slowedAnswer.check === 'differs' &&
+      slowedAnswer.hidden === false &&
+      JSON.stringify(slowedAnswer.lines) === JSON.stringify([slowedSentence]) &&
+      slowedSentence === "What plays differs from the declaration at the start of section 'x', track 't1' (and 2 more places)." &&
+      new RegExp(`Song structure in #\\d+: ${songLiteralPattern(slowedSentence)}`).test(slowedGetCode),
+    JSON.stringify({ slowedAnswer, sentenceInReply: slowedGetCode.includes(slowedSentence) }),
+  );
+
+  // Opening and closing the Timeline while a check runs, or after it answered, changes nothing about the version that plays:
+  // the answer still arrives, and the line stays when the Parts view comes back.
+  const viewSwitch = async (key, view) => {
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, key);
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === ${JSON.stringify(view)} ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun(`the ${view} view did not open`);
+    }
+  };
+  const slowedAgainCode = songHelperCode({ t1Tail: '.fast(2).velocity(0).postgain(0.6)' });
+  await callTool(client, 'set_code', { code: slowedAgainCode, label: 'probe song timeline opened during the check' });
+  await waitActive(slowedAgainCode);
+  await viewSwitch('2', 'timeline');
+  await viewSwitch('4', 'parts');
+  const duringAnswer = await songCheckAnswer(cdp).catch((err) => (err instanceof ProbeCouldNotRun ? null : Promise.reject(err)));
+  await viewSwitch('2', 'timeline');
+  await viewSwitch('4', 'parts');
+  await sleep(300);
+  const afterViews = await evaluateExpr(cdp, `(() => { const el = document.getElementById('song-notes'); return { check: el.dataset.check ?? null, hidden: el.hidden, lines: [...el.children].map((line) => line.textContent) }; })()`);
+  report(
+    'song: opening and closing the Timeline during the check, and again after it answered, keeps the answer of the version that plays',
+    duringAnswer !== null &&
+      duringAnswer.check === 'differs' &&
+      JSON.stringify(duringAnswer.lines) === JSON.stringify([slowedSentence]) &&
+      afterViews.check === 'differs' &&
+      afterViews.hidden === false &&
+      JSON.stringify(afterViews.lines) === JSON.stringify([slowedSentence]),
+    JSON.stringify({ duringAnswer, afterViews }),
+  );
+
+  // The taught template and the probe's helper piece play as they declare: the check finds no difference and no line appears.
+  const templateCode = structureTemplateText();
+  await callTool(client, 'set_code', { code: templateCode, label: 'probe song template' });
+  await waitActive(templateCode);
+  await songOpenParts(cdp);
+  const templateAnswer = await songCheckAnswer(cdp);
+  const templateSections = await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head').length`);
+  const templateState = await stateWord();
+  report(
+    'song: the get_code template plays as written, the Parts view lists its one section, and the check finds no difference',
+    templateAnswer.check === 'agrees' && templateAnswer.hidden === true && templateAnswer.lines.length === 0 && templateSections === 1 && templateState === 'Playing',
+    JSON.stringify({ templateAnswer, templateSections, templateState }),
+  );
+
+  const shiftedHelper = songHelperCode({ shift: 4 });
+  await callTool(client, 'set_code', { code: shiftedHelper, label: 'probe song helper piece shifted by 4' });
+  await waitActive(shiftedHelper);
+  const helperPieceAnswer = await songCheckAnswer(cdp);
+  report(
+    'song: the helper piece with three variation kinds, a rest, a shift and a section harmony plays as declared, so no line appears',
+    helperPieceAnswer.check === 'agrees' && helperPieceAnswer.hidden === true && helperPieceAnswer.lines.length === 0,
+    JSON.stringify(helperPieceAnswer),
+  );
+
+  // A helper whose rest branch plays a variation instead of silence is a changed helper (its line comes first) and a
+  // difference at the two rests (the second line); the next tool reply carries both.
+  const restPlaysHelper = songHelperCode({ t1Tail: '.gain(0)' }).replace("const v = key === '-' ? silence : variations[key];", "const v = key === '-' ? variations.va : variations[key];");
+  if (restPlaysHelper === songHelperCode({ t1Tail: '.gain(0)' })) throw new ProbeCouldNotRun('the rest branch of the helper text was not found, so the changed helper could not be built');
+  await callTool(client, 'set_code', { code: restPlaysHelper, label: 'probe song helper plays a rest' });
+  await waitActive(restPlaysHelper);
+  const restAnswer = await songCheckAnswer(cdp);
+  const restGetCode = await callTool(client, 'get_code', {});
+  const restLines = restAnswer.lines;
+  const restDiffers = differsLine({ section: 'y', track: 't3', more: 1 });
+  const restInReply = songReplyLines(restGetCode);
+  report(
+    'song: a helper changed so that a rest plays a variation shows the helper line and then the differs line',
+    restAnswer.check === 'differs' &&
+      JSON.stringify(restLines) === JSON.stringify([helperSentence, restDiffers]) &&
+      restInReply.length === 2 &&
+      new RegExp(`^Song structure in #\\d+: ${songLiteralPattern(helperSentence)}$`).test(restInReply[0]) &&
+      new RegExp(`^Song structure in #\\d+: ${songLiteralPattern(restDiffers)}$`).test(restInReply[1]),
+    JSON.stringify({ restAnswer, restInReply }),
+  );
+
+  // The next change clears the old line at once; its own answer follows, and a piece that agrees says nothing.
+  await callTool(client, 'set_code', { code: structuredCode, label: 'probe song after a difference' });
+  await waitActive(structuredCode);
+  const clearedAtOnce = await evaluateExpr(cdp, `(() => { const el = document.getElementById('song-notes'); return { check: el.dataset.check ?? null, lines: [...el.children].map((line) => line.textContent) }; })()`);
+  const clearedAnswer = await songCheckAnswer(cdp);
+  report(
+    'song: the next change clears the differs line until its own answer',
+    ['pending', 'agrees'].includes(clearedAtOnce.check) &&
+      !clearedAtOnce.lines.includes(restDiffers) &&
+      clearedAnswer.check === 'agrees' &&
+      clearedAnswer.hidden === true &&
+      clearedAnswer.lines.length === 0,
+    JSON.stringify({ clearedAtOnce, clearedAnswer }),
+  );
+
+  // A large piece is checked within the query budget of 2000 ms, measured here in the real page.
+  const bigCode = songBigCode(40, [1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6]);
+  await callTool(client, 'set_code', { code: bigCode, label: 'probe song 40 tracks and 12 sections' });
+  await waitActive(bigCode);
+  const bigAnswer = await songCheckAnswer(cdp, 20000);
+  report(
+    'song: a piece of 40 tracks and 12 sections is checked within the query budget',
+    bigAnswer.check === 'agrees' && bigAnswer.ms <= 2000 && bigAnswer.hidden === true,
+    JSON.stringify({ checkMs: bigAnswer.ms, check: bigAnswer.check, lines: bigAnswer.lines }),
+  );
+
+  // A helper without its two checks plays a piece with a missing cell without a word; the page names the section and the
+  // track, draws no list, and Claude gets the same sentence.
+  const uncheckedHelper = songHelperCode({ t1Tail: '.gain(0)', plan: { ...SONG_HELPER_PLAN, z: zWithoutT3 } })
+    .split('\n')
+    .filter((line) => !line.includes('throw new Error'))
+    .join('\n');
+  const missingReply = await callTool(client, 'set_code', { code: uncheckedHelper, label: 'probe song missing cell' });
+  await waitActive(uncheckedHelper);
+  const missingSentence = songMessageText({ state: 'unreadable', reason: 'cell-missing', section: 'z', track: 't3', group: null, variation: null, source: null, helper: 'changed' });
+  const missingParts = await partsWhen((read) => read.message !== null);
+  report(
+    'song: a missing cell under a helper that does not check its cells is named by its section and its track, and no list is drawn',
+    missingParts.message === missingSentence &&
+      missingSentence === "Parts can't read this song: section 'z' has no cell for track 't3'." &&
+      missingParts.list === null &&
+      missingParts.rows === 0 &&
+      missingParts.notes === null &&
+      new RegExp(`Song structure in #\\d+: ${songLiteralPattern(missingSentence)}`).test(missingReply),
+    JSON.stringify({ missingParts, sentenceInReply: missingReply.includes(missingSentence) }),
+  );
+
+  // Pieces without a structure keep their Parts view as it was: the arrange() cards, the no-parts line with the Ask offer, and
+  // an unrelated constant named song changes nothing.
+  const arrangeLines = [
+    'const one = note("c4").s("sine").gain(0)',
+    'const two = note("e4").s("square").gain(0)',
+    'const three = note("g4").s("triangle").gain(0)',
+  ];
+  const arrangePiece = [...arrangeLines, 'main: arrange([2, one], [2, two], [2, three])'].join('\n');
+  const noPartsPiece = 's("bd").gain(0)';
+  const unrelatedSong = ["const song = 'la';", arrangePiece].join('\n');
+  const songObjectPiece = ["const song = { tempo: 90, key: 'C' };", arrangePiece].join('\n');
+  const older = {};
+  for (const [name, code] of [['arrange', arrangePiece], ['none', noPartsPiece], ['unrelatedSong', unrelatedSong], ['songObject', songObjectPiece]]) {
+    await callTool(client, 'set_code', { code, label: `probe song older piece ${name}` });
+    await waitActive(code);
+    older[name] = await partsWhen((read) => (name === 'none' ? read.message !== null : read.cards > 0));
+  }
+  report(
+    'song: a piece without a structure keeps its arrange() rows, its messages and its Ask offer, and has no song grid',
+    [older.arrange, older.unrelatedSong, older.songObject].every((read) => read.cards === 3 && read.list === null && read.notes === null && read.message === null && read.askOffered === false) &&
+      older.none.message === PARTS_COPY.none &&
+      older.none.cards === 0 &&
+      older.none.list === null &&
+      older.none.notes === null &&
+      older.none.askOffered === true,
+    JSON.stringify(older),
+  );
+
+  // A piece with both a song and arrange(): the song grid stands, the arrange() cards are not drawn.
+  const bothCode = [structuredCode, ...arrangeLines.slice(0, 2), 'main: arrange([2, one], [2, two])'].join('\n');
+  await callTool(client, 'set_code', { code: bothCode, label: 'probe song and arrange' });
+  await waitActive(bothCode);
+  const bothParts = await partsWhen((read) => read.list !== null);
+  report(
+    'song: a piece with both a song and arrange() shows the song grid and no part cards',
+    bothParts.list !== null &&
+      bothParts.cards === 0 &&
+      bothParts.message === null &&
+      bothParts.askOffered === false &&
+      JSON.stringify(bothParts.list.sections) === JSON.stringify(SONG_HELPER_LIST.sections) &&
+      bothParts.list.tracks.at(-1).track === 'main',
+    JSON.stringify(bothParts),
+  );
+
+  // The grid and its lines fit the Parts view at 1024 and 1920 pixels in the three layouts: nothing scrolls sideways and
+  // nothing in them but the playing header wears the accent, secondary accent, destructive or Jam colors. A track name of 50
+  // characters and the helper line are drawn, so wrapping is exercised.
+  const longTrack = 'a'.repeat(25) + 'b'.repeat(25);
+  const fitCode = changedHelperCode.replaceAll('t2', longTrack);
+  await callTool(client, 'set_code', { code: fitCode, label: 'probe song fit' });
+  await waitActive(fitCode);
+  await partsWhen((read) => read.list !== null && read.notes !== null);
+  const fitRead = `(() => {
+    const colorOfToken = (name) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(' + name + ')';
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    };
+    const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map(colorOfToken);
+    const text = colorOfToken('--text');
+    const muted = colorOfToken('--text-muted');
+    const colorsOf = (selector) => [...new Set([...document.querySelectorAll(selector)].map((el) => getComputedStyle(el).color))];
+    const hits = [];
+    for (const scope of document.querySelectorAll('#parts-rows .song-grid, #song-notes')) {
+      for (const el of [scope, ...scope.querySelectorAll('*')]) {
+        // The playing section's header is the Parts card and wears the accent by design; everything else must not.
+        if (el.closest('.song-head') !== null) continue;
+        const style = getComputedStyle(el);
+        for (const property of ['color', 'borderTopColor', 'borderBottomColor', 'backgroundColor', 'outlineColor']) {
+          if (reserved.includes(style[property])) hits.push(el.className + ':' + property);
+        }
+      }
+    }
+    const view = document.getElementById('parts-view');
+    return {
+      layout: document.getElementById('workspace').dataset.layout,
+      listDrawn: document.querySelector('#parts-rows .song-grid') !== null,
+      notesShown: !document.getElementById('song-notes').hidden,
+      sideways: view.scrollWidth > view.clientWidth,
+      viewWidth: view.clientWidth,
+      namesOk: colorsOf('.song-rowhead, .song-fold, .song-fold-name, .song-cell, .part-name').every((color) => color === text),
+      mutedOk: colorsOf('.song-corner, .song-harmony, .song-count, .song-head-action').every((color) => color === muted),
+      hits,
+    };
+  })()`;
+  const fits = [];
+  for (const layout of ['a', 'b', 'c']) {
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, layout);
+    for (const reading of await atWidths(cdp, [1024, 1920], async (width) => ({ width, ...(await evaluateExpr(cdp, fitRead)) }))) fits.push(reading);
+  }
+  await pressKey(cdp, 'a');
+  report(
+    'song: the song grid and its lines fit the Parts view at 1024 and 1920 pixels in layouts a, b and c, with no sideways scroll and no accent color',
+    fits.length === 6 && fits.every((fit) => fit.listDrawn && fit.notesShown && !fit.sideways && fit.viewWidth > 0 && fit.namesOk && fit.mutedOk && fit.hits.length === 0),
+    JSON.stringify(fits),
+  );
+
+  // The grid has one tab stop (the other controls are reached by the arrow keys), and a right-click on a track name asks about
+  // that track and on a cell about that cell; a section header asks about its part.
+  const focusRead = await evaluateExpr(
+    cdp,
+    `(() => {
+      const grid = document.querySelector('#parts-rows .song-grid');
+      const controls = [...grid.querySelectorAll('button')];
+      return {
+        controls: controls.length,
+        tabStops: controls.filter((el) => el.tabIndex >= 0).length,
+        otherFocusable: [...grid.querySelectorAll('*')].filter((el) => el.tabIndex >= 0 && el.tagName !== 'BUTTON').length,
+      };
+    })()`,
+  );
+  const askedOnName = await askAt(cdp, '#parts-rows .song-grid .song-track-row .song-rowhead');
+  if (askedOnName.open) await pressKey(cdp, 'Escape');
+  await waitFor(cdp, `document.getElementById('ask-box').hidden ? true : null`, 2000);
+  const askedOnCell = await askAt(cdp, '#parts-rows .song-grid .song-cell');
+  if (askedOnCell.open) await pressKey(cdp, 'Escape');
+  await waitFor(cdp, `document.getElementById('ask-box').hidden ? true : null`, 2000);
+  report(
+    'song: the grid has one tab stop among its controls, and a right-click on a track name asks about the track and on a cell about the cell',
+    focusRead.controls > 10 &&
+      focusRead.tabStops === 1 &&
+      focusRead.otherFocusable === 0 &&
+      [askedOnName, askedOnCell].every((asked) => asked.prevented === true && asked.open === true) &&
+      askedOnName.chip === 'Track t1' &&
+      askedOnCell.chip === 'Cell "x" \u00B7 t1 \u00B7 va',
+    JSON.stringify({ focusRead, askedOnName, askedOnCell }),
+  );
+  await pressKey(cdp, 'Escape');
+
+  // The Mixer keeps the fader of a helper track and writes its post-gain at the end of that track's statement, changing
+  // no other line.
+  const faderCode = songHelperCode({});
+  await callTool(client, 'set_code', { code: faderCode, label: 'probe song helper fader' });
+  await waitActive(faderCode);
+  const postgainBefore = [...new Set((await songTrackOnsets(cdp, faderCode, 0, 3)).map((o) => o.postgain))];
+  await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  await pressKey(cdp, 'Escape');
+  await pressKey(cdp, '3');
+  await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'mixer' ? true : null`, 3000);
+  await waitFor(cdp, `document.querySelectorAll('#mixer-strips .mx-strip').length === 3 ? true : null`, 5000);
+  const strips = await evaluateExpr(
+    cdp,
+    `[...document.querySelectorAll('#mixer-strips .mx-strip')].map((strip) => ({ track: strip.dataset.track, faderEnabled: !strip.querySelector('.mx-fader').disabled, readout: strip.querySelector('.mx-readout').textContent }))`,
+  );
+  await dragSlider(cdp, '.mx-strip[data-track="label:t1"] .mx-fader', 0.2, 0.6, 6);
+  const writtenCode = await waitFor(cdp, `${replState}.activeCode !== ${JSON.stringify(faderCode)} ? ${replState}.activeCode : null`, 4000);
+  const oldLines = faderCode.split('\n');
+  const newLines = writtenCode === null ? [] : writtenCode.split('\n');
+  const changedLines = newLines.filter((line, index) => line !== oldLines[index]);
+  const written = changedLines.length === 1 ? /^t1: play\('t1', t1\)\.velocity\(0\)\.postgain\(([0-9.]+)\)$/.exec(changedLines[0]) : null;
+  const postgainAfter = writtenCode === null ? [] : [...new Set((await songTrackOnsets(cdp, writtenCode, 0, 3)).map((o) => o.postgain))];
+  await pressKey(cdp, 'Escape');
+  report(
+    "song: the Mixer keeps the fader of a track built by the helper and writes .postgain at the end of that track's statement",
+    strips.map((strip) => strip.track).join(',') === 'label:t1,label:t2,label:t3' &&
+      strips.every((strip) => strip.faderEnabled) &&
+      strips[0].readout === '0.50' &&
+      postgainBefore.join(',') === '0.5' &&
+      written !== null &&
+      newLines.length === oldLines.length &&
+      Number(written[1]) !== 0.5 &&
+      postgainAfter.join(',') === String(Number(written[1])),
+    JSON.stringify({ strips, postgainBefore, changedLines, postgainAfter }),
+  );
+
+  // A variation written in degrees as a function of the harmony takes the harmony of the section it plays in: a section of
+  // 3 cycles in E minor and one of 5 cycles under the piece's C major, eight degrees a cycle, two passes.
+  const degreeSections = [['x', 3, 'E3:minor'], ['y', 5]];
+  const degreeCode = songSingleTrackCode(degreeSections, '(h) => n("0 1 2 3 4 5 6 7").scale(h)');
+  await callTool(client, 'set_code', { code: degreeCode, label: 'probe song degrees' });
+  await waitActive(degreeCode);
+  const degreeOnsets = (await songTrackHaps(cdp, degreeCode, 0, 0, 16)).filter((hap) => hap.onset);
+  const degreeUses = [[0, 'x', 3], [3, 'y', 5], [8, 'x', 3], [11, 'y', 5]];
+  const degreeHarmony = { x: 'E3:minor', y: 'C3:major' };
+  let degreeWrong = 0;
+  for (const [start, section, length] of degreeUses) {
+    for (let cycle = start; cycle < start + length; cycle++) {
+      const got = degreeOnsets.filter((hap) => hap.wholeBegin >= cycle && hap.wholeBegin < cycle + 1).map((hap) => songMidiOf(hap.note)).sort((a, b) => a - b);
+      const want = [0, 1, 2, 3, 4, 5, 6, 7].map((degree) => songDegreeNote(degreeHarmony[section], degree)).sort((a, b) => a - b);
+      if (got.join(',') !== want.join(',')) degreeWrong++;
+    }
+  }
+  const firstCycles = [0, 3].map((cycle) => degreeOnsets.filter((hap) => hap.wholeBegin >= cycle && hap.wholeBegin < cycle + 1).map((hap) => hap.note));
+  report(
+    'song: a variation in degrees takes the scale of each section it plays in',
+    degreeWrong === 0 && degreeOnsets.length === 16 * 8,
+    JSON.stringify({ cyclesChecked: 16, cyclesWrong: degreeWrong, firstCycleOfX: firstCycles[0], firstCycleOfY: firstCycles[1] }),
+  );
+
+  // A note that is held past a section line (two-cycle notes, the second starting at the last cycle of x): it keeps the
+  // pitch of its own section's scale, its whole ends at the line, and the only onset after the line is the next section's own.
+  const heldCode = songSingleTrackCode(degreeSections, '(h) => n("0 2").slow(4).scale(h)');
+  await callTool(client, 'set_code', { code: heldCode, label: 'probe song held note' });
+  await waitActive(heldCode);
+  const heldHaps = await songTrackHaps(cdp, heldCode, 0, 0, 8);
+  const heldNote = heldHaps.find((hap) => hap.onset && hap.wholeBegin === 2);
+  const afterTheLine = heldHaps.filter((hap) => hap.partBegin >= 3 && hap.partBegin < 4);
+  report(
+    'song: a note held across a section boundary keeps its own section scale, is cut at the line and is not struck again',
+    heldNote !== undefined &&
+      songMidiOf(heldNote.note) === songDegreeNote('E3:minor', 2) &&
+      heldNote.wholeEnd === 3 &&
+      heldNote.partEnd === 3 &&
+      afterTheLine.length === 1 &&
+      afterTheLine[0].onset &&
+      afterTheLine[0].wholeBegin === 3 &&
+      songMidiOf(afterTheLine[0].note) === songDegreeNote('C3:major', 0),
+    JSON.stringify({ heldNote, afterTheLine }),
+  );
+
+  // Adding a bare number to a pattern of degrees leaves it unchanged; adding the same number as n() moves it up.
+  const addRead = async (tail, label) => {
+    const code = `t1: n("0 2")${tail}.scale('C3:major').gain(0)`;
+    await callTool(client, 'set_code', { code, label });
+    await waitActive(code);
+    return (await songTrackHaps(cdp, code, 0, 0, 1)).filter((hap) => hap.onset).map((hap) => songMidiOf(hap.note));
+  };
+  const plainRead = await addRead('', 'probe song degrees plain');
+  const bareRead = await addRead('.add(2)', 'probe song degrees add a number');
+  const controlRead = await addRead('.add(n(2))', 'probe song degrees add n');
+  report(
+    'song: adding a bare number to a degree pattern does not transpose it, adding n() does',
+    plainRead.join(',') === '48,52' && bareRead.join(',') === '48,52' && controlRead.join(',') === '52,55',
+    JSON.stringify({ plain: plainRead, addNumber: bareRead, addN: controlRead }),
+  );
+
+  // Launches. A launch rewrites the shift alone and the section it names must start on the line the change takes over on.
+  // The piece is silent and carries a marker track that writes what the scheduler plays into a log of the window.
+  const launchTemplate = songLaunchTemplate({ cps: 1 });
+  const storedTimingKey = 'moontide.changeTiming';
+  const storeTiming = async (value) => {
+    await evaluateExpr(cdp, `(() => { localStorage.setItem(${JSON.stringify(storedTimingKey)}, ${JSON.stringify(value)}); })()`);
+    await reloadPage(cdp);
+  };
+  const startLaunchPiece = async (label, template = launchTemplate) => {
+    await songLaunchLogReset(cdp);
+    const code = songLaunchFill(template, 0, 0);
+    await callTool(client, 'set_code', { code, label });
+    await waitActive(code);
+    await sleep(1500);
+  };
+  // Polls from here until the scheduler is within half a cycle of `cycle`; the page waits for the rest, so no page call lasts long.
+  // A scheduler that is stopped or throttled would never get there, so this gives up after a minute instead of waiting forever.
+  const approachCycle = async (cycle) => {
+    const deadline = Date.now() + 60000;
+    while ((await readSchedulerNow(cdp)) < cycle - 0.5) {
+      if (Date.now() > deadline) throw new ProbeCouldNotRun(`the scheduler did not reach cycle ${cycle} within 60 seconds`);
+      await sleep(60);
+    }
+  };
+  const landedOnItsLine = (landing, target, line) =>
+    landing.landing === line &&
+    landing.markSection === target &&
+    landing.sectionHere === target &&
+    landing.intoSection === 0 &&
+    landing.t1Step === 0 &&
+    landing.oldAtOrAfter === 0 &&
+    landing.newBefore === 0;
+
+  // A hand evaluation under the next bar and under the next phrase: the page computes the line from the scheduler's frontier,
+  // the shift that puts the launched section on it is written, and the first cycle of that section plays on the line.
+  // The page plans its takeover again once the new code is evaluated, so a line computed here can move to the next one when
+  // the evaluation is slow. The page-side expression reads the line again after the evaluation; a run in which it moved is
+  // not judged (it says nothing about the launch), it is printed and tried again with a fresh version, three times at most.
+  // A bar is a short span, so the bar variant runs on a slow clock (a bar of two seconds) to leave a margin of about a second.
+  const barTemplate = songLaunchTemplate({ cps: 0.5 });
+  const handLaunches = [];
+  try {
+    for (const [timing, lineLength, template] of [['bar', 1, barTemplate], ['phrase', 4, launchTemplate]]) {
+      await storeTiming(timing);
+      await startLaunchPiece(`probe song launch ${timing}`, template);
+      let version = 0;
+      for (const target of ['y', 'z', 'x']) {
+        let row = null;
+        for (let attempt = 1; attempt <= 3 && (row === null || row.marginLost); attempt++) {
+          version += 1;
+          const now = await readSchedulerNow(cdp);
+          // Early in the span between two lines, so the line the page computes should not move under the call.
+          const until = lineLength === 1 ? Math.ceil(now + 1) + 0.1 : Math.ceil((now + 1) / lineLength) * lineLength + 1.5;
+          await approachCycle(until);
+          const out = await evaluateExpr(
+            cdp,
+            songLaunchHandExpression({ template, lineLength, start: SONG_LAUNCH_STARTS[target], version, untilCycle: until }),
+          );
+          if (out.lineAfter !== out.line) {
+            console.log(
+              `probe:page RETRY: the line moved from cycle ${out.line} to ${out.lineAfter} while the ${timing} launch of ${target} was evaluating (${Math.round(out.evaluateMs)} ms), attempt ${attempt} of 3 is not judged`,
+            );
+            row = { timing, target, marginLost: true, line: out.line, lineAfter: out.lineAfter, evaluateMs: Math.round(out.evaluateMs), onLine: false };
+            continue;
+          }
+          const landing = await songLaunchLanding(cdp, { template, version, shift: out.shift });
+          row = {
+            timing,
+            target,
+            marginLost: false,
+            attempt,
+            line: out.line,
+            lineAfter: out.lineAfter,
+            evaluateMs: Math.round(out.evaluateMs),
+            landing: landing.landing,
+            neverPlayed: landing.neverPlayed === true,
+            onLine: landedOnItsLine(landing, target, out.line) && out.line % lineLength === 0,
+            section: landing.markSection,
+            step: landing.t1Step,
+            oldAtOrAfter: landing.oldAtOrAfter,
+          };
+        }
+        handLaunches.push(row);
+      }
+    }
+  } finally {
+    await storeTiming('now');
+  }
+  report(
+    "song: a shift rewrite evaluated under next bar and under next phrase lands the launched section's first cycle on the line",
+    handLaunches.length === 6 && handLaunches.every((row) => row.onLine),
+    JSON.stringify(handLaunches),
+  );
+
+  // A gate set for the end of the current section: the line is the first section start of the playing structure that is
+  // far enough ahead, the new code is the stack of the solo patterns of its tracks, and the page's own takeover gate holds
+  // the old music until the line. The last request comes late in its section, so the line is the end of the next one.
+  await startLaunchPiece('probe song launch section end');
+  const startsOfStructure = Object.values(SONG_LAUNCH_STARTS);
+  const endLaunches = [];
+  let currentShift = 0;
+  let endVersion = 0;
+  for (const [playing, into, target] of [['x', 1.2, 'z'], ['y', 2, 'x'], ['z', 3, 'y'], ['y', 4.7, 'z']]) {
+    endVersion += 1;
+    const now = await readSchedulerNow(cdp);
+    const base = currentShift + SONG_LAUNCH_STARTS[playing] + into;
+    const until = base + Math.ceil((now + 1 - base) / SONG_LAUNCH_TOTAL) * SONG_LAUNCH_TOTAL;
+    await approachCycle(until);
+    const out = await evaluateExpr(
+      cdp,
+      songLaunchEndExpression({ template: launchTemplate, currentShift, start: SONG_LAUNCH_STARTS[target], version: endVersion, trackCount: 4, untilCycle: until }),
+    );
+    const landing = await songLaunchLanding(cdp, { template: launchTemplate, version: endVersion, shift: out.shift });
+    const lineInOld = (((out.line - currentShift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+    endLaunches.push({
+      playing: out.playing,
+      target,
+      line: out.line,
+      landing: landing.landing,
+      neverPlayed: landing.neverPlayed === true,
+      lineIsSectionStartOfOld: startsOfStructure.includes(lineInOld),
+      leadSeconds: (out.line - out.frontier) / out.cps,
+      onLine: landedOnItsLine(landing, target, out.line),
+      step: landing.t1Step,
+    });
+    currentShift = out.shift;
+    await sleep(250);
+  }
+  report(
+    'song: a takeover gate set for the end of the current section lands the new code on that section line',
+    endLaunches.length === 4 && endLaunches.every((row) => row.onLine && row.lineIsSectionStartOfOld && row.leadSeconds >= 0.5),
+    JSON.stringify(endLaunches),
+  );
+
+  // Stop and Play. The scheduler's cycle count restarts at 0 at every Play, so a shift a launch left in the code would start the
+  // music inside the structure; the page therefore writes shift 0 into the code as part of a Play after Stop, and the music
+  // starts from the first section. With shift 0 in the code Play changes nothing.
+  const topHistoryId = async () => {
+    const reply = await callTool(client, 'list_history', {});
+    const match = /^#(\d+) /m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(reply).slice(0, 200)}`);
+    return Number(match[1]);
+  };
+  const topHistoryRow = async () => {
+    const reply = await callTool(client, 'list_history', {});
+    const match = /^#\d+ (.*)$/m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(reply).slice(0, 200)}`);
+    return match[1];
+  };
+  const placeInStructure = (shift, cycle) => {
+    const position = (((cycle - shift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+    return Object.keys(SONG_LAUNCH_STARTS)[Object.values(SONG_LAUNCH_STARTS).filter((start) => start <= position).length - 1];
+  };
+  // The sections the marker track logged for the first six cycles after a Play, as "cycle:section".
+  const heardFromPlay = async (version) => {
+    const deadline = Date.now() + 20000;
+    let entries = await songLaunchLogRead(cdp);
+    while (!entries.some((entry) => entry.v === version && entry.begin >= 5) && Date.now() < deadline) {
+      await sleep(100);
+      entries = await songLaunchLogRead(cdp);
+    }
+    return entries.filter((entry) => entry.v === version && entry.begin >= 0 && entry.begin < 6).sort((a, b) => a.begin - b.begin).map((entry) => `${entry.begin}:${entry.section}`);
+  };
+  const sectionsFor = (shift) => [0, 1, 2, 3, 4, 5].map((cycle) => `${cycle}:${placeInStructure(shift, cycle)}`);
+
+  const stoppedShift = songLaunchFill(launchTemplate, 4, 100);
+  await callTool(client, 'set_code', { code: stoppedShift, label: 'probe song stored shift' });
+  await waitActive(stoppedShift);
+  await sleep(2500);
+  const cycleBeforeStop = await readSchedulerNow(cdp);
+  await stopMusic(cdp);
+  const cycleWhileStopped = await readSchedulerNow(cdp);
+  const historyBeforePlay = await topHistoryId();
+  await songLaunchLogReset(cdp);
+  await playMusic(cdp);
+  const cycleRightAfterPlay = await readSchedulerNow(cdp);
+  const heardWithShift = await heardFromPlay(100);
+  const historyAfterPlay = await topHistoryId();
+  const rowAfterPlay = await topHistoryRow();
+  const codeAfterPlay = await evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+  const serverCodeAfterPlay = String(await callTool(client, 'get_code', {}));
+  report(
+    'song: after Stop, Play writes shift 0 into the code and starts from the first section, with one history row',
+    cycleBeforeStop > 2 &&
+      cycleWhileStopped === 0 &&
+      Math.abs(cycleRightAfterPlay) < 0.5 &&
+      heardWithShift.join(',') === sectionsFor(0).join(',') &&
+      heardWithShift[0].endsWith(':x') &&
+      codeAfterPlay === songLaunchFill(launchTemplate, 0, 100) &&
+      serverCodeAfterPlay.includes('shift: 0,') &&
+      !serverCodeAfterPlay.includes('shift: 4,') &&
+      historyAfterPlay === historyBeforePlay + 1 &&
+      rowAfterPlay.includes('edited by hand'),
+    JSON.stringify({ cycleBeforeStop, cycleWhileStopped, cycleRightAfterPlay, heardWithShift, expected: sectionsFor(0), codeKeepsOnlyTheShift: codeAfterPlay === songLaunchFill(launchTemplate, 0, 100), historyBeforePlay, historyAfterPlay, rowAfterPlay }),
+  );
+
+  // The probe writes shift 0 into the code itself while the music is stopped, then Play evaluates that text. This shows that
+  // Play on code with shift 0 starts from the first section and adds one history row; it does not show that the page writes the
+  // shift back to 0 by itself.
+  await stopMusic(cdp);
+  const firstSectionCode = songLaunchFill(launchTemplate, 0, 101);
+  await evaluateExpr(cdp, `(() => { document.getElementById('repl').editor.setCode(${JSON.stringify(firstSectionCode)}); return true; })()`);
+  const historyBeforeRewrite = await topHistoryId();
+  await songLaunchLogReset(cdp);
+  await playMusic(cdp);
+  const heardFromFirst = await heardFromPlay(101);
+  const historyAfterRewrite = await topHistoryId();
+  report(
+    'song: Play after Stop on code with shift 0 starts from the first section and adds one history row',
+    heardFromFirst.join(',') === sectionsFor(0).join(',') &&
+      heardFromFirst[0].endsWith(':x') &&
+      historyAfterRewrite === historyBeforeRewrite + 1,
+    JSON.stringify({ heardFromFirst, expected: sectionsFor(0), historyBeforeRewrite, historyAfterRewrite }),
+  );
+
+  // Play after Stop on code whose shift is already 0 changes nothing: the text stays as it is, the music starts from the first
+  // section, and no history row is added.
+  const alreadyZero = songLaunchFill(launchTemplate, 0, 102);
+  await callTool(client, 'set_code', { code: alreadyZero, label: 'probe song shift already zero' });
+  await waitActive(alreadyZero);
+  await sleep(2500);
+  await stopMusic(cdp);
+  const historyBeforeZero = await topHistoryId();
+  await songLaunchLogReset(cdp);
+  await playMusic(cdp);
+  const heardZero = await heardFromPlay(102);
+  const codeAfterZero = await evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+  const historyAfterZero = await topHistoryId();
+  report(
+    'song: Play after Stop with the shift already 0 changes nothing and adds no history row',
+    codeAfterZero === alreadyZero && heardZero.join(',') === sectionsFor(0).join(',') && heardZero[0].endsWith(':x') && historyAfterZero === historyBeforeZero,
+    JSON.stringify({ heardZero, expected: sectionsFor(0), codeUnchanged: codeAfterZero === alreadyZero, historyBeforeZero, historyAfterZero }),
+  );
+
+  // The page's own note tag names the track of every note a labeled track triggers. The check only listens to it. First the
+  // notes seen per track over 15 cycles (every section once) are counted against what each track alone plays; a muted track
+  // is never seen. Then a change at the next bar renames t1 to t9: the notes before the line carry t1, those from it carry t9.
+  const lightCode = (label) => songHelperCode({ cps: 2 }).replace("t1: play('t1', t1)", `${label}: play('t1', t1)`) + '\n_t4: note("c2 c2").gain(0)';
+  const reachCycle = async (cycle) => {
+    if (!Number.isFinite(cycle)) throw new ProbeCouldNotRun(`the cycle to wait for is not a number (${cycle})`);
+    if ((await waitFor(cdp, `document.getElementById('repl').editor.repl.scheduler.now() >= ${cycle} ? true : null`, 60000)) !== true) {
+      throw new ProbeCouldNotRun(`the scheduler did not reach cycle ${cycle} within 60 seconds`);
+    }
+  };
+  const lightRead = () => evaluateExpr(cdp, 'window.__noteSeen.seen.map((e) => ({ key: e.key, wb: e.wb }))');
+  const lightBefore = lightCode('t1');
+  let lightFacts = {};
+  let lightOk = false;
+  try {
+    await callTool(client, 'set_code', { code: lightBefore, label: 'probe song note tag' });
+    await waitActive(lightBefore);
+    // The page carries the tag: p is an accessor whose getter gives the same function every time.
+    const accessor = await evaluateExpr(
+      cdp,
+      `(() => { const d = Object.getOwnPropertyDescriptor(globalThis.Pattern.prototype, 'p'); return d !== undefined && typeof d.get === 'function' && typeof d.set === 'function' && d.get() === d.get(); })()`,
+    );
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_START);
+    const started = await readSchedulerNow(cdp);
+    await reachCycle(started + 3);
+    const from = Math.ceil(await readSchedulerNow(cdp)) + 1;
+    await reachCycle(from + 15.5);
+    const seen = await lightRead();
+    const counted = (key) => seen.filter((e) => e.key === key && e.wb >= from && e.wb < from + 15).length;
+    const perTrack = [];
+    for (const [index, name] of ['t1', 't2', 't3'].entries()) {
+      const queried = (await songTrackHaps(cdp, lightBefore, index, from, from + 15)).filter((hap) => hap.onset).length;
+      perTrack.push({ key: `label:${name}`, seen: counted(`label:${name}`), queried });
+    }
+    const unkeyed = seen.filter((e) => typeof e.key !== 'string' || e.key === '').length;
+    const mutedSeen = seen.filter((e) => e.key === 'label:_t4' || e.key === 'label:t4').length;
+    // The change at the next bar.
+    await evaluateExpr(cdp, 'window.__noteSeen.seen.length = 0');
+    await reachCycle((await readSchedulerNow(cdp)) + 4);
+    const reply = await callTool(client, 'set_code', { code: lightCode('t9'), label: 'probe song note tag renamed', at: 'bar' });
+    const line = Number(/takes over at cycle (\d+)/.exec(reply)?.[1]);
+    if (!Number.isInteger(line)) throw new ProbeCouldNotRun(`set_code did not name the cycle it takes over at: ${reply}`);
+    await reachCycle(line + 4);
+    const after = await lightRead();
+    const oldAtOrAfter = after.filter((e) => e.key === 'label:t1' && e.wb >= line).length;
+    const newBefore = after.filter((e) => e.key === 'label:t9' && e.wb < line).length;
+    const oldBefore = after.filter((e) => e.key === 'label:t1' && e.wb < line).length;
+    const newFrom = after.filter((e) => e.key === 'label:t9' && e.wb >= line).length;
+    const unkeyedAfter = after.filter((e) => typeof e.key !== 'string' || e.key === '').length;
+    lightFacts = { accessor, perTrack, unkeyed, mutedSeen, line, oldAtOrAfter, newBefore, oldBefore, newFrom, unkeyedAfter };
+    lightOk =
+      accessor === true &&
+      perTrack.every((row) => row.seen > 0 && row.seen === row.queried) &&
+      unkeyed === 0 &&
+      mutedSeen === 0 &&
+      Number.isInteger(line) &&
+      oldAtOrAfter === 0 &&
+      newBefore === 0 &&
+      oldBefore > 0 &&
+      newFrom > 0 &&
+      unkeyedAfter === 0;
+  } finally {
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_STOP);
+    await callTool(client, 'set_code', { code: 's("bd").gain(0)', label: 'probe song note tag done' });
+  }
+  report("song: the page's note tag names the track of every note a labeled track triggers, also across a bar takeover", lightOk, JSON.stringify(lightFacts));
+
+  // Anonymous `$:` tracks have no label to name them. The page counts them in code order from the start of each evaluation, the way
+  // the repl numbers them, and a muted `_$:` statement is not counted. Two silent tracks of one and two notes a cycle: only $0 and $1
+  // are named, with one and two notes a cycle; a new evaluation of the same code with a comment added numbers them the same way.
+  const dollarCode = 'setcps(2)\n$: note("c3").gain(0)\n$: note("c3 e3").gain(0)\n_$: note("g3 g3 g3").gain(0)';
+  let dollarFacts = {};
+  let dollarOk = false;
+  try {
+    await callTool(client, 'set_code', { code: dollarCode, label: 'probe song dollar tracks' });
+    await waitActive(dollarCode);
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_START);
+    const readDollar = async (code, label) => {
+      await evaluateExpr(cdp, 'window.__noteSeen.seen.length = 0');
+      if (code !== null) {
+        await callTool(client, 'set_code', { code, label });
+        await waitActive(code);
+      }
+      const startedAt = await readSchedulerNow(cdp);
+      await reachCycle(startedAt + 3);
+      const first = Math.ceil(await readSchedulerNow(cdp)) + 1;
+      await evaluateExpr(cdp, 'window.__noteSeen.seen.length = 0');
+      await reachCycle(first + 8.5);
+      const seen = await lightRead();
+      const inside = seen.filter((e) => e.wb >= first && e.wb < first + 8);
+      return {
+        keys: [...new Set(seen.map((e) => e.key))].sort(),
+        firstPerCycle: inside.filter((e) => e.key === '$0').length / 8,
+        secondPerCycle: inside.filter((e) => e.key === '$1').length / 8,
+      };
+    };
+    const firstRun = await readDollar(null, '');
+    const again = dollarCode + '\n// again';
+    const secondRun = await readDollar(again, 'probe song dollar tracks again');
+    dollarFacts = { firstRun, secondRun };
+    dollarOk = [firstRun, secondRun].every((run) => run.keys.join(',') === '$0,$1' && run.firstPerCycle === 1 && run.secondPerCycle === 2);
+  } finally {
+    await evaluateExpr(cdp, SONG_NOTE_LISTEN_STOP);
+    await callTool(client, 'set_code', { code: 's("bd").gain(0)', label: 'probe song dollar tracks done' });
+  }
+  report("song: the page's note tag counts $ statements in code order from the start of each evaluation", dollarOk, JSON.stringify(dollarFacts));
+
+  // A rest makes no note and so no code location: five slots are written, three notes are heard per cycle, and each note
+  // carries one location whose code is its own token. Read twice, through the real pattern and through the per-track path.
+  const restCode = 't1: note("c3 ~ e3 - g3").gain(0)';
+  await callTool(client, 'set_code', { code: restCode, label: 'probe song rest location' });
+  await waitActive(restCode);
+  const restFacts = {};
+  for (const [path, trackIndex] of [['real pattern', null], ['per-track path', 0]]) {
+    const haps = (await songNoteLocations(cdp, restCode, trackIndex, 0, 2)).sort((a, b) => a.wholeBegin - b.wholeBegin);
+    restFacts[path] = {
+      starts: haps.map((h) => h.wholeBegin),
+      locations: haps.map((h) => h.locations.length),
+      code: haps.map((h) => (h.locations.length === 1 ? restCode.slice(h.locations[0].start, h.locations[0].end) : null)),
+    };
+  }
+  report(
+    'song: a rest makes no note and no location',
+    Object.values(restFacts).every(
+      (f) =>
+        f.starts.join(',') === '0,0.4,0.8,1,1.4,1.8' && f.locations.every((count) => count === 1) && f.code.join(',') === 'c3,e3,g3,c3,e3,g3',
+    ),
+    JSON.stringify(restFacts),
+  );
+
+  // Locations through the helper. A structured piece (shift 4, two passes) whose t1 variation va has a velocity string next to its
+  // notes and plays in two sections: every note of every track has a list of { start, end } offsets into the code, the code at the
+  // one in the note's own literal is its own token, no location comes from the song declaration or the clock, the same variation
+  // gives the same token in both of its sections, and a note in degrees has one location (the harmony is a single-quoted string).
+  const locShift = 4;
+  const locCycles = locShift + 30;
+  const locCode = songHelperCode({ shift: locShift, t1Tail: '.gain(0)' }).replace('va: note("<c3 d3 e3>")', 'va: note("<c3 d3 e3>").velocity("0.5 1")');
+  if (!locCode.includes('.velocity("0.5 1")')) throw new Error('probe:page: the helper piece no longer has the t1 variation the location check rewrites');
+  await callTool(client, 'set_code', { code: locCode, label: 'probe song locations' });
+  await waitActive(locCode);
+  const lineOf = (name) => {
+    const at = locCode.indexOf(`const ${name} =`);
+    return [at, locCode.indexOf('\n', at)];
+  };
+  const inLine = (name, loc) => loc.start >= lineOf(name)[0] && loc.end <= lineOf(name)[1];
+  const sliceOf = (loc) => locCode.slice(loc.start, loc.end);
+  const locTracks = [];
+  for (const index of [0, 1, 2]) {
+    locTracks.push((await songNoteLocations(cdp, locCode, index, 0, locCycles)).sort((a, b) => a.wholeBegin - b.wholeBegin));
+  }
+  const locReal = await songNoteLocations(cdp, locCode, null, 0, locCycles);
+  const locKey = (h) => JSON.stringify([h.wholeBegin, h.note, h.locations]);
+  const locRealKeys = locReal.map(locKey).sort();
+  const locAllKeys = locTracks.flat().map(locKey).sort();
+  const locAllHaps = locTracks.flat();
+  const locShapeOk = locAllHaps.every(
+    (h) =>
+      h.locations.length > 0 &&
+      h.locations.every((l) => Object.keys(l).sort().join(',') === 'end,start' && Number.isInteger(l.start) && Number.isInteger(l.end) && l.end > l.start),
+  );
+  const locOutside = locAllHaps.filter((h, i) => {
+    const owner = i < locTracks[0].length ? 't1' : i < locTracks[0].length + locTracks[1].length ? 't2' : 't3';
+    return !h.locations.every((l) => inLine(owner, l));
+  }).length;
+  // t1 and t3 play note names: exactly one location holds the note's own name, and t1's other location is its velocity token.
+  const ownNameOk = (h) => h.locations.filter((l) => sliceOf(l).toLowerCase() === String(h.note).toLowerCase()).length === 1;
+  const t1Ok = locTracks[0].every((h) => ownNameOk(h) && h.locations.length <= 2 && h.locations.every((l) => sliceOf(l).toLowerCase() === String(h.note).toLowerCase() || ['0.5', '1'].includes(sliceOf(l))));
+  const t3Ok = locTracks[2].every((h) => h.locations.length === 1 && ownNameOk(h));
+  const tokenAt = (hapList, start, cycle) => hapList.filter((h) => h.wholeBegin >= start + cycle && h.wholeBegin < start + cycle + 1).map((h) => h.locations.find((l) => sliceOf(l).toLowerCase() === String(h.note).toLowerCase()).start);
+  const sameInTwoSections = [0, 1, 2].every((cycle) => {
+    const inX = tokenAt(locTracks[0], locShift, cycle);
+    const inZ = tokenAt(locTracks[0], locShift + 8, cycle);
+    return inX.length === 1 && inX.join(',') === inZ.join(',');
+  });
+  report(
+    "song: a note's code location is a list of { start, end } offsets into the code and the code at it is the note's own token, inside a variation of a structured piece",
+    locShapeOk &&
+      locOutside === 0 &&
+      t1Ok &&
+      t3Ok &&
+      sameInTwoSections &&
+      locTracks.map((list) => list.length).join(',') === '34,64,24' &&
+      locRealKeys.join('|') === locAllKeys.join('|'),
+    JSON.stringify({ notes: locTracks.map((list) => list.length), realNotes: locReal.length, shapeOk: locShapeOk, outsideOwnVariation: locOutside, t1Ok, t3Ok, sameInTwoSections, bothPathsAgree: locRealKeys.join('|') === locAllKeys.join('|') }),
+  );
+
+  const locDegreeHaps = locTracks[1];
+  const locDegreeWrong = locDegreeHaps.filter((h) => {
+    const cycle = Math.floor(h.wholeBegin);
+    const inStructure = (((cycle - locShift) % 15) + 15) % 15;
+    const section = inStructure < 3 ? 'x' : inStructure < 8 ? 'y' : 'z';
+    const degree = SONG_DEGREES[Math.round((h.wholeBegin - cycle) * 4)];
+    return !(
+      section !== 'z' &&
+      h.locations.length === 1 &&
+      sliceOf(h.locations[0]) === String(degree) &&
+      inLine('t2', h.locations[0]) &&
+      songMidiOf(h.note) === songDegreeNote(section === 'x' ? 'E3:minor' : 'C3:major', degree)
+    );
+  }).length;
+  report(
+    'song: a note in degrees leads back to its degree token and the harmony passed as a single-quoted string adds no location',
+    locDegreeHaps.length === 64 && locDegreeWrong === 0,
+    JSON.stringify({ notes: locDegreeHaps.length, wrong: locDegreeWrong, locationsPerNote: [...new Set(locDegreeHaps.map((h) => h.locations.length))] }),
+  );
+}
+
+// ---- the Song grid: launching a section --------------------------------------------------------------------------------
+
+/** The section of the launch piece that plays at `cycle` under `shift`. */
+function songLaunchPlace(shift, cycle) {
+  const position = (((cycle - shift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+  return Object.keys(SONG_LAUNCH_STARTS)[Object.values(SONG_LAUNCH_STARTS).filter((start) => start <= position).length - 1];
+}
+
+/** The shift the code in the editor writes, as a number. */
+const songShiftRead = (cdp) =>
+  evaluateExpr(cdp, `(() => { const m = /shift: (-?[\\d.]+)/.exec(document.getElementById('repl').editor.code); return m === null ? null : Number(m[1]); })()`);
+
+/**
+ * Where a launch made from the grid is heard. The grid rewrites only the shift, so the marker's version stays the same and
+ * every logged cycle is judged by the arithmetic of the shift that should play there: the old shift before `line`, the new one
+ * from it. A launch landed on its line when every logged cycle agrees, the section at the line is the target, 0 cycles in, the
+ * launched track t1 is on its first step there, and nothing of the old structure sounds at or after the line. The wait for the
+ * log has no end of its own: a launch the page never plays is reported with what was logged, so the check fails and says so.
+ */
+async function songGridLanding(cdp, { oldShift, line, target }) {
+  const deadline = Date.now() + 45000;
+  let entries = await songLaunchLogRead(cdp);
+  while (!entries.some((entry) => entry.begin >= line + 1) && Date.now() < deadline) {
+    await sleep(100);
+    entries = await songLaunchLogRead(cdp);
+  }
+  await sleep(300);
+  entries = await songLaunchLogRead(cdp);
+  const code = await evaluateExpr(cdp, `document.getElementById('repl').editor.repl.state.activeCode`);
+  const newShift = Number(/shift: (-?[\d.]+)/.exec(code)[1]);
+  const expectedAt = (cycle) => songLaunchPlace(cycle >= line ? newShift : oldShift, cycle);
+  const wrong = entries.filter((entry) => entry.section !== expectedAt(entry.begin));
+  const atLine = entries.find((entry) => entry.begin === line);
+  const position = (((line - newShift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+  const t1 = (await songTrackHaps(cdp, code, 0, line, line + 1)).filter((hap) => hap.onset);
+  const steps = SONG_T1_STEPS[SONG_HELPER_PLAN[target].t1];
+  return {
+    line,
+    oldShift,
+    newShift,
+    logged: entries.length,
+    disagree: wrong.length,
+    markAtLine: atLine === undefined ? null : atLine.section,
+    intoSection: position - SONG_LAUNCH_STARTS[target],
+    t1Step: t1.length === 1 ? steps.indexOf(t1[0].note) : null,
+    oldAtOrAfter: entries.filter((entry) => entry.begin >= line && entry.section !== songLaunchPlace(newShift, entry.begin)).length,
+    onLine:
+      atLine !== undefined &&
+      atLine.section === target &&
+      position === SONG_LAUNCH_STARTS[target] &&
+      t1.length === 1 &&
+      steps.indexOf(t1[0].note) === 0 &&
+      wrong.length === 0,
+  };
+}
+
+// ---- the Song grid -----------------------------------------------------------------------------------------------------
+
+/**
+ * Song grid checks: the grid that replaces the Parts list for a piece with a song, proven in the live page. Each check plays
+ * a silent piece with set_code, opens the Parts view and reads what the page draws.
+ */
+export async function gridBlocks(context) {
+  const { cdp, client, report } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  // The checks read the code they wrote, so the page must be running that code first; a page that is not is an error, not a pass.
+  const waitActive = async (code) => {
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of this check within 8 seconds');
+    }
+  };
+  /** Plays `code` and opens the Parts view. */
+  const showPiece = async (code, label) => {
+    await callTool(client, 'set_code', { code, label });
+    await waitActive(code);
+    await songOpenParts(cdp);
+  };
+
+  // A structured piece shows as a grid of tracks by sections; a piece without a song keeps the Parts view as it was.
+  const helperCode = songHelperCode({ t1Tail: '.gain(0)' });
+  await showPiece(helperCode, 'probe grid helper piece');
+  const readGrid = `(() => {
+    const rows = document.getElementById('parts-rows');
+    const bar = document.getElementById('song-bar');
+    return {
+      list: ${SONG_LIST_READ},
+      dataView: rows.getAttribute('data-view'),
+      role: rows.querySelector('.song-grid') === null ? null : rows.querySelector('.song-grid').getAttribute('role'),
+      headers: [...rows.querySelectorAll('thead .song-head')].map((head) => ({ className: head.className, part: head.dataset.part, state: head.dataset.state })),
+      kinds: [...rows.querySelectorAll('tr.song-track-row')].map((tr) => [...tr.querySelectorAll('.song-cell')].map((cell) => cell.dataset.kind)),
+      levels: [...rows.querySelectorAll('tbody > tr')].map((tr) => tr.getAttribute('aria-level')),
+      barShown: bar !== null && !bar.hidden,
+      messageHidden: document.getElementById('parts-message').hidden,
+      messageText: document.getElementById('parts-message').textContent,
+      askOffered: !document.getElementById('parts-ask').hidden,
+      children: rows.children.length,
+      structure: [...rows.querySelectorAll('*')].map((el) => el.tagName + '.' + el.className),
+      cards: rows.querySelectorAll('.part-card:not(.song-head)').length,
+    };
+  })()`;
+  const grid = await waitFor(cdp, `(() => { const read = ${readGrid}; return read.list === null ? null : read; })()`, 5000);
+  const arrangeLines = [
+    'const one = note("c4").s("sine").gain(0)',
+    'const two = note("e4").s("square").gain(0)',
+    'const three = note("g4").s("triangle").gain(0)',
+  ];
+  const arrangePiece = [...arrangeLines, 'main: arrange([2, one], [2, two], [2, three])'].join('\n');
+  await showPiece(arrangePiece, 'probe grid arrange piece');
+  const arranged = await waitFor(cdp, `(() => { const read = ${readGrid}; return read.cards > 0 ? read : null; })()`, 5000);
+  const emptyPiece = 's("bd").gain(0)';
+  await showPiece(emptyPiece, 'probe grid empty piece');
+  const empty = await waitFor(cdp, `(() => { const read = ${readGrid}; return read.messageHidden ? null : read; })()`, 5000);
+  const arrangeStructure = ['DIV.parts-row', ...['one', 'two', 'three'].flatMap(() => ['BUTTON.part-card', 'SPAN.part-name', 'SPAN.part-state', 'SPAN.part-progress', 'SPAN.part-progress-fill'])];
+  report(
+    'grid: a structured piece shows as a grid of tracks by sections with lengths and harmonies, and a piece without a song keeps the Parts view',
+    grid !== null &&
+      JSON.stringify(grid.list) === JSON.stringify(SONG_HELPER_LIST) &&
+      grid.dataView === 'song' &&
+      grid.role === 'grid' &&
+      grid.headers.length === 3 &&
+      grid.headers.every((head) => head.className === 'part-card song-head') &&
+      grid.headers.map((head) => head.part).join(',') === 'x,y,z' &&
+      JSON.stringify(grid.kinds) === JSON.stringify([['other', 'other', 'other'], ['degrees', 'degrees', 'rest'], ['fixed', 'rest', 'fixed']]) &&
+      grid.levels.join(',') === '1,2,2,1,2,3' &&
+      grid.messageHidden === true &&
+      grid.askOffered === false &&
+      arranged !== null &&
+      arranged.dataView === null &&
+      arranged.list === null &&
+      arranged.barShown === false &&
+      JSON.stringify(arranged.structure) === JSON.stringify(arrangeStructure) &&
+      arranged.messageHidden === true &&
+      arranged.askOffered === false &&
+      empty.dataView === null &&
+      empty.list === null &&
+      empty.barShown === false &&
+      empty.children === 0 &&
+      empty.messageText === PARTS_COPY.none &&
+      empty.askOffered === true,
+    JSON.stringify({ grid: grid && { ...grid, structure: grid.structure.length }, arranged, empty }),
+  );
+
+  // The layout and the view of the checks below: full screen, the Parts view; the end of the group puts layout a back.
+  const setLayout = async (letter) => {
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, letter);
+    await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(letter)} ? true : null`, 3000);
+  };
+  const topHistoryId = async () => {
+    const reply = await callTool(client, 'list_history', {});
+    const match = /^#(\d+) /m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(reply).slice(0, 200)}`);
+    return Number(match[1]);
+  };
+  /** Waits for the grid after a reload: the page loads the code the server holds and plays it again. */
+  const gridAfterReload = async () => {
+    await waitFor(cdp, `document.querySelector('#parts-rows .song-grid') !== null ? true : null`, 15000);
+  };
+  await setLayout('c');
+
+  // Groups fold and the state is remembered in this browser. A fold hides every row below at any depth and keeps the fold
+  // state of the groups inside; it writes no code and records no version. An unreadable stored value is ignored (every
+  // group starts open) and a path that no longer exists is ignored too.
+  const readFolds = `(() => {
+    const grid = document.querySelector('#parts-rows .song-grid');
+    if (!grid) return null;
+    return {
+      folds: [...grid.querySelectorAll('.song-fold')].map((button) => [button.querySelector('.song-fold-name').textContent, button.getAttribute('aria-expanded'), button.querySelector('.song-count').textContent]),
+      hidden: [...grid.querySelectorAll('tbody > tr[hidden]')].map((tr) => tr.getAttribute('data-key')),
+      stored: localStorage.getItem('moontide.songFolds'),
+      codeUnchanged: document.getElementById('repl').editor.repl.state.activeCode === ${JSON.stringify(helperCode)},
+    };
+  })()`;
+  const foldButton = (name) => `tr.song-group-row[data-key='g:["${name}"]'] .song-fold`;
+  const nestedFoldButton = `tr.song-group-row[data-key='g:["g2","g3"]'] .song-fold`;
+  const foldsWhen = (done) => waitFor(cdp, `(() => { const read = ${readFolds}; return read !== null && (${done})(read) ? read : null; })()`, 5000);
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  await showPiece(helperCode, 'probe grid folds');
+  const openState = await foldsWhen('(read) => read.folds.length === 3');
+  const historyBeforeFold = await topHistoryId();
+  await clickElement(cdp, foldButton('g1'));
+  const afterG1 = await foldsWhen('(read) => read.hidden.length === 2');
+  await clickElement(cdp, nestedFoldButton);
+  await clickElement(cdp, foldButton('g2'));
+  const afterG2 = await foldsWhen('(read) => read.hidden.length === 4');
+  await clickElement(cdp, foldButton('g2'));
+  const afterReopen = await foldsWhen('(read) => read.hidden.length === 3');
+  const historyAfterFold = await topHistoryId();
+  await reloadPage(cdp);
+  await gridAfterReload();
+  const afterReload = await foldsWhen('(read) => read.hidden.length === 3');
+  // What the page says on its console and what it throws is heard during the reload that reads the bad value.
+  await evaluateExpr(cdp, `localStorage.setItem('moontide.songFolds', '{not json')`);
+  const heard = { errors: [], thrown: [] };
+  const stopListening = cdp.onEvent((message) => {
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') {
+      heard.errors.push(message.params.args.map((arg) => String(arg.value ?? arg.description ?? '')).join(' '));
+    }
+    if (message.method === 'Runtime.exceptionThrown') heard.thrown.push(String(message.params.exceptionDetails.text));
+  });
+  await reloadPage(cdp);
+  await gridAfterReload();
+  const afterBadStore = await foldsWhen('(read) => read.folds.length === 3');
+  await sleep(500);
+  stopListening();
+  const badStoreConsole = { reported: heard.errors.filter((text) => text.includes('moontide.songFolds')), thrown: heard.thrown };
+  await evaluateExpr(cdp, `localStorage.setItem('moontide.songFolds', '[["nowhere"],["g2","nowhere"]]')`);
+  await reloadPage(cdp);
+  await gridAfterReload();
+  const afterUnknownPath = await foldsWhen('(read) => read.folds.length === 3');
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  const allOpen = (read) => read !== null && read.hidden.length === 0 && read.folds.every((fold) => fold[1] === 'true');
+  report(
+    'grid: groups fold and the fold state survives a reload, and an unreadable stored fold state is ignored',
+    allOpen(openState) &&
+      afterG1 !== null &&
+      JSON.stringify(afterG1.hidden) === JSON.stringify(['t:t1', 't:t2']) &&
+      JSON.stringify(afterG1.folds) === JSON.stringify([['g1', 'false', '2 tracks'], ['g2', 'true', '1 track'], ['g3', 'true', '1 track']]) &&
+      afterG1.stored === '[["g1"]]' &&
+      afterG1.codeUnchanged === true &&
+      afterReopen !== null &&
+      afterReopen.codeUnchanged === true &&
+      afterG2 !== null &&
+      JSON.stringify(afterG2.hidden) === JSON.stringify(['t:t1', 't:t2', 'g:["g2","g3"]', 't:t3']) &&
+      afterReopen !== null &&
+      JSON.stringify(afterReopen.hidden) === JSON.stringify(['t:t1', 't:t2', 't:t3']) &&
+      JSON.stringify(afterReopen.folds) === JSON.stringify([['g1', 'false', '2 tracks'], ['g2', 'true', '1 track'], ['g3', 'false', '1 track']]) &&
+      historyAfterFold === historyBeforeFold &&
+      afterReload !== null &&
+      JSON.stringify(afterReload.folds) === JSON.stringify(afterReopen.folds) &&
+      JSON.stringify(afterReload.hidden) === JSON.stringify(afterReopen.hidden) &&
+      allOpen(afterBadStore) &&
+      badStoreConsole.reported.length === 1 &&
+      badStoreConsole.reported[0] === "Moontide: the stored fold state under 'moontide.songFolds' cannot be read; every group starts open." &&
+      badStoreConsole.thrown.length === 0 &&
+      allOpen(afterUnknownPath),
+    JSON.stringify({ openState, afterG1, afterG2, afterReopen, historyBeforeFold, historyAfterFold, afterReload, afterBadStore, badStoreConsole, afterUnknownPath }),
+  );
+
+  // The view is called Song while the code declares a song (readable or not) and Parts otherwise; its key and its place do
+  // not change, and the top bar still fits with either name.
+  const readTitle = `(() => {
+    const button = document.querySelector('#view-buttons button[data-key="4"]');
+    const grid = document.querySelector('#parts-rows .song-grid');
+    return {
+      name: button.querySelector('.view-name').textContent,
+      label: button.getAttribute('aria-label'),
+      title: button.title,
+      pressed: button.getAttribute('aria-pressed'),
+      gridLabel: grid ? grid.getAttribute('aria-label') : null,
+      view: document.getElementById('workspace').dataset.view,
+    };
+  })()`;
+  const barFits = (cdp2) => atWidths(cdp2, [800, 1024, 1366], () => evaluateExpr(cdp2, `(() => { const bar = document.getElementById('top-bar'); return bar.scrollWidth <= bar.clientWidth; })()`));
+  await showPiece(helperCode, 'probe grid title song');
+  const titleSong = await waitFor(cdp, `(() => { const read = ${readTitle}; return read.name === 'Song' ? read : null; })()`, 5000);
+  const barFitsSong = await barFits(cdp);
+  const arithmeticCode = helperCode.replace("['y', 5]", "['y', 2 + 3]");
+  await showPiece(arithmeticCode, 'probe grid title unreadable song');
+  const titleUnreadable = await waitFor(cdp, `(() => { const read = ${readTitle}; return document.getElementById('parts-message').hidden ? null : read; })()`, 5000);
+  await showPiece(arrangePiece, 'probe grid title arrange');
+  const titleArrange = await waitFor(cdp, `(() => { const read = ${readTitle}; return read.name === 'Parts' ? read : null; })()`, 5000);
+  const barFitsParts = await barFits(cdp);
+  await showPiece(helperCode, 'probe grid title song again');
+  await waitFor(cdp, `(() => { const read = ${readTitle}; return read.name === 'Song' ? read : null; })()`, 5000);
+  await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  await pressKey(cdp, '4');
+  const closedByKey = await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'none' ? true : null`, 3000);
+  await pressKey(cdp, '4');
+  const reopenedByKey = await waitFor(cdp, `(() => { const read = ${readTitle}; return read.view === 'parts' && read.gridLabel !== null ? read : null; })()`, 3000);
+  report(
+    'grid: the view is called Song for a structured piece and Parts otherwise, on key 4',
+    titleSong !== null &&
+      titleSong.label === '4 Song' &&
+      titleSong.title === 'Song (key 4)' &&
+      titleSong.gridLabel === 'Song' &&
+      titleUnreadable !== null &&
+      titleUnreadable.name === 'Song' &&
+      titleUnreadable.label === '4 Song' &&
+      titleUnreadable.gridLabel === null &&
+      titleArrange !== null &&
+      titleArrange.label === '4 Parts' &&
+      titleArrange.title === 'Parts (key 4)' &&
+      closedByKey === true &&
+      reopenedByKey !== null &&
+      reopenedByKey.name === 'Song' &&
+      barFitsSong.every((fits) => fits === true) &&
+      barFitsParts.every((fits) => fits === true),
+    JSON.stringify({ titleSong, titleUnreadable, titleArrange, reopenedByKey, barFitsSong, barFitsParts }),
+  );
+
+  // 40 tracks by 12 sections: only the grid scrolls, in both directions, and its name column and header row stay where they
+  // are; the page never scrolls sideways at 1024 and 1920 pixels in the three layouts; nothing in the grid wears a reserved color.
+  const bulk = Array.from({ length: 20 }, (_, i) => `'t${i + 1}'`).join(', ');
+  const inner = Array.from({ length: 10 }, (_, i) => `'t${i + 21}'`).join(', ');
+  const bigCode = songBigCode(40, [1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6], { groups: `{ bulk: [${bulk}], rest: { inner: [${inner}] } }` });
+  await showPiece(bigCode, 'probe grid 40 tracks and 12 sections');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-track-row').length === 40 ? true : null`, 8000);
+  const sizeRead = `(async () => {
+    const scroller = document.querySelector('#parts-rows .song-grid-scroll');
+    const view = document.getElementById('parts-view');
+    const rect = (el) => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height].map((n) => Math.round(n * 100) / 100); };
+    const corner = document.querySelector('.song-corner');
+    const head = document.querySelectorAll('thead .song-head')[2].closest('th');
+    const rowHead = document.querySelector('.song-track-row .song-rowhead');
+    const settle = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    await settle();
+    scroller.scrollLeft = 0;
+    scroller.scrollTop = 0;
+    await settle();
+    const before = { corner: rect(corner), head: rect(head), rowHead: rect(rowHead) };
+    scroller.scrollLeft = 300;
+    scroller.scrollTop = 200;
+    await settle();
+    const after = { corner: rect(corner), head: rect(head), rowHead: rect(rowHead) };
+    const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map((name) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(' + name + ')';
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+    const hits = [];
+    for (const selector of ['.song-cell', '.song-fold', '.song-rowhead']) {
+      const el = document.querySelector(selector);
+      const style = getComputedStyle(el);
+      for (const property of ['color', 'backgroundColor', 'borderTopColor', 'borderBottomColor', 'borderLeftColor', 'borderRightColor', 'outlineColor']) {
+        if (reserved.includes(style[property])) hits.push(selector + ':' + property);
+      }
+    }
+    return {
+      layout: document.getElementById('workspace').dataset.layout,
+      documentSideways: document.documentElement.scrollWidth > document.documentElement.clientWidth,
+      viewSideways: view.scrollWidth > view.clientWidth,
+      scrollsSideways: scroller.scrollWidth > scroller.clientWidth,
+      scrollsDown: scroller.scrollHeight > scroller.clientHeight,
+      scrolled: [scroller.scrollLeft, scroller.scrollTop],
+      cornerStays: JSON.stringify(before.corner) === JSON.stringify(after.corner),
+      headTopStays: before.head[1] === after.head[1] && before.head[0] !== after.head[0],
+      rowHeadLeftStays: before.rowHead[0] === after.rowHead[0] && before.rowHead[1] !== after.rowHead[1],
+      hits,
+    };
+  })()`;
+  const sizes = [];
+  for (const layout of ['a', 'b', 'c']) {
+    await setLayout(layout);
+    for (const reading of await atWidths(cdp, [1024, 1920], async (width) => ({ width, ...(await evaluateExpr(cdp, sizeRead)) }))) sizes.push(reading);
+  }
+  await setLayout('c');
+  report(
+    'grid: 40 tracks by 12 sections scroll inside the grid only, the name column and the header row stay, and the page never scrolls sideways',
+    sizes.length === 6 &&
+      sizes.every(
+        (read) =>
+          !read.documentSideways &&
+          !read.viewSideways &&
+          read.scrollsSideways &&
+          read.scrollsDown &&
+          read.scrolled[0] > 0 &&
+          read.scrolled[1] > 0 &&
+          read.cornerStays &&
+          read.headTopStays &&
+          read.rowHeadLeftStays &&
+          read.hits.length === 0,
+      ),
+    JSON.stringify(sizes),
+  );
+
+  // The playing section: its header says "Playing n/length", its column is washed, the line under the toolbar names it, and
+  // all of it follows the section clock; nothing is highlighted while the music is stopped.
+  const fastCode = songHelperCode({ cps: 2, t1Tail: '.gain(0)' });
+  await showPiece(fastCode, 'probe grid playing section');
+  const lengths = [3, 5, 7];
+  const sectionNames = ['x', 'y', 'z'];
+  const sectionAtCycle = (cycle) => {
+    const position = arrangementPosition(cycle, 0, 15);
+    let start = 0;
+    for (let index = 0; index < lengths.length; index++) {
+      if (position < start + lengths[index]) return { index, cycleIn: Math.floor(position - start) + 1 };
+      start += lengths[index];
+    }
+    return { index: lengths.length - 1, cycleIn: lengths.at(-1) };
+  };
+  const readPlaying = `(() => {
+    const colorOfToken = (name) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(' + name + ')';
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    };
+    const grid = document.querySelector('#parts-rows .song-grid');
+    const heads = [...grid.querySelectorAll('thead .song-head')];
+    const cols = [...grid.querySelectorAll('colgroup col')].slice(1);
+    const now = document.getElementById('song-now');
+    const playing = heads.findIndex((head) => head.dataset.state === 'playing');
+    return {
+      cycle: document.getElementById('repl').editor.repl.scheduler.now(),
+      states: heads.map((head) => head.dataset.state),
+      texts: heads.map((head) => head.querySelector('.part-state').textContent),
+      titles: heads.map((head) => head.title),
+      actions: heads.map((head) => head.querySelector('.song-head-action').hidden),
+      washed: cols.map((col) => col.getAttribute('data-playing')),
+      now: now.hidden ? null : now.textContent,
+      border: playing < 0 ? null : getComputedStyle(heads[playing]).borderTopColor,
+      accent: colorOfToken('--accent'),
+      wash: playing < 0 ? null : getComputedStyle(cols[playing]).backgroundColor,
+      secondary: colorOfToken('--secondary'),
+      idleWash: cols.filter((col, index) => index !== playing).map((col) => getComputedStyle(col).backgroundColor),
+      fill: playing < 0 ? null : heads[playing].querySelector('.part-progress-fill').style.width,
+    };
+  })()`;
+  await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-state="playing"]') ? true : null`, 8000);
+  const playingSamples = [];
+  for (let i = 0; i < 28; i++) {
+    playingSamples.push(await evaluateExpr(cdp, readPlaying));
+    await sleep(250);
+  }
+  const sampleMatches = (read) => {
+    const playing = read.states.reduce((found, state, index) => (state === 'playing' ? [...found, index] : found), []);
+    if (playing.length !== 1) return false;
+    const [index] = playing;
+    const allowed = [-0.2, 0, 0.2].map((delta) => sectionAtCycle(read.cycle + delta)).filter((section) => section.index === index);
+    return (
+      allowed.some((section) => read.texts[index] === `Playing ${section.cycleIn}/${lengths[index]}`) &&
+      allowed.some((section) => read.titles[index] === `Playing, cycle ${section.cycleIn} of ${lengths[index]}`) &&
+      allowed.some((section) => read.now === `Playing section '${sectionNames[index]}', cycle ${section.cycleIn} of ${lengths[index]}.`) &&
+      read.actions[index] === true &&
+      read.states.every((state, other) => other === index || (state === 'idle' && read.texts[other] === `${lengths[other]} cycles` && read.actions[other] === false)) &&
+      read.washed.every((washed, other) => (other === index ? washed === 'true' : washed === null)) &&
+      read.border === read.accent &&
+      read.wash === read.secondary &&
+      read.idleWash.every((color) => color !== read.secondary) &&
+      /%$/.test(read.fill)
+    );
+  };
+  const sectionsSeen = new Set(playingSamples.map((read) => read.states.indexOf('playing')));
+  await stopMusic(cdp);
+  const stoppedRead = await waitFor(cdp, `(() => { const read = ${readPlaying}; return read.states.every((state) => state === 'idle') ? read : null; })()`, 4000);
+  await playMusic(cdp);
+  await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-state="playing"]') ? true : null`, 8000);
+  report(
+    'grid: the playing section is highlighted with its position, follows the music, and nothing is highlighted while stopped',
+    playingSamples.length === 28 &&
+      playingSamples.every(sampleMatches) &&
+      sectionsSeen.size === 3 &&
+      stoppedRead !== null &&
+      stoppedRead.washed.every((washed) => washed === null) &&
+      stoppedRead.now === null &&
+      stoppedRead.titles.every((title) => title === 'Starts the piece at this section.') &&
+      stoppedRead.texts.join('|') === '3 cycles|5 cycles|7 cycles',
+    JSON.stringify({ firstSample: playingSamples[0], badSamples: playingSamples.filter((read) => !sampleMatches(read)).slice(0, 2), sectionsSeen: [...sectionsSeen], stoppedRead }),
+  );
+
+  // The playing column scrolls into view once, when the sound starts; while the music plays the grid never follows it sideways.
+  const quickCode = `setcps(4)\n${songBigCode(3, Array(12).fill(1))}`;
+  await showPiece(quickCode, 'probe grid no following');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-head').length === 12 ? true : null`, 8000);
+  await stopMusic(cdp);
+  const scrollerLeft = `document.querySelector('#parts-rows .song-grid-scroll').scrollLeft`;
+  const leftBeforePlay = await evaluateExpr(cdp, `(() => { const scroller = document.querySelector('#parts-rows .song-grid-scroll'); scroller.scrollLeft = scroller.scrollWidth; return scroller.scrollLeft; })()`);
+  await playMusic(cdp);
+  await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-state="playing"]') ? true : null`, 8000);
+  await sleep(300);
+  const leftAfterPlay = await evaluateExpr(cdp, scrollerLeft);
+  const followSamples = [];
+  for (let i = 0; i < 14; i++) {
+    followSamples.push(await evaluateExpr(cdp, `({ left: ${scrollerLeft}, playing: [...document.querySelectorAll('#parts-rows .song-head')].findIndex((head) => head.dataset.state === 'playing') })`));
+    await sleep(200);
+  }
+  report(
+    'grid: the playing column scrolls into view once at Play, and the grid does not follow the playing section sideways',
+    leftBeforePlay > 100 &&
+      leftAfterPlay < leftBeforePlay - 50 &&
+      followSamples.every((sample) => Math.abs(sample.left - leftAfterPlay) <= 1) &&
+      new Set(followSamples.map((sample) => sample.playing)).size >= 4,
+    JSON.stringify({ leftBeforePlay, leftAfterPlay, left: [...new Set(followSamples.map((sample) => sample.left))], playing: [...new Set(followSamples.map((sample) => sample.playing))] }),
+  );
+
+  // The launch choice is a setting of this browser: it is remembered across a reload, an unknown stored value is ignored, and
+  // it changes the titles of the headers and nothing in the code.
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songLaunch')`);
+  await showPiece(helperCode, 'probe grid launch choice');
+  const readLaunch = `(() => {
+    const group = document.getElementById('song-launch');
+    const heads = [...document.querySelectorAll('#parts-rows .song-head')];
+    return {
+      pressed: [...group.querySelectorAll('button')].map((button) => [button.textContent, button.getAttribute('aria-pressed')]),
+      names: [...group.querySelectorAll('button')].map((button) => button.getAttribute('aria-label')),
+      groupTitle: group.title,
+      label: document.getElementById('song-launch-label').textContent,
+      stored: localStorage.getItem('moontide.songLaunch'),
+      idleTitles: heads.filter((head) => head.dataset.state === 'idle').map((head) => head.title),
+      barShown: !document.getElementById('song-bar').hidden,
+      codeUnchanged: document.getElementById('repl').editor.code === ${JSON.stringify(helperCode)},
+    };
+  })()`;
+  const launchWhen = (value) =>
+    waitFor(cdp, `(() => { const read = ${readLaunch}; return read.pressed.some((entry) => entry[1] === 'true' && entry[0] === ${JSON.stringify(value)}) && read.idleTitles.length > 0 ? read : null; })()`, 6000);
+  const launchDefault = await launchWhen('end of section');
+  const historyBeforeChoice = await topHistoryId();
+  await clickElement(cdp, `#song-launch button[data-value="bar"]`);
+  const launchBar = await launchWhen('next bar');
+  const historyAfterChoice = await topHistoryId();
+  await reloadPage(cdp);
+  await gridAfterReload();
+  const launchBarAgain = await launchWhen('next bar');
+  await clickElement(cdp, `#song-launch button[data-value="phrase"]`);
+  const launchPhrase = await launchWhen('next phrase');
+  await evaluateExpr(cdp, `localStorage.setItem('moontide.songLaunch', 'sometime')`);
+  await reloadPage(cdp);
+  await gridAfterReload();
+  const launchBadStore = await launchWhen('end of section');
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songLaunch')`);
+  const idleTitleOf = { section: 'Starts at the end of the section that plays. Click to queue it.', phrase: 'Starts on the next phrase. Click to queue it.', bar: 'Starts on the next bar. Click to queue it.' };
+  const titlesAre = (read, value) => read !== null && read.idleTitles.length > 0 && read.idleTitles.every((title) => title === idleTitleOf[value]);
+  report(
+    'grid: the launch choice is remembered across a reload and changes the header titles only',
+    launchDefault !== null &&
+      launchDefault.label === 'Launch at' &&
+      launchDefault.barShown === true &&
+      launchDefault.groupTitle === 'When a launched section starts: at the end of the section that plays, on the next phrase or on the next bar.' &&
+      JSON.stringify(launchDefault.pressed) === JSON.stringify([['end of section', 'true'], ['next phrase', 'false'], ['next bar', 'false']]) &&
+      JSON.stringify(launchDefault.names) === JSON.stringify(['Sections start at the end of the section that plays', 'Sections start on the next phrase', 'Sections start on the next bar']) &&
+      titlesAre(launchDefault, 'section') &&
+      launchBar !== null &&
+      launchBar.stored === 'bar' &&
+      titlesAre(launchBar, 'bar') &&
+      launchBar.codeUnchanged === true &&
+      historyAfterChoice === historyBeforeChoice &&
+      launchBarAgain !== null &&
+      launchBarAgain.stored === 'bar' &&
+      titlesAre(launchBarAgain, 'bar') &&
+      launchPhrase !== null &&
+      launchPhrase.stored === 'phrase' &&
+      titlesAre(launchPhrase, 'phrase') &&
+      launchBadStore !== null &&
+      titlesAre(launchBadStore, 'section'),
+    JSON.stringify({ launchDefault, launchBar, launchBarAgain, launchPhrase, launchBadStore, historyBeforeChoice, historyAfterChoice }),
+  );
+
+  // The grid is one Tab stop; the arrow keys, Home, End, Ctrl+Home and Ctrl+End move between its headers, fold buttons and
+  // cells, Left and Right never fold a group, Enter and Space press the control, the page's own keys keep working, and a
+  // new version of the code leaves focus on the same cell.
+  await showPiece(helperCode, 'probe grid keyboard');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000);
+  const whereIsFocus = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const el = document.activeElement;
+        if (!el || el === document.body) return null;
+        if (el.matches('.song-head')) return 'head ' + el.dataset.part;
+        if (el.matches('.song-fold')) return 'fold ' + el.querySelector('.song-fold-name').textContent;
+        if (el.matches('.song-cell')) return 'cell ' + el.dataset.track + ' ' + el.dataset.section;
+        return el.tagName + (el.id ? '#' + el.id : '');
+      })()`,
+    );
+  const keyThenFocus = async (key, options) => {
+    await pressKey(cdp, key, options);
+    await sleep(60);
+    return whereIsFocus();
+  };
+  // The tab stop is the first header; the next Tab from the last launch button lands on it.
+  await evaluateExpr(cdp, `document.querySelector('#parts-rows .song-head').focus()`);
+  await evaluateExpr(cdp, `document.querySelector('#song-launch button[data-value="bar"]').focus()`);
+  const intoGrid = await keyThenFocus('Tab');
+  const outOfGrid = await keyThenFocus('Tab');
+  await evaluateExpr(cdp, `document.querySelector('#song-launch button[data-value="bar"]').focus()`);
+  await keyThenFocus('Tab');
+  const tabStops = await evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-grid button')].filter((button) => button.tabIndex === 0).length`);
+  const walk = [];
+  for (const [key, options] of [
+    ['ArrowRight'], ['ArrowDown'], ['ArrowDown'], ['ArrowRight'], ['End'], ['Home'], ['ArrowDown'], ['ArrowDown'],
+    ['ArrowLeft'], ['ArrowRight'], ['End', { ctrl: true }], ['Home', { ctrl: true }],
+  ]) {
+    walk.push(await keyThenFocus(key, options));
+  }
+  const foldsAfterWalk = await evaluateExpr(cdp, `({ expanded: [...document.querySelectorAll('.song-fold')].map((button) => button.getAttribute('aria-expanded')), stored: localStorage.getItem('moontide.songFolds') })`);
+  // Enter folds the group the focus is on and Space opens it again; the focus stays on its button.
+  await evaluateExpr(cdp, `document.querySelector('.song-fold').focus()`);
+  await pressKey(cdp, 'Enter');
+  const afterEnter = await waitFor(cdp, `document.querySelector('.song-fold').getAttribute('aria-expanded') === 'false' ? { focus: document.activeElement.className, hidden: document.querySelectorAll('tbody > tr[hidden]').length } : null`, 3000);
+  await pressKey(cdp, ' ');
+  const afterSpace = await waitFor(cdp, `document.querySelector('.song-fold').getAttribute('aria-expanded') === 'true' ? { focus: document.activeElement.className, hidden: document.querySelectorAll('tbody > tr[hidden]').length } : null`, 3000);
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  // A page key still works with the focus in the grid; then the layout goes back.
+  await evaluateExpr(cdp, `document.querySelector('.song-cell[data-track="t2"][data-section="1"]').focus()`);
+  await pressKey(cdp, 'b');
+  const layoutB = await waitFor(cdp, `document.getElementById('workspace').dataset.layout === 'b' ? true : null`, 3000);
+  await pressKey(cdp, 'c');
+  await waitFor(cdp, `document.getElementById('workspace').dataset.layout === 'c' ? true : null`, 3000);
+  // A new version of the code redraws the grid and leaves the focus on the same cell.
+  await evaluateExpr(cdp, `document.querySelector('.song-cell[data-track="t2"][data-section="1"]').focus()`);
+  const changedForKeys = songHelperCode({ t1Tail: '.gain(0.0)' });
+  await callTool(client, 'set_code', { code: changedForKeys, label: 'probe grid keyboard new version' });
+  await waitActive(changedForKeys);
+  await sleep(300);
+  const afterVersion = await whereIsFocus();
+  const stopsAfterVersion = await evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-grid button')].filter((button) => button.tabIndex === 0).map((button) => button.dataset.track + ' ' + button.dataset.section)`);
+  report(
+    'grid: the grid has one Tab stop and the arrow keys move between headers, fold buttons and cells',
+    intoGrid === 'head x' &&
+      (outOfGrid === null || !/^(head|cell|fold) /.test(outOfGrid)) &&
+      tabStops === 1 &&
+      JSON.stringify(walk) === JSON.stringify([
+        'head y', 'fold g1', 'cell t1 0', 'cell t1 1', 'cell t1 2', 'cell t1 0', 'cell t2 0', 'fold g2',
+        'fold g2', 'fold g2', 'cell t3 2', 'head x',
+      ]) &&
+      foldsAfterWalk.expanded.every((value) => value === 'true') &&
+      foldsAfterWalk.stored === null &&
+      afterEnter !== null &&
+      afterEnter.focus === 'song-fold' &&
+      afterEnter.hidden === 2 &&
+      afterSpace !== null &&
+      afterSpace.focus === 'song-fold' &&
+      afterSpace.hidden === 0 &&
+      layoutB === true &&
+      afterVersion === 'cell t2 1' &&
+      JSON.stringify(stopsAfterVersion) === JSON.stringify(['t2 1']),
+    JSON.stringify({ intoGrid, outOfGrid, tabStops, walk, foldsAfterWalk, afterEnter, afterSpace, layoutB, afterVersion, stopsAfterVersion }),
+  );
+
+  // ---- launching a section ----
+  // A header click queues the section: the header says Queued with a countdown and names the line (data-line), nothing is
+  // written to the history until the section takes over, and then the launched section's first cycle sounds on that line with
+  // one history row. The marker piece plays nothing and logs the section of every cycle; the grid rewrites only its shift.
+  const launchTemplate = songLaunchTemplate({ cps: 1 });
+  const slowTemplate = songLaunchTemplate({ cps: 0.5 });
+  const historyTop = async () => {
+    const reply = String(await callTool(client, 'list_history', {}));
+    const match = /^#(\d+) (.*)$/m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${reply.slice(0, 200)}`);
+    return { id: Number(match[1]), row: match[2] };
+  };
+  const startMarkerPiece = async (label, template = launchTemplate) => {
+    await songLaunchLogReset(cdp);
+    await showPiece(songLaunchFill(template, 0, 0), label);
+    await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-head').length === 3 ? true : null`, 8000);
+    await sleep(1500);
+  };
+  const reachCycle = async (cycle) => {
+    const deadline = Date.now() + 90000;
+    while ((await readSchedulerNow(cdp)) < cycle) {
+      if (Date.now() > deadline) throw new ProbeCouldNotRun(`the scheduler did not reach cycle ${cycle} within 90 seconds`);
+      await sleep(15);
+    }
+  };
+  /**
+   * Waits until the scheduler has just passed a phrase line, so that a phrase launch clicked now has almost a whole phrase of
+   * lead. A check that must act on a queued launch before its line (cancel it, replace it) needs that room: from a random
+   * moment the line can be a few seconds away and land before the check's own clicks, and a click on the header of the section
+   * that then plays queues that section again, whose header says Queued and not Playing.
+   */
+  const reachJustPastPhraseLine = async () => {
+    const now = await readSchedulerNow(cdp);
+    const into = now % DEFAULT_PHRASE_CYCLES;
+    if (into >= 0.25 && into <= 0.8) return;
+    const base = Math.floor(now / DEFAULT_PHRASE_CYCLES) * DEFAULT_PHRASE_CYCLES;
+    await reachCycle(into < 0.25 ? base + 0.3 : base + DEFAULT_PHRASE_CYCLES + 0.3);
+  };
+  /** Stops the check as "could not run" when the line a launch queued for is nearer than `cycles`, naming the distance. */
+  const requireLead = async (line, cycles, what) => {
+    const lead = Number(line) - (await readSchedulerNow(cdp));
+    if (!(lead >= cycles)) throw new ProbeCouldNotRun(`${what}: the launch line is only ${Number.isFinite(lead) ? lead.toFixed(2) : String(lead)} cycles ahead, less than the ${cycles} the check needs before it can act on the queued launch`);
+  };
+  const headerRead = (index) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const head = document.querySelector('#parts-rows .song-head[data-index="${index}"]');
+        if (head === null) return null;
+        return { state: head.dataset.state, text: head.querySelector('.part-state').textContent, action: head.querySelector('.song-head-action').textContent, line: head.dataset.line ?? null, title: head.title, disabled: head.getAttribute('aria-disabled') };
+      })()`,
+    );
+  const playingIndex = () => evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-head')].findIndex((head) => head.dataset.state === 'playing')`);
+  /**
+   * The index of the header that shows as playing, waiting up to 5 seconds for one: a header is playing only while the grid is
+   * drawn for sound that plays, so a check that clicks "the playing section" first waits for that to be true. When none shows,
+   * the check could not run, and the reason names what the page showed instead.
+   */
+  const waitPlayingHeader = async (what) => {
+    const index = await waitFor(cdp, `(() => { const at = [...document.querySelectorAll('#parts-rows .song-head')].findIndex((head) => head.dataset.state === 'playing'); return at >= 0 ? at : null; })()`, 5000);
+    if (index !== null) return index;
+    const shown = await evaluateExpr(
+      cdp,
+      `(() => ({
+        view: document.getElementById('workspace').dataset.view,
+        gridDrawn: document.querySelector('#parts-rows .song-grid') !== null,
+        headers: [...document.querySelectorAll('#parts-rows .song-head')].map((head) => [head.dataset.state, head.querySelector('.part-state').textContent]),
+        sound: document.getElementById('sound-state').textContent,
+        transport: document.getElementById('transport-button').textContent,
+        now: document.getElementById('song-now').hidden ? null : document.getElementById('song-now').textContent,
+        line: document.getElementById('song-line').hidden ? null : document.getElementById('song-line').textContent,
+        cycle: document.getElementById('repl').editor.repl.scheduler.now(),
+      }))()`,
+    );
+    throw new ProbeCouldNotRun(`${what}: no section header showed as playing within 5 seconds (${JSON.stringify(shown)})`);
+  };
+  const songLineRead = () => evaluateExpr(cdp, `(() => { const el = document.getElementById('song-line'); return { hidden: el.hidden, kind: el.getAttribute('data-kind'), text: el.textContent }; })()`);
+  const waitQueued = (index, timeoutMs = 3000) =>
+    waitFor(cdp, `(() => { const head = document.querySelector('#parts-rows .song-head[data-index="${index}"]'); return head && head.dataset.state === 'queued' ? head.dataset.line : null; })()`, timeoutMs);
+  const clickHead = (index) => clickElement(cdp, `#parts-rows .song-head[data-index="${index}"]`);
+  const chooseLaunch = async (value) => {
+    await clickElement(cdp, `#song-launch button[data-value="${value}"]`);
+    await waitFor(cdp, `document.querySelector('#song-launch button[data-value="${value}"]').getAttribute('aria-pressed') === 'true' ? true : null`, 3000);
+  };
+  const sectionStartsOf = Object.values(SONG_LAUNCH_STARTS);
+  /**
+   * One launch from a random moment: after a wait of 0.3 to 1.3 cycles the header `step` sections after the playing one is
+   * clicked. A launch that turns out to need no code change (the section already starts on that line) is hidden again and not
+   * judged here; the caller asks again. Otherwise the queued header and the sentence are read, the history is looked at while
+   * the launch waits, and once it took over its landing and its history row are judged.
+   */
+  const launchOnce = async (step) => {
+    const before = await historyTop();
+    const oldShift = await songShiftRead(cdp);
+    await reachCycle((await readSchedulerNow(cdp)) + 0.3 + Math.random());
+    const playing = await waitPlayingHeader('a section launch');
+    const index = (playing + step) % 3;
+    const codeBefore = await evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+    await songLaunchLogReset(cdp);
+    await clickHead(index);
+    const queued = await waitQueued(index);
+    const header = await headerRead(index);
+    const sentence = await songLineRead();
+    const duringWait = await historyTop();
+    const codeWhileQueued = await evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+    const row = { playing: sectionNames[playing], target: sectionNames[index], queued: header, sentence: sentence.kind, historyWhileQueued: duringWait.id === before.id };
+    if (queued === null) return row;
+    if (sentence.kind === 'already') {
+      await clickHead(index);
+      await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="${index}"]').dataset.state !== 'queued' ? true : null`, 3000);
+      return { ...row, noChange: true, codeUntouched: codeWhileQueued === codeBefore };
+    }
+    const line = Number(queued);
+    Object.assign(row, await songGridLanding(cdp, { oldShift, line, target: sectionNames[index] }));
+    await sleep(400);
+    const after = await historyTop();
+    row.historyRows = after.id - before.id;
+    row.historyLabel = after.row;
+    row.sentenceWhileQueued = sentence.text;
+    return row;
+  };
+  /** Up to `steps.length` launches (each asked again, up to three times, when it needed no code change). */
+  const launchRows = async (steps) => {
+    const rows = [];
+    for (const step of steps) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const row = await launchOnce(step);
+        rows.push(row);
+        if (!row.noChange) break;
+      }
+    }
+    return rows;
+  };
+  const queuedHeaderOk = (row) =>
+    row.queued !== null &&
+    row.queued.state === 'queued' &&
+    /^Queued — in \d+ (bars|beats?)$/.test(row.queued.text) &&
+    row.queued.action === 'Cancel' &&
+    row.queued.title === 'Queued. Click to cancel.' &&
+    row.historyWhileQueued === true;
+  const landedOk = (row, lineIs) =>
+    queuedHeaderOk(row) &&
+    row.onLine === true &&
+    lineIs(row.line, row) &&
+    row.historyRows === 1 &&
+    row.historyLabel.includes(`launched ${row.target}`);
+  const judged = (rows) => rows.filter((row) => !row.noChange);
+  /** The line is a section start of the structure that played before the launch (the end of the section that plays). */
+  const isOldSectionStart = (line, row) => sectionStartsOf.includes((((line - row.oldShift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL);
+
+  await startMarkerPiece('probe grid launch end of section');
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songLaunch')`);
+  const endLaunches = await launchRows([0, 2]);
+  report(
+    'grid: a section launched from its header at the end of the section lands on that line at its first cycle',
+    judged(endLaunches).length === 2 && endLaunches.length <= 4 && judged(endLaunches).every((row) => landedOk(row, isOldSectionStart)),
+    JSON.stringify(endLaunches),
+  );
+
+  // The next phrase (lines every 4 cycles) at one cycle a second, and the next bar on a slow clock (a bar of two seconds), as
+  // the earlier measurements did: two launches each, the same landing judgement.
+  await chooseLaunch('phrase');
+  const phraseLaunches = await launchRows([0, 2]);
+  await startMarkerPiece('probe grid launch next bar', slowTemplate);
+  await chooseLaunch('bar');
+  const barLaunches = await launchRows([0, 2]);
+  report(
+    'grid: launches at the next phrase and the next bar land on their lines',
+    judged(phraseLaunches).length === 2 &&
+      judged(barLaunches).length === 2 &&
+      judged(phraseLaunches).every((row) => landedOk(row, (line) => line % 4 === 0)) &&
+      judged(barLaunches).every((row) => landedOk(row, (line) => Number.isInteger(line))),
+    JSON.stringify({ phrase: phraseLaunches, bar: barLaunches }),
+  );
+
+  // The queued header counts down with the words of the top bar, a second click cancels the launch with no history row and
+  // the music untouched, and a click on another header replaces it (the latest wins) and is built on the waiting code.
+  await chooseLaunch('phrase');
+  const countdownPair = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const queued = [...document.querySelectorAll('#parts-rows .song-head')].filter((head) => head.dataset.state === 'queued');
+        const bar = document.getElementById('pending-change');
+        return {
+          queued: queued.length,
+          header: queued.length === 1 ? queued[0].querySelector('.part-state').textContent : null,
+          bar: bar.hidden ? null : bar.querySelector('.pending-rest').textContent,
+        };
+      })()`,
+    );
+  const barStatus = () => evaluateExpr(cdp, `document.getElementById('change-status').textContent`);
+  const editorCode = () => evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+  await startMarkerPiece('probe grid cancel and replace', slowTemplate);
+  const cancelBase = { code: await editorCode(), shift: await songShiftRead(cdp), history: await historyTop() };
+  await reachJustPastPhraseLine();
+  const firstTarget = ((await waitPlayingHeader('the cancel check, before the first launch')) + 1) % 3;
+  await songLaunchLogReset(cdp);
+  await clickHead(firstTarget);
+  const firstLine = await waitQueued(firstTarget);
+  await requireLead(firstLine, 2.5, 'the cancel check');
+  const pairs = [];
+  for (let i = 0; i < 6; i++) {
+    pairs.push(await countdownPair());
+    await sleep(350);
+  }
+  const queuedCode = await editorCode();
+  // Typing that was never evaluated turns every control off with the dirty sentence, and a click on the queued header then
+  // changes nothing; once the typing is taken out again the header cancels.
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: '// probe\\n' } })`);
+  const dirtyLine = await waitFor(cdp, `(() => { const el = document.getElementById('song-line'); return el.getAttribute('data-kind') === 'dirty' ? el.textContent : null; })()`, 2500);
+  const dirtyHeader = await headerRead(firstTarget);
+  await clickHead(firstTarget);
+  await sleep(300);
+  const afterDirtyClick = { header: await headerRead(firstTarget), code: await editorCode() };
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, to: 9, insert: '' } })`);
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'queued' ? true : null`, 2500);
+  // The cancel: the old music keeps playing, the editor goes back to the playing code, the bar says so, nothing is recorded.
+  await clickHead(firstTarget);
+  const canceled = await waitFor(
+    cdp,
+    `(() => { const head = document.querySelector('#parts-rows .song-head[data-index="${firstTarget}"]'); return head.dataset.state !== 'queued' && document.getElementById('change-status').textContent === 'Change canceled.' ? true : null; })()`,
+    3000,
+  );
+  const afterCancel = { code: await editorCode(), history: await historyTop(), bar: await countdownPair(), status: await barStatus(), sentence: await songLineRead() };
+  // The old line passes with nothing happening: every cycle logged keeps following the old shift.
+  await reachCycle(Number(firstLine) + 2);
+  const afterOldLine = await songLaunchLogRead(cdp);
+  const oldOnly = afterOldLine.filter((entry) => entry.section !== songLaunchPlace(cancelBase.shift, entry.begin)).length;
+  const historyAfterLine = await historyTop();
+  // The replace: a second launch, then a click on another header.
+  await reachJustPastPhraseLine();
+  const playingNow = await waitPlayingHeader('the cancel check, before the replace');
+  await songLaunchLogReset(cdp);
+  await clickHead(playingNow);
+  const replacedFrom = await waitQueued(playingNow);
+  await requireLead(replacedFrom, 1.5, 'the replace check');
+  const oldPositionOfLine = (((Number(replacedFrom) - cancelBase.shift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+  // Another section than the playing one, and not one that already starts on that line.
+  const secondTarget = [0, 1, 2].find((i) => i !== playingNow && SONG_LAUNCH_STARTS[sectionNames[i]] !== oldPositionOfLine);
+  const historyBeforeReplace = await historyTop();
+  await clickHead(secondTarget);
+  const replacedTo = await waitQueued(secondTarget);
+  const afterReplace = { first: await headerRead(playingNow), second: await headerRead(secondTarget), sentence: await songLineRead() };
+  const replaceLanding = replacedTo === null ? null : await songGridLanding(cdp, { oldShift: cancelBase.shift, line: Number(replacedTo), target: sectionNames[secondTarget] });
+  await sleep(400);
+  const historyAfterReplace = await historyTop();
+  report(
+    "grid: the queued header counts down with the top bar's words, a second click cancels it with no history row, and another header replaces it",
+    firstLine !== null &&
+      pairs.length === 6 &&
+      pairs.every((pair) => pair.queued === 1 && pair.bar !== null && pair.header === `Queued — ${pair.bar}`) &&
+      queuedCode !== cancelBase.code &&
+      dirtyLine === "The editor has changes that are not playing yet. Evaluate them first — the grid works on the playing code." &&
+      dirtyHeader !== null &&
+      dirtyHeader.disabled === 'true' &&
+      afterDirtyClick.header.state === 'queued' &&
+      afterDirtyClick.code.startsWith('// probe\n') &&
+      canceled === true &&
+      afterCancel.code === cancelBase.code &&
+      afterCancel.history.id === cancelBase.history.id &&
+      afterCancel.bar.bar === null &&
+      afterCancel.bar.queued === 0 &&
+      afterCancel.status === 'Change canceled.' &&
+      afterCancel.sentence.hidden === true &&
+      oldOnly === 0 &&
+      afterOldLine.length > 0 &&
+      historyAfterLine.id === cancelBase.history.id &&
+      replacedFrom !== null &&
+      replacedTo !== null &&
+      afterReplace.first.state !== 'queued' &&
+      afterReplace.second.state === 'queued' &&
+      afterReplace.second.line === replacedTo &&
+      afterReplace.sentence.kind === 'queued' &&
+      afterReplace.sentence.text.includes(`'${sectionNames[secondTarget]}'`) &&
+      replaceLanding !== null &&
+      replaceLanding.onLine === true &&
+      historyAfterReplace.id === historyBeforeReplace.id + 1 &&
+      historyAfterReplace.row.includes(`launched ${sectionNames[secondTarget]}`),
+    JSON.stringify({ firstTarget, firstLine, pairs, dirtyLine, dirtyHeader, afterDirtyClick: { state: afterDirtyClick.header.state, startsWithTyping: afterDirtyClick.code.startsWith('// probe\n') }, canceled, afterCancel: { ...afterCancel, code: afterCancel.code === cancelBase.code }, oldOnly, entriesAfterOldLine: afterOldLine.length, historyAfterLine, replacedFrom, replacedTo, afterReplace, replaceLanding, historyBeforeReplace, historyAfterReplace }),
+  );
+
+  // A launch that needs no code change shows its countdown and writes nothing: the section that comes next at the end of the
+  // section that plays already starts there. The text stays, the history stays, the line says so, a second click hides the
+  // countdown, and the countdown ends by itself when the scheduler reaches the line.
+  await chooseLaunch('section');
+  await startMarkerPiece('probe grid no change', slowTemplate);
+  const nextOnes = [];
+  for (let pass = 0; pass < 1; pass++) {
+    // A moment well before the end of the section that plays, so the line is its end.
+    let readyAt = null;
+    for (let wait = 0; wait < 200 && readyAt === null; wait++) {
+      const probe = await evaluateExpr(cdp, `(() => { const s = document.getElementById('repl').editor.repl.scheduler; return { now: s.now(), shift: Number(/shift: (-?[\\d.]+)/.exec(document.getElementById('repl').editor.code)[1]) }; })()`);
+      const position = (((probe.now - probe.shift) % SONG_LAUNCH_TOTAL) + SONG_LAUNCH_TOTAL) % SONG_LAUNCH_TOTAL;
+      const into = position - sectionStartsOf.filter((start) => start <= position).at(-1);
+      const length = [3, 5, 7][sectionStartsOf.filter((start) => start <= position).length - 1];
+      if (length - into >= 1.2 && into >= 0.2) readyAt = probe;
+      else await sleep(120);
+    }
+    if (readyAt === null) throw new ProbeCouldNotRun('no moment well before the end of a section came within 24 seconds');
+    const playing = await waitPlayingHeader('the launch that needs no code change');
+    const next = (playing + 1) % 3;
+    const before = { code: await editorCode(), history: await historyTop() };
+    await clickHead(next);
+    const queued = await waitQueued(next);
+    const header = await headerRead(next);
+    const sentence = await songLineRead();
+    const cellsDisabled = await evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-cell')].filter((cell) => cell.getAttribute('aria-disabled') === 'true').length`);
+    const during = { code: await editorCode(), history: await historyTop() };
+    // A second click hides the countdown and leaves the code alone.
+    await clickHead(next);
+    await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="${next}"]').dataset.state !== 'queued' ? true : null`, 3000);
+    const afterHide = { sentence: await songLineRead(), header: await headerRead(next), code: await editorCode() };
+    // Again, and this time the line is reached.
+    await clickHead(next);
+    const again = await waitQueued(next);
+    await reachCycle(Number(again) + 0.6);
+    const reached = await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="${next}"]').dataset.state === 'playing' && document.getElementById('song-line').hidden ? true : null`, 4000);
+    const afterLine = { code: await editorCode(), history: await historyTop() };
+    nextOnes.push({
+      playing: sectionNames[playing],
+      next: sectionNames[next],
+      queued,
+      header,
+      sentence,
+      cellsDisabled,
+      codeUntouched: during.code === before.code && afterHide.code === before.code && afterLine.code === before.code,
+      historyUntouched: during.history.id === before.history.id && afterLine.history.id === before.history.id,
+      afterHide: { sentence: afterHide.sentence.hidden, state: afterHide.header.state },
+      again: again !== null,
+      reached,
+    });
+  }
+  const noChange = nextOnes[0];
+  report(
+    'grid: a launch that needs no code change shows its countdown and writes nothing',
+    noChange !== undefined &&
+      noChange.queued !== null &&
+      /^Queued — in \d+ (bars|beats?)$/.test(noChange.header.text) &&
+      noChange.header.action === 'Cancel' &&
+      noChange.sentence.kind === 'already' &&
+      noChange.sentence.text === `Section '${noChange.next}' already starts on that line, so the code stays as it is. Click it again to hide the countdown.` &&
+      noChange.cellsDisabled === 0 &&
+      noChange.codeUntouched === true &&
+      noChange.historyUntouched === true &&
+      noChange.afterHide.sentence === true &&
+      noChange.afterHide.state !== 'queued' &&
+      noChange.again === true &&
+      noChange.reached === true,
+    JSON.stringify(nextOnes),
+  );
+
+  // A click while stopped starts the piece at that section at once: the shift is written so it starts at cycle 0, the sound
+  // comes back, no countdown shows, and it is one history entry.
+  await startMarkerPiece('probe grid stopped click', launchTemplate);
+  await stopMusic(cdp);
+  await sleep(400);
+  const stoppedBefore = { history: await historyTop(), shift: await songShiftRead(cdp) };
+  await songLaunchLogReset(cdp);
+  const stoppedHeader = await headerRead(2);
+  await clickHead(2);
+  await waitFor(cdp, `(() => { const word = document.querySelector('#sound-state .state-label'); return word && word.textContent === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null; })()`, 8000);
+  await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="2"]').dataset.state === 'playing' ? true : null`, 4000);
+  await sleep(2500);
+  const stoppedEntries = await songLaunchLogRead(cdp);
+  const stoppedAfter = { history: await historyTop(), shift: await songShiftRead(cdp), header: await headerRead(2), sentence: await songLineRead(), queuedHeaders: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`) };
+  const stoppedFirst = stoppedEntries.length === 0 ? null : stoppedEntries.reduce((best, entry) => (entry.begin < best.begin ? entry : best));
+  report(
+    'grid: a click while stopped starts the piece at that section at once',
+    stoppedHeader.title === 'Starts the piece at this section.' &&
+      stoppedBefore.shift === 0 &&
+      stoppedAfter.shift === SONG_LAUNCH_TOTAL - SONG_LAUNCH_STARTS.z &&
+      stoppedFirst !== null &&
+      stoppedFirst.begin === 0 &&
+      stoppedFirst.section === 'z' &&
+      stoppedEntries.every((entry) => entry.section === songLaunchPlace(stoppedAfter.shift, entry.begin)) &&
+      stoppedAfter.queuedHeaders === 0 &&
+      stoppedAfter.header.state === 'playing' &&
+      stoppedAfter.history.id === stoppedBefore.history.id + 1 &&
+      stoppedAfter.history.row.includes('launched z'),
+    JSON.stringify({ stoppedHeader, stoppedBefore, stoppedAfter, first: stoppedFirst, entries: stoppedEntries.length }),
+  );
+
+  // While another change waits for its line, or the editor holds text that was never evaluated, every header and cell is
+  // switched off and the line says why; a click then changes nothing.
+  await startMarkerPiece('probe grid disabled', launchTemplate);
+  const disabledCounts = () =>
+    evaluateExpr(
+      cdp,
+      `({ heads: [...document.querySelectorAll('#parts-rows .song-head')].filter((el) => el.getAttribute('aria-disabled') === 'true').length, cells: [...document.querySelectorAll('#parts-rows .song-cell')].filter((el) => el.getAttribute('aria-disabled') === 'true').length })`,
+    );
+  const disabledBefore = { code: await editorCode(), history: await historyTop(), counts: await disabledCounts(), sentence: await songLineRead() };
+  const waitingCode = songLaunchFill(launchTemplate, 0, 7);
+  await callTool(client, 'set_code', { code: waitingCode, label: 'probe grid a change waits', at: 'phrase', phraseCycles: 64 });
+  const waitingLine = await waitFor(cdp, `(() => { const el = document.getElementById('song-line'); return el.getAttribute('data-kind') === 'waiting' ? el.textContent : null; })()`, 4000);
+  const waitingCounts = await disabledCounts();
+  const waitingCodeInEditor = await editorCode();
+  const historyWaiting = await historyTop();
+  await clickHead(1);
+  await clickElement(cdp, '#parts-rows .song-cell[data-track="t1"][data-section="0"]');
+  await sleep(500);
+  const afterWaitingClick = { code: await editorCode(), history: await historyTop(), queued: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`), sentence: await songLineRead() };
+  // An immediate change from Claude replaces the waiting one.
+  await callTool(client, 'set_code', { code: songLaunchFill(launchTemplate, 0, 8), label: 'probe grid the change lands' });
+  await waitFor(cdp, `document.getElementById('song-line').hidden ? true : null`, 5000);
+  const afterReplace2 = await disabledCounts();
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: '// probe\\n' } })`);
+  const typingLine = await waitFor(cdp, `(() => { const el = document.getElementById('song-line'); return el.getAttribute('data-kind') === 'dirty' ? el.textContent : null; })()`, 3000);
+  const typingCounts = await disabledCounts();
+  const typedCode = await editorCode();
+  const historyTyping = await historyTop();
+  await clickHead(1);
+  await clickElement(cdp, '#parts-rows .song-cell[data-track="t1"][data-section="0"]');
+  await sleep(500);
+  const afterTypingClick = { code: await editorCode(), history: await historyTop(), queued: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`) };
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, to: 9, insert: '' } })`);
+  const typingGone = await waitFor(cdp, `document.getElementById('song-line').hidden ? true : null`, 3000);
+  const typingGoneCounts = await disabledCounts();
+  report(
+    'grid: while a change waits or the editor holds unevaluated typing, headers and cells are disabled and the line says why',
+    disabledBefore.counts.heads === 0 &&
+      disabledBefore.counts.cells === 0 &&
+      disabledBefore.sentence.hidden === true &&
+      waitingLine === 'A change is waiting for its bar line. The grid works again when it takes over.' &&
+      waitingCounts.heads === 3 &&
+      waitingCounts.cells === 12 &&
+      afterWaitingClick.code === waitingCodeInEditor &&
+      afterWaitingClick.history.id === historyWaiting.id &&
+      afterWaitingClick.queued === 0 &&
+      afterReplace2.heads === 0 &&
+      afterReplace2.cells === 0 &&
+      typingLine === 'The editor has changes that are not playing yet. Evaluate them first — the grid works on the playing code.' &&
+      typingCounts.heads === 3 &&
+      typingCounts.cells === 12 &&
+      afterTypingClick.code === typedCode &&
+      afterTypingClick.history.id === historyTyping.id &&
+      afterTypingClick.queued === 0 &&
+      typingGone === true &&
+      typingGoneCounts.heads === 0 &&
+      typingGoneCounts.cells === 0,
+    JSON.stringify({ disabledBefore, waitingLine, waitingCounts, afterWaitingClick: { ...afterWaitingClick, code: afterWaitingClick.code === waitingCodeInEditor }, afterReplace2, typingLine, typingCounts, afterTypingClick: { ...afterTypingClick, code: afterTypingClick.code === typedCode }, historyTyping, typingGoneCounts }),
+  );
+
+  // After a launch shifted the piece, Stop then Play starts from the first section: the page writes shift 0 into the code as
+  // part of the Play, the first header is the playing one, the corner loses its shift, and the Play is one history row.
+  await chooseLaunch('section');
+  await startMarkerPiece('probe grid stop then play', launchTemplate);
+  const shiftedLaunch = await launchRows([0]);
+  const cornerRead = () => evaluateExpr(cdp, `document.querySelector('#parts-rows .song-corner').textContent`);
+  const shiftedBy = await songShiftRead(cdp);
+  const cornerShifted = await cornerRead();
+  await stopMusic(cdp);
+  await sleep(400);
+  const historyBeforePlay2 = await historyTop();
+  const codeBeforePlay2 = await editorCode();
+  await playMusic(cdp);
+  const firstPlaying = await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="0"]').dataset.state === 'playing' ? true : null`, 4000);
+  await sleep(700);
+  const afterPlay2 = { shift: await songShiftRead(cdp), corner: await cornerRead(), history: await historyTop(), code: await editorCode(), states: await evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-head')].map((head) => head.dataset.state)`) };
+  report(
+    'grid: after a launch shifted the piece, Stop then Play starts from the first section',
+    judged(shiftedLaunch).length === 1 &&
+      judged(shiftedLaunch).every((row) => row.onLine === true) &&
+      shiftedBy !== 0 &&
+      cornerShifted.includes(', shifted by') &&
+      firstPlaying === true &&
+      afterPlay2.states.join(',') === 'playing,idle,idle' &&
+      afterPlay2.shift === 0 &&
+      afterPlay2.corner === '3 sections, 15 cycles' &&
+      afterPlay2.code === codeBeforePlay2.replace(/shift: -?[\d.]+,/, 'shift: 0,') &&
+      afterPlay2.history.id === historyBeforePlay2.id + 1 &&
+      afterPlay2.history.row.includes('edited by hand'),
+    JSON.stringify({ shiftedBy, cornerShifted, shiftedLaunch: shiftedLaunch.map((row) => ({ target: row.target, line: row.line, newShift: row.newShift, onLine: row.onLine })), afterPlay2: { ...afterPlay2, code: afterPlay2.code === codeBeforePlay2.replace(/shift: -?[\d.]+,/, 'shift: 0,') }, historyBeforePlay2 }),
+  );
+
+  // ---- a launch against typing, a Stop and a click on its line ----
+  // The page prepares a launch asynchronously, so typing, a Stop or a click can land between the moment the shift is written
+  // and the moment the evaluation runs, or after the scheduler has already queried past the line. These checks slip one action
+  // in front of the next evaluation of the repl (once), which makes such a moment certain instead of a matter of luck.
+  const beforeNextEvaluate = (action, delayMs = 0) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const repl = document.getElementById('repl').editor.repl;
+        const original = repl.evaluate;
+        const race = { fired: false, restore() { repl.evaluate = original; } };
+        window.__probeRace = race;
+        repl.evaluate = async function (...args) {
+          race.restore();
+          race.fired = true;
+          (${action})();
+          if (${delayMs} > 0) await new Promise((resolve) => setTimeout(resolve, ${delayMs}));
+          return original.apply(this, args);
+        };
+      })()`,
+    );
+  const raceFired = (timeoutMs) => waitFor(cdp, `window.__probeRace && window.__probeRace.fired ? true : null`, timeoutMs);
+  const raceRestore = () => evaluateExpr(cdp, `window.__probeRace && window.__probeRace.restore()`);
+  const replaceEditorText = (text) =>
+    evaluateExpr(cdp, `(() => { const view = document.getElementById('repl').editor.editor; view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: ${JSON.stringify(text)} } }); })()`);
+
+  // Typing that arrives while a launch is prepared is never overwritten. The evaluation is held for three seconds on a slow
+  // clock, so the line the shift was written for has passed and the launch is written again; the typing makes that second
+  // try refuse, the page cancels the launch, and the typing must still be in the editor, with the dirty sentence under the bar.
+  const typedMark = '// probe typing\n';
+  await chooseLaunch('bar');
+  await startMarkerPiece('probe grid cancel keeps typing', slowTemplate);
+  const typingBase = { code: await editorCode(), history: await historyTop() };
+  let typingRace = null;
+  for (let attempt = 1; attempt <= 4 && typingRace === null; attempt++) {
+    const playing = await waitPlayingHeader('the launch that typing interrupts');
+    const target = (playing + 1) % 3;
+    await beforeNextEvaluate(`() => document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: ${JSON.stringify(typedMark)} } })`, 3200);
+    await clickHead(target);
+    if ((await raceFired(1500)) === null) {
+      // The section already starts on that line, so nothing was written: hide the countdown and ask again.
+      await raceRestore();
+      await clickHead(target);
+      await sleep(400);
+      continue;
+    }
+    await sleep(5000);
+    typingRace = {
+      target: sectionNames[target],
+      hasTyping: (await editorCode()).includes(typedMark),
+      queued: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`),
+      line: await songLineRead(),
+      history: await historyTop(),
+      word: await readStateWord(cdp),
+    };
+  }
+  await replaceEditorText(typingBase.code);
+  await waitFor(cdp, `document.getElementById('song-line').hidden ? true : null`, 3000);
+  report(
+    'grid: a launch the page cancels after typing arrived leaves the typing in the editor and says the editor has changes',
+    typingRace !== null &&
+      typingRace.hasTyping === true &&
+      typingRace.queued === 0 &&
+      typingRace.line.kind === 'dirty' &&
+      typingRace.history.id === typingBase.history.id &&
+      typingRace.word === SOUND_LABELS.playing,
+    JSON.stringify(typingRace),
+  );
+
+  // A Stop that lands while a launch is prepared must not start the scheduler again: the sound stays stopped, the code that
+  // was evaluated is recorded as one launch, and Play starts the piece from its first section afterwards.
+  await chooseLaunch('bar');
+  await startMarkerPiece('probe grid stop during launch', slowTemplate);
+  const stopRaceBase = await historyTop();
+  let stopRace = null;
+  for (let attempt = 1; attempt <= 4 && stopRace === null; attempt++) {
+    const playing = await waitPlayingHeader('the launch that a Stop interrupts');
+    const target = (playing + 1) % 3;
+    await beforeNextEvaluate(`() => document.querySelector(${JSON.stringify(TRANSPORT_SELECTOR)}).click()`);
+    await clickHead(target);
+    if ((await raceFired(1500)) === null) {
+      await raceRestore();
+      await clickHead(target);
+      await sleep(400);
+      continue;
+    }
+    await sleep(2000);
+    stopRace = {
+      target: sectionNames[target],
+      word: await readStateWord(cdp),
+      started: await evaluateExpr(cdp, `document.getElementById('repl').editor.repl.scheduler.started`),
+      history: await historyTop(),
+      queued: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`),
+    };
+    // The server must hold the same truth: its reply to get_code carries the stopped note only while it believes the sound is stopped.
+    stopRace.serverStopped = (await callTool(client, 'get_code', {})).includes(STOPPED_NOTE);
+  }
+  report(
+    'grid: a Stop that lands while a launch is prepared leaves the sound stopped and records the launch once',
+    stopRace !== null &&
+      stopRace.word === SOUND_LABELS.stopped &&
+      stopRace.started === false &&
+      stopRace.serverStopped === true &&
+      stopRace.queued === 0 &&
+      stopRace.history.id === stopRaceBase.id + 1 &&
+      stopRace.history.row.includes(`launched ${stopRace.target}`),
+    JSON.stringify({ stopRace, stopRaceBase }),
+  );
+
+  // Once the scheduler has queried past the line of a waiting launch, the notes of the new section are already scheduled, so a
+  // click on its header (a cancel) or on another header (a replacement) changes nothing and the launch takes over on its line.
+  /** Clicks the header after the playing one until a launch really waits (not the "already starts there" case); null after three tries. */
+  const queueLaunch = async (what) => {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await reachJustPastPhraseLine();
+      const playing = await waitPlayingHeader(what);
+      const target = (playing + 1) % 3;
+      const codeBefore = await editorCode();
+      const shiftBefore = await songShiftRead(cdp);
+      await songLaunchLogReset(cdp);
+      await clickHead(target);
+      const line = await waitQueued(target);
+      const sentence = await songLineRead();
+      if (line !== null && sentence.kind === 'queued') return { playing, target, line: Number(line), codeBefore, shiftBefore };
+      if (line !== null) {
+        await clickHead(target);
+        await sleep(400);
+      }
+      await reachCycle((await readSchedulerNow(cdp)) + 2);
+    }
+    return null;
+  };
+  await chooseLaunch('phrase');
+  await startMarkerPiece('probe grid late cancel', slowTemplate);
+  const late = await queueLaunch('the late cancel');
+  if (late === null) throw new ProbeCouldNotRun('the late cancel: no launch waited in three tries');
+  await requireLead(late.line, 2.5, 'the late cancel');
+  const lateWaitingCode = await editorCode();
+  const lateHistory = await historyTop();
+  const lateQuery = await evaluateExpr(
+    cdp,
+    `document.getElementById('repl').editor.repl.scheduler.pattern.queryArc(${late.line} - 0.05, ${late.line} + 0.05, { cyclist: 'probe' }).length`,
+  );
+  await sleep(150);
+  await clickHead(late.target);
+  await sleep(500);
+  const afterLateCancel = { header: await headerRead(late.target), code: await editorCode(), status: await barStatus(), history: await historyTop() };
+  const lateOther = [0, 1, 2].find((i) => i !== late.target && i !== late.playing);
+  await clickHead(lateOther);
+  await sleep(500);
+  const afterLateReplace = { first: await headerRead(late.target), other: await headerRead(lateOther), code: await editorCode() };
+  const lateLanding = await songGridLanding(cdp, { oldShift: late.shiftBefore, line: late.line, target: sectionNames[late.target] });
+  await sleep(500);
+  const lateEnd = await historyTop();
+  report(
+    'grid: a click on a launch whose line the scheduler has already passed neither cancels nor replaces it',
+    lateQuery > 0 &&
+      afterLateCancel.header.state === 'queued' &&
+      afterLateCancel.code === lateWaitingCode &&
+      afterLateCancel.status !== 'Change canceled.' &&
+      afterLateCancel.history.id === lateHistory.id &&
+      afterLateReplace.first.state === 'queued' &&
+      afterLateReplace.other.state !== 'queued' &&
+      afterLateReplace.code === lateWaitingCode &&
+      lateLanding.onLine === true &&
+      lateEnd.id === lateHistory.id + 1 &&
+      lateEnd.row.includes(`launched ${sectionNames[late.target]}`),
+    JSON.stringify({ late, lateQuery, afterLateCancel: { ...afterLateCancel, code: afterLateCancel.code === lateWaitingCode }, afterLateReplace: { ...afterLateReplace, code: afterLateReplace.code === lateWaitingCode }, lateLanding, lateHistory, lateEnd }),
+  );
+
+  // A Stop while a launch waits drops it and puts the playing code back in the editor: the shift it wrote would never play (Play
+  // writes shift 0), and left in the editor it would lock the grid as typing that was never evaluated. The grid stays usable
+  // while stopped, and a click on a header then starts the piece at that section.
+  await chooseLaunch('phrase');
+  await startMarkerPiece('probe grid stop with a queued launch', slowTemplate);
+  const stopQueued = await queueLaunch('the Stop with a queued launch');
+  if (stopQueued === null) throw new ProbeCouldNotRun('the Stop with a queued launch: no launch waited in three tries');
+  const stopQueuedHistory = await historyTop();
+  await stopMusic(cdp);
+  await sleep(600);
+  const afterStopQueued = {
+    codeBack: (await editorCode()) === stopQueued.codeBefore,
+    line: await songLineRead(),
+    disabled: await disabledCounts(),
+    queued: await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`),
+    history: await historyTop(),
+  };
+  await clickHead(2);
+  await waitFor(cdp, `(() => { const word = document.querySelector('#sound-state .state-label'); return word && word.textContent === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null; })()`, 8000);
+  const startedAtSection = await waitFor(cdp, `document.querySelector('#parts-rows .song-head[data-index="2"]').dataset.state === 'playing' ? true : null`, 4000);
+  report(
+    'grid: a Stop while a launch waits puts the playing code back, keeps the grid usable, and a click then starts the piece there',
+    afterStopQueued.codeBack === true &&
+      afterStopQueued.line.hidden === true &&
+      afterStopQueued.disabled.heads === 0 &&
+      afterStopQueued.disabled.cells === 0 &&
+      afterStopQueued.queued === 0 &&
+      afterStopQueued.history.id === stopQueuedHistory.id &&
+      startedAtSection === true,
+    JSON.stringify({ afterStopQueued, startedAtSection }),
+  );
+
+  // ---- changing a cell ----
+  // A click on a cell opens a list of the track's variations and a rest; choosing one rewrites exactly that string of the
+  // plan, plays the new code, and is one history entry. The checks use the helper piece and the hand-edit timing at 'now'.
+  await pickTiming(cdp, 'now');
+  const cellSelector = (track, section) => `#parts-rows .song-cell[data-track="${track}"][data-section="${section}"]`;
+  /** The list as a person sees it: its name, its options with their words and selection, which one is active, and where focus is. */
+  const listRead = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const list = document.getElementById('song-cell-list');
+        return {
+          hidden: list.hidden,
+          role: list.getAttribute('role'),
+          label: list.getAttribute('aria-label'),
+          describedBy: list.getAttribute('aria-describedby'),
+          note: list.getAttribute('aria-describedby') === null ? null : document.getElementById(list.getAttribute('aria-describedby')).textContent,
+          active: list.getAttribute('aria-activedescendant'),
+          focus: document.activeElement === list ? 'list' : document.activeElement.className || document.activeElement.tagName,
+          options: [...list.querySelectorAll('[role="option"]')].map((option) => ({ id: option.id, text: option.textContent, selected: option.getAttribute('aria-selected'), activeMark: option.getAttribute('data-active') })),
+          placement: list.getAttribute('data-placement'),
+          box: (() => { const r = list.getBoundingClientRect(); return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: innerWidth, height: innerHeight }; })(),
+        };
+      })()`,
+    );
+  const openCell = async (track, section) => {
+    await clickElement(cdp, cellSelector(track, section));
+    return waitFor(cdp, `document.getElementById('song-cell-list').hidden ? null : true`, 3000);
+  };
+  /** Both codes read by the page's own reader: the plan cells, the variations and the helper state, for a comparison. */
+  const songShape = (code) =>
+    evaluateExpr(
+      cdp,
+      `(async () => {
+        const { readStructure } = await import('/structure.js');
+        const { extractTracks } = await import('/tracks.js');
+        const parse = window.acorn.parse;
+        const reading = readStructure(${JSON.stringify(code)}, { parse, tracks: extractTracks(${JSON.stringify(code)}, { parse }) });
+        if (reading.state !== 'read') return { state: reading.state };
+        return {
+          state: 'read',
+          helper: reading.helper,
+          shift: reading.shift,
+          sections: reading.sections.map((section) => [section.name, section.length]),
+          cells: reading.tracks.map((track) => [track.name, track.cells.map((cell) => cell.key)]),
+          variations: reading.tracks.map((track) => [track.name, track.variations.map((variation) => variation.key)]),
+          outside: ${JSON.stringify(code)}.slice(0, ${JSON.stringify(code)}.indexOf('const song')),
+        };
+      })()`,
+    );
+  /** Waits for the top history row to move past `id`. */
+  const historyPast = async (id) => {
+    const deadline = Date.now() + 5000;
+    for (;;) {
+      const top = await historyTop();
+      if (top.id > id || Date.now() > deadline) return top;
+      await sleep(100);
+    }
+  };
+  const activeCode = () => evaluateExpr(cdp, `document.getElementById('repl').editor.repl.state.activeCode`);
+
+  await showPiece(helperCode, 'probe grid cell change');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000);
+  const cellBefore = { code: await editorCode(), history: await historyTop() };
+  const cellShapeBefore = await songShape(cellBefore.code);
+  const opened = await openCell('t1', 1);
+  const listOpen = await listRead();
+  await clickElement(cdp, '#song-cell-list [role="option"]:first-of-type');
+  await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode !== ${JSON.stringify(cellBefore.code)} ? true : null`, 5000);
+  const cellAfter = { code: await editorCode(), played: await activeCode(), history: await historyPast(cellBefore.history.id) };
+  const cellShapeAfter = await songShape(cellAfter.code);
+  const getCodeReply = String(await callTool(client, 'get_code', {}));
+  const listShut = await listRead();
+  const expectedCode = cellBefore.code.replace("y: { t1: 'vb'", "y: { t1: 'va'");
+  const onlyThatCell = (before, after) => {
+    const cells = (shape) => shape.cells.map(([track, keys]) => [track, keys.map((key, i) => (track === 't1' && i === 1 ? '*' : key))]);
+    return (
+      JSON.stringify(cells(before)) === JSON.stringify(cells(after)) &&
+      JSON.stringify(before.variations) === JSON.stringify(after.variations) &&
+      JSON.stringify(before.sections) === JSON.stringify(after.sections) &&
+      before.helper === after.helper &&
+      before.shift === after.shift &&
+      before.outside === after.outside
+    );
+  };
+  report(
+    'grid: choosing another variation in a cell rewrites exactly that string of the plan, plays it and records one history row',
+    opened === true &&
+      listOpen.role === 'listbox' &&
+      listOpen.label === "Variation for 't1' in section 'y'" &&
+      listOpen.options.map((option) => option.text.replace('current', '')).join(',') === 'va,vb,rest' &&
+      listOpen.options.map((option) => option.selected).join(',') === 'false,true,false' &&
+      listOpen.options[1].text === 'vbcurrent' &&
+      listOpen.active === listOpen.options[1].id &&
+      listOpen.focus === 'list' &&
+      listOpen.box.top >= 0 &&
+      listOpen.box.bottom <= listOpen.box.height &&
+      listOpen.box.left >= 0 &&
+      listOpen.box.right <= listOpen.box.width &&
+      cellAfter.code === expectedCode &&
+      cellAfter.played === expectedCode &&
+      getCodeReply.includes(expectedCode) &&
+      cellShapeBefore.state === 'read' &&
+      cellShapeAfter.state === 'read' &&
+      cellShapeBefore.cells[0][1].join(',') === 'va,vb,va' &&
+      cellShapeAfter.cells[0][1].join(',') === 'va,va,va' &&
+      onlyThatCell(cellShapeBefore, cellShapeAfter) &&
+      listShut.hidden === true &&
+      cellAfter.history.id === cellBefore.history.id + 1 &&
+      cellAfter.history.row.includes('changed t1 in y: va'),
+    JSON.stringify({ opened, listOpen, codeIsExpected: cellAfter.code === expectedCode, playedIsExpected: cellAfter.played === expectedCode, getCode: getCodeReply.includes(expectedCode), before: cellShapeBefore.cells, after: cellShapeAfter.cells, historyBefore: cellBefore.history, historyAfter: cellAfter.history, listShut: listShut.hidden }),
+  );
+
+  // Choosing the option the cell holds already closes the list and writes, evaluates and records nothing.
+  const sameBefore = { code: await editorCode(), played: await activeCode(), history: await historyTop() };
+  await openCell('t1', 1);
+  const sameList = await listRead();
+  const currentOption = sameList.options.find((option) => option.selected === 'true');
+  await clickElement(cdp, `#song-cell-list #${currentOption.id}`);
+  await sleep(700);
+  const sameAfter = {
+    code: await editorCode(),
+    played: await activeCode(),
+    history: await historyTop(),
+    listHidden: await evaluateExpr(cdp, `document.getElementById('song-cell-list').hidden`),
+    focus: await evaluateExpr(cdp, `document.activeElement.className + ' ' + document.activeElement.dataset.track + ' ' + document.activeElement.dataset.section`),
+    banner: await evaluateExpr(cdp, `document.getElementById('eval-error') ? document.getElementById('eval-error').textContent : ''`),
+  };
+  report(
+    'grid: choosing the current option writes nothing and records nothing',
+    currentOption !== undefined &&
+      currentOption.text === 'vacurrent' &&
+      sameAfter.code === sameBefore.code &&
+      sameAfter.played === sameBefore.played &&
+      sameAfter.history.id === sameBefore.history.id &&
+      sameAfter.listHidden === true &&
+      sameAfter.focus === 'song-cell t1 1' &&
+      sameAfter.banner === '',
+    JSON.stringify({ currentOption, sameBefore: { ...sameBefore, code: sameBefore.code.length }, sameAfter: { ...sameAfter, code: sameAfter.code === sameBefore.code, played: sameAfter.played === sameBefore.played } }),
+  );
+
+  // With the hand-edit timing at the next bar, the change waits: the cell shows the new name and the waiting words, the top bar
+  // counts down, the music, the history and the server's code are untouched until the line, and then the change takes over
+  // on that very line. The marker track logs the section each trigger belongs to, so the cell of the marker is the evidence.
+  await pickTiming(cdp, 'bar');
+  await startMarkerPiece('probe grid cell waits for the bar', slowTemplate);
+  await reachCycle(7.6);
+  await songLaunchLogReset(cdp);
+  await reachCycle(8.05);
+  const waitBase = { code: await editorCode(), history: await historyTop(), server: String(await callTool(client, 'get_code', {})) };
+  await clickElement(cdp, cellSelector('mark', 2));
+  await waitFor(cdp, `document.getElementById('song-cell-list').hidden ? null : true`, 3000);
+  const markList = await listRead();
+  await clickElement(cdp, `#song-cell-list #${markList.options[1].id}`);
+  const readWait = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const cell = document.querySelector(${JSON.stringify(cellSelector('mark', 2))});
+        const other = document.querySelector(${JSON.stringify(cellSelector('mark', 1))});
+        const bar = document.getElementById('pending-change');
+        const line = document.getElementById('song-line');
+        return {
+          name: cell.querySelector('.song-variation').textContent,
+          wait: cell.querySelector('.song-wait') === null ? null : cell.querySelector('.song-wait').textContent,
+          other: other.querySelector('.song-variation').textContent + '|' + (other.querySelector('.song-wait') === null ? '' : 'wait'),
+          bar: bar.hidden ? null : bar.querySelector('.pending-rest').textContent,
+          line: line.hidden ? null : line.getAttribute('data-kind'),
+          disabled: cell.getAttribute('aria-disabled'),
+          cycle: document.getElementById('repl').editor.repl.scheduler.now(),
+        };
+      })()`,
+    );
+  const waitSamples = [];
+  let waitDone = null;
+  for (let i = 0; i < 120 && waitDone === null; i++) {
+    const sample = await readWait();
+    sample.history = (await historyTop()).id;
+    waitSamples.push(sample);
+    if (sample.wait === null && sample.name === 'my') waitDone = sample;
+    else await sleep(120);
+  }
+  await sleep(2200);
+  const waitAfter = { code: await editorCode(), history: await historyTop(), server: String(await callTool(client, 'get_code', {})), cell: await readWait() };
+  const waitEntries = (await songLaunchLogRead(cdp)).filter((entry) => entry.begin >= 8);
+  const waitingOnes = waitSamples.filter((sample) => sample.wait !== null);
+  const newCell = "z: { t1: 'va', t2: '-', t3: 'va', mark: 'my' }";
+  const markedNew = waitEntries.filter((entry) => entry.section === 'y');
+  const markedOld = waitEntries.filter((entry) => entry.section === 'z');
+  const firstNew = markedNew.length === 0 ? null : Math.min(...markedNew.map((entry) => entry.begin));
+  const lastOld = markedOld.length === 0 ? null : Math.max(...markedOld.map((entry) => entry.begin));
+  report(
+    'grid: with the hand-edit timing at the next bar the cell shows the waiting text and the change takes over on the line',
+    markList.options.map((option) => option.text.replace('current', '')).join(',') === 'mx,my,mz,rest' &&
+      waitBase.server.includes("z: { t1: 'va', t2: '-', t3: 'va', mark: 'mz' }") &&
+      waitingOnes.length >= 2 &&
+      waitingOnes.every((sample) => sample.name === 'my' && sample.wait === 'waiting for the next bar' && sample.other === 'my|' && sample.line === 'waiting' && sample.disabled === 'true') &&
+      waitingOnes.every((sample) => /^in \d+ (bars?|beats?)$/.test(sample.bar ?? '')) &&
+      waitingOnes.every((sample) => sample.history === waitBase.history.id) &&
+      waitDone !== null &&
+      waitAfter.code.includes(newCell) &&
+      waitAfter.server.includes(newCell) &&
+      waitAfter.cell.wait === null &&
+      waitAfter.cell.name === 'my' &&
+      waitAfter.history.id === waitBase.history.id + 1 &&
+      waitAfter.history.row.includes('changed mark in z: my') &&
+      firstNew !== null &&
+      firstNew > 8 &&
+      Math.abs(waitDone.cycle - firstNew) < 0.6 &&
+      waitingOnes.at(-1).cycle < firstNew + 0.1 &&
+      lastOld !== null &&
+      lastOld < firstNew &&
+      markedOld.every((entry) => entry.begin < firstNew) &&
+      markedNew.every((entry) => entry.begin >= firstNew),
+    JSON.stringify({ options: markList.options.map((option) => option.text), waitBaseHistory: waitBase.history, waitingSamples: waitingOnes.length, firstSample: waitingOnes[0], lastSample: waitingOnes.at(-1), waitDone, waitAfter: { ...waitAfter, code: waitAfter.code.includes(newCell), server: waitAfter.server.includes(newCell) }, firstNew, lastOld, entries: waitEntries.length }),
+  );
+  await pickTiming(cdp, 'now');
+
+  // While another change waits, while the editor holds unevaluated typing, or when the cell changed in the code since the click,
+  // a choice writes nothing and records nothing; a refusal that comes from the code says why in one sentence.
+  const refusalCodes = {};
+  await showPiece(helperCode, 'probe grid cell refusals');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000);
+  const lineText = () => evaluateExpr(cdp, `(() => { const el = document.getElementById('song-line'); return el.hidden ? null : { kind: el.getAttribute('data-kind'), text: el.textContent }; })()`);
+  const refBase = { code: await editorCode(), history: await historyTop() };
+
+  // A change of someone else's that waits when the list is already open: the choice is refused by the shared path.
+  await openCell('t1', 1);
+  const cellWaitingCode = `${refBase.code}\n// waits`;
+  await callTool(client, 'set_code', { code: cellWaitingCode, label: 'probe grid cell refused while waiting', at: 'phrase', phraseCycles: 64 });
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'waiting' ? true : null`, 4000);
+  const cellWaitingHistory = await historyTop();
+  await clickElement(cdp, '#song-cell-list [role="option"]:first-of-type');
+  await sleep(600);
+  refusalCodes.waiting = { code: await editorCode(), history: await historyTop(), line: await lineText(), listHidden: await evaluateExpr(cdp, `document.getElementById('song-cell-list').hidden`) };
+  // The same list opened first and the cells switched off meanwhile: a click on a cell opens nothing.
+  const disabledOpen = await evaluateExpr(cdp, `(() => { const cell = document.querySelector(${JSON.stringify(cellSelector('t1', 0))}); return { disabled: cell.getAttribute('aria-disabled') }; })()`);
+  await clickElement(cdp, cellSelector('t1', 0));
+  await sleep(300);
+  refusalCodes.disabledClick = { disabled: disabledOpen.disabled, listHidden: await evaluateExpr(cdp, `document.getElementById('song-cell-list').hidden`) };
+  await callTool(client, 'set_code', { code: refBase.code, label: 'probe grid cell refusals back' });
+  await waitFor(cdp, `document.getElementById('song-line').hidden ? true : null`, 5000);
+
+  // Typing that was never evaluated, after the list was opened: the choice is refused and the typing stays.
+  const cellTypingBase = { history: await historyTop() };
+  await openCell('t1', 1);
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: '// probe\\n' } })`);
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'dirty' ? true : null`, 3000);
+  const cellTypedCode = await editorCode();
+  await clickElement(cdp, '#song-cell-list [role="option"]:first-of-type');
+  await sleep(600);
+  refusalCodes.dirty = { code: await editorCode(), typed: cellTypedCode, played: await activeCode(), history: await historyTop(), line: await lineText() };
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, to: 9, insert: '' } })`);
+  await waitFor(cdp, `document.getElementById('song-line').hidden ? true : null`, 3000);
+
+  // The very cell changes in the code while the list is open.
+  const staleBase = { code: await editorCode() };
+  await openCell('t1', 1);
+  const staleCode = staleBase.code.replace("y: { t1: 'vb'", "y: { t1: 'va'");
+  await callTool(client, 'set_code', { code: staleCode, label: 'probe grid cell changes under the list' });
+  await waitActive(staleCode);
+  const staleHistory = await historyTop();
+  await clickElement(cdp, '#song-cell-list [role="option"]:last-of-type');
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'refused' ? true : null`, 3000);
+  refusalCodes.stale = { code: await editorCode(), played: await activeCode(), history: await historyTop(), line: await lineText(), staleHistory };
+
+  // A variation that is gone from the code by the time it is chosen.
+  const noVbPlan = { x: { t1: 'va', t2: 'va', t3: 'va' }, y: { t1: 'va', t2: 'va', t3: '-' }, z: { t1: 'va', t2: '-', t3: 'va' } };
+  const withVb = songHelperCode({ plan: noVbPlan, t1Tail: '.gain(0)' });
+  const withoutVb = withVb.replace(`, vb: note("<${SONG_T1_STEPS.vb.join(' ')}>")`, '');
+  if (withoutVb === withVb) throw new ProbeCouldNotRun('the variation to take out of the piece is not where the probe looks for it');
+  await showPiece(withVb, 'probe grid variation goes');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000);
+  await openCell('t1', 0);
+  await callTool(client, 'set_code', { code: withoutVb, label: 'probe grid the variation is taken out' });
+  await waitActive(withoutVb);
+  const goneHistory = await historyTop();
+  await clickElement(cdp, '#song-cell-list [role="option"]:nth-of-type(2)');
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'refused' ? true : null`, 3000);
+  refusalCodes.gone = { code: await editorCode(), history: await historyTop(), line: await lineText(), goneHistory };
+  report(
+    'grid: a cell change is refused while another change waits, while the editor holds unevaluated typing, and when the cell changed since the click',
+    refusalCodes.waiting.code === cellWaitingCode &&
+      refusalCodes.waiting.history.id === cellWaitingHistory.id &&
+      refusalCodes.waiting.line !== null &&
+      refusalCodes.waiting.line.kind === 'waiting' &&
+      refusalCodes.waiting.listHidden === true &&
+      refusalCodes.disabledClick.disabled === 'true' &&
+      refusalCodes.disabledClick.listHidden === true &&
+      refusalCodes.dirty.code === cellTypedCode &&
+      refusalCodes.dirty.played === refBase.code &&
+      refusalCodes.dirty.history.id === cellTypingBase.history.id &&
+      refusalCodes.dirty.line.kind === 'dirty' &&
+      refusalCodes.stale.code === staleCode &&
+      refusalCodes.stale.played === staleCode &&
+      refusalCodes.stale.history.id === staleHistory.id &&
+      refusalCodes.stale.line.kind === 'refused' &&
+      refusalCodes.stale.line.text === 'That cell changed in the code since you clicked. Nothing was changed.' &&
+      refusalCodes.gone.code === withoutVb &&
+      refusalCodes.gone.history.id === goneHistory.id &&
+      refusalCodes.gone.line.text === 'That variation is no longer in the code. Nothing was changed.',
+    JSON.stringify({ waiting: { ...refusalCodes.waiting, code: refusalCodes.waiting.code === cellWaitingCode }, disabledClick: refusalCodes.disabledClick, cellWaitingHistory, cellTypingBase, dirty: { ...refusalCodes.dirty, code: refusalCodes.dirty.code === cellTypedCode, typed: undefined, played: refusalCodes.dirty.played === refBase.code }, stale: { ...refusalCodes.stale, code: refusalCodes.stale.code === staleCode, played: refusalCodes.stale.played === staleCode }, gone: { ...refusalCodes.gone, code: refusalCodes.gone.code === withoutVb } }),
+  );
+
+  // A name with a quote is written escaped and plays; a name that cannot be written into the plan is refused and nothing changes.
+  const quoteCode = [
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    "const song = { shift: 0, sections: [['p', 2], ['q', 2]], plan: { p: { t1: 'va' }, q: { t1: 'va' } } };",
+    SONG_HELPER_TEXT,
+    "const t1 = { va: note('c3'), 'it\\'s': note('d3'), 'a\\nb': note('e3') };",
+    "t1: play('t1', t1).gain(0)",
+  ].join('\n');
+  await showPiece(quoteCode, 'probe grid names that need quoting');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 2 ? true : null`, 8000);
+  const quoteBase = await historyTop();
+  await openCell('t1', 0);
+  const quoteList = await listRead();
+  await clickElement(cdp, '#song-cell-list [role="option"]:nth-of-type(2)');
+  await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode !== ${JSON.stringify(quoteCode)} ? true : null`, 5000);
+  const quoted = { code: await editorCode(), played: await activeCode(), history: await historyPast(quoteBase.id) };
+  const quotedShape = await songShape(quoted.code);
+  await openCell('t1', 0);
+  await clickElement(cdp, '#song-cell-list [role="option"]:nth-of-type(3)');
+  await waitFor(cdp, `document.getElementById('song-line').getAttribute('data-kind') === 'refused' ? true : null`, 3000);
+  const unwritable = { code: await editorCode(), history: await historyTop(), line: await lineText() };
+  report(
+    'grid: a variation name with a quote is written escaped and plays, and a name that cannot be written is refused with a sentence',
+    quoteList.options.map((option) => option.text.replace('current', '')).join('|') === "va|it's|a b|rest" &&
+      quoted.code === quoteCode.replace("p: { t1: 'va' }", "p: { t1: 'it\\'s' }") &&
+      quoted.played === quoted.code &&
+      quotedShape.state === 'read' &&
+      quotedShape.cells[0][1].join('|') === "it's|va" &&
+      quoted.history.id === quoteBase.id + 1 &&
+      unwritable.code === quoted.code &&
+      unwritable.history.id === quoted.history.id &&
+      unwritable.line.text === "That variation's name cannot be written into the plan as it is. Nothing was changed.",
+    JSON.stringify({ quoteList: quoteList.options.map((option) => option.text), quotedCode: quoted.code.split('\n')[1], quotedShape: quotedShape.cells, quoteBase, quotedHistory: quoted.history, unwritable }),
+  );
+
+  // A section used twice shares one cell: the list says so before the choice, and the change shows in both columns.
+  const sharedCode = [
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    "const song = { shift: 0, sections: [['p', 2], ['q', 2], ['p', 2]], plan: { p: { t1: 'va' }, q: { t1: 'vb' } } };",
+    SONG_HELPER_TEXT,
+    "const t1 = { va: note('c3'), vb: note('d3') };",
+    "t1: play('t1', t1).gain(0)",
+  ].join('\n');
+  await showPiece(sharedCode, 'probe grid a section used twice');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 3 ? true : null`, 8000);
+  const sharedBase = await historyTop();
+  await openCell('t1', 2);
+  const sharedList = await listRead();
+  await clickElement(cdp, '#song-cell-list [role="option"]:nth-of-type(3)');
+  await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode !== ${JSON.stringify(sharedCode)} ? true : null`, 5000);
+  const sharedAfter = {
+    code: await editorCode(),
+    played: await activeCode(),
+    history: await historyPast(sharedBase.id),
+    columns: await evaluateExpr(cdp, `[...document.querySelectorAll('#parts-rows .song-cell')].map((cell) => cell.querySelector('.song-variation').textContent)`),
+  };
+  report(
+    'grid: a section used twice shares one cell: the list says so and the change shows in both columns',
+    sharedList.note === "Section 'p' is used 2 times; the change applies to each use." &&
+      sharedList.describedBy !== null &&
+      sharedList.options.length === 3 &&
+      sharedAfter.code === sharedCode.replace("p: { t1: 'va' }", "p: { t1: 'vb' }") &&
+      sharedAfter.played === sharedAfter.code &&
+      sharedAfter.columns.join(',') === 'vb,vb,vb' &&
+      sharedAfter.history.id === sharedBase.id + 1,
+    JSON.stringify({ sharedList: { note: sharedList.note, options: sharedList.options.map((option) => option.text) }, columns: sharedAfter.columns, history: sharedAfter.history, base: sharedBase }),
+  );
+
+  // The list works from the keyboard: Enter opens it, the arrows, Home and End move the active option, Esc and Tab close it and
+  // give focus back to the cell (Esc does not close the view), and Enter on an option chooses it.
+  await showPiece(helperCode, 'probe grid cell keyboard');
+  await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000);
+  const keyBase = { code: await editorCode(), history: await historyTop() };
+  await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(cellSelector('t1', 0))}).focus()`);
+  const cellFocus = () => evaluateExpr(cdp, `document.activeElement.className + ' ' + document.activeElement.dataset.track + ' ' + document.activeElement.dataset.section`);
+  const activeIndex = (read) => read.options.findIndex((option) => option.id === read.active);
+  const listShown = () => waitFor(cdp, `document.getElementById('song-cell-list').hidden ? null : true`, 3000);
+  const listGone = () => waitFor(cdp, `document.getElementById('song-cell-list').hidden ? true : null`, 3000);
+  await pressKey(cdp, 'Enter');
+  await listShown();
+  const kbOpen = await listRead();
+  await pressKey(cdp, 'ArrowDown');
+  const kbDown = await listRead();
+  await pressKey(cdp, 'End');
+  const kbEnd = await listRead();
+  await pressKey(cdp, 'Home');
+  const kbHome = await listRead();
+  await pressKey(cdp, 'Escape');
+  await listGone();
+  const kbEsc = { focus: await cellFocus(), viewOpen: await evaluateExpr(cdp, `!document.getElementById('parts-view').hidden`), expanded: await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(cellSelector('t1', 0))}).getAttribute('aria-expanded')`) };
+  await pressKey(cdp, ' ');
+  await listShown();
+  await pressKey(cdp, 'Tab');
+  await listGone();
+  const kbTab = { focus: await cellFocus() };
+  await pressKey(cdp, 'Enter');
+  await listShown();
+  await pressKey(cdp, 'ArrowDown');
+  await pressKey(cdp, 'Enter');
+  await waitFor(cdp, `document.getElementById('repl').editor.repl.state.activeCode !== ${JSON.stringify(keyBase.code)} ? true : null`, 5000);
+  const kbChosen = { code: await editorCode(), history: await historyPast(keyBase.history.id), focus: await cellFocus() };
+  report(
+    'grid: the cell list works from the keyboard and closes with Esc and Tab, returning focus to the cell',
+    kbOpen.focus === 'list' &&
+      activeIndex(kbOpen) === 0 &&
+      kbOpen.options[0].selected === 'true' &&
+      activeIndex(kbDown) === 1 &&
+      activeIndex(kbEnd) === 2 &&
+      kbEnd.options[2].text === 'rest' &&
+      activeIndex(kbHome) === 0 &&
+      kbEsc.focus === 'song-cell t1 0' &&
+      kbEsc.viewOpen === true &&
+      kbEsc.expanded === 'false' &&
+      kbTab.focus === 'song-cell t1 0' &&
+      kbChosen.code === keyBase.code.replace("x: { t1: 'va'", "x: { t1: 'vb'") &&
+      kbChosen.history.id === keyBase.history.id + 1 &&
+      kbChosen.focus === 'song-cell t1 0',
+    JSON.stringify({ opened: [kbOpen.focus, activeIndex(kbOpen)], down: activeIndex(kbDown), end: activeIndex(kbEnd), home: activeIndex(kbHome), esc: kbEsc, tab: kbTab, chosen: { ...kbChosen, code: kbChosen.code === keyBase.code.replace("x: { t1: 'va'", "x: { t1: 'vb'") }, history: keyBase.history }),
+  );
+  // ---- harmony: the Jam view follows the section that plays ----
+  // A piece in three sections whose keys differ (a major key, a flat major key, another major key). Each section's degree
+  // variation plays in its own key, and the Declared line of the Jam view shows that key with the section's name. The
+  // expected words come from the page's own declaredLine and readHarmonyText.
+  const threeKeys = [['x', 'C3:major'], ['y', 'Eb3:major'], ['z', 'G3:major']];
+  const threeKeyCode = ({ notes = 'c4 e4 a4 f#4', fixedHarmony = 'C3:major' } = {}) =>
+    [
+      'setcps(2)',
+      `const song = { shift: 0, sections: [${threeKeys.map(([name, harmony]) => `['${name}', 4, '${harmony}']`).join(', ')}], plan: { ${threeKeys.map(([name]) => `${name}: { t1: 'd', t2: 'f' }`).join(', ')} } };`,
+      HELPER_TEXT,
+      `const t1 = { d: (h) => n("0 2 4").scale(h) };`,
+      `const t2 = { f: ['${fixedHarmony}', note("${notes}")] };`,
+      `t1: play('t1', t1).gain(0)`,
+      `t2: play('t2', t2).gain(0)`,
+    ].join('\n');
+  const declaredWords = (text) => declaredLine({ state: 'declared', ...readHarmonyText(text), text }).text;
+  const keyAtCycle = (cycle) => threeKeys[Math.floor((((cycle % 12) + 12) % 12) / 4)][0];
+  const jamRead = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const el = (id) => document.getElementById(id);
+        return {
+          cycle: el('repl').editor.repl.scheduler.now(),
+          state: el('jam-view').dataset.state,
+          declaredHidden: el('jam-declared').hidden,
+          value: el('jam-declared-value').textContent,
+          section: el('jam-declared-section').textContent,
+          sectionHidden: el('jam-declared-section').hidden,
+          sectionChildren: el('jam-declared-section').children.length,
+        };
+      })()`,
+    );
+  const threeKeyPiece = threeKeyCode();
+  await callTool(client, 'set_code', { code: threeKeyPiece, label: 'probe grid three keys' });
+  await waitActive(threeKeyPiece);
+  await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  await pressKey(cdp, '5');
+  await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'jam' ? true : null`, 3000);
+  await waitFor(cdp, `document.getElementById('jam-view').dataset.state === 'ready' && !document.getElementById('jam-declared-section').hidden ? true : null`, 15000);
+  const jamSamples = [];
+  const jamSampleEnd = Date.now() + 8000;
+  while (Date.now() < jamSampleEnd) {
+    jamSamples.push(await jamRead());
+    await sleep(60);
+  }
+  const jamNames = jamSamples.map((sample) => /^section '(\w)'$/.exec(sample.section)?.[1] ?? null);
+  const jamFirstSeen = ['x', 'y', 'z'].map((name) => jamNames.indexOf(name));
+  const jamValueWrong = jamSamples.filter((sample, i) => jamNames[i] === null || sample.value !== declaredWords(threeKeys.find(([name]) => name === jamNames[i])[1])).length;
+  // The name may lag the music by the poll (a quarter of a second, half a cycle here) and the sampling.
+  const jamLate = jamSamples.filter((sample, i) => jamNames[i] !== keyAtCycle(sample.cycle) && jamNames[i] !== keyAtCycle(sample.cycle - 0.8)).length;
+  await callTool(client, 'stop', {});
+  await sleep(1200);
+  const jamStopped = await jamRead();
+  const jamBodyShown = jamSamples.every((sample) => sample.state === 'ready' && sample.declaredHidden === false && sample.sectionHidden === false && sample.sectionChildren === 0);
+  report(
+    "grid: Jam's Declared line follows the section that plays and names it, and follows the first section while stopped",
+    jamSamples.length > 20 &&
+      jamBodyShown &&
+      jamFirstSeen.every((at) => at >= 0) &&
+      jamFirstSeen[0] < jamFirstSeen[1] &&
+      jamFirstSeen[1] < jamFirstSeen[2] &&
+      jamValueWrong === 0 &&
+      jamLate === 0 &&
+      new Set(jamSamples.map((sample) => sample.value)).size === 3 &&
+      jamStopped.state === 'ready' &&
+      jamStopped.section === "section 'x'" &&
+      jamStopped.value === declaredWords('C3:major'),
+    JSON.stringify({ samples: jamSamples.length, firstSeen: jamFirstSeen, valueWrong: jamValueWrong, late: jamLate, values: [...new Set(jamSamples.map((sample) => `${sample.section} ${sample.value}`))], stopped: jamStopped }),
+  );
+
+  // A piece without a structure keeps the line it always had, and the section name stays hidden.
+  const plainJam = "const harmony = 'D3:dorian'\nlead: n(\"0 2 4\").scale(harmony).gain(0)";
+  await callTool(client, 'set_code', { code: plainJam, label: 'probe grid jam without a structure' });
+  await waitActive(plainJam);
+  const plainRead = await waitFor(
+    cdp,
+    `(() => { const el = (id) => document.getElementById(id); return el('jam-view').dataset.state === 'ready' && !el('jam-declared').hidden ? { value: el('jam-declared-value').textContent, section: el('jam-declared-section').textContent, sectionHidden: el('jam-declared-section').hidden, label: el('jam-declared-label').textContent } : null; })()`,
+    15000,
+  );
+  report(
+    'grid: a piece without a structure keeps the Jam Declared line and hides the section name',
+    plainRead !== null && plainRead.value === declaredWords('D3:dorian') && plainRead.section === '' && plainRead.sectionHidden === true && plainRead.label === 'Declared:',
+    JSON.stringify(plainRead),
+  );
+  await pressKey(cdp, '5');
+  await sleep(300);
+
+  // ---- harmony: the fit words under fixed variations ----
+  // One section in C major with three fixed variations on three tracks: one inside the scale, one with two notes outside it and
+  // one with drum sounds only. The expected words come from the page's own fitOf and fitText, given the pitch classes written
+  // in the code.
+  const fitBits = (...pcs) => pcs.reduce((mask, pc) => mask | (1 << pc), 0);
+  const fitHarmonyC = sectionHarmony({ harmony: { from: 'own', text: 'C3:major' } });
+  const fitCases = [
+    { track: 't1', key: 'fa', notes: 'c4 e4 g4', pcs: [0, 4, 7] },
+    { track: 't2', key: 'fb', notes: 'c4 f#4 bb4', pcs: [0, 6, 10] },
+    { track: 't3', key: 'fc', notes: null, pcs: [] },
+  ];
+  const fitWords = (item) => {
+    const fit = fitOf({ masks: [fitBits(...item.pcs), 0], length: 2, harmony: fitHarmonyC });
+    return { fit, ...fitText(fit, { track: item.track, section: 'x', variation: item.key, fixedHarmony: 'C3:major', sectionHarmonyText: 'C3:major' }) };
+  };
+  const fitPieceCode = [
+    "const song = { shift: 0, sections: [['x', 2, 'C3:major']], plan: { x: { t1: 'fa', t2: 'fb', t3: 'fc' } } };",
+    HELPER_TEXT,
+    ...fitCases.map((item) => `const ${item.track} = { ${item.key}: ['C3:major', ${item.notes === null ? 's("bd hh")' : `note("${item.notes}")`}] };`),
+    ...fitCases.map((item) => `${item.track}: play('${item.track}', ${item.track}).gain(0)`),
+  ].join('\n');
+  const fitCellsRead = `(() => {
+    const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map((name) => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(' + name + ')';
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    });
+    const muted = (() => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--text-muted)';
+      document.body.appendChild(probe);
+      const color = getComputedStyle(probe).color;
+      probe.remove();
+      return color;
+    })();
+    return [...document.querySelectorAll('#parts-rows .song-cell')].map((cell) => {
+      const line = cell.querySelector('.song-fit');
+      const style = line === null ? null : getComputedStyle(line);
+      return {
+        track: cell.dataset.track,
+        section: cell.dataset.section,
+        fit: cell.getAttribute('data-fit'),
+        outside: cell.getAttribute('data-outside'),
+        title: cell.title,
+        line: line === null ? null : line.textContent,
+        lineCount: cell.querySelectorAll('.song-fit').length,
+        reservedColor: style === null ? false : reserved.includes(style.color),
+        mutedColor: style === null ? null : style.color === muted,
+        height: line === null ? null : line.getBoundingClientRect().height,
+        lineHeight: style === null ? null : parseFloat(style.lineHeight),
+      };
+    });
+  })()`;
+  await showPiece(fitPieceCode, 'probe grid fit words');
+  const fitRead = await waitFor(cdp, `(() => { const cells = ${fitCellsRead}; return cells.length === 3 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  const fitExpected = fitCases.map(fitWords);
+  report(
+    'grid: a fixed variation says fits, does not fit with its outside notes, or cannot check, in words',
+    fitRead !== null &&
+      fitRead.every((cell, i) => cell.track === fitCases[i].track && cell.fit === fitExpected[i].fit.state && cell.line === fitExpected[i].line && cell.title === fitExpected[i].title && cell.lineCount === 1) &&
+      fitRead[0].line === 'fits' &&
+      fitRead[1].line === 'does not fit (F#, Bb)' &&
+      fitRead[1].outside === 'F#, Bb' &&
+      fitRead[0].outside === null &&
+      fitRead[2].line === 'cannot check' &&
+      fitRead[2].title.endsWith('The page found no pitched notes to compare.') &&
+      fitRead[1].title.endsWith('These notes are outside C3:major: F#, Bb. Nothing is changed.') &&
+      fitRead.every((cell) => cell.reservedColor === false && cell.mutedColor === true && cell.height <= 2 * cell.lineHeight + 1),
+    JSON.stringify({ read: fitRead, expected: fitExpected.map((item) => [item.line, item.title]) }),
+  );
+
+  // ---- harmony: why a fit cannot be checked, nothing while the answer is pending, the cell list, three keys ----
+  /** The words the page's own fitOf and fitText give for one fixed variation in one section. */
+  const fitFor = ({ track, key, section, length, harmony, harmonyText, pcs }) => {
+    const fit = fitOf({ masks: Array.from({ length }, (_, i) => (i === 0 ? fitBits(...pcs) : 0)), length, harmony: sectionHarmony({ harmony }) });
+    return { fit, ...fitText(fit, { track, section, variation: key, fixedHarmony: 'C3:major', sectionHarmonyText: harmonyText }) };
+  };
+  const fitCellsOf = (track) => `(() => { const cells = ${fitCellsRead}; return cells.filter((cell) => cell.track === ${JSON.stringify(track)}); })()`;
+  /** What a cell shows of its fit, as the grid draws it. */
+  const fitShown = (cell) => ({ fit: cell.fit, line: cell.line, title: cell.title, outside: cell.outside });
+  const fitMatches = (cell, expected) => cell.fit === expected.fit.state && cell.line === expected.line && cell.title === expected.title && (cell.outside ?? null) === (expected.fit.outside === undefined ? null : expected.fit.outside.join(', '));
+
+  // A piece with chord text as one section's harmony, a fixed variation with drum sounds only, and nothing drawn while the
+  // query has not answered: a record of every change of the grid says that no fit word showed before the first answer.
+  const reasonPiece = [
+    "const song = { shift: 0, sections: [['x', 2, 'Am7 D7'], ['y', 2, 'C3:major']], plan: { x: { k1: 'fa', k2: 'fd' }, y: { k1: 'fa', k2: 'fd' } } };",
+    HELPER_TEXT,
+    `const k1 = { fa: ['C3:major', note("c4 e4")] };`,
+    `const k2 = { fd: ['C3:major', s("bd hh")] };`,
+    `k1: play('k1', k1).gain(0)`,
+    `k2: play('k2', k2).gain(0)`,
+  ].join('\n');
+  await evaluateExpr(
+    cdp,
+    `(() => {
+      window.__fitLog = [];
+      if (window.__fitObserver) window.__fitObserver.disconnect();
+      window.__fitObserver = new MutationObserver(() => {
+        const root = document.getElementById('parts-rows');
+        window.__fitLog.push({
+          k1: root.querySelectorAll('.song-cell[data-track="k1"]').length,
+          withFit: root.querySelectorAll('[data-fit]').length,
+          lines: root.querySelectorAll('.song-fit').length,
+          text: [...root.querySelectorAll('.song-fit')].map((node) => node.textContent).join('|'),
+        });
+      });
+      window.__fitObserver.observe(document.getElementById('parts-rows'), { childList: true, subtree: true, attributes: true, characterData: true });
+    })()`,
+  );
+  await showPiece(reasonPiece, 'probe grid fit reasons');
+  const reasonRead = await waitFor(cdp, `(() => { const cells = ${fitCellsRead}; return cells.length === 4 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  const fitLog = await evaluateExpr(cdp, `(() => { window.__fitObserver.disconnect(); return window.__fitLog; })()`);
+  const ownCells = fitLog.filter((entry) => entry.k1 === 2);
+  const firstAnswered = ownCells.findIndex((entry) => entry.withFit > 0);
+  const pendingCells = firstAnswered === -1 ? ownCells : ownCells.slice(0, firstAnswered);
+  const harmonyChords = { from: 'own', text: 'Am7 D7' };
+  const harmonyScale = { from: 'own', text: 'C3:major' };
+  const reasonExpected = [
+    fitFor({ track: 'k1', key: 'fa', section: 'x', length: 2, harmony: harmonyChords, harmonyText: 'Am7 D7', pcs: [0, 4] }),
+    fitFor({ track: 'k1', key: 'fa', section: 'y', length: 2, harmony: harmonyScale, harmonyText: 'C3:major', pcs: [0, 4] }),
+    fitFor({ track: 'k2', key: 'fd', section: 'x', length: 2, harmony: harmonyChords, harmonyText: 'Am7 D7', pcs: [] }),
+    fitFor({ track: 'k2', key: 'fd', section: 'y', length: 2, harmony: harmonyScale, harmonyText: 'C3:major', pcs: [] }),
+  ];
+  const reasonOrdered = reasonRead === null ? [] : ['k1', 'k2'].flatMap((track) => reasonRead.filter((cell) => cell.track === track).sort((a, b) => Number(a.section) - Number(b.section)));
+
+  // A piece with no harmony anywhere, and one whose harmony constant the page cannot read.
+  const noHarmonyPiece = [
+    "const song = { shift: 0, sections: [['x', 2], ['y', 2]], plan: { x: { k3: 'fa' }, y: { k3: 'fa' } } };",
+    HELPER_TEXT,
+    `const k3 = { fa: ['C3:major', note("c4 e4")] };`,
+    `k3: play('k3', k3).gain(0)`,
+  ].join('\n');
+  await showPiece(noHarmonyPiece, 'probe grid fit without harmony');
+  const noHarmonyRead = await waitFor(cdp, `(() => { const cells = ${fitCellsOf('k3')}; return cells.length === 2 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  const unreadablePiece = [
+    "const harmony = 'banana';",
+    "const song = { shift: 0, sections: [['x', 2]], plan: { x: { k4: 'fa' } } };",
+    HELPER_TEXT,
+    `const k4 = { fa: ['C3:major', note("c4 e4")] };`,
+    `k4: play('k4', k4).gain(0)`,
+  ].join('\n');
+  await showPiece(unreadablePiece, 'probe grid fit unreadable harmony');
+  const unreadableRead = await waitFor(cdp, `(() => { const cells = ${fitCellsOf('k4')}; return cells.length === 1 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  const noHarmonyExpected = ['x', 'y'].map((section) => fitFor({ track: 'k3', key: 'fa', section, length: 2, harmony: { from: 'none', text: null }, harmonyText: '', pcs: [0, 4] }));
+  const unreadableExpected = fitFor({ track: 'k4', key: 'fa', section: 'x', length: 2, harmony: { from: 'piece-unreadable', text: null }, harmonyText: '', pcs: [0, 4] });
+  report(
+    'grid: cannot check gives its reason for chord harmony, no harmony and no pitched notes, and no fit word shows while the answer is pending',
+    reasonRead !== null &&
+      reasonOrdered.length === 4 &&
+      reasonOrdered[0].track === 'k1' &&
+      [reasonOrdered[0], reasonOrdered[2], reasonOrdered[3]].every((cell) => cell.fit === 'cannot-check' && cell.line === 'cannot check') &&
+      reasonOrdered[1].fit === 'fits' &&
+      reasonOrdered.every((cell, i) => fitMatches(cell, [reasonExpected[0], reasonExpected[1], reasonExpected[2], reasonExpected[3]][i])) &&
+      reasonOrdered[0].title.endsWith('The harmony is not one of the nine scales the page knows.') &&
+      reasonOrdered[3].title.endsWith('The page found no pitched notes to compare.') &&
+      pendingCells.length > 0 &&
+      pendingCells.every((entry) => entry.lines === 0 && entry.withFit === 0 && entry.text === '') &&
+      firstAnswered > 0 &&
+      noHarmonyRead !== null &&
+      noHarmonyRead.every((cell, i) => fitMatches(cell, noHarmonyExpected[i]) && cell.fit === 'cannot-check' && cell.title.endsWith('This section declares no harmony.')) &&
+      unreadableRead !== null &&
+      fitMatches(unreadableRead[0], unreadableExpected) &&
+      unreadableRead[0].title.endsWith('The harmony of this section is not readable.'),
+    JSON.stringify({ reasons: reasonOrdered.map(fitShown), pending: pendingCells.length, firstAnswered, log: fitLog.length, noHarmony: noHarmonyRead && noHarmonyRead.map(fitShown), unreadable: unreadableRead && unreadableRead.map(fitShown) }),
+  );
+
+  // The list that opens on a cell notes each fixed variation with its fit for the section being edited.
+  const listPiece = [
+    "const song = { shift: 0, sections: [['x', 2, 'C3:major'], ['y', 2, 'Eb3:major']], plan: { x: { m1: 'fa' }, y: { m1: 'fa' } } };",
+    HELPER_TEXT,
+    `const m1 = { fa: ['C3:major', note("c4 e4 g4")], fb: ['C3:major', note("c4 e4 a4")], dg: (h) => n("0 2").scale(h), pl: note("d4") };`,
+    `m1: play('m1', m1).gain(0)`,
+  ].join('\n');
+  await showPiece(listPiece, 'probe grid fit in the cell list');
+  await waitFor(cdp, `(() => { const cells = ${fitCellsOf('m1')}; return cells.length === 2 && cells.every((cell) => cell.fit !== null) ? true : null; })()`, 20000);
+  const listNotes = () =>
+    evaluateExpr(
+      cdp,
+      `[...document.querySelectorAll('#song-cell-list [role="option"]')].map((option) => ({ name: option.querySelector('.song-option-name').textContent, notes: [...option.querySelectorAll('.song-option-note')].map((node) => node.textContent) }))`,
+    );
+  const harmonyEb = { from: 'own', text: 'Eb3:major' };
+  const listWords = (name, harmony, harmonyText, key, pcs) => fitFor({ track: 'm1', key, section: name, length: 2, harmony, harmonyText, pcs }).line;
+  await openCell('m1', 1);
+  const listEb = await listNotes();
+  await pressKey(cdp, 'Escape');
+  await openCell('m1', 0);
+  const listC = await listNotes();
+  await pressKey(cdp, 'Escape');
+  const listEbExpected = [
+    ['fa', 'current', listWords('y', harmonyEb, 'Eb3:major', 'fa', [0, 4, 7])],
+    ['fb', listWords('y', harmonyEb, 'Eb3:major', 'fb', [0, 4, 9])],
+    ['dg', 'follows the harmony'],
+    ['pl'],
+    ['rest'],
+  ];
+  const listCExpected = [
+    ['fa', 'current', listWords('x', harmonyScale, 'C3:major', 'fa', [0, 4, 7])],
+    ['fb', listWords('x', harmonyScale, 'C3:major', 'fb', [0, 4, 9])],
+    ['dg', 'follows the harmony'],
+    ['pl'],
+    ['rest'],
+  ];
+  const listShape = (read) => read.map((option) => [option.name, ...option.notes]);
+  report(
+    "grid: the cell list shows each fixed variation's fit for the section being edited",
+    JSON.stringify(listShape(listEb)) === JSON.stringify(listEbExpected) &&
+      JSON.stringify(listShape(listC)) === JSON.stringify(listCExpected) &&
+      listEb[0].notes[1] !== listC[0].notes[1],
+    JSON.stringify({ eb: listShape(listEb), c: listShape(listC), expectedEb: listEbExpected, expectedC: listCExpected }),
+  );
+
+  // The piece in three keys: the same fixed variation gets its own words in each section.
+  await showPiece(threeKeyPiece, 'probe grid fit in three keys');
+  const keysRead = await waitFor(cdp, `(() => { const cells = ${fitCellsOf('t2')}; return cells.length === 3 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  const keysExpected = threeKeys.map(([name, text]) => fitFor({ track: 't2', key: 'f', section: name, length: 4, harmony: { from: 'own', text }, harmonyText: text, pcs: [0, 4, 9, 6] }));
+  report(
+    "grid: on the three-key piece each section's fixed variation gets its own fit words",
+    keysRead !== null &&
+      keysRead.length === 3 &&
+      keysRead.every((cell, i) => fitMatches(cell, keysExpected[i])) &&
+      new Set(keysRead.map((cell) => cell.line)).size >= 2 &&
+      new Set(keysExpected.map((item) => item.line)).size >= 2,
+    JSON.stringify({ read: keysRead && keysRead.map(fitShown), expected: keysExpected.map((item) => item.line) }),
+  );
+
+  // ---- Ask Claude from the grid ----
+  // A right-click, or the Menu key and Shift+F10 on a focused control, opens the Ask box with the context of what was pointed
+  // at. The expected chips come from the page's own describeContext, given the facts the cells show.
+  const REQUEST_PREFIX = 'Request from the Moontide page: ';
+  const askBoxRead = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const box = document.getElementById('ask-box');
+        const field = document.getElementById('ask-field');
+        const r = box.getBoundingClientRect();
+        return {
+          open: !box.hidden,
+          boxes: document.querySelectorAll('#ask-box').length,
+          chip: document.getElementById('ask-context-chip').textContent,
+          value: field.value,
+          start: field.selectionStart,
+          end: field.selectionEnd,
+          focusInField: document.activeElement === field,
+          left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+        };
+      })()`,
+    );
+  /** Empties the field and closes the box, so the next right-click starts from nothing. */
+  const askReset = async () => {
+    await evaluateExpr(cdp, `(() => { const f = document.getElementById('ask-field'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+    if ((await askBoxRead()).open) await pressKey(cdp, 'Escape');
+  };
+  const askFieldSet = (text) => evaluateExpr(cdp, `(() => { const f = document.getElementById('ask-field'); f.value = ${JSON.stringify(text)}; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  const stopAskListeners = async () => {
+    for (const child of spawnedListeners) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill();
+        await exited;
+      }
+    }
+    await sleep(300);
+  };
+  const cellAt = (track, section) => `#parts-rows .song-cell[data-track="${track}"][data-section="${section}"]`;
+  const groupRowAt = (path) => `#parts-rows tr.song-group-row[data-key='g:${JSON.stringify(path)}']`;
+  const askPlayed = async () => ({ code: await editorCode(), history: await historyTop() });
+
+  await showPiece(helperCode, 'probe grid ask');
+  // The fit of t3's fixed variation, once the page has answered: the chip carries what the cell shows.
+  const askFitCell = await waitFor(cdp, `(() => { const cell = document.querySelector(${JSON.stringify(cellAt('t3', 0))}); return cell !== null && cell.getAttribute('data-fit') !== null ? { fit: cell.getAttribute('data-fit'), outside: cell.getAttribute('data-outside') } : null; })()`, 20000);
+  if (askFitCell === null) throw new ProbeCouldNotRun('the page did not answer the fit of the fixed variation within 20 seconds');
+  const askBefore = await askPlayed();
+  const askTargets = [
+    ['a plain cell', cellAt('t1', 1), { kind: 'cell', section: 'y', track: 't1', variation: 'vb' }],
+    ['a rest cell', cellAt('t3', 1), { kind: 'cell', section: 'y', track: 't3', rest: true }],
+    ['a fixed cell with its fit', cellAt('t3', 0), { kind: 'cell', section: 'x', track: 't3', variation: 'va', fit: askFitCell.fit, ...(askFitCell.outside === null ? {} : { outside: askFitCell.outside }) }],
+    ['the text inside a cell', `${cellAt('t1', 0)} .song-variation`, { kind: 'cell', section: 'x', track: 't1', variation: 'va' }],
+    ['a section header', '#parts-rows .song-head[data-index="1"]', { kind: 'part', name: 'y' }],
+    ['a nested group row', `${groupRowAt(['g2', 'g3'])} .song-fold`, { kind: 'group', name: 'g3', parent: 'g2' }],
+    ['a top group row', groupRowAt(['g1']), { kind: 'group', name: 'g1' }],
+    ['a track name', 'tr.song-track-row[data-key="t:t2"] .song-rowhead', { kind: 'track', track: 't2' }],
+    ['the corner', '#parts-rows .song-corner', { kind: 'session' }],
+    ['the toolbar', '#song-bar', { kind: 'session' }],
+  ];
+  const askSeen = [];
+  for (const [name, selector, descriptor] of askTargets) {
+    const answer = await askAt(cdp, selector);
+    askSeen.push({ name, ...answer, expected: describeContext(descriptor).chip });
+  }
+  await askReset();
+  const askAfter = await askPlayed();
+  report(
+    'grid: a right-click on a cell, a section header, a group row and a track name opens the Ask box with that context',
+    askSeen.every((item) => item.prevented === true && item.open === true && item.chip === item.expected) &&
+      askSeen[0].chip === 'Cell "y" · t1 · vb' &&
+      askSeen[1].chip === 'Cell "y" · t3 · rest' &&
+      askSeen[4].chip === 'Part "y"' &&
+      askSeen[5].chip === 'Group "g3" · in "g2"' &&
+      askSeen[7].chip === 'Track t2' &&
+      askSeen[8].chip === ASK_COPY.wholeSession &&
+      askSeen[9].chip === ASK_COPY.wholeSession &&
+      askAfter.code === askBefore.code &&
+      askAfter.history.id === askBefore.history.id,
+    JSON.stringify({ askFitCell, askSeen: askSeen.map((item) => [item.name, item.chip, item.expected]), codeUnchanged: askAfter.code === askBefore.code, history: [askBefore.history.id, askAfter.history.id] }),
+  );
+
+  // An open cell list closes when the Ask box opens for another right-click.
+  await clickElement(cdp, cellAt('t1', 0));
+  const listWasOpen = await waitFor(cdp, `document.getElementById('song-cell-list').hidden ? null : true`, 3000);
+  const listAsk = await askAt(cdp, cellAt('t1', 2));
+  const listClosed = await evaluateExpr(cdp, `document.getElementById('song-cell-list').hidden`);
+  await askReset();
+  report(
+    'grid: a right-click closes an open cell list before the Ask box opens',
+    listWasOpen === true && listAsk.open === true && listAsk.chip === 'Cell "z" · t1 · va' && listClosed === true,
+    JSON.stringify({ listWasOpen, listAsk, listClosed }),
+  );
+
+  // A request sent from a cell reaches Claude through the request line, with the cell's section, track and variation.
+  await stopAskListeners();
+  const askListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (askListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  const sentAt = await askAt(cdp, cellAt('t1', 1));
+  await cdp('Input.insertText', { text: 'make this variation shorter' });
+  await pressKey(cdp, 'Enter');
+  const askDeadline = Date.now() + 5000;
+  while (askListener.lines.length === 0 && Date.now() < askDeadline) await sleep(100);
+  const printedAsk = askListener.lines[0];
+  let askParsed = null;
+  if (printedAsk !== undefined && printedAsk.startsWith(REQUEST_PREFIX)) {
+    try {
+      askParsed = JSON.parse(printedAsk.slice(REQUEST_PREFIX.length));
+    } catch {
+      askParsed = null;
+    }
+  }
+  const askReceived = await waitFor(cdp, `(() => { const el = document.getElementById('ask-status'); return !el.hidden && el.querySelector('.ask-long').textContent === ${JSON.stringify(ASK_COPY.received)} ? true : null; })()`, 4000);
+  await stopAskListeners();
+  report(
+    'grid: a request sent from a cell reaches Claude with the cell context',
+    sentAt.open === true &&
+      askParsed !== null &&
+      askListener.lines.length === 1 &&
+      JSON.stringify(askParsed.context) === JSON.stringify({ kind: 'cell', section: 'y', track: 't1', variation: 'vb' }) &&
+      askParsed.chip === 'Cell "y" · t1 · vb' &&
+      askParsed.text === 'make this variation shorter' &&
+      askReceived === true,
+    JSON.stringify({ lines: askListener.lines.length, context: askParsed && askParsed.context, chip: askParsed && askParsed.chip, text: askParsed && askParsed.text, askReceived }),
+  );
+
+  // The ready-made request: only a cell that does not fit offers it, it sits in the field with the caret at the end, it is
+  // never sent, and a draft the person already wrote is kept with the request after it.
+  await showPiece(fitPieceCode, 'probe grid ask fit request');
+  const askFitCells = await waitFor(cdp, `(() => { const cells = ${fitCellsRead}; return cells.length === 3 && cells.every((cell) => cell.fit !== null) ? cells : null; })()`, 20000);
+  if (askFitCells === null) throw new ProbeCouldNotRun('the page did not answer the fit of the three fixed variations within 20 seconds');
+  const fitRequestText = "Fit variation 'fb' of track 't2' to the harmony of section 'x' (C3:major). It has notes outside it: F#, Bb.";
+  await stopAskListeners();
+  const fitListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (fitListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  // The status of the request sent a moment ago ("Claude received it") hides by itself; this check looks at the status after
+  // its own right-click, so it starts from a hidden one.
+  if ((await waitFor(cdp, `document.getElementById('ask-status').hidden ? true : null`, 8000)) !== true) {
+    throw new ProbeCouldNotRun('the status of the earlier request did not hide within 8 seconds');
+  }
+  const requestBefore = await askPlayed();
+  const notFitAsk = await askAt(cdp, cellAt('t2', 0));
+  const notFitBox = await askBoxRead();
+  // The same cell asked about again while the request is in the field: it is not added a second time.
+  await askAt(cdp, cellAt('t2', 0));
+  const repeatBox = await askBoxRead();
+  await sleep(1500);
+  const sentStatus = await evaluateExpr(cdp, `document.getElementById('ask-status').hidden`);
+  const sentLines = fitListener.lines.length;
+  // A draft: the box closes, the draft stays in the field, the next right-click adds the request after it.
+  await askFieldSet('my draft');
+  await pressKey(cdp, 'Escape');
+  await askAt(cdp, cellAt('t2', 0));
+  const draftBox = await askBoxRead();
+  // A cell that fits and a cell that cannot be checked add nothing: an empty field stays empty, a draft stays as it is.
+  await askReset();
+  await askAt(cdp, cellAt('t1', 0));
+  const fitsBox = await askBoxRead();
+  await askAt(cdp, cellAt('t3', 0));
+  const cannotBox = await askBoxRead();
+  await askFieldSet('keep me');
+  await pressKey(cdp, 'Escape');
+  await askAt(cdp, cellAt('t1', 0));
+  const keptBox = await askBoxRead();
+  await askReset();
+  const requestAfter = await askPlayed();
+  await stopAskListeners();
+  report(
+    'grid: a does-not-fit cell opens the Ask box with the fit request ready and not sent, and keeps an existing draft',
+    notFitAsk.open === true &&
+      notFitAsk.chip === 'Cell "x" · t2 · fb · does not fit (F#, Bb)' &&
+      notFitBox.value === fitRequestText &&
+      notFitBox.start === fitRequestText.length &&
+      notFitBox.end === fitRequestText.length &&
+      notFitBox.focusInField === true &&
+      repeatBox.value === fitRequestText &&
+      sentStatus === true &&
+      sentLines === 0 &&
+      draftBox.value === `my draft\n\n${fitRequestText}` &&
+      draftBox.start === draftBox.value.length &&
+      fitsBox.chip === 'Cell "x" · t1 · fa · fits' &&
+      fitsBox.value === '' &&
+      cannotBox.chip === 'Cell "x" · t3 · fc · cannot check' &&
+      cannotBox.value === '' &&
+      keptBox.value === 'keep me' &&
+      requestAfter.code === requestBefore.code &&
+      requestAfter.history.id === requestBefore.history.id,
+    JSON.stringify({ chip: notFitAsk.chip, value: notFitBox.value, caret: [notFitBox.start, notFitBox.end], sentStatus, sentLines, draft: draftBox.value, fits: [fitsBox.chip, fitsBox.value], cannot: [cannotBox.chip, cannotBox.value], kept: keptBox.value, history: [requestBefore.history.id, requestAfter.history.id] }),
+  );
+
+  // The keyboard's right-click: the Menu key and Shift+F10 on a focused control of the grid open the same box at the middle of
+  // the control; F10 alone and Shift with the Menu key do nothing; Shift with the mouse keeps the browser's own menu.
+  await showPiece(helperCode, 'probe grid ask keys');
+  const keyAsk = async (selector, key, shiftKey) => {
+    const answer = await evaluateExpr(
+      cdp,
+      `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (el === null) throw new Error('keyAsk: no element matches ' + ${JSON.stringify(selector)});
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        el.focus();
+        const focused = document.activeElement === el;
+        const r = el.getBoundingClientRect();
+        const event = new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, shiftKey: ${shiftKey ? 'true' : 'false'}, bubbles: true, cancelable: true });
+        const notPrevented = el.dispatchEvent(event);
+        return { focused, prevented: !notPrevented, centre: { x: r.x + r.width / 2, y: r.y + r.height / 2 } };
+      })()`,
+    );
+    const box = await askBoxRead();
+    const gapX = Math.max(box.left - answer.centre.x, 0, answer.centre.x - box.right);
+    const gapY = Math.max(box.top - answer.centre.y, 0, answer.centre.y - box.bottom);
+    return { ...answer, open: box.open, boxes: box.boxes, chip: box.chip, near: Math.hypot(gapX, gapY) < 60 };
+  };
+  await askReset();
+  const keysBefore = await askPlayed();
+  const keyCases = [
+    ['a cell by Shift+F10', cellAt('t1', 1), 'F10', true, 'Cell "y" · t1 · vb'],
+    ['a cell by the Menu key', cellAt('t1', 1), 'ContextMenu', false, 'Cell "y" · t1 · vb'],
+    ['a rest cell by the Menu key', cellAt('t3', 1), 'ContextMenu', false, 'Cell "y" · t3 · rest'],
+    ['a header by Shift+F10', '#parts-rows .song-head[data-index="2"]', 'F10', true, 'Part "z"'],
+    ['a fold button by the Menu key', `${groupRowAt(['g2', 'g3'])} .song-fold`, 'ContextMenu', false, 'Group "g3" · in "g2"'],
+    ['a top fold button by Shift+F10', `${groupRowAt(['g1'])} .song-fold`, 'F10', true, 'Group "g1"'],
+  ];
+  const keySeen = [];
+  for (const [name, selector, key, shiftKey, expected] of keyCases) {
+    const answer = await keyAsk(selector, key, shiftKey);
+    keySeen.push({ name, ...answer, expected });
+    await askReset();
+  }
+  const f10Alone = await keyAsk(cellAt('t1', 1), 'F10', false);
+  const shiftedMenu = await keyAsk(cellAt('t1', 1), 'ContextMenu', true);
+  const shiftedMouse = await askAt(cdp, cellAt('t1', 1), { shiftKey: true });
+  const keysAfter = await askPlayed();
+  report(
+    'grid: Shift+F10 and the Menu key open the Ask box for the focused control',
+    keySeen.every((item) => item.focused === true && item.prevented === true && item.open === true && item.boxes === 1 && item.near === true && item.chip === item.expected) &&
+      f10Alone.prevented === false &&
+      f10Alone.open === false &&
+      shiftedMenu.prevented === false &&
+      shiftedMenu.open === false &&
+      shiftedMouse.prevented === false &&
+      shiftedMouse.open === false &&
+      keysAfter.code === keysBefore.code &&
+      keysAfter.history.id === keysBefore.history.id,
+    JSON.stringify({ keySeen: keySeen.map((item) => [item.name, item.chip, item.expected, item.prevented, item.near]), f10Alone, shiftedMenu, shiftedMouse, history: [keysBefore.history.id, keysAfter.history.id] }),
+  );
+
+  // ---- pictures of the grid for the person's own eye ----
+  // Off unless MOONTIDE_PROBE_SHOTS names a folder outside the repository. A realistic piece (nested groups, five sections, a
+  // folded group, a section that plays and one launch that waits) and a piece whose fixed variations show the three fit words,
+  // each at 1920 by 1080 and 3840 by 2160 in the layouts where the view is beside the editor and where it fills the window. The
+  // names are built from the constants below only, never from text of the page.
+  const gridShotsFolder = shotsFolder();
+  if (gridShotsFolder !== null) {
+    const shotLines = songShotLines;
+    const shotPlaying = songShotPlayingCode(0.1);
+    const shotFit = [
+      'setcps(0.1)',
+      "const harmony = 'C3:major'",
+      "const song = { shift: 0, sections: [['x', 4, 'C3:major'], ['y', 4, 'Eb3:major'], ['z', 4, 'G3:major']], plan: { " +
+        shotLines({
+          x: { inside: 'run', outside: 'run', drums: 'hits', follow: 'degrees' },
+          y: { inside: 'run', outside: 'run', drums: 'hits', follow: 'degrees' },
+          z: { inside: 'run', outside: 'run', drums: 'hits', follow: 'degrees' },
+        }) +
+        ' } };',
+      HELPER_TEXT,
+      "const inside = { run: ['C3:major', note(\"c4 e4 g4 e4\")] };",
+      "const outside = { run: ['C3:major', note(\"c4 f#4 bb4 c5\")] };",
+      'const drums = { hits: [\'C3:major\', s("bd hh sd hh")] };',
+      'const follow = { degrees: (h) => n("0 2 4 2").scale(h) };',
+      ...['inside', 'outside', 'drums', 'follow'].map((name) => `${name}: play('${name}', ${name}).gain(0)`),
+    ].join('\n');
+    const SHOT_SIZES_GRID = [[1920, 1080], [3840, 2160]];
+    const SHOT_LAYOUTS_GRID = ['a', 'c'];
+    const gridWritten = [];
+    const gridPicture = async (state, width, height, layout) => {
+      const file = `grid-${state}-${width}x${height}-layout-${layout}.png`;
+      const shot = await cdp('Page.captureScreenshot', { format: 'png' });
+      fs.writeFileSync(path.join(gridShotsFolder, file), Buffer.from(shot.data, 'base64'));
+      gridWritten.push(file);
+    };
+    const gridMatrix = async (state) => {
+      for (const layout of SHOT_LAYOUTS_GRID) {
+        await setLayout(layout);
+        for (const [width, height] of SHOT_SIZES_GRID) {
+          await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+          await sleep(600);
+          await gridPicture(state, width, height, layout);
+        }
+        await cdp('Emulation.clearDeviceMetricsOverride');
+        await sleep(300);
+      }
+    };
+    try {
+      // A section plays, a group is folded and one launch waits for the next phrase.
+      await showPiece(shotPlaying, 'probe grid pictures playing');
+      await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-head').length === 5 ? true : null`, 8000);
+      const shotPlayingAt = await waitPlayingHeader('the pictures of the grid');
+      await chooseLaunch('phrase');
+      const shotTarget = (shotPlayingAt + 1) % 5;
+      await clickElement(cdp, foldButton('rhythm'));
+      await clickHead(shotTarget);
+      if ((await waitQueued(shotTarget)) === null) throw new ProbeCouldNotRun('the launch for the picture did not queue');
+      await gridMatrix('playing');
+      await clickHead(shotTarget);
+      await clickElement(cdp, foldButton('rhythm'));
+      await chooseLaunch('section');
+      // The three fit words and a degree variation, in three keys.
+      await showPiece(shotFit, 'probe grid pictures fit');
+      const shotFitRead = await waitFor(cdp, `(() => { const cells = ${fitCellsRead}; return cells.filter((cell) => cell.fit !== null).length === 9 ? cells : null; })()`, 20000);
+      if (shotFitRead === null) throw new ProbeCouldNotRun('the fit words for the pictures did not appear within 20 seconds');
+      await gridMatrix('fit');
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    const gridExpected = ['playing', 'fit'].flatMap((state) => SHOT_LAYOUTS_GRID.flatMap((layout) => SHOT_SIZES_GRID.map(([width, height]) => `grid-${state}-${width}x${height}-layout-${layout}.png`))).sort();
+    const gridProblems = [];
+    for (const name of gridExpected) {
+      const file = path.join(gridShotsFolder, name);
+      if (!fs.existsSync(file)) gridProblems.push(`${name} is missing`);
+      else if (fs.readFileSync(file).subarray(0, 4).toString('hex') !== '89504e47') gridProblems.push(`${name} is not a PNG`);
+    }
+    report(
+      'grid: pictures of the grid are saved outside the repository',
+      gridProblems.length === 0 && gridWritten.length === 8 && path.relative(REPO_ROOT, gridShotsFolder).startsWith('..'),
+      JSON.stringify({ written: gridWritten.length, problems: gridProblems.slice(0, 5) }),
+    );
+    console.log(`probe:page grid pictures saved in ${gridShotsFolder}`);
+  }
+  await setLayout('a');
+}
+
+/** The lines of a plan of cells as the song writes them. */
+const songShotLines = (plan) => Object.entries(plan).map(([section, cells]) => `${section}: { ${Object.entries(cells).map(([track, key]) => `${track}: '${key}'`).join(', ')} }`).join(', ');
+
+/** The grid's realistic silent piece (nested groups, five sections, six tracks) at `cps` cycles a second, also used for the Mixer pictures. */
+export function songShotPlayingCode(cps) {
+  return [
+    `setcps(${cps})`,
+    "const harmony = 'C3:major'",
+    "const song = { shift: 0, sections: [['intro', 4], ['verse', 8, 'A3:minor'], ['chorus', 8], ['bridge', 4, 'F3:major'], ['outro', 4]], groups: { rhythm: { drums: ['kick', 'hats'], percussion: ['shaker'] }, chords: ['bass', 'pad'], melody: ['lead'] }, plan: { " +
+      songShotLines({
+        intro: { kick: 'four', hats: '-', shaker: 'steady', bass: '-', pad: 'long', lead: '-' },
+        verse: { kick: 'four', hats: 'offbeat', shaker: 'steady', bass: 'walk', pad: 'chords', lead: 'theme' },
+        chorus: { kick: 'four', hats: 'eighths', shaker: 'steady', bass: 'root', pad: 'chords', lead: 'hook' },
+        bridge: { kick: 'half', hats: 'offbeat', shaker: '-', bass: 'root', pad: 'long', lead: 'answer' },
+        outro: { kick: 'half', hats: '-', shaker: 'steady', bass: 'root', pad: 'long', lead: '-' },
+      }) +
+      ' } };',
+    HELPER_TEXT,
+    'const kick = { four: s("bd*4"), half: s("bd ~ ~ ~") };',
+    'const hats = { eighths: s("hh*8"), offbeat: s("~ hh ~ hh") };',
+    'const shaker = { steady: s("sh*4") };',
+    'const bass = { root: note("c2 c2 g2 c2"), walk: note("c2 e2 g2 e2") };',
+    'const pad = { chords: (h) => n("0 2 4").scale(h), long: (h) => n("0").scale(h) };',
+    "const lead = { theme: (h) => n(\"0 2 4 2\").scale(h), answer: ['C3:major', note(\"c4 e4 g4 f#4\")], hook: ['C3:major', note(\"c4 e4 g4 e4\")] };",
+    ...['kick', 'hats', 'shaker', 'bass', 'pad', 'lead'].map((name) => `${name}: play('${name}', ${name}).gain(0)`),
+  ].join('\n');
+}
+
+// ---- the groups in the Mixer -------------------------------------------------------------------------------------------
+
+/**
+ * A silent structured piece for the Mixer checks, with neutral names: sections x and y of 4 cycles, `groups` as the song
+ * writes them (default g1 with t1 and t2, g2 holding g3 with t3), one track per name of `names` played with play() and no
+ * gain, then the statements of `extra`: by default one track outside every group that sends to the reverb bus. `patterns`
+ * gives a track its own pattern as code (default one note a cycle) and `cps` sets the tempo.
+ */
+export function mixerGroupsCode({ groups = "{ g1: ['t1', 't2'], g2: { g3: ['t3'] } }", names = ['t1', 't2', 't3'], extra = ["t4: note('c3').room(0.2).gain(0)"], patterns = {}, cps = null } = {}) {
+  const plan = `{ ${['x', 'y'].map((section) => `${section}: { ${names.map((name) => `${name}: 'va'`).join(', ')} }`).join(', ')} }`;
+  return [
+    ...(cps === null ? [] : [`setcps(${cps})`]),
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    `const song = { shift: 0, sections: [['x', 4], ['y', 4]], ${groups === null ? '' : `groups: ${groups}, `}plan: ${plan} };`,
+    SONG_HELPER_TEXT,
+    ...names.map((name) => `const ${name} = { va: ${patterns[name] ?? "note('c3')"} };`),
+    ...names.map((name) => `${name}: play('${name}', ${name}).gain(0)`),
+    ...extra,
+  ].join('\n');
+}
+
+/**
+ * Mixer group checks: a structured piece's groups drawn as frames in the Mixer, proven in the live page. Each check plays a
+ * silent piece with set_code, opens the Mixer with key 3 and reads what the page draws.
+ */
+export async function mixerGroupBlocks(context) {
+  const { cdp, client, report } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const waitActive = async (code) => {
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of this check within 8 seconds');
+    }
+  };
+  const openMixer = async () => {
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) === 'mixer') return;
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, '3');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'mixer' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Mixer did not open');
+    }
+  };
+  /** Plays `code` and opens the Mixer. */
+  const showPiece = async (code, label) => {
+    await callTool(client, 'set_code', { code, label });
+    await waitActive(code);
+    await openMixer();
+  };
+  // What the page draws, as plain data. A frame lists its fold name, its count line, its fold state and its items in
+  // order; a strip is its track and a bus strip its bus and orbit. The page side reads nested frames with a stack of its own.
+  const READ_MIXER = `(() => {
+    const strips = document.getElementById('mixer-strips');
+    const describe = (el) => {
+      if (el.classList.contains('mx-bus')) return { kind: 'bus', bus: el.dataset.bus };
+      if (!el.classList.contains('mx-group')) return { kind: 'strip', track: el.dataset.track };
+      const fold = el.querySelector(':scope > .mx-group-head .mx-fold');
+      const body = el.querySelector(':scope > .mx-group-body');
+      return {
+        kind: 'group',
+        key: el.dataset.group,
+        name: fold.querySelector('.mx-fold-name').textContent,
+        count: el.querySelector(':scope > .mx-group-head .mx-group-count').textContent,
+        chevron: fold.querySelector('.mx-fold-chevron').textContent,
+        role: el.getAttribute('role'),
+        label: el.getAttribute('aria-label'),
+        folded: el.dataset.folded,
+        deep: el.dataset.deep === undefined ? null : el.dataset.deep,
+        expanded: fold.getAttribute('aria-expanded'),
+        controls: fold.getAttribute('aria-controls') === body.id,
+        title: fold.title,
+        bodyHidden: body.hidden,
+        items: [],
+        childrenOf: body,
+      };
+    };
+    const result = { items: [] };
+    const work = [{ from: strips, into: result.items }];
+    while (work.length > 0) {
+      const { from, into } = work.pop();
+      for (const child of from.children) {
+        const item = describe(child);
+        into.push(item);
+        if (item.kind === 'group') work.push({ from: item.childrenOf, into: item.items });
+      }
+    }
+    const clean = [{ items: result.items }];
+    while (clean.length > 0) {
+      const node = clean.pop();
+      for (const item of node.items) {
+        delete item.childrenOf;
+        if (item.kind === 'group') clean.push(item);
+      }
+    }
+    return result.items;
+  })()`;
+  const brief = (items) => items.map((item) => (item.kind === 'group' ? { group: item.name, items: brief(item.items) } : item.kind === 'bus' ? 'bus' : item.track));
+  const mixerWhen = (done) => waitFor(cdp, `(() => { const read = ${READ_MIXER}; return (${done})(read) ? read : null; })()`, 5000);
+
+  // A structured piece's groups show as frames holding their tracks' strips, then the tracks outside any group, then the
+  // bus strips.
+  const code = mixerGroupsCode();
+  await showPiece(code, 'probe mixer groups');
+  const framed = await mixerWhen('(read) => read.length >= 4');
+  const shape = framed === null ? null : brief(framed);
+  const [g1, g2] = framed === null ? [null, null] : framed;
+  report(
+    "mixer: a structured piece's groups show as frames holding their tracks' strips, then the tracks outside any group, then the bus strips",
+    shape !== null &&
+      JSON.stringify(shape) === JSON.stringify([{ group: 'g1', items: ['label:t1', 'label:t2'] }, { group: 'g2', items: [{ group: 'g3', items: ['label:t3'] }] }, 'label:t4', 'bus']) &&
+      g1.key === '["g1"]' &&
+      g2.key === '["g2"]' &&
+      g2.items[0].key === '["g2","g3"]' &&
+      [g1.count, g2.count, g2.items[0].count].join('|') === '2 tracks|1 track|1 track' &&
+      g1.role === 'group' &&
+      g1.label === 'Group g1' &&
+      g1.folded === 'false' &&
+      g1.expanded === 'true' &&
+      g1.controls === true &&
+      g1.chevron === '▾' &&
+      g1.bodyHidden === false,
+    JSON.stringify(framed),
+  );
+
+  const topHistoryId = async () => {
+    const reply = await callTool(client, 'list_history', {});
+    const match = /^#(\d+) /m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(reply).slice(0, 200)}`);
+    return Number(match[1]);
+  };
+  const frameSelector = (key) => `.mx-group[data-group='${key}']`;
+  const frameFold = (key) => `${frameSelector(key)} > .mx-group-head .mx-fold`;
+  const gridFold = (name) => `tr.song-group-row[data-key='g:["${name}"]'] .song-fold`;
+  const openView = async (letter, view) => {
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) === view) return;
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, letter);
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === ${JSON.stringify(view)} ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun(`the ${view} view did not open`);
+    }
+  };
+  /** The fold state of the frame with this key, as the Mixer draws it, or null when there is none. */
+  const frameState = (key) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const frame = document.querySelector(${JSON.stringify(frameSelector(key))});
+        if (frame === null) return null;
+        const fold = frame.querySelector(':scope > .mx-group-head .mx-fold');
+        return { folded: frame.dataset.folded, expanded: fold.getAttribute('aria-expanded'), bodyHidden: frame.querySelector(':scope > .mx-group-body').hidden, chevron: fold.querySelector('.mx-fold-chevron').textContent, title: fold.title };
+      })()`,
+    );
+  const gridState = (name) =>
+    waitFor(
+      cdp,
+      `(() => { const button = document.querySelector(${JSON.stringify(gridFold(name))}); return button === null ? null : { expanded: button.getAttribute('aria-expanded') }; })()`,
+      5000,
+    );
+  const afterReload = async () => {
+    // The page may come back on the Mixer or on another view: wait for the piece to play, then open the Mixer.
+    await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 15000);
+    await openView('3', 'mixer');
+    await waitFor(cdp, `document.querySelector('#mixer-strips .mx-group') !== null ? true : null`, 10000);
+  };
+
+  // Folding a group in the Mixer folds it in the Song grid and the reverse, and a reload keeps it. A fold writes no code and
+  // records no version.
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  await showPiece(code, 'probe mixer folds');
+  await mixerWhen('(read) => read.length >= 4');
+  const historyBefore = await topHistoryId();
+  await clickElement(cdp, frameFold('["g1"]'));
+  const mixerG1 = await waitFor(cdp, `(() => { const f = document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}); return f !== null && f.dataset.folded === 'true' ? true : null; })()`, 3000);
+  const g1Folded = await frameState('["g1"]');
+  const storedAfterMixerFold = await evaluateExpr(cdp, `localStorage.getItem('moontide.songFolds')`);
+  const focusStayed = await evaluateExpr(cdp, `document.activeElement !== null && document.activeElement.classList.contains('mx-fold') && document.activeElement.closest('.mx-group').dataset.group === '["g1"]'`);
+  await openView('4', 'parts');
+  const gridG1 = await gridState('g1');
+  const gridG2Before = await gridState('g2');
+  await clickElement(cdp, gridFold('g2'));
+  await openView('3', 'mixer');
+  const g2Folded = await mixerWhen('(read) => read.length >= 4');
+  const g2State = await frameState('["g2"]');
+  await reloadPage(cdp);
+  await afterReload();
+  const reloadedG1 = await frameState('["g1"]');
+  const reloadedG2 = await frameState('["g2"]');
+  const reloadedG3 = await frameState('["g2","g3"]');
+  await openView('4', 'parts');
+  const gridAfterReload = [await gridState('g1'), await gridState('g2')];
+  const historyAfter = await topHistoryId();
+  const codeKept = await evaluateExpr(cdp, `${replState}.activeCode === ${JSON.stringify(code)}`);
+  await openView('3', 'mixer');
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  report(
+    'mixer: folding a group in the Mixer folds it in the Song grid and the reverse, and a reload keeps it',
+    mixerG1 === true &&
+      g1Folded !== null &&
+      g1Folded.folded === 'true' &&
+      g1Folded.expanded === 'false' &&
+      g1Folded.bodyHidden === true &&
+      g1Folded.chevron === '\u25b8' &&
+      g1Folded.title === "Open 'g1'" &&
+      storedAfterMixerFold === '[["g1"]]' &&
+      focusStayed === true &&
+      gridG1 !== null &&
+      gridG1.expanded === 'false' &&
+      gridG2Before !== null &&
+      gridG2Before.expanded === 'true' &&
+      g2Folded !== null &&
+      g2State !== null &&
+      g2State.folded === 'true' &&
+      g2State.bodyHidden === true &&
+      reloadedG1 !== null &&
+      reloadedG1.folded === 'true' &&
+      reloadedG2 !== null &&
+      reloadedG2.folded === 'true' &&
+      reloadedG3 !== null &&
+      reloadedG3.folded === 'false' &&
+      gridAfterReload.every((state) => state !== null && state.expanded === 'false') &&
+      historyAfter === historyBefore &&
+      codeKept === true,
+    JSON.stringify({ g1Folded, storedAfterMixerFold, focusStayed, gridG1, gridG2Before, g2State, reloadedG1, reloadedG2, reloadedG3, gridAfterReload, historyBefore, historyAfter, codeKept }),
+  );
+
+  // A stored fold state that cannot be read is ignored: every group starts open, and the page says so once.
+  await evaluateExpr(cdp, `localStorage.setItem('moontide.songFolds', '{not json')`);
+  const heard = { errors: [], thrown: [] };
+  const stopListening = cdp.onEvent((message) => {
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') {
+      heard.errors.push(message.params.args.map((arg) => String(arg.value ?? arg.description ?? '')).join(' '));
+    }
+    if (message.method === 'Runtime.exceptionThrown') heard.thrown.push(String(message.params.exceptionDetails.text));
+  });
+  await reloadPage(cdp);
+  await afterReload();
+  const badFrames = await mixerWhen('(read) => read.length >= 4');
+  await sleep(500);
+  stopListening();
+  const openAll = [];
+  const walk = [...(badFrames ?? [])];
+  while (walk.length > 0) {
+    const item = walk.pop();
+    if (item.kind !== 'group') continue;
+    openAll.push(item.folded === 'false' && item.expanded === 'true' && item.bodyHidden === false);
+    walk.push(...item.items);
+  }
+  const unreadable = { reported: heard.errors.filter((text) => text.includes('moontide.songFolds')), thrown: heard.thrown };
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  report(
+    'mixer: a stored fold state that cannot be read starts every group open',
+    badFrames !== null && openAll.length === 3 && openAll.every(Boolean) && unreadable.reported.length === 1 && unreadable.thrown.length === 0,
+    JSON.stringify({ openAll, unreadable }),
+  );
+
+  // Groups nest to any depth; a frame from the fifth level on is marked deep, and folding a level hides only its own body.
+  const deepCode = mixerGroupsCode({ groups: "{ a: { b: { c: { d: { e: { f: ['t1'] } } } } } }", names: ['t1'], extra: [] });
+  await showPiece(deepCode, 'probe mixer nesting');
+  const deepFrames = await waitFor(cdp, `document.querySelectorAll('#mixer-strips .mx-group').length === 6 ? true : null`, 5000);
+  const levels = await evaluateExpr(
+    cdp,
+    `[...document.querySelectorAll('#mixer-strips .mx-group')].map((frame) => ({ name: frame.querySelector(':scope > .mx-group-head .mx-fold-name').textContent, deep: frame.dataset.deep === undefined ? null : frame.dataset.deep, label: frame.getAttribute('aria-label') }))`,
+  );
+  await clickElement(cdp, frameFold('["a","b"]'));
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["a","b"]'))}).dataset.folded === 'true' ? true : null`, 3000);
+  const afterFold = await evaluateExpr(
+    cdp,
+    `(() => {
+      const frames = [...document.querySelectorAll('#mixer-strips .mx-group')];
+      const shown = (el) => el.getClientRects().length > 0;
+      return {
+        folded: frames.map((frame) => frame.dataset.folded),
+        bodyHidden: frames.map((frame) => frame.querySelector(':scope > .mx-group-body').hidden),
+        headsShown: frames.map((frame) => shown(frame.querySelector(':scope > .mx-group-head'))),
+        stripShown: shown(document.querySelector('#mixer-strips .mx-strip[data-track="label:t1"]')),
+        noSideScroll: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      };
+    })()`,
+  );
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  report(
+    'mixer: groups nest to any depth and a frame from level five on is marked deep',
+    deepFrames === true &&
+      JSON.stringify(levels.map((level) => level.deep)) === JSON.stringify([null, null, null, null, 'true', 'true']) &&
+      levels.map((level) => level.label).join('|') === 'Group a|Group b|Group c|Group d|Group e|Group f' &&
+      JSON.stringify(afterFold.folded) === JSON.stringify(['false', 'true', 'false', 'false', 'false', 'false']) &&
+      JSON.stringify(afterFold.bodyHidden) === JSON.stringify([false, true, false, false, false, false]) &&
+      JSON.stringify(afterFold.headsShown) === JSON.stringify([true, true, false, false, false, false]) &&
+      afterFold.stripShown === false &&
+      afterFold.noSideScroll === true,
+    JSON.stringify({ levels, afterFold }),
+  );
+
+  // A group with one strip reads 1 track, and a group with none reads 0 tracks and stays. The reader refuses a group that
+  // names a track with no labeled statement, but it reads an empty list.
+  const countCode = mixerGroupsCode({ groups: "{ g0: [], g1: ['t1'] }", names: ['t1'], extra: [] });
+  await showPiece(countCode, 'probe mixer counts');
+  const counted = await mixerWhen('(read) => read.length === 2');
+  report(
+    'mixer: a group with one strip reads 1 track, and a group with no strip reads 0 tracks and stays',
+    counted !== null &&
+      JSON.stringify(brief(counted)) === JSON.stringify([{ group: 'g0', items: [] }, { group: 'g1', items: ['label:t1'] }]) &&
+      counted[0].count === '0 tracks' &&
+      counted[1].count === '1 track',
+    JSON.stringify(counted),
+  );
+
+  // Two groups with the same name side by side cannot be told apart: the reader refuses them, the Mixer stays flat with every
+  // strip on show (none hidden), and Claude's reply carries the same sentence as the other views.
+  const twinCode = mixerGroupsCode({ groups: "{ top: [{ sub: ['t1'] }, { sub: ['t2'] }] }", names: ['t1', 't2'], extra: [] });
+  const twinReply = await callTool(client, 'set_code', { code: twinCode, label: 'probe mixer twin groups' });
+  await waitActive(twinCode);
+  await openMixer();
+  const twinRead = await mixerWhen('(read) => read.length >= 2');
+  const twinSentence = songMessageText({ state: 'unreadable', reason: 'groups-duplicate-group', section: null, track: null, group: 'sub', variation: null, source: null, helper: 'canonical' });
+  report(
+    'mixer: two groups with one name side by side are refused with a plain sentence, and the Mixer stays flat with every strip on show',
+    twinRead !== null &&
+      JSON.stringify(brief(twinRead)) === JSON.stringify(['label:t1', 'label:t2']) &&
+      new RegExp(`Song structure in #\\d+: ${songLiteralPattern(twinSentence)}`).test(twinReply),
+    JSON.stringify({ twinRead, twinReply }),
+  );
+
+  // A frame that only a held strip keeps alive is stale: its buttons are off while the hand holds the fader, and it goes once
+  // the fader is let go, with no further change to the code. The nested frames of a group that left the code go with it.
+  const heldCode = mixerGroupsCode();
+  await showPiece(heldCode, 'probe mixer held base');
+  await mixerWhen('(read) => read.length >= 4');
+  await evaluateExpr(cdp, `document.querySelector('.mx-strip[data-track="label:t1"] .mx-fader').dispatchEvent(new Event('pointerdown', { bubbles: true }))`);
+  const heldNext = mixerGroupsCode({ names: ['t2', 't3'], groups: "{ h: ['t2'], g2: { g3: ['t3'] } }", extra: [] });
+  await callTool(client, 'set_code', { code: heldNext, label: 'probe mixer held next' });
+  await waitActive(heldNext);
+  const heldShape = await mixerWhen('(read) => read.some((item) => item.kind === "group" && item.name === "h")');
+  const heldState = await evaluateExpr(
+    cdp,
+    `(() => {
+      const frame = document.querySelector(${JSON.stringify(frameSelector('["g1"]'))});
+      if (frame === null) return null;
+      const head = frame.querySelector(':scope > .mx-group-head');
+      return { mute: head.querySelector('.mx-mute').disabled, solo: head.querySelector('.mx-solo').disabled, strips: [...frame.querySelectorAll('.mx-strip')].map((el) => el.dataset.track) };
+    })()`,
+  );
+  await evaluateExpr(cdp, `document.querySelector('.mx-strip[data-track="label:t1"] .mx-fader').dispatchEvent(new Event('pointerup', { bubbles: true }))`);
+  const heldGone = await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}) === null ? true : null`, 3000);
+  const heldAfter = await mixerWhen('(read) => read.length >= 2');
+  report(
+    'mixer: a frame kept only by a held strip has its buttons off, and goes after the release without another change to the code',
+    heldShape !== null &&
+      heldState !== null &&
+      heldState.mute === true &&
+      heldState.solo === true &&
+      heldState.strips.join() === 'label:t1' &&
+      heldGone === true &&
+      heldAfter !== null &&
+      JSON.stringify(brief(heldAfter)) === JSON.stringify([{ group: 'h', items: ['label:t2'] }, { group: 'g2', items: [{ group: 'g3', items: ['label:t3'] }] }]),
+    JSON.stringify({ heldState, heldGone, heldAfter: heldAfter === null ? null : brief(heldAfter) }),
+  );
+
+  // --- Mute and solo on a group ---
+
+  const headSelector = (key) => `${frameSelector(key)} > .mx-group-head`;
+  /** What the head of the group with this key shows: its buttons, count line, hover text and note. */
+  const headState = (key) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const head = document.querySelector(${JSON.stringify(headSelector(key))});
+        if (head === null) return null;
+        const read = (button) => ({ pressed: button.getAttribute('aria-pressed'), label: button.getAttribute('aria-label'), title: button.title, disabled: button.disabled, border: getComputedStyle(button).borderTopStyle });
+        const note = head.querySelector('.mx-group-note');
+        return { mute: read(head.querySelector('.mx-mute')), solo: read(head.querySelector('.mx-solo')), count: head.querySelector('.mx-group-count').textContent, countTitle: head.querySelector('.mx-group-count').title, note: note.hidden ? null : note.textContent };
+      })()`,
+    );
+  const activeCode = () => evaluateExpr(cdp, `${replState}.activeCode`);
+  const historyLabels = async (count) => {
+    const reply = String(await callTool(client, 'list_history', {}));
+    return reply
+      .split('\n')
+      .filter((row) => /^#\d+ /.test(row))
+      .slice(0, count)
+      .map((row) => /"([^"]*)"/.exec(row)?.[1] ?? row);
+  };
+  const waitForText = (test) => waitFor(cdp, `(() => { const code = ${replState}.activeCode; return (${test})(code) ? code : null; })()`, 5000);
+  const lineOf = (code, name) => code.split('\n').find((line) => new RegExp(`^S?_?${name}:`).test(line)) ?? null;
+
+  // One click on a group's M mutes every track of the group in one rewrite and one history version; the second click unmutes.
+  const groupCode = mixerGroupsCode();
+  await showPiece(groupCode, 'probe mixer group mute');
+  await mixerWhen('(read) => read.length >= 4');
+  const groupHistoryBefore = await topHistoryId();
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-mute`);
+  const groupMuted = await waitForText('(code) => /^_t1:/m.test(code) && /^_t2:/m.test(code)');
+  const afterMuteHistory = await historyLabels(2);
+  const afterMuteId = await topHistoryId();
+  const mutedHead = await headState('["g1"]');
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-mute`);
+  const groupUnmuted = await waitForText('(code) => code === ' + JSON.stringify(groupCode));
+  const afterUnmuteHistory = await historyLabels(3);
+  const afterUnmuteId = await topHistoryId();
+  report(
+    "mixer: one click on a group's M mutes every track of the group in one rewrite and one history version, and a second click unmutes them all",
+    groupMuted !== null &&
+      lineOf(groupMuted, 't3') === lineOf(groupCode, 't3') &&
+      lineOf(groupMuted, 't4') === lineOf(groupCode, 't4') &&
+      afterMuteId === groupHistoryBefore + 1 &&
+      afterMuteHistory[0] === 'mixer: group g1 muted' &&
+      mutedHead !== null &&
+      mutedHead.mute.pressed === 'true' &&
+      groupUnmuted !== null &&
+      afterUnmuteId === afterMuteId + 1 &&
+      afterUnmuteHistory[0] === 'mixer: group g1 unmuted' &&
+      afterUnmuteHistory[1] === 'mixer: group g1 muted',
+    JSON.stringify({ groupMuted, afterMuteHistory, mutedHead, groupHistoryBefore, afterMuteId, afterUnmuteHistory, afterUnmuteId }),
+  );
+
+  // One click on a group's S writes the solo marker on every reachable track, and a second click ends it.
+  await showPiece(groupCode, 'probe mixer group solo');
+  await mixerWhen('(read) => read.length >= 4');
+  const soloHistoryBefore = await topHistoryId();
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-solo`);
+  const groupSoloed = await waitForText('(code) => /^S_t1:/m.test(code) && /^S_t2:/m.test(code)');
+  const soloOnHistory = await historyLabels(1);
+  const soloOnId = await topHistoryId();
+  const soloedHead = await headState('["g1"]');
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-solo`);
+  const soloEnded = await waitForText('(code) => code === ' + JSON.stringify(groupCode));
+  const soloOffHistory = await historyLabels(1);
+  const soloOffId = await topHistoryId();
+  report(
+    'mixer: group S solos every reachable track with the solo marker and a second click ends it',
+    groupSoloed !== null &&
+      lineOf(groupSoloed, 't3') === lineOf(groupCode, 't3') &&
+      soloOnId === soloHistoryBefore + 1 &&
+      soloOnHistory[0] === 'mixer: group g1 solo on' &&
+      soloedHead !== null &&
+      soloedHead.solo.pressed === 'true' &&
+      soloedHead.solo.title === 'End the solo of 2 tracks' &&
+      soloEnded !== null &&
+      soloOffId === soloOnId + 1 &&
+      soloOffHistory[0] === 'mixer: group g1 solo off',
+    JSON.stringify({ groupSoloed, soloOnHistory, soloedHead, soloOnId, soloOffHistory, soloOffId }),
+  );
+
+  // A group with some tracks muted shows the partial mark; one click mutes them all.
+  await showPiece(groupCode, 'probe mixer group partial');
+  await mixerWhen('(read) => read.length >= 4');
+  await clickElement(cdp, `.mx-strip[data-track="label:t1"] .mx-mute`);
+  await waitForText('(code) => /^_t1:/m.test(code) && /^t2:/m.test(code)');
+  const partialHead = await waitFor(cdp, `(() => { const button = document.querySelector(${JSON.stringify(`${headSelector('["g1"]')} .mx-mute`)}); return button !== null && button.getAttribute('aria-pressed') === 'mixed' ? true : null; })()`, 5000).then(() => headState('["g1"]'));
+  const partialHistoryBefore = await topHistoryId();
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-mute`);
+  const partialMuted = await waitForText('(code) => /^_t1:/m.test(code) && /^_t2:/m.test(code)');
+  const partialId = await topHistoryId();
+  const partialLabels = await historyLabels(1);
+  report(
+    'mixer: a partly muted group shows the partial mark, its count line and title, and one click mutes all',
+    partialHead !== null &&
+      partialHead.mute.pressed === 'mixed' &&
+      partialHead.mute.border === 'dashed' &&
+      partialHead.mute.label === 'Mute g1, 1 of 2 tracks muted' &&
+      partialHead.mute.title === '1 of 2 tracks muted. A click mutes all 2.' &&
+      partialHead.count === '1 of 2 muted' &&
+      partialHead.solo.pressed === 'false' &&
+      partialHead.solo.border === 'solid' &&
+      partialMuted !== null &&
+      partialId === partialHistoryBefore + 1 &&
+      partialLabels[0] === 'mixer: group g1 muted',
+    JSON.stringify({ partialHead, partialMuted, partialHistoryBefore, partialId, partialLabels }),
+  );
+
+  // A track the Mixer cannot solo (its name starts with a capital S) is skipped, named in the note and left as it is.
+  const skipCode = mixerGroupsCode({ groups: "{ g1: ['t1', 'Snare'] }", names: ['t1', 'Snare'], extra: [] });
+  await showPiece(skipCode, 'probe mixer group skip');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(headSelector('["g1"]'))}) !== null ? true : null`, 5000);
+  const skipHead = await headState('["g1"]');
+  await clickElement(cdp, `${headSelector('["g1"]')} .mx-solo`);
+  const skipSoloed = await waitForText('(code) => /^S_t1:/m.test(code)');
+  report(
+    "mixer: a track the Mixer cannot solo is skipped, named in the group's note, and left as it is",
+    skipHead !== null &&
+      skipHead.note === "Skips 1 track the mixer can't change." &&
+      skipHead.solo.disabled === false &&
+      skipSoloed !== null &&
+      lineOf(skipSoloed, 'Snare') === lineOf(skipCode, 'Snare') &&
+      !/^S_Snare/m.test(skipSoloed),
+    JSON.stringify({ skipHead, skipSoloed }),
+  );
+
+  // While a change waits for its line the group buttons are off, and the fold button still works.
+  const nextCode = mixerGroupsCode({ extra: ["t4: note('c3').room(0.2).gain(0)", "t5: note('d3').gain(0)"] });
+  await showPiece(groupCode, 'probe mixer group waiting base');
+  await mixerWhen('(read) => read.length >= 4');
+  await callTool(client, 'set_code', { code: nextCode, label: 'probe mixer group waiting', at: 'phrase', phraseCycles: 4 });
+  const waitingNotice = await waitFor(cdp, `(() => { const notice = document.getElementById('mixer-notice'); return !notice.hidden ? notice.textContent : null; })()`, 6000);
+  const waitingHead = await headState('["g1"]');
+  await clickElement(cdp, frameFold('["g1"]'));
+  const foldedWhileWaiting = await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'true' ? true : null`, 3000);
+  await clickElement(cdp, frameFold('["g1"]'));
+  const openedWhileWaiting = await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'false' ? true : null`, 3000);
+  await waitActive(nextCode);
+  const takenOver = await waitFor(cdp, `document.getElementById('mixer-notice').hidden ? true : null`, 6000);
+  const takenOverHead = await waitFor(cdp, `(() => { const button = document.querySelector(${JSON.stringify(`${headSelector('["g1"]')} .mx-mute`)}); return button !== null && !button.disabled ? true : null; })()`, 6000).then(() => headState('["g1"]'));
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  report(
+    'mixer: while a change waits for its line the group buttons are off and the fold still works',
+    typeof waitingNotice === 'string' &&
+      waitingNotice.startsWith('A change is waiting for its bar line.') &&
+      waitingHead !== null &&
+      waitingHead.mute.disabled === true &&
+      waitingHead.solo.disabled === true &&
+      foldedWhileWaiting === true &&
+      openedWhileWaiting === true &&
+      takenOver === true &&
+      takenOverHead !== null &&
+      takenOverHead.mute.disabled === false &&
+      takenOverHead.solo.disabled === false,
+    JSON.stringify({ waitingNotice, waitingHead, foldedWhileWaiting, openedWhileWaiting, takenOver, takenOverHead }),
+  );
+
+  // A track written with play() has no shared-code line and keeps its fader, sends and effects from inside its frame; a
+  // track built from another constant still shows the line. The tracks are silenced by their velocity, so the fader and
+  // the send can move without a sound.
+  const quietCode = mixerGroupsCode({
+    names: ['t1', 't2'],
+    groups: "{ g1: ['t1', 't2'] }",
+    extra: ["const base = note('c3');", 'kick: base.fast(2).velocity(0)'],
+  }).replace(/^(t[12]): play\('(t[12])', t[12]\)\.gain\(0\)$/gm, "$1: play('$2', $2).velocity(0)");
+  await showPiece(quietCode, 'probe mixer play track');
+  await mixerWhen('(read) => read.length >= 3');
+  const T1 = '.mx-strip[data-track="label:t1"]';
+  // A fader or a send commits its version a moment after the key: wait until the newest row is past `id`, then read it.
+  const historyPast = async (id) => {
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const now = await topHistoryId();
+      if (now > id) {
+        await sleep(500);
+        return topHistoryId();
+      }
+      await sleep(100);
+    }
+    return id;
+  };
+  const rootNotes = await evaluateExpr(
+    cdp,
+    `(() => {
+      const note = (track) => {
+        const el = document.querySelector('.mx-strip[data-track="label:' + track + '"] .mx-root-note');
+        return el === null ? null : { hidden: el.hidden, text: el.textContent, title: el.title, shown: el.getClientRects().length > 0 };
+      };
+      return { t1: note('t1'), t2: note('t2'), kick: note('kick'), inFrame: document.querySelector(${JSON.stringify(`${frameSelector('["g1"]')} ${T1}`)}) !== null };
+    })()`,
+  );
+  const quietHistory = await topHistoryId();
+  await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(`${T1} .mx-fader`)}).focus()`);
+  await pressKey(cdp, 'PageDown');
+  const faderCode = await waitForText("(code) => /^t1: play\\('t1', t1\\)\\.velocity\\(0\\)\\.postgain\\(/m.test(code)");
+  const faderId = await historyPast(quietHistory);
+  await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(`${T1} .mx-send-slider[data-bus="reverb"]`)}).focus()`);
+  await pressKey(cdp, 'ArrowRight');
+  const sendCode = await waitForText("(code) => /^t1: .*\\.room\\(/m.test(code)");
+  const sendId = await historyPast(faderId);
+  await clickElement(cdp, `${T1} .mx-add`);
+  await clickElement(cdp, `${T1} .mx-add-item[data-effect="hpf"]`);
+  const effectCode = await waitForText("(code) => /^t1: .*\\.hpf\\(/m.test(code)");
+  const effectId = await historyPast(sendId);
+  const writtenT1 = effectCode === null ? null : lineOf(effectCode, 't1');
+  report(
+    'mixer: a play() track in a group shows no shared-code line, and its fader, send and an added effect work from inside the frame; a track built from another constant still shows the line',
+    rootNotes.inFrame === true &&
+      rootNotes.t1 !== null &&
+      rootNotes.t1.hidden === true &&
+      rootNotes.t1.shown === false &&
+      rootNotes.t1.text === '' &&
+      rootNotes.t1.title === '' &&
+      rootNotes.t2 !== null &&
+      rootNotes.t2.hidden === true &&
+      rootNotes.kick !== null &&
+      rootNotes.kick.hidden === false &&
+      rootNotes.kick.text === 'Built from shared code' &&
+      faderCode !== null &&
+      sendCode !== null &&
+      effectCode !== null &&
+      lineOf(effectCode, 't2') === lineOf(quietCode, 't2') &&
+      lineOf(effectCode, 'kick') === lineOf(quietCode, 'kick') &&
+      writtenT1 !== null &&
+      writtenT1.includes('.postgain(') &&
+      writtenT1.includes('.room(') &&
+      writtenT1.includes('.hpf(') &&
+      faderId === quietHistory + 1 &&
+      sendId === faderId + 1 &&
+      effectId === sendId + 1,
+    JSON.stringify({ rootNotes, writtenT1, quietHistory, faderId, sendId, effectId }),
+  );
+
+  // The line is dropped only for the song helper the page knows: when the piece changed play(), its tracks keep the line, which
+  // is the warning that the Mixer reads only what the track writes after the shared code.
+  const changedHelperCode = mixerGroupsCode({ names: ['t1', 't2'], groups: "{ g1: ['t1', 't2'] }", extra: [] }).replace('throw new Error(', 'throw new TypeError(');
+  await showPiece(changedHelperCode, 'probe mixer changed helper');
+  await mixerWhen('(read) => read.length >= 1');
+  const changedNotes = await evaluateExpr(
+    cdp,
+    `['t1', 't2'].map((track) => { const el = document.querySelector('.mx-strip[data-track="label:' + track + '"] .mx-root-note'); return el === null ? null : { hidden: el.hidden, text: el.textContent }; })`,
+  );
+  report(
+    'mixer: a play() track keeps the shared-code line when the piece changed the song helper',
+    changedHelperCode.includes('throw new TypeError(') &&
+      changedNotes.every((note) => note !== null && note.hidden === false && note.text === 'Built from shared code'),
+    JSON.stringify({ changedNotes }),
+  );
+
+  // A structured piece whose song names no groups draws a flat Mixer: the strips in code order, then the bus strips.
+  const flatCode = mixerGroupsCode({ groups: null, extra: ["t4: note('c3').room(0.2).velocity(0)"] }).replace(/^(t[123]): play\('(t[123])', t[123]\)\.gain\(0\)$/gm, "$1: play('$2', $2).velocity(0)");
+  await showPiece(flatCode, 'probe mixer flat');
+  const flat = await mixerWhen('(read) => read.length === 5');
+  const flatHistory = await topHistoryId();
+  await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(`${T1} .mx-fader`)}).focus()`);
+  await pressKey(cdp, 'PageDown');
+  const flatFaderCode = await waitForText("(code) => /^t1: play\\('t1', t1\\)\\.velocity\\(0\\)\\.postgain\\(/m.test(code)");
+  const flatFaderId = await historyPast(flatHistory);
+  await clickElement(cdp, `${T1} .mx-mute`);
+  const flatMutedCode = await waitForText('(code) => /^_t1: /m.test(code)');
+  const flatMuteId = await historyPast(flatFaderId);
+  const flatFrames = await evaluateExpr(cdp, `document.querySelectorAll('#mixer-strips .mx-group').length`);
+  report(
+    'mixer: a structured piece whose song names no groups draws a flat Mixer whose controls all work',
+    flat !== null &&
+      flatFrames === 0 &&
+      JSON.stringify(brief(flat)) === JSON.stringify(['label:t1', 'label:t2', 'label:t3', 'label:t4', 'bus']) &&
+      flatFaderCode !== null &&
+      flatMutedCode !== null &&
+      flatFaderId === flatHistory + 1 &&
+      flatMuteId === flatFaderId + 1,
+    JSON.stringify({ shape: flat === null ? null : brief(flat), flatFrames, flatHistory, flatFaderId, flatMuteId }),
+  );
+
+  // A right-click on a group head or frame opens the Ask box with the group context (and its parent for a nested group); a
+  // right-click on a strip inside the frame still gives the track. Asking evaluates nothing and records nothing.
+  const askCode = mixerGroupsCode();
+  await showPiece(askCode, 'probe mixer group ask');
+  await mixerWhen('(read) => read.length >= 4');
+  const askHistoryBefore = await topHistoryId();
+  const askedG1 = await askAt(cdp, frameFold('["g1"]'));
+  await pressKey(cdp, 'Escape');
+  const askedG1Head = await askAt(cdp, `${headSelector('["g1"]')} .mx-group-count`);
+  await pressKey(cdp, 'Escape');
+  const askedG3 = await askAt(cdp, frameFold('["g2","g3"]'));
+  await pressKey(cdp, 'Escape');
+  const askedG2 = await askAt(cdp, frameFold('["g2"]'));
+  await pressKey(cdp, 'Escape');
+  const askedTrack = await askAt(cdp, `${T1} .mx-name`);
+  await pressKey(cdp, 'Escape');
+  const askHistoryAfter = await topHistoryId();
+  const askCodeKept = await evaluateExpr(cdp, `${replState}.activeCode === ${JSON.stringify(askCode)}`);
+  const wantG1 = describeContext({ kind: 'group', name: 'g1' }).chip;
+  const wantG3 = describeContext({ kind: 'group', name: 'g3', parent: 'g2' }).chip;
+  const wantG2 = describeContext({ kind: 'group', name: 'g2' }).chip;
+  const wantTrack = describeContext({ kind: 'track', track: 't1' }).chip;
+  report(
+    'mixer: a right-click on a group head opens the Ask box with the group context, and on a strip inside it gives the track',
+    [askedG1, askedG1Head, askedG3, askedG2, askedTrack].every((answer) => answer.prevented === true && answer.open === true) &&
+      askedG1.chip === wantG1 &&
+      askedG1Head.chip === wantG1 &&
+      askedG3.chip === wantG3 &&
+      askedG2.chip === wantG2 &&
+      askedTrack.chip === wantTrack &&
+      wantG3 !== wantG2 &&
+      askHistoryAfter === askHistoryBefore &&
+      askCodeKept === true,
+    JSON.stringify({ askedG1, askedG1Head, askedG3, askedG2, askedTrack, wantG1, wantG3, wantG2, wantTrack, askHistoryBefore, askHistoryAfter, askCodeKept }),
+  );
+
+  // From the keyboard a group's buttons take Enter and Space and no arrow key. Tab goes fold, M, S, then the strips of an
+  // open group; the strips of a folded group are not reached.
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  await showPiece(askCode, 'probe mixer group keys');
+  await mixerWhen('(read) => read.length >= 4');
+  const keyHistoryBefore = await topHistoryId();
+  const keyState = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const fold = document.querySelector(${JSON.stringify(frameFold('["g1"]'))});
+        const active = document.activeElement;
+        return {
+          expanded: fold.getAttribute('aria-expanded'),
+          active: active === null ? null : active.className.split(' ')[0],
+          inHead: active !== null && active.closest('.mx-group-head') !== null,
+          frame: active === null || active.closest('.mx-group') === null ? null : active.closest('.mx-group').dataset.group,
+          strip: active === null || active.closest('.mx-strip') === null ? null : active.closest('.mx-strip').dataset.track,
+          code: ${replState}.activeCode === ${JSON.stringify(askCode)},
+        };
+      })()`,
+    );
+  const focusOn = (selector) => evaluateExpr(cdp, `document.querySelector(${JSON.stringify(selector)}).focus()`);
+  const arrowsLeftAlone = [];
+  for (const [label, selector] of [['fold', frameFold('["g1"]')], ['M', `${headSelector('["g1"]')} .mx-mute`], ['S', `${headSelector('["g1"]')} .mx-solo`]]) {
+    await focusOn(selector);
+    const before = await keyState();
+    for (const key of ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End']) {
+      await pressKey(cdp, key);
+      const after = await keyState();
+      arrowsLeftAlone.push(`${label}:${key}:${after.expanded === before.expanded && after.active === before.active && after.frame === before.frame && after.code === true}`);
+    }
+  }
+  await focusOn(frameFold('["g1"]'));
+  await pressKey(cdp, 'Enter');
+  const enterFolds = await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'true' ? true : null`, 3000);
+  const afterEnter = await keyState();
+  // With the group folded, Tab from S leaves the frame: the strips inside are not reached.
+  await focusOn(`${headSelector('["g1"]')} .mx-solo`);
+  await pressKey(cdp, 'Tab');
+  const tabFromFolded = await keyState();
+  await focusOn(frameFold('["g1"]'));
+  await pressKey(cdp, ' ');
+  const spaceUnfolds = await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'false' ? true : null`, 3000);
+  const afterSpace = await keyState();
+  const tabOrder = [];
+  await focusOn(frameFold('["g1"]'));
+  for (let step = 0; step < 3; step++) {
+    await pressKey(cdp, 'Tab');
+    const at = await keyState();
+    tabOrder.push({ active: at.active, inHead: at.inHead, frame: at.frame, strip: at.strip });
+  }
+  const keyHistoryAfter = await topHistoryId();
+  await pressKey(cdp, 'Escape');
+  await evaluateExpr(cdp, `localStorage.removeItem('moontide.songFolds')`);
+  report(
+    'mixer: arrow keys do nothing on a group\'s buttons, Enter and Space fold, and Tab goes fold, M, S, then the strips of an open group',
+    arrowsLeftAlone.length === 18 &&
+      arrowsLeftAlone.every((entry) => entry.endsWith(':true')) &&
+      enterFolds === true &&
+      afterEnter.active === 'mx-fold' &&
+      tabFromFolded.frame !== '["g1"]' &&
+      tabFromFolded.strip !== 'label:t1' &&
+      spaceUnfolds === true &&
+      afterSpace.active === 'mx-fold' &&
+      tabOrder[0].active === 'mx-mute' &&
+      tabOrder[0].inHead === true &&
+      tabOrder[1].active === 'mx-solo' &&
+      tabOrder[1].inHead === true &&
+      tabOrder[2].inHead === false &&
+      tabOrder[2].frame === '["g1"]' &&
+      tabOrder[2].strip === 'label:t1' &&
+      keyHistoryAfter === keyHistoryBefore,
+    JSON.stringify({ arrowsLeftAlone: arrowsLeftAlone.filter((entry) => entry.endsWith(':false')), enterFolds, afterEnter, tabFromFolded, spaceUnfolds, afterSpace, tabOrder, keyHistoryBefore, keyHistoryAfter }),
+  );
+
+  // Nested groups fit their panel at 1024 and 1920 pixels in layouts a, b and c; a group head stays at the left while a wide
+  // group scrolls; no head, group button or note takes the accent, the second accent, the destructive colour or a Jam one.
+  const wideNames = Array.from({ length: 13 }, (_, i) => `t${i + 1}`);
+  const wideCode = mixerGroupsCode({
+    names: wideNames,
+    groups: `{ wide: [${wideNames.slice(0, 12).map((name) => `'${name}'`).join(', ')}], outer: { mid: { inner: ['t13'] } } }`,
+    extra: [],
+  });
+  await showPiece(wideCode, 'probe mixer group sizes');
+  await mixerWhen('(read) => read.length >= 2');
+  const wideHead = `${headSelector('["wide"]')}`;
+  const sizeRows = [];
+  for (const [width, height] of [[1024, 768], [1920, 1080]]) {
+    await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    for (const layout of ['a', 'b', 'c']) {
+      await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+      await pressKey(cdp, layout);
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(layout)} ? true : null`, 3000);
+      await sleep(300);
+      const row = await evaluateExpr(
+        cdp,
+        `new Promise((resolve) => {
+          const strips = document.getElementById('mixer-strips');
+          const view = document.getElementById('mixer-view');
+          const head = document.querySelector(${JSON.stringify(wideHead)});
+          strips.scrollLeft = 0;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            const leftBefore = head.getBoundingClientRect().left;
+            strips.scrollLeft = 200;
+            requestAnimationFrame(() => requestAnimationFrame(() => {
+              const leftAfter = head.getBoundingClientRect().left;
+              const scrolled = strips.scrollLeft;
+              strips.scrollLeft = 0;
+              const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map((name) => {
+                const probe = document.createElement('div');
+                probe.style.color = 'var(' + name + ')';
+                document.body.append(probe);
+                const color = getComputedStyle(probe).color;
+                probe.remove();
+                return color;
+              });
+              const offenders = [];
+              for (const selector of ['.mx-group-head', '.mx-fold', '.mx-fold-chevron', '.mx-fold-name', '.mx-group-count', '.mx-group-head .mx-mute', '.mx-group-head .mx-solo', '.mx-group-note']) {
+                for (const el of document.querySelectorAll('#mixer-strips ' + selector)) {
+                  const style = getComputedStyle(el);
+                  for (const property of ['color', 'backgroundColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor', 'outlineColor']) {
+                    if (reserved.includes(style[property])) offenders.push(selector + ' ' + property);
+                  }
+                }
+              }
+              resolve({
+                width: window.innerWidth,
+                layout: document.getElementById('workspace').dataset.layout,
+                viewFits: view.scrollWidth <= view.clientWidth,
+                documentFits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+                stripsScroll: strips.scrollWidth > strips.clientWidth,
+                scrolled,
+                leftBefore: Math.round(leftBefore * 10) / 10,
+                leftAfter: Math.round(leftAfter * 10) / 10,
+                offenders: [...new Set(offenders)],
+              });
+            }));
+          }));
+        })`,
+      );
+      sizeRows.push(row);
+    }
+  }
+  await cdp('Emulation.clearDeviceMetricsOverride');
+  await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  await pressKey(cdp, 'a');
+  await waitFor(cdp, `document.getElementById('workspace').dataset.layout === 'a' ? true : null`, 3000);
+  report(
+    'mixer: nested groups fit their panel at 1024 and 1920 pixels in layouts a, b and c, a group head stays at the left while a wide group scrolls, and no head, group button or note takes a reserved colour',
+    sizeRows.length === 6 &&
+      sizeRows.every(
+        (row) =>
+          row.viewFits === true &&
+          row.documentFits === true &&
+          row.stripsScroll === true &&
+          row.scrolled > 0 &&
+          Math.abs(row.leftAfter - row.leftBefore) <= 1 &&
+          row.offenders.length === 0,
+      ),
+    JSON.stringify(sizeRows),
+  );
+
+  // --- Lights ---
+  // A silent piece at one cycle a second: a track plays one note a cycle, so the gaps between its notes are long enough to tell
+  // one blink from the next. The light must turn on in the first frame at or after the moment the note is heard (worked out
+  // here from the output timestamp, apart from the page) and be dark again about 180 ms later.
+  const LIGHT_FRAME_MS = 17;
+  const T1_LIGHT = '#mixer-strips .mx-strip[data-track="label:t1"] .mx-light';
+  const watchFor = async (lights, keys, seconds, enough) => {
+    await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(lights, keys));
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      if (enough !== undefined && (await evaluateExpr(cdp, `window.__lightWatch.notes.length`)) >= enough) break;
+      await sleep(250);
+    }
+    return evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  };
+  await showPiece('setcps(1)\nt1: note("c3").gain(0)', 'probe mixer light timing');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(T1_LIGHT)}) !== null ? true : null`, 5000);
+  const timing = await watchFor({ t1: T1_LIGHT }, ['label:t1'], 20, 9);
+  const timingRows = lightRows(timing, 't1', 'label:t1', LIGHT_FRAME_MS + 20);
+  const timedOn = timingRows.filter((row) => row.litAfter !== null);
+  const faded = timedOn.filter((row) => row.fadeMs !== null && row.fadeMs >= 150 && row.fadeMs <= 260);
+  report(
+    "mixer: a track's light lights in the first frame at or after its note is heard and fades out in about 180 ms",
+    timingRows.length >= 8 && timedOn.length >= timingRows.length - 1 && timedOn.length >= 7 && faded.length === timedOn.length,
+    JSON.stringify(timingRows.map((row) => ({ lit: row.litAfter === null ? null : Math.round(row.litAfter), fade: row.fadeMs === null ? null : Math.round(row.fadeMs) }))),
+  );
+
+  // A group's light, folded or open, lights in the same way as the light of any track below it. g1 holds t1 (a note at the
+  // start of the cycle) and t2 (a note half a cycle later), so the group's light must blink for both.
+  const stripLight = (track) => `#mixer-strips .mx-strip[data-track="${track}"] .mx-light`;
+  const groupLight = (key) => `.mx-group[data-group='${key}'] > .mx-group-head .mx-group-title > .mx-light`;
+  const lightCode = mixerGroupsCode({ cps: 1, patterns: { t2: "note('c3').late(0.5)" } });
+  const lit = (watch, name) => watch.events[name].filter((event) => event.opacity === '1').length;
+  const everLit = (watch, name) => watch.events[name].some((event) => (event.opacity !== '' && Number(event.opacity) > 0) || event.lit === 'true');
+  const matched = (watch, name, key, windowMs) => lightRows(watch, name, key, windowMs).filter((row) => row.litAfter !== null).length;
+  const noteCount = (watch, key) => watch.notes.filter((note) => note.key === key).length;
+  await showPiece(lightCode, 'probe mixer group lights');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(groupLight('["g1"]'))}) !== null ? true : null`, 5000);
+  const groupWatch = async () => {
+    const watch = await watchFor({ t1: stripLight('label:t1'), t2: stripLight('label:t2'), g1: groupLight('["g1"]') }, ['label:t1', 'label:t2'], 20, 14);
+    return {
+      t1Notes: noteCount(watch, 'label:t1'),
+      t2Notes: noteCount(watch, 'label:t2'),
+      t1: matched(watch, 't1', 'label:t1', LIGHT_FRAME_MS + 20),
+      t2: matched(watch, 't2', 'label:t2', LIGHT_FRAME_MS + 20),
+      g1ForT1: matched(watch, 'g1', 'label:t1', LIGHT_FRAME_MS + 20),
+      g1ForT2: matched(watch, 'g1', 'label:t2', LIGHT_FRAME_MS + 20),
+    };
+  };
+  const groupOpen = await groupWatch();
+  await clickElement(cdp, frameFold('["g1"]'));
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'true' ? true : null`, 3000);
+  const groupFolded = await groupWatch();
+  await clickElement(cdp, frameFold('["g1"]'));
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["g1"]'))}).dataset.folded === 'false' ? true : null`, 3000);
+  const groupLit = (row) => row.t1Notes >= 6 && row.t2Notes >= 6 && row.g1ForT1 >= row.t1Notes - 1 && row.g1ForT2 >= row.t2Notes - 1 && row.t1 >= row.t1Notes - 1 && row.t2 >= row.t2Notes - 1;
+  report(
+    "mixer: a group's light lights when any of its tracks plays a note, open and folded",
+    groupLit(groupOpen) && groupLit(groupFolded),
+    JSON.stringify({ groupOpen, groupFolded }),
+  );
+
+  // A muted track never lights, and neither does a track another track's solo silences. Their group keeps lighting while any
+  // of its tracks sounds, and stays dark when none does.
+  const sounding = (track, value) => waitFor(cdp, `(() => { const el = document.querySelector('#mixer-strips .mx-strip[data-track="${track}"]'); return el !== null && el.dataset.sounding === '${value}' ? true : null; })()`, 8000);
+  await clickElement(cdp, '#mixer-strips .mx-strip[data-track="label:t1"] .mx-mute');
+  await sounding('label:t1', 'false');
+  const muteWatch = await watchFor({ t1: stripLight('label:t1'), t2: stripLight('label:t2'), g1: groupLight('["g1"]') }, ['label:t1', 'label:t2'], 4.5);
+  const muted = {
+    t1Notes: noteCount(muteWatch, 'label:t1'),
+    t1Lit: everLit(muteWatch, 't1'),
+    t2Notes: noteCount(muteWatch, 'label:t2'),
+    t2: matched(muteWatch, 't2', 'label:t2', LIGHT_FRAME_MS + 20),
+    g1: matched(muteWatch, 'g1', 'label:t2', LIGHT_FRAME_MS + 20),
+  };
+  await clickElement(cdp, '#mixer-strips .mx-strip[data-track="label:t3"] .mx-solo');
+  await sounding('label:t3', 'true');
+  await sounding('label:t2', 'false');
+  const soloWatch = await watchFor(
+    { t1: stripLight('label:t1'), t2: stripLight('label:t2'), t3: stripLight('label:t3'), g1: groupLight('["g1"]'), g2: groupLight('["g2"]'), g3: groupLight('["g2","g3"]') },
+    ['label:t3'],
+    4.5,
+  );
+  const soloed = {
+    t3Notes: noteCount(soloWatch, 'label:t3'),
+    t3: matched(soloWatch, 't3', 'label:t3', LIGHT_FRAME_MS + 20),
+    g2: matched(soloWatch, 'g2', 'label:t3', LIGHT_FRAME_MS + 20),
+    g3: matched(soloWatch, 'g3', 'label:t3', LIGHT_FRAME_MS + 20),
+    silentLit: ['t1', 't2', 'g1'].filter((name) => everLit(soloWatch, name)),
+  };
+  report(
+    'mixer: a muted track and a track silenced by a solo never light, and their group stays dark when none of its tracks sounds',
+    muted.t1Lit === false &&
+      muted.t2Notes >= 3 &&
+      muted.t2 >= muted.t2Notes - 1 &&
+      muted.g1 >= muted.t2Notes - 1 &&
+      soloed.t3Notes >= 3 &&
+      soloed.t3 >= soloed.t3Notes - 1 &&
+      soloed.g2 >= soloed.t3Notes - 1 &&
+      soloed.g3 >= soloed.t3Notes - 1 &&
+      soloed.silentLit.length === 0,
+    JSON.stringify({ muted, soloed }),
+  );
+
+  // A track without a label has no light and the page says why; a bus strip is not a track and has none.
+  await showPiece('stack(note("c3").gain(0), note("e3").gain(0))', 'probe mixer unlabeled lights');
+  await waitFor(cdp, `document.querySelectorAll('#mixer-strips .mx-strip').length === 2 ? true : null`, 5000);
+  const unlabeled = await evaluateExpr(
+    cdp,
+    `[...document.querySelectorAll('#mixer-strips .mx-strip')].map((el) => ({ light: el.querySelector('.mx-light') === null ? 'none' : el.querySelector('.mx-light').hidden ? 'hidden' : 'shown', note: el.querySelector('.mx-note').textContent }))`,
+  );
+  await showPiece('t1: note("c3").room(0.3).gain(0)', 'probe mixer bus lights');
+  await waitFor(cdp, `document.querySelector('#mixer-strips .mx-bus[data-bus="reverb"]') !== null ? true : null`, 5000);
+  const busLights = await evaluateExpr(
+    cdp,
+    `({ buses: document.querySelectorAll('#mixer-strips .mx-bus').length, busLights: document.querySelectorAll('#mixer-strips .mx-bus .mx-light').length, trackLight: document.querySelector('#mixer-strips .mx-strip[data-track="label:t1"] .mx-light').hidden })`,
+  );
+  report(
+    'mixer: an unlabeled track has no light and says why, and a bus strip has no light',
+    unlabeled.length === 2 &&
+      unlabeled.every((strip) => strip.light === 'hidden' && strip.note === MIXER_COPY.soloNeedsLabel) &&
+      MIXER_COPY.soloNeedsLabel === 'Solo and the light need a label — ask Claude to name this track.' &&
+      busLights.buses >= 1 &&
+      busLights.busLights === 0 &&
+      busLights.trackLight === false,
+    JSON.stringify({ unlabeled, busLights }),
+  );
+
+  // Each $ track's light follows its own notes: $0 and $1 are counted in code order, one note a cycle and two.
+  await showPiece('setcps(1)\n$: note("c3").gain(0)\n$: note("e3 g3").gain(0)', 'probe mixer dollar lights');
+  await waitFor(cdp, `document.querySelectorAll('#mixer-strips > .mx-strip:not(.mx-bus)').length === 2 ? true : null`, 5000);
+  const dollarWatch = await watchFor(
+    { first: '#mixer-strips > .mx-strip:not(.mx-bus):nth-child(1) .mx-light', second: '#mixer-strips > .mx-strip:not(.mx-bus):nth-child(2) .mx-light' },
+    ['$0', '$1'],
+    4.5,
+  );
+  const dollars = {
+    firstNotes: noteCount(dollarWatch, '$0'),
+    secondNotes: noteCount(dollarWatch, '$1'),
+    first: matched(dollarWatch, 'first', '$0', LIGHT_FRAME_MS + 20),
+    second: matched(dollarWatch, 'second', '$1', LIGHT_FRAME_MS + 20),
+    firstLit: lit(dollarWatch, 'first'),
+    secondLit: lit(dollarWatch, 'second'),
+  };
+  report(
+    "mixer: each $ track's light lights for its own notes",
+    dollars.firstNotes >= 3 &&
+      dollars.secondNotes >= 7 &&
+      dollars.first >= dollars.firstNotes - 1 &&
+      dollars.second >= dollars.secondNotes - 1 &&
+      dollars.firstLit <= dollars.firstNotes &&
+      dollars.secondLit <= dollars.secondNotes &&
+      dollars.secondLit > dollars.firstLit,
+    JSON.stringify(dollars),
+  );
+
+  // A muted copy kept next to a track of the same base name (`hats_` and `hats`) shares its note key: the audible track blinks
+  // and the copy stays dark. The page numbers the second strip's identity, but the notes still come under the one key.
+  await showPiece('setcps(1)\nhats_: note("c3").gain(0)\nhats: note("e3").gain(0)', 'probe mixer twin light');
+  await waitFor(cdp, `document.querySelectorAll('#mixer-strips > .mx-strip:not(.mx-bus)').length === 2 ? true : null`, 5000);
+  const twinStrips = await evaluateExpr(cdp, `[...document.querySelectorAll('#mixer-strips > .mx-strip:not(.mx-bus)')].map((el) => ({ track: el.dataset.track, sounding: el.dataset.sounding }))`);
+  const twinAudible = twinStrips.find((strip) => strip.sounding === 'true');
+  const twinMuted = twinStrips.find((strip) => strip.sounding === 'false');
+  const twinWatch =
+    twinAudible && twinMuted
+      ? await watchFor({ audible: stripLight(twinAudible.track), muted: stripLight(twinMuted.track) }, ['label:hats'], 4.5)
+      : null;
+  const twin = twinWatch && { notes: noteCount(twinWatch, 'label:hats'), audible: matched(twinWatch, 'audible', 'label:hats', LIGHT_FRAME_MS + 20), mutedLit: everLit(twinWatch, 'muted') };
+  report(
+    'mixer: a muted copy next to a track of the same base name stays dark while the audible track blinks',
+    twinStrips.length === 2 && twin !== null && twin.notes >= 3 && twin.audible >= twin.notes - 1 && twin.mutedLit === false,
+    JSON.stringify({ twinStrips, twin }),
+  );
+
+  // --- When the lights go dark and how they look without motion ---
+  const FLAT_LIGHTS = 'setcps(1)\nt1: note("c3").gain(0)\nt2: note("c3").late(0.5).gain(0)';
+  const FLAT_WATCH = { t1: stripLight('label:t1'), t2: stripLight('label:t2') };
+  const FLAT_KEYS = ['label:t1', 'label:t2'];
+  // Every light the Mixer holds, as plain data: the inline opacity of its fill and its lit mark.
+  const READ_LIGHTS = `[...document.querySelectorAll('#mixer-strips .mx-light')].map((light) => ({ opacity: light.querySelector('.mx-light-fill').style.opacity, lit: light.dataset.lit === undefined ? null : light.dataset.lit }))`;
+  const allUnlit = (rows) => rows.length > 0 && rows.every((row) => (row.opacity === '' || Number(row.opacity) === 0) && row.lit !== 'true');
+  const afterAll = (events, since, test) => events.filter((event) => event.t > since).some(test);
+  const blinking = (event) => (event.opacity !== '' && Number(event.opacity) > 0) || event.lit === 'true';
+
+  // Stop takes every light dark in the same moment the state word changes, nothing lights while stopped, and Play brings them back.
+  await showPiece(FLAT_LIGHTS, 'probe mixer light stop');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(FLAT_WATCH.t2)}) !== null ? true : null`, 5000);
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(FLAT_WATCH, FLAT_KEYS));
+  await waitFor(cdp, `window.__lightWatch.events.t1.length >= 2 && window.__lightWatch.events.t2.length >= 2 ? true : null`, 8000);
+  await evaluateExpr(
+    cdp,
+    `(() => {
+      window.__stopMarks = [];
+      const target = document.getElementById('sound-state');
+      window.__stopObserver = new MutationObserver(() => window.__stopMarks.push({ t: performance.now(), word: target.querySelector('.state-label').textContent }));
+      window.__stopObserver.observe(target, { childList: true, subtree: true, characterData: true });
+    })()`,
+  );
+  await stopMusic(cdp);
+  const atStop = await evaluateExpr(cdp, READ_LIGHTS);
+  await sleep(2200);
+  const stopMarks = await evaluateExpr(cdp, `(() => { window.__stopObserver.disconnect(); return window.__stopMarks; })()`);
+  const stopT = (stopMarks.find((mark) => mark.word !== SOUND_LABELS.playing) ?? { t: Infinity }).t;
+  const whileStopped = await evaluateExpr(cdp, `JSON.parse(JSON.stringify(window.__lightWatch.events))`);
+  await playMusic(cdp);
+  await sleep(3500);
+  const afterPlay = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  const stopClears = ['t1', 't2'].map((name) => whileStopped[name].some((event) => event.opacity === '' && event.t >= stopT - 20 && event.t <= stopT + 100));
+  const lateBlinks = ['t1', 't2'].map((name) => afterAll(whileStopped[name], stopT + 100, blinking));
+  const playBlinks = ['t1', 't2'].map((name) => afterAll(afterPlay.events[name], stopT + 2400, (event) => event.opacity === '1'));
+  report(
+    'mixer: Stop clears every light at once and nothing lights until Play',
+    stopT !== Infinity && allUnlit(atStop) && stopClears.every(Boolean) && lateBlinks.every((late) => late === false) && playBlinks.every(Boolean),
+    JSON.stringify({ stopT: Math.round(stopT), atStop, stopClears, lateBlinks, playBlinks }),
+  );
+
+  // The light loop survives what is not permanent. A tempo of 0 draws nothing and the lights come back with the tempo; a browser
+  // without an output timestamp falls back to the context's latencies and says so once; a frame that fails ends the lights
+  // only until the music is stopped and started again.
+  {
+    const heardLights = { errors: [], warnings: [] };
+    const stopHearing = cdp.onEvent((message) => {
+      if (message.method !== 'Runtime.consoleAPICalled') return;
+      const text = message.params.args.map((arg) => String(arg.value ?? arg.description ?? '')).join(' ');
+      if (message.params.type === 'error') heardLights.errors.push(text);
+      if (message.params.type === 'warning') heardLights.warnings.push(text);
+    });
+    // How many times a light's fill was written in the next `ms` milliseconds.
+    const countLightWrites = (ms) =>
+      evaluateExpr(
+        cdp,
+        `new Promise((resolve) => {
+          let count = 0;
+          const observers = [...document.querySelectorAll('#mixer-strips .mx-light .mx-light-fill')].map((fill) => {
+            const observer = new MutationObserver(() => { count += 1; });
+            observer.observe(fill, { attributes: true, attributeFilter: ['style'] });
+            return observer;
+          });
+          setTimeout(() => { for (const observer of observers) observer.disconnect(); resolve(count); }, ${ms});
+        })`,
+      );
+    const stoppedMessages = () => heardLights.errors.filter((text) => text.includes('the Mixer lights stopped')).length;
+    let survived = null;
+    try {
+      await showPiece(FLAT_LIGHTS, 'probe mixer lights survive');
+      await waitFor(cdp, `document.querySelector(${JSON.stringify(FLAT_WATCH.t2)}) !== null ? true : null`, 5000);
+      const baseline = await countLightWrites(3500);
+      // A tempo of 0: nothing is drawn, the loop is not broken, and the lights follow the tempo back.
+      const zeroCode = FLAT_LIGHTS.replace('setcps(1)', 'setcps(0)');
+      await callTool(client, 'set_code', { code: zeroCode, label: 'probe mixer lights tempo zero' });
+      await waitActive(zeroCode);
+      await sleep(600);
+      const atZero = await countLightWrites(1500);
+      const brokenAtZero = stoppedMessages();
+      await callTool(client, 'set_code', { code: FLAT_LIGHTS, label: 'probe mixer lights tempo back' });
+      await waitActive(FLAT_LIGHTS);
+      const afterZero = await countLightWrites(3500);
+      // No output timestamp: the lights still blink, and the page says so once.
+      await evaluateExpr(cdp, `(() => { getAudioContext().getOutputTimestamp = undefined; })()`);
+      const withoutPair = await countLightWrites(3500);
+      const pairWarnings = heardLights.warnings.filter((text) => text.includes('getOutputTimestamp')).length;
+      await evaluateExpr(cdp, `(() => { delete getAudioContext().getOutputTimestamp; })()`);
+      // A frame that fails ends the lights with one message ...
+      await evaluateExpr(cdp, `(() => { getAudioContext().getOutputTimestamp = () => { throw new Error('probe: a frame that fails'); }; })()`);
+      await sleep(1200);
+      const brokenMessages = stoppedMessages();
+      const whileBroken = await countLightWrites(1500);
+      await evaluateExpr(cdp, `(() => { delete getAudioContext().getOutputTimestamp; })()`);
+      // ... and a Stop and Play brings them back.
+      await stopMusic(cdp);
+      await sleep(400);
+      await playMusic(cdp);
+      const afterRestart = await countLightWrites(3500);
+      survived = { baseline, atZero, brokenAtZero, afterZero, withoutPair, pairWarnings, brokenMessages, whileBroken, afterRestart, finalMessages: stoppedMessages() };
+    } finally {
+      await evaluateExpr(cdp, `(() => { delete getAudioContext().getOutputTimestamp; })()`);
+      stopHearing();
+    }
+    report(
+      'mixer: a tempo of 0 draws nothing and the lights return with the tempo, no output timestamp falls back with one warning, and a failed frame ends the lights only until Stop and Play',
+      survived !== null &&
+        survived.baseline > 4 &&
+        survived.atZero === 0 &&
+        survived.brokenAtZero === 0 &&
+        survived.afterZero > 4 &&
+        survived.withoutPair > 4 &&
+        survived.pairWarnings === 1 &&
+        survived.brokenMessages === 1 &&
+        survived.whileBroken === 0 &&
+        survived.afterRestart > 4 &&
+        survived.finalMessages === 1,
+      JSON.stringify({ survived, errors: heardLights.errors, warnings: heardLights.warnings }),
+    );
+  }
+
+  // A hidden tab draws nothing and drops the notes it sees; coming back, every light starts unlit and follows the next notes.
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(FLAT_WATCH.t2)}) !== null ? true : null`, 5000);
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(FLAT_WATCH, FLAT_KEYS));
+  await waitFor(cdp, `window.__lightWatch.events.t1.length >= 2 ? true : null`, 8000);
+  let hiddenWatch = null;
+  let backAtOnce = null;
+  let hideT = 0;
+  let showT = 0;
+  try {
+    hideT = await evaluateExpr(
+      cdp,
+      `(() => {
+        Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+        Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+        document.dispatchEvent(new Event('visibilitychange'));
+        return performance.now();
+      })()`,
+    );
+    await sleep(3300);
+    showT = await evaluateExpr(
+      cdp,
+      `(() => {
+        delete document.visibilityState;
+        delete document.hidden;
+        document.dispatchEvent(new Event('visibilitychange'));
+        return performance.now();
+      })()`,
+    );
+    backAtOnce = await evaluateExpr(cdp, READ_LIGHTS);
+    await sleep(3000);
+  } finally {
+    await evaluateExpr(cdp, `(() => { delete document.visibilityState; delete document.hidden; })()`);
+    hiddenWatch = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  }
+  const whileHidden = ['t1', 't2'].map((name) => hiddenWatch.events[name].filter((event) => event.t > hideT + 100 && event.t < showT).length);
+  const afterBack = ['t1', 't2'].map((name) => afterAll(hiddenWatch.events[name], showT, (event) => event.opacity === '1'));
+  report(
+    'mixer: a hidden tab draws no light, and every light is unlit when it comes back',
+    whileHidden.every((count) => count === 0) && backAtOnce !== null && allUnlit(backAtOnce) && afterBack.every(Boolean),
+    JSON.stringify({ whileHidden, backAtOnce, afterBack }),
+  );
+
+  // With motion off no opacity is ever written. A light is lit from its note until one cycle later, a mute clears it at
+  // once, and switching motion clears both forms.
+  const motionNow = () => evaluateExpr(cdp, `document.documentElement.dataset.motion`);
+  const switchMotion = async (wanted) => {
+    if ((await motionNow()) !== wanted) await evaluateExpr(cdp, `document.getElementById('motion-switch').click()`);
+    if ((await waitFor(cdp, `document.documentElement.dataset.motion === ${JSON.stringify(wanted)} ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun(`the motion switch did not reach ${wanted}`);
+    }
+  };
+  const motionAtStart = await motionNow();
+  await switchMotion('on');
+  await showPiece('setcps(1)\nt1: note("c3").gain(0)\nt2: note("c3").slow(3).gain(0)', 'probe mixer light motion off');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(FLAT_WATCH.t2)}) !== null ? true : null`, 5000);
+  const blinkingOn = await waitFor(cdp, `(${READ_LIGHTS}).some((row) => row.opacity !== '') ? true : null`, 6000);
+  await switchMotion('off');
+  const switchedOff = await evaluateExpr(cdp, READ_LIGHTS);
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(FLAT_WATCH, ['label:t2']));
+  await sleep(10500);
+  const steady = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  const t2Rows = steady.notes.map((note) => {
+    const lits = steady.events.t2.filter((event) => event.lit === 'true' && event.t >= note.heard - 1 && event.t <= note.heard + LIGHT_FRAME_MS + 20);
+    const off = lits.length === 0 ? undefined : steady.events.t2.find((event) => event.lit === 'false' && event.t > lits[0].t);
+    return { onAfter: lits.length === 0 ? null : lits[0].t - note.heard, offAfter: off === undefined ? null : off.t - note.heard };
+  });
+  const noOpacity = ['t1', 't2'].every((name) => steady.events[name].every((event) => event.opacity === ''));
+  const t1Steady = steady.events.t1.every((event) => event.lit !== 'false');
+  // The last note's light may not have gone out yet when the watch stops; every other note's did, one cycle after it.
+  const settledRows = t2Rows.slice(0, -1);
+  // Mute t1: its light goes out in the frame after the Mixer draws the change, and never lights again.
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(FLAT_WATCH, []));
+  await evaluateExpr(
+    cdp,
+    `(() => {
+      const strip = document.querySelector('#mixer-strips .mx-strip[data-track="label:t1"]');
+      window.__soundingAt = null;
+      new MutationObserver(() => { if (strip.dataset.sounding === 'false' && window.__soundingAt === null) window.__soundingAt = performance.now(); }).observe(strip, { attributes: true, attributeFilter: ['data-sounding'] });
+    })()`,
+  );
+  await clickElement(cdp, '#mixer-strips .mx-strip[data-track="label:t1"] .mx-mute');
+  await waitFor(cdp, `window.__soundingAt !== null ? true : null`, 8000);
+  await sleep(2500);
+  const soundingAt = await evaluateExpr(cdp, `window.__soundingAt`);
+  const muteOffWatch = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  const mutedOff = muteOffWatch.events.t1.find((event) => event.lit === 'false' && event.t >= soundingAt - 5);
+  const mutedAgain = afterAll(muteOffWatch.events.t1, soundingAt + 100, (event) => event.lit === 'true');
+  // Back to motion on: both forms are gone at once, and the lights blink with an opacity again.
+  await switchMotion('on');
+  const switchedOn = await evaluateExpr(cdp, READ_LIGHTS);
+  const blinksAgain = await waitFor(cdp, `(${READ_LIGHTS}).some((row) => row.opacity !== '') ? true : null`, 8000);
+  await switchMotion(motionAtStart);
+  report(
+    'mixer: with motion off no inline opacity is written, a light stays lit for one cycle after a note, a mute clears it at once, and switching motion clears both forms',
+    blinkingOn === true &&
+      allUnlit(switchedOff) &&
+      switchedOff.every((row) => row.opacity === '' && row.lit === null) &&
+      noOpacity &&
+      t1Steady &&
+      steady.notes.length >= 3 &&
+      settledRows.length >= 2 &&
+      settledRows.every((row) => row.onAfter !== null && row.offAfter !== null && row.offAfter >= 990 && row.offAfter <= 1100) &&
+      mutedOff !== undefined &&
+      mutedOff.t - soundingAt <= 120 &&
+      mutedAgain === false &&
+      switchedOn.every((row) => row.opacity === '' && row.lit === null) &&
+      blinksAgain === true,
+    JSON.stringify({ blinkingOn, switchedOff, noOpacity, t1Steady, t2Rows, mutedOffAfter: mutedOff === undefined ? null : Math.round(mutedOff.t - soundingAt), mutedAgain, switchedOn, blinksAgain }),
+  );
+
+  // Opening the Mixer while music plays starts every light unlit, and nothing is drawn while it is closed.
+  await showPiece(FLAT_LIGHTS, 'probe mixer light open');
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(FLAT_WATCH.t2)}) !== null ? true : null`, 5000);
+  await waitFor(cdp, `(${READ_LIGHTS}).some((row) => row.opacity !== '') ? true : null`, 6000);
+  await openView('4', 'parts');
+  await sleep(600);
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(FLAT_WATCH, FLAT_KEYS));
+  await sleep(2600);
+  const whileClosed = await evaluateExpr(cdp, `JSON.parse(JSON.stringify(window.__lightWatch.events))`);
+  await openView('3', 'mixer');
+  const justOpened = await evaluateExpr(cdp, READ_LIGHTS);
+  await sleep(3200);
+  const afterOpen = await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+  const closedWrites = ['t1', 't2'].map((name) => whileClosed[name].length);
+  const blinksAfterOpen = ['t1', 't2'].map((name) => afterOpen.events[name].some((event) => event.opacity === '1'));
+  report(
+    'mixer: opening the Mixer while music plays starts every light unlit',
+    closedWrites.every((count) => count === 0) && allUnlit(justOpened) && blinksAfterOpen.every(Boolean),
+    JSON.stringify({ closedWrites, justOpened, blinksAfterOpen }),
+  );
+
+  // A piece without a structure keeps its Mixer: the strips in code order and then the bus, each labeled strip with a light in front of
+  // its name, and Tab goes from a name to the strip's next control and never to a light.
+  await showPiece('setcps(1)\nt1: note("c3").room(0.3).gain(0)\nt2: note("e3").gain(0)', 'probe mixer flat lights');
+  await waitFor(cdp, `document.querySelector('#mixer-strips .mx-bus[data-bus="reverb"]') !== null ? true : null`, 5000);
+  const flatLights = await evaluateExpr(
+    cdp,
+    `(() => {
+      const strips = [...document.getElementById('mixer-strips').children];
+      const first = (el) => { const row = el.children[0]; return row.className + ':' + [...row.children].map((child) => child.className).join('+'); };
+      const tabbable = [...document.querySelectorAll('#mixer-strips button, #mixer-strips input, #mixer-strips [tabindex]')];
+      return {
+        groups: document.querySelectorAll('#mixer-strips .mx-group').length,
+        order: strips.map((el) => (el.classList.contains('mx-bus') ? 'bus' : el.dataset.track)),
+        rows: strips.filter((el) => !el.classList.contains('mx-bus')).map(first),
+        busRows: strips.filter((el) => el.classList.contains('mx-bus')).map((el) => el.querySelectorAll('.mx-light').length),
+        lightIsTabbable: tabbable.some((el) => el.classList.contains('mx-light') || el.closest('.mx-light') !== null),
+        lightTags: [...document.querySelectorAll('#mixer-strips .mx-light')].map((el) => el.tagName + ':' + el.getAttribute('aria-hidden') + ':' + el.hasAttribute('tabindex')),
+      };
+    })()`,
+  );
+  await evaluateExpr(cdp, `document.querySelector('#mixer-strips .mx-strip[data-track="label:t1"] .mx-name').focus()`);
+  await pressKey(cdp, 'Tab');
+  const afterTab = await evaluateExpr(
+    cdp,
+    `(() => { const el = document.activeElement; return { inStrip: el.closest('.mx-strip') !== null && el.closest('.mx-strip').dataset.track === 'label:t1', isName: el.classList.contains('mx-name'), inLight: el.closest('.mx-light') !== null, tag: el.tagName }; })()`,
+  );
+  report(
+    'mixer: a piece without a structure keeps its Mixer, with one light in each labeled track strip',
+    flatLights.groups === 0 &&
+      JSON.stringify(flatLights.order.slice(0, 2)) === JSON.stringify(['label:t1', 'label:t2']) &&
+      flatLights.order.slice(2).every((entry) => entry === 'bus') &&
+      flatLights.order.length >= 3 &&
+      flatLights.rows.every((row) => row === 'mx-name-row:mx-light+mx-name') &&
+      flatLights.busRows.every((count) => count === 0) &&
+      flatLights.lightIsTabbable === false &&
+      flatLights.lightTags.every((tag) => tag === 'SPAN:true:false') &&
+      afterTab.inStrip === true &&
+      afterTab.isName === false &&
+      afterTab.inLight === false,
+    JSON.stringify({ flatLights, afterTab }),
+  );
+
+  // --- Cost at 40 tracks ---
+  // The page's own light module is built in the page with 40 tracks under 8 groups and fed about 5 notes a frame (300 a second),
+  // and 3000 frames are timed in one block, because a single frame is below the clock's resolution. The same block is timed again
+  // with a forced style and layout pass after each frame, which is reported only.
+  const benchRead = await evaluateExpr(
+    cdp,
+    `(async () => {
+      const { createLights } = await import('/lights.js');
+      const names = Array.from({ length: 40 }, (_, i) => 't' + i);
+      const tracks = names.map((name) => ({ key: 'label:' + name, id: 'label:' + name, sounding: true }));
+      const ancestors = new Map(names.map((name, i) => ['label:' + name, ['g' + (i % 8)]]));
+      const toPerf = (target) => target * 1000;
+      const frames = 3000;
+      const run = (forced) => {
+        const lights = createLights();
+        lights.setLayout({ tracks, ancestors });
+        let ts = performance.now();
+        let changes = 0;
+        const started = performance.now();
+        for (let frame = 0; frame < frames; frame++) {
+          ts += 16.7;
+          for (let k = 0; k < 5; k++) lights.noteSeen('label:t' + ((frame * 5 + k) % 40), { at: ts - 2 });
+          changes += lights.frame(ts, { motion: 'on', cps: 1, toPerf }).length;
+          if (forced) document.documentElement.getBoundingClientRect();
+        }
+        return { perFrame: (performance.now() - started) / frames, changes };
+      };
+      run(false);
+      const plain = run(false);
+      const forced = run(true);
+      return { frames, plainMs: plain.perFrame, forcedMs: forced.perFrame, changes: plain.changes };
+    })()`,
+  );
+  const ms3 = (value) => Math.round(value * 1000) / 1000;
+  report(
+    'mixer: the light loop costs under 0.2 ms of JavaScript a frame at 40 tracks',
+    benchRead !== null && benchRead.frames === 3000 && benchRead.changes > 0 && benchRead.plainMs < 0.2,
+    JSON.stringify(benchRead === null ? null : { frames: benchRead.frames, jsMsPerFrame: ms3(benchRead.plainMs), withForcedStyleAndLayoutMsPerFrame: ms3(benchRead.forcedMs), changes: benchRead.changes }),
+  );
+
+  // A silent piece of 40 tracks in 8 groups of 5, each playing 8 notes a cycle at one cycle a second (320 notes a second): the page
+  // plays it with the Mixer closed and then with the Mixer open and the lights running, and the animation-frame intervals of
+  // 10 seconds are recorded each time. A frame is dropped when its interval is over 1.5 times the median. The bound is loose on
+  // purpose: frame numbers depend on the machine and the load.
+  const bigNames = Array.from({ length: 40 }, (_, i) => `t${i}`);
+  const bigGroups = `{ ${Array.from({ length: 8 }, (_, g) => `g${g}: [${bigNames.slice(g * 5, g * 5 + 5).map((name) => `'${name}'`).join(', ')}]`).join(', ')} }`;
+  const bigPatterns = Object.fromEntries(bigNames.map((name) => [name, 'note("c3*8")']));
+  const bigCode = mixerGroupsCode({ groups: bigGroups, names: bigNames, extra: [], patterns: bigPatterns, cps: 1 });
+  const FRAMES_START = `(() => {
+    const rec = (window.__frameRecord = { ints: [], last: null, on: true, raf: 0, loaf: 0 });
+    try {
+      rec.observer = new PerformanceObserver((list) => { rec.loaf += list.getEntries().length; });
+      rec.observer.observe({ type: 'long-animation-frame', buffered: false });
+    } catch (err) {
+      rec.loaf = null;
+    }
+    const tick = (ts) => {
+      if (!rec.on) return;
+      if (rec.last !== null) rec.ints.push(ts - rec.last);
+      rec.last = ts;
+      rec.raf = requestAnimationFrame(tick);
+    };
+    rec.raf = requestAnimationFrame(tick);
+    return true;
+  })()`;
+  const FRAMES_STOP = `(() => {
+    const rec = window.__frameRecord;
+    rec.on = false;
+    cancelAnimationFrame(rec.raf);
+    if (rec.observer) rec.observer.disconnect();
+    delete window.__frameRecord;
+    return { ints: rec.ints, loaf: rec.loaf };
+  })()`;
+  const frameFacts = (read) => {
+    const sorted = [...read.ints].sort((a, b) => a - b);
+    const median = sorted.length === 0 ? 0 : sorted[Math.floor(sorted.length / 2)];
+    return { frames: read.ints.length, medianMs: Math.round(median * 10) / 10, dropped: read.ints.filter((interval) => interval > 1.5 * median).length, longAnimationFrames: read.loaf };
+  };
+  const recordFrames = async (seconds) => {
+    await evaluateExpr(cdp, FRAMES_START);
+    await sleep(seconds * 1000);
+    return frameFacts(await evaluateExpr(cdp, FRAMES_STOP));
+  };
+  await showPiece(bigCode, 'probe mixer 40 tracks');
+  await waitFor(cdp, `document.querySelectorAll('#mixer-strips .mx-strip:not(.mx-bus)').length === 40 ? true : null`, 15000);
+  await openView('4', 'parts');
+  await sleep(3000);
+  const closedFrames = await recordFrames(10);
+  await openView('3', 'mixer');
+  await sleep(3000);
+  const litWhileOpen = await evaluateExpr(cdp, `document.querySelectorAll('#mixer-strips .mx-light').length`);
+  const openFrames = await recordFrames(10);
+  report(
+    '40 tracks in 8 groups play with the Mixer open without dropping more frames than with it closed',
+    closedFrames.frames >= 300 && openFrames.frames >= 300 && litWhileOpen >= 48 && openFrames.dropped <= closedFrames.dropped + 3,
+    JSON.stringify({ closed: closedFrames, open: openFrames, lights: litWhileOpen }),
+  );
+  await callTool(client, 'set_code', { code: 't1: note("c3").gain(0)', label: 'probe mixer 40 tracks done' });
+
+  // --- Pictures of the Mixer for the person's own eye ---
+  // Off unless MOONTIDE_PROBE_SHOTS names a folder outside the repository. The grid's realistic piece (nested groups) at one
+  // cycle a second, with one group folded and one group partly muted, is saved at 1920 by 1080 and 3840 by 2160 in the layouts
+  // a, b and c: with the music stopped, so every light is dark and the groups read clean ("groups"), and while it plays, taken
+  // at a moment when lights are lit ("lights"). The names are built from the constants below only, never from text of the page.
+  const mixerShotsFolder = shotsFolder();
+  if (mixerShotsFolder !== null) {
+    const MIXER_SHOT_SIZES = [[1920, 1080], [3840, 2160]];
+    const MIXER_SHOT_LAYOUTS = ['a', 'b', 'c'];
+    const written = [];
+    const litLights = `[...document.querySelectorAll('#mixer-strips .mx-light-fill')].filter((el) => Number(el.style.opacity) > 0.4).length`;
+    const litAtPicture = [];
+    const pictureMatrix = async (state) => {
+      for (const layout of MIXER_SHOT_LAYOUTS) {
+        await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+        await pressKey(cdp, layout);
+        await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(layout)} ? true : null`, 3000);
+        for (const [width, height] of MIXER_SHOT_SIZES) {
+          await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+          await sleep(600);
+          if (state === 'lights') {
+            // Taken at once when at least two lights are lit: the picture shows how a lit dot looks, not the timing.
+            await waitFor(cdp, `(() => (${litLights}) >= 2 ? true : null)()`, 6000);
+          }
+          written.push(await saveShot(cdp, mixerShotsFolder, state, width, height, layout, 'mixer'));
+          if (state === 'lights') litAtPicture.push(await evaluateExpr(cdp, litLights));
+        }
+        await cdp('Emulation.clearDeviceMetricsOverride');
+        await sleep(300);
+      }
+    };
+    const chordsFold = `.mx-group[data-group='["chords"]'] > .mx-group-head .mx-fold`;
+    try {
+      await showPiece(songShotPlayingCode(1), 'probe mixer pictures');
+      await waitFor(cdp, `document.querySelectorAll('#mixer-strips .mx-strip:not(.mx-bus)').length === 6 ? true : null`, 8000);
+      // An effect panel an earlier check left open would sit in every picture: it is closed first.
+      if ((await evaluateExpr(cdp, `document.querySelector('.mx-insp-close') !== null && document.querySelector('.mx-insp-close').getClientRects().length > 0`)) === true) {
+        await clickElement(cdp, '.mx-insp-close');
+      }
+      await clickElement(cdp, chordsFold);
+      await waitFor(cdp, `document.querySelector(${JSON.stringify(frameSelector('["chords"]'))}).dataset.folded === 'true' ? true : null`, 3000);
+      await clickElement(cdp, '#mixer-strips .mx-strip[data-track="label:kick"] .mx-mute');
+      await sounding('label:kick', 'false');
+      await pictureMatrix('lights');
+      await stopMusic(cdp);
+      await sleep(600);
+      await pictureMatrix('groups');
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+      await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+      await pressKey(cdp, 'a');
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === 'a' ? true : null`, 3000);
+    }
+    // The fold goes back to open and the music to a quiet piece, so nothing else sees this state.
+    if ((await evaluateExpr(cdp, `document.querySelector(${JSON.stringify(frameSelector('["chords"]'))}).dataset.folded`)) === 'true') await clickElement(cdp, chordsFold);
+    await callTool(client, 'set_code', { code: 't1: note("c3").gain(0)', label: 'probe mixer pictures done' });
+    const expectedPictures = ['groups', 'lights'].flatMap((state) => MIXER_SHOT_LAYOUTS.flatMap((layout) => MIXER_SHOT_SIZES.map(([width, height]) => `mixer-${state}-${width}x${height}-layout-${layout}.png`))).sort();
+    const pictureProblems = [];
+    for (const name of expectedPictures) {
+      const file = path.join(mixerShotsFolder, name);
+      if (!fs.existsSync(file)) pictureProblems.push(`${name} is missing`);
+      else if (fs.readFileSync(file).subarray(0, 4).toString('hex') !== '89504e47') pictureProblems.push(`${name} is not a PNG`);
+    }
+    report(
+      'mixer: pictures of nested groups and of lights are saved outside the repository',
+      pictureProblems.length === 0 && written.length === 12 && path.relative(REPO_ROOT, mixerShotsFolder).startsWith('..'),
+      JSON.stringify({ written: written.length, problems: pictureProblems.slice(0, 5), litLightsAtLightPictures: litAtPicture }),
+    );
+    console.log('probe:page mixer pictures saved in a scratch folder outside the repository');
+  }
+}
+
+// ---- the notes you edit on the Timeline ----------------------------------------------------------------------------------
+
+/**
+ * Timeline edit checks: a click on a note of a lane, the panel under the lanes and the rewrite of one token, proven in the
+ * live page with real mouse and key events. Each check plays a silent piece with neutral names (t1, t2, ...) and notes (c3 e3
+ * g3) with set_code, opens the Timeline with key 2 and reads what the page draws and what the code is afterwards.
+ */
+export async function timelineBlocks(context) {
+  const { cdp, client, report } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const activeCodeExpr = `${replState}.activeCode`;
+  const waitActive = async (code) => {
+    if ((await waitFor(cdp, `${activeCodeExpr} === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of this check within 8 seconds');
+    }
+  };
+  const blurActive = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  const openTimeline = async () => {
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) === 'timeline') return;
+    await blurActive();
+    await pressKey(cdp, '2');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'timeline' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Timeline did not open');
+    }
+  };
+  /** Plays `code`, opens the Timeline and waits until it draws `lanes` lanes. */
+  const showPiece = async (code, label, lanes) => {
+    await callTool(client, 'set_code', { code, label });
+    await waitActive(code);
+    await openTimeline();
+    const drawn = await waitFor(
+      cdp,
+      `(() => { const view = document.getElementById('timeline-view'); return view.dataset.state === 'ok' && document.querySelectorAll('#timeline-lanes .lane').length === ${lanes} ? true : null; })()`,
+      10000,
+    );
+    if (drawn !== true) throw new ProbeCouldNotRun('the Timeline did not draw the lanes of this check within 10 seconds');
+  };
+  const historyTop = async () => {
+    const reply = await callTool(client, 'list_history', {});
+    const match = /^#(\d+) (.*)$/m.exec(reply);
+    if (match === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(reply).slice(0, 200)}`);
+    return { id: Number(match[1]), row: match[2] };
+  };
+  /** The centre of the `nth` note mark of lane `lane` (in the order they are drawn), where a real click lands. */
+  const noteCenter = (lane, nth) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const rect = document.querySelectorAll('#timeline-lanes .lane')[${lane}].querySelectorAll('rect.event[data-kind="note"]')[${nth}];
+        if (!rect) return null;
+        rect.scrollIntoView({ block: 'nearest' });
+        const r = rect.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+      })()`,
+    );
+  const clickAt = async (point, { button = 'left', ctrl = false } = {}) => {
+    const buttons = button === 'left' ? 1 : 2;
+    const modifiers = ctrl ? 2 : 0;
+    await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button, buttons, clickCount: 1, modifiers });
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button, buttons: 0, clickCount: 1, modifiers });
+  };
+  const READ_PANEL = `(() => {
+    const panel = document.getElementById('timeline-note');
+    const values = [...panel.querySelectorAll('.tl-value')].map((el) => el.textContent);
+    const line = document.getElementById('timeline-note-line');
+    return {
+      hidden: panel.hidden,
+      lane: panel.querySelector('.tl-lane-name').textContent,
+      position: panel.querySelector('.tl-note-position').textContent,
+      state: panel.querySelector('.tl-note-state').textContent,
+      controlsHidden: panel.querySelector('.tl-note-controls').hidden,
+      pitch: values[0],
+      velocity: values[1],
+      line: line.textContent,
+      lineKind: line.getAttribute('data-kind'),
+      hint: panel.querySelector('.tl-note-hint').textContent,
+      rings: document.querySelectorAll('#timeline-lanes .tl-ring').length,
+    };
+  })()`;
+  const readPanel = () => evaluateExpr(cdp, READ_PANEL);
+  const panelWhen = (done) => waitFor(cdp, `(() => { const read = ${READ_PANEL}; return (${done})(read) ? read : null; })()`, 5000);
+  const clearViews = async () => {
+    if (await evaluateExpr(cdp, `!document.getElementById('ask-box').hidden`)) await pressKey(cdp, 'Escape');
+    await blurActive();
+  };
+  await clearViews();
+  // The Ask box and the listener that would read a request line: a gesture on a note the page cannot edit puts its request in
+  // the box, and nothing may reach the server before the person presses Enter.
+  // The Ask box, its field and the listener that would read a request line, as the Song grid's checks read them.
+  const askBoxRead = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const box = document.getElementById('ask-box');
+        const field = document.getElementById('ask-field');
+        const r = box.getBoundingClientRect();
+        return {
+          open: !box.hidden,
+          chip: document.getElementById('ask-context-chip').textContent,
+          value: field.value,
+          start: field.selectionStart,
+          end: field.selectionEnd,
+          focusInField: document.activeElement === field,
+          focusOnLanes: document.activeElement === document.getElementById('timeline-lanes'),
+          message: document.getElementById('ask-message').hidden ? '' : document.getElementById('ask-message').textContent,
+          left: r.left, right: r.right, top: r.top, bottom: r.bottom,
+        };
+      })()`,
+    );
+  const askFieldSet = (text) => evaluateExpr(cdp, `(() => { const f = document.getElementById('ask-field'); f.value = ${JSON.stringify(text)}; f.dispatchEvent(new Event('input', { bubbles: true })); return true; })()`);
+  /** Empties the field and closes the box, so the next gesture starts from nothing. */
+  const askReset = async () => {
+    await askFieldSet('');
+    if ((await askBoxRead()).open) await pressKey(cdp, 'Escape');
+  };
+  const stopAskListeners = async () => {
+    for (const child of spawnedListeners) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill();
+        await exited;
+      }
+    }
+    await sleep(300);
+  };
+  const REQUEST_PREFIX = 'Request from the Moontide page: ';
+  const parsedRequest = (line) => (line !== undefined && line.startsWith(REQUEST_PREFIX) ? JSON.parse(line.slice(REQUEST_PREFIX.length)) : null);
+  const editorAndHistory = async () => ({ editor: await editorText(), active: await evaluateExpr(cdp, activeCodeExpr), history: await historyTop() });
+  /** The cycle and beat the panel shows for the selected note, read from its position line. */
+  const placeOf = (read) => {
+    const match = /^ · cycle (\d+), beat (\d)/.exec(read.position);
+    return match === null ? null : { cycle: Number(match[1]), beat: Number(match[2]) };
+  };
+
+
+  // A click selects a note that is one token of a double-quoted note string; Up rewrites exactly that token after the page has
+  // read the edited track back, adds one history row and tells Claude on its next get_code that the code was edited by hand.
+  const literalCode = 't1: note("c3 e3 g3").gain(0)\nt2: note("e3").gain(0)';
+  await showPiece(literalCode, 'probe timeline literal', 2);
+  const idle = await readPanel();
+  const target = await noteCenter(0, 0);
+  const historyBefore = await historyTop();
+  await clickAt(target);
+  const selected = await panelWhen('(read) => read.state !== ""');
+  const codeAfterClick = await evaluateExpr(cdp, activeCodeExpr);
+  const historyAfterClick = await historyTop();
+  await pressKey(cdp, 'ArrowUp');
+  const written = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(literalCode)} ? ${activeCodeExpr} : null`, 8000);
+  const sentence = await panelWhen('(read) => read.line.startsWith("Changed")');
+  const historyAfter = await historyTop();
+  const getCode = String(await callTool(client, 'get_code', {}));
+  const expected = literalCode.replace('c3', 'c#3');
+  report(
+    'timeline: a click selects a literal note and Up writes only its token, read back, with one history row and the hand-edit note',
+    idle !== null &&
+      idle.hidden === false &&
+      idle.state === '' &&
+      idle.position === 'No note selected' &&
+      idle.controlsHidden === true &&
+      idle.hint.startsWith('Click a note to edit it.') &&
+      selected !== null &&
+      selected.lane === 't1' &&
+      selected.state === 'Editable' &&
+      /^ · cycle \d+, beat 1$/.test(selected.position) &&
+      selected.pitch === 'c3 · 48' &&
+      selected.controlsHidden === false &&
+      selected.rings === 1 &&
+      selected.line === 'An edit rewrites one token in the code: c3.' &&
+      codeAfterClick === literalCode &&
+      historyAfterClick.id === historyBefore.id &&
+      written === expected &&
+      sentence !== null &&
+      sentence.line === 'Changed c3 to c#3.' &&
+      historyAfter.id === historyBefore.id + 1 &&
+      historyAfter.row.includes('changed t1: c3 to c#3') &&
+      getCode.includes(HAND_EDIT_NOTE),
+    JSON.stringify({ idle, selected, codeAfterClick: codeAfterClick === literalCode, written, expectedCode: written === expected, sentence, historyBefore, historyAfter, handEditNote: getCode.includes(HAND_EDIT_NOTE) }),
+  );
+
+  // Every kind of note: one lane for each, and the first note of the lane is clicked. A note the page can edit says Editable and
+  // names its token; every other says Not editable with the sentence of the first reason that applies, and Up on it changes no
+  // code and adds no history row.
+  const kindsCode = [
+    'const riff = note("c3 e3");',
+    'const only = note("d3");',
+    't1: note("c3 e3 g3").gain(0)',
+    "t2: n(\"0 2 4\").scale('C3:major').gain(0)",
+    "t3: n(run(3)).scale('C3:major').gain(0)",
+    't4: note("c3 e3").add(note("12")).gain(0)',
+    't5: note("c3*2 e3").gain(0)',
+    't6: note("c3 e3").add(note(12)).gain(0)',
+    't7: riff.gain(0)',
+    't8: riff.gain(0)',
+    't9: note("c3\\x20e3 g3").gain(0)',
+    // A single-quoted string is not read as mini-notation, so it holds one note.
+    "t10: note('c3').gain(0)",
+    't11: only.gain(0)',
+    't12: note("c3 e3 g3").velocity("0.5 1").gain(0)',
+  ].join('\n');
+  const kinds = [
+    ['t1', 'a double-quoted note string', 'Editable', 'An edit rewrites one token in the code: c3.'],
+    ['t2', 'degrees', 'Not editable', TIMELINE_COPY.noteReasons.degrees],
+    ['t3', 'a note made by a function', 'Not editable', TIMELINE_COPY.noteReasons['no-token']],
+    ['t4', 'an added string', 'Not editable', TIMELINE_COPY.noteReasons.several],
+    ['t5', 'a factor', 'Not editable', TIMELINE_COPY.noteReasons.several],
+    ['t6', 'an added number', 'Not editable', TIMELINE_COPY.noteReasons.shifted],
+    ['t7', 'code shared with t8', 'Not editable', TIMELINE_COPY.noteReasons.shared],
+    ['t8', 'code shared with t7', 'Not editable', TIMELINE_COPY.noteReasons.shared],
+    ['t9', 'an escape sequence', 'Not editable', TIMELINE_COPY.noteReasons.escape],
+    ['t10', 'a single-quoted string', 'Not editable', TIMELINE_COPY.noteReasons['no-token']],
+    ['t11', 'a const that only this track reads', 'Not editable', TIMELINE_COPY.noteReasons.outside],
+    ['t12', 'a velocity string', 'Editable', 'An edit rewrites one token in the code: c3.'],
+  ];
+  await showPiece(kindsCode, 'probe timeline kinds', kinds.length);
+  const kindResults = [];
+  const kindHistoryBefore = await historyTop();
+  for (const [lane, [name, what, state, sentenceText]] of kinds.entries()) {
+    const point = await noteCenter(lane, 0);
+    if (point === null) throw new ProbeCouldNotRun(`lane ${name} of the kinds piece draws no note`);
+    await clickAt(point);
+    const read = await panelWhen(`(read) => read.lane === ${JSON.stringify(name)}`);
+    let unchanged = null;
+    if (state === 'Not editable') {
+      await pressKey(cdp, 'ArrowUp');
+      await sleep(250);
+      unchanged = (await evaluateExpr(cdp, activeCodeExpr)) === kindsCode;
+      // Up on such a note opens the Ask box with a request ready; it is closed so it does not cover the next lane.
+      await askReset();
+    }
+    kindResults.push({ name, what, ok: read !== null && read.state === state && read.line === sentenceText && read.rings === 1 && unchanged !== false, state: read && read.state, line: read && read.line, unchanged });
+  }
+  const kindHistoryAfter = await historyTop();
+  report(
+    'timeline: every kind of note shows Editable or the sentence of its reason, and Up on a refused note changes no code',
+    kindResults.every((entry) => entry.ok) && kindHistoryAfter.id === kindHistoryBefore.id && (await evaluateExpr(cdp, activeCodeExpr)) === kindsCode,
+    JSON.stringify({ failing: kindResults.filter((entry) => !entry.ok), checked: kindResults.length, historyBefore: kindHistoryBefore.id, historyAfter: kindHistoryAfter.id }),
+  );
+
+  // A note inside a variation of a structured piece is editable, and its edit lands inside the track's own const: the code differs
+  // from the playing code in one stretch that lies in the initializer of `const t1`. The identity names the section.
+  const structuredCode = songHelperCode({ t1Tail: '.gain(0)' });
+  const insideConst = (code, from, to) => {
+    const start = code.indexOf('const t1 = ');
+    const end = code.indexOf('\n', start);
+    return start !== -1 && from >= start && to <= end;
+  };
+  /** The one stretch in which two texts differ: the common start and end taken away. */
+  const differingStretch = (before, after) => {
+    let from = 0;
+    while (from < before.length && from < after.length && before[from] === after[from]) from++;
+    let tail = 0;
+    while (tail < before.length - from && tail < after.length - from && before[before.length - 1 - tail] === after[after.length - 1 - tail]) tail++;
+    return { from, to: before.length - tail, old: before.slice(from, before.length - tail), inserted: after.slice(from, after.length - tail) };
+  };
+  // The page the Timeline shows depends on how long the music has been playing, so the first note of the lane is whichever step of
+  // the variation sounds there; the edit is the same whichever it is.
+  const NEXT_STEP = { c3: 'c#3', d3: 'd#3', e3: 'f3' };
+  const editedVariation = (code, token) => code.replace('<c3 d3 e3>', `<${['c3', 'd3', 'e3'].map((step) => (step === token ? NEXT_STEP[step] : step)).join(' ')}>`);
+  await showPiece(structuredCode, 'probe timeline variation', 3);
+  await clickAt(await noteCenter(0, 0));
+  const inVariation = await panelWhen('(read) => read.lane === "t1"');
+  // The token is the pitch as written; the sentence under it may already say where the token plays.
+  const writtenPitch = (read) => (read === null ? null : read.pitch.split(' ')[0]);
+  const variationToken = writtenPitch(inVariation);
+  await pressKey(cdp, 'ArrowUp');
+  const variationWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(structuredCode)} ? ${activeCodeExpr} : null`, 8000);
+  const variationDiff = variationWritten === null ? null : differingStretch(structuredCode, variationWritten);
+  report(
+    'timeline: a note inside a variation of a structured piece is editable and its edit lands inside the track\'s own const',
+    inVariation !== null &&
+      inVariation.state === 'Editable' &&
+      / · section '[xyz]'$/.test(inVariation.position) &&
+      variationDiff !== null &&
+      insideConst(structuredCode, variationDiff.from, variationDiff.to) &&
+      variationToken !== null &&
+      variationWritten === editedVariation(structuredCode, variationToken),
+    JSON.stringify({ inVariation, variationDiff }),
+  );
+
+  // The weighted mini clock (a double-quoted string in the place of the clock of the helper) adds a place to every note of the
+  // song, in a string that is no argument of a call: the notes of a variation stay editable.
+  const clockLine = HELPER_TEXT.split('\n').find((line) => line.startsWith('const clock = '));
+  const weightedCode = songHelperCode({ t1Tail: '.gain(0)' }).replace(clockLine, 'const clock = "<x@3 y@5 z@7>".late(song.shift);');
+  await showPiece(weightedCode, 'probe timeline weighted clock', 3);
+  const clockLocations = await songNoteLocations(cdp, weightedCode, 0, 0, 3);
+  await clickAt(await noteCenter(0, 0));
+  const withClock = await panelWhen('(read) => read.lane === "t1"');
+  const clockToken = writtenPitch(withClock);
+  await pressKey(cdp, 'ArrowUp');
+  const clockWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(weightedCode)} ? ${activeCodeExpr} : null`, 8000);
+  const clockDiff = clockWritten === null ? null : differingStretch(weightedCode, clockWritten);
+  report(
+    "timeline: the weighted mini clock leaves a variation's notes editable",
+    weightedCode !== songHelperCode({ t1Tail: '.gain(0)' }) &&
+      clockLocations.length > 0 &&
+      clockLocations.every((entry) => entry.locations.length === 2) &&
+      withClock !== null &&
+      withClock.state === 'Editable' &&
+      clockDiff !== null &&
+      insideConst(weightedCode, clockDiff.from, clockDiff.to) &&
+      clockToken !== null &&
+      clockWritten === editedVariation(weightedCode, clockToken),
+    JSON.stringify({ firstLocations: clockLocations.slice(0, 2), withClock, clockDiff }),
+  );
+
+  // A token that a song plays in two sections says so as soon as its note is selected, before any gesture, and one edit changes the
+  // note in both sections as the real pattern plays them: the variation `va` of t1 plays in x and in z.
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline places reset', 1);
+  await showPiece(structuredCode, 'probe timeline places', 3);
+  // The page the Timeline shows depends on how long the music has played, so the first note of t1 that lies in x or in z is picked.
+  let placesNote = null;
+  for (let nth = 0; nth < 20 && placesNote === null; nth++) {
+    const point = await noteCenter(0, nth);
+    if (point === null) break;
+    await clickAt(point);
+    const read = await panelWhen('(read) => read.lane === "t1"');
+    if (read !== null && / · section '[xz]'$/.test(read.position)) placesNote = read;
+  }
+  const placesHistoryBefore = await historyTop();
+  const placesSentence = placesNote === null ? null : await panelWhen('(read) => read.line.startsWith("Plays in")');
+  const placesCodeBefore = await evaluateExpr(cdp, activeCodeExpr);
+  const placesToken = writtenPitch(placesNote);
+  const placesNext = NEXT_STEP[placesToken];
+  await pressKey(cdp, 'ArrowUp');
+  const placesWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(structuredCode)} ? ${activeCodeExpr} : null`, 8000);
+  const placesResult = await panelWhen('(read) => read.line.startsWith("Changed")');
+  const placesHistoryAfter = await historyTop();
+  // The notes of t1 in the code that plays now: in x (cycles 0 to 3) and in z (cycles 8 to 15) the steps of va, with the one token
+  // changed, in y the steps of vb as they were.
+  const placesOnsets = placesWritten === null ? [] : await songTrackOnsets(cdp, placesWritten, 0, 15);
+  const vaSteps = SONG_T1_STEPS.va.map((step) => (step === placesToken ? placesNext : step));
+  const inPlan = (cycle) => (cycle < 3 ? { name: 'x', offset: cycle } : cycle < 8 ? { name: 'y', offset: cycle - 3 } : { name: 'z', offset: cycle - 8 });
+  const placesChanged = { x: 0, z: 0 };
+  let placesStray = 0;
+  for (const onset of placesOnsets) {
+    const where = inPlan(Math.floor(onset.at + 1e-9));
+    const expected = where.name === 'y' ? SONG_T1_STEPS.vb[where.offset % SONG_T1_STEPS.vb.length] : vaSteps[where.offset % vaSteps.length];
+    if (onset.note !== expected) placesStray++;
+    else if (where.name !== 'y' && onset.note === placesNext) placesChanged[where.name]++;
+  }
+  report(
+    "timeline: a token used in two sections says Plays in 2 places: sections 'x' and 'z' before any gesture, and one edit changes both",
+    placesNote !== null &&
+      placesNote.state === 'Editable' &&
+      placesSentence !== null &&
+      placesSentence.line === "Plays in 2 places: sections 'x' and 'z'. An edit changes all of them." &&
+      placesSentence.lineKind === 'standing' &&
+      placesCodeBefore === structuredCode &&
+      placesNext !== undefined &&
+      placesWritten === editedVariation(structuredCode, placesToken) &&
+      placesResult !== null &&
+      placesResult.line === `Changed ${placesToken} to ${placesNext} in 2 places.` &&
+      placesHistoryAfter.id === placesHistoryBefore.id + 1 &&
+      placesHistoryAfter.row.includes(`changed t1: ${placesToken} to ${placesNext} in 2 places`) &&
+      placesChanged.x >= 1 &&
+      placesChanged.z >= 1 &&
+      placesStray === 0,
+    JSON.stringify({ placesNote, placesSentence, placesToken, placesResult, placesHistoryBefore, placesHistoryAfter, placesChanged, placesStray, onsets: placesOnsets.length }),
+  );
+
+  // With nothing selected the Timeline is what it was: the same lanes, notes and loop marks after a click on empty lane area, the
+  // panel says No note selected, and a right-click on a lane still gives the lane context with the moment and selects nothing.
+  const quietCode = 't1: note("<c3 g3>").gain(0)\nt2: note("e3 g3").gain(0)';
+  // A note selected by an earlier check comes back when the same lane has the same note at the same time, so a piece with no
+  // such lane is drawn first and takes the old selection away.
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline reset', 1);
+  await showPiece(quietCode, 'probe timeline quiet', 2);
+  const READ_LANES = `(() => ({
+    lanes: [...document.querySelectorAll('#timeline-lanes .lane')].map((lane) => ({
+      track: lane.dataset.track,
+      events: lane.querySelectorAll('rect.event').length,
+      loopMarks: lane.querySelectorAll('line.loop-mark').length,
+      sub: lane.querySelector('.lane-sub').textContent,
+    })),
+    rings: document.querySelectorAll('#timeline-lanes .tl-ring').length,
+  }))()`;
+  const lanesBefore = await evaluateExpr(cdp, READ_LANES);
+  const panelBefore = await readPanel();
+  const emptyArea = await evaluateExpr(
+    cdp,
+    `(() => {
+      const r = document.querySelectorAll('#timeline-lanes .lane .lane-events')[0].getBoundingClientRect();
+      // Half way down the lane: its notes sit at the top and at the bottom, more than half a rem away.
+      return { x: r.x + r.width * 0.3, y: r.y + r.height / 2 };
+    })()`,
+  );
+  await clickAt(emptyArea);
+  await sleep(150);
+  const lanesAfterClick = await evaluateExpr(cdp, READ_LANES);
+  const panelAfterClick = await readPanel();
+  const rightClickAt = await evaluateExpr(
+    cdp,
+    `(() => {
+      const svg = document.querySelectorAll('#timeline-lanes .lane .lane-events')[1];
+      // The panel under the lanes takes room, so the lane is brought into view before the point is taken.
+      svg.scrollIntoView({ block: 'nearest' });
+      const r = svg.getBoundingClientRect();
+      return { x: r.x + r.width * 0.27, y: r.y + r.height / 2 };
+    })()`,
+  );
+  const pageStartNow = await evaluateExpr(cdp, `Number(document.getElementById('timeline-lanes').dataset.pageStart)`);
+  await clickAt(rightClickAt, { button: 'right' });
+  const askChip = await waitFor(cdp, `!document.getElementById('ask-box').hidden ? document.getElementById('ask-context-chip').textContent : null`, 3000);
+  const panelAfterRightClick = await readPanel();
+  await pressKey(cdp, 'Escape');
+  await waitFor(cdp, `document.getElementById('ask-box').hidden ? true : null`, 2000);
+  const panelAfterEscape = await readPanel();
+  const lanesAfterEscape = await evaluateExpr(cdp, READ_LANES);
+  report(
+    'timeline: with nothing selected the lanes look as before, the panel says No note selected, and a right-click on a lane gives the lane context and selects nothing',
+    lanesBefore.lanes.length === 2 &&
+      lanesBefore.lanes.every((lane) => lane.events === 32 || lane.events === 64) &&
+      JSON.stringify(lanesAfterClick) === JSON.stringify(lanesBefore) &&
+      JSON.stringify(lanesAfterEscape) === JSON.stringify(lanesBefore) &&
+      panelBefore.position === 'No note selected' &&
+      panelAfterClick.position === 'No note selected' &&
+      panelAfterClick.rings === 0 &&
+      panelBefore.hint === TIMELINE_COPY.noteHintNone &&
+      typeof askChip === 'string' &&
+      askChip.startsWith(`Lane t2 · cycle ${pageStartNow + 8}, beat 3`) &&
+      panelAfterRightClick.position === 'No note selected' &&
+      panelAfterRightClick.rings === 0 &&
+      panelAfterEscape.position === 'No note selected' &&
+      panelAfterEscape.controlsHidden === true &&
+      (await evaluateExpr(cdp, activeCodeExpr)) === quietCode,
+    JSON.stringify({ lanesBefore, panelBefore: panelBefore.position, panelAfterClick: panelAfterClick.position, askChip, panelAfterRightClick: panelAfterRightClick.position, panelAfterEscape: panelAfterEscape.position, sameLanes: JSON.stringify(lanesAfterEscape) === JSON.stringify(lanesBefore) }),
+  );
+
+  // The ring is drawn over the layout of the lane: it lies on the note it marks, for the first and the last cycle of the page.
+  await showPiece('t1: note("<c3 g3>").gain(0)', 'probe timeline ring', 1);
+  const ringRows = [];
+  for (const nth of [0, 1, 30, 31]) {
+    await clickAt(await noteCenter(0, nth));
+    const boxes = await waitFor(
+      cdp,
+      `(() => {
+        const ring = document.querySelector('#timeline-lanes .tl-ring');
+        const mark = document.querySelectorAll('#timeline-lanes .lane rect.event[data-kind="note"]')[${nth}];
+        if (!ring || !mark) return null;
+        const a = ring.getBoundingClientRect();
+        const b = mark.getBoundingClientRect();
+        return { ring: [a.left, a.top, a.width, a.height], mark: [b.left, b.top, b.width, b.height] };
+      })()`,
+      3000,
+    );
+    ringRows.push({ nth, boxes });
+  }
+  const within = (a, b, tolerance) => a.every((value, i) => Math.abs(value - b[i]) <= tolerance);
+  report(
+    'timeline: the ring of a selected note lies on its note at the first and the last cycle of the page',
+    ringRows.length === 4 && ringRows.every((row) => row.boxes !== null && within(row.boxes.ring, row.boxes.mark, 1.5)),
+    JSON.stringify(ringRows),
+  );
+
+  // A pitch drag with a real mouse: the button goes down on a note, the pointer moves up in small steps, and while the button is
+  // still held the ghost and the sentence are there and the code, the playing code and the history are as they were. The release
+  // writes once.
+  const dragCode = 't1: note("c3 e3 g3").gain(0)\nt2: note("e3").gain(0)';
+  const moveMouse = (point) => cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, button: 'left', buttons: 1 });
+  /** Presses on `from`, moves in steps of at most 3 pixels to `to`, and leaves the button held. */
+  const dragTo = async (from, to) => {
+    await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
+    const distance = Math.hypot(to.x - from.x, to.y - from.y);
+    const steps = Math.max(1, Math.ceil(distance / 3));
+    for (let i = 1; i <= steps; i++) await moveMouse({ x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps });
+  };
+  const release = (point) => cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 });
+  /** With the button held, moves in steps of at most 3 pixels from `from` to `to`. */
+  const dragBack = async (start, from, to) => {
+    const steps = Math.max(1, Math.ceil(Math.hypot(to.x - from.x, to.y - from.y) / 3));
+    for (let i = 1; i <= steps; i++) await moveMouse({ x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps });
+  };
+  const READ_DRAG = `(() => ({
+    ghosts: document.querySelectorAll('#timeline-lanes .tl-ghost').length,
+    dragging: document.getElementById('timeline-lanes').getAttribute('data-dragging'),
+    line: document.getElementById('timeline-note-line').textContent,
+    kind: document.getElementById('timeline-note-line').getAttribute('data-kind'),
+    pitch: [...document.querySelectorAll('#timeline-note .tl-value')][0].textContent,
+    code: document.getElementById('repl').editor.repl.state.activeCode,
+    editor: document.getElementById('repl').editor.code,
+  }))()`;
+  const remPx = await evaluateExpr(cdp, `parseFloat(getComputedStyle(document.documentElement).fontSize)`);
+  await showPiece(dragCode, 'probe timeline drag', 2);
+  const dragStart = await noteCenter(0, 0);
+  const dragHistoryBefore = await historyTop();
+  await dragTo(dragStart, { x: dragStart.x, y: dragStart.y - 1.1 * remPx });
+  const held = await evaluateExpr(cdp, READ_DRAG);
+  const heldHistory = await historyTop();
+  const dragToken = (/^(\S+) → /.exec(held.line) ?? [])[1] ?? null;
+  await release({ x: dragStart.x, y: dragStart.y - 1.1 * remPx });
+  const dragWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(dragCode)} ? ${activeCodeExpr} : null`, 8000);
+  const afterDrag = await panelWhen('(read) => read.line.startsWith("Changed")');
+  const dragHistoryAfter = await historyTop();
+  const dragGhostsAfter = await evaluateExpr(cdp, READ_DRAG);
+  const dragDiff = dragWritten === null ? null : differingStretch(dragCode, dragWritten);
+  report(
+    'timeline: a real mouse drag up on an editable note shows the ghost and the preview and writes once on release',
+    dragStart !== null &&
+      dragToken === 'c3' &&
+      held.ghosts === 1 &&
+      held.dragging === 'pitch' &&
+      held.kind === 'preview' &&
+      held.line === 'c3 → d3 (+2 semitones). Release to write.' &&
+      held.code === dragCode &&
+      held.editor === dragCode &&
+      heldHistory.id === dragHistoryBefore.id &&
+      dragWritten === dragCode.replace('c3', 'd3') &&
+      afterDrag !== null &&
+      afterDrag.line === 'Changed c3 to d3.' &&
+      dragHistoryAfter.id === dragHistoryBefore.id + 1 &&
+      dragHistoryAfter.row.includes('changed t1: c3 to d3') &&
+      dragGhostsAfter.ghosts === 0 &&
+      dragGhostsAfter.dragging === null,
+    JSON.stringify({ held, heldHistory: heldHistory.id === dragHistoryBefore.id, dragWritten, afterDrag, dragHistoryBefore, dragHistoryAfter, dragGhostsAfter }),
+  );
+
+  // Every way a drag can end without a write, and a drag on a note the page cannot edit: after each the code, the playing code
+  // and the top row of the history are as they were, and no ghost is left.
+  const cancelCode = 't1: note("c3 e3 g3").gain(0)\nt2: n("0 2 4").scale(\'C3:major\').gain(0)';
+  await showPiece(cancelCode, 'probe timeline cancel', 2);
+  const cancelHistory = await historyTop();
+  const cancelRows = [];
+  const settleCancel = async (name, extra = {}) => {
+    await sleep(300);
+    const state = await evaluateExpr(cdp, READ_DRAG);
+    const history = await historyTop();
+    cancelRows.push({ name, ok: state.code === cancelCode && state.editor === cancelCode && state.ghosts === 0 && state.dragging === null && history.id === cancelHistory.id, state: { code: state.code === cancelCode, ghosts: state.ghosts, dragging: state.dragging, line: state.line }, history: history.id === cancelHistory.id, ...extra });
+  };
+  const upBy = (point, rems) => ({ x: point.x, y: point.y - rems * remPx });
+  {
+    const from = await noteCenter(0, 0);
+    // Up two steps and back to almost nowhere: the preview goes and the release writes nothing.
+    await dragTo(from, upBy(from, 1.1));
+    const peak = await evaluateExpr(cdp, READ_DRAG);
+    await dragBack(from, upBy(from, 1.1), upBy(from, 0.1));
+    const back = await evaluateExpr(cdp, READ_DRAG);
+    await release(upBy(from, 0.1));
+    await settleCancel('back to zero', { peakGhosts: peak.ghosts, backGhosts: back.ghosts });
+  }
+  {
+    const from = await noteCenter(0, 0);
+    await dragTo(from, upBy(from, 1.1));
+    const peak = await evaluateExpr(cdp, READ_DRAG);
+    await pressKey(cdp, 'Escape');
+    const during = await evaluateExpr(cdp, READ_DRAG);
+    await release(upBy(from, 1.1));
+    await settleCancel('Escape', { peakGhosts: peak.ghosts, duringGhosts: during.ghosts, duringDragging: during.dragging });
+  }
+  {
+    const from = await noteCenter(0, 0);
+    await dragTo(from, upBy(from, 1.1));
+    const peak = await evaluateExpr(cdp, READ_DRAG);
+    // The page hears the window lose focus (the event a real blur sends); the button is still down.
+    await evaluateExpr(cdp, `(() => { window.dispatchEvent(new Event('blur')); return true; })()`);
+    const during = await evaluateExpr(cdp, READ_DRAG);
+    await release(upBy(from, 1.1));
+    await settleCancel('window blur', { peakGhosts: peak.ghosts, duringGhosts: during.ghosts });
+  }
+  {
+    // The degrees lane (t2) cannot be edited: the note does not move, no ghost, and the release writes nothing.
+    const from = await noteCenter(1, 0);
+    await dragTo(from, upBy(from, 1.1));
+    const during = await evaluateExpr(cdp, READ_DRAG);
+    const panel = await readPanel();
+    await release(upBy(from, 1.1));
+    // The release prepares a request in the Ask box; it is closed here so it does not cover the lanes below.
+    await askReset();
+    await settleCancel('a note the page cannot edit', { duringGhosts: during.ghosts, duringDragging: during.dragging, state: panel.state, line: during.line });
+  }
+  report(
+    'timeline: a drag back to zero, Escape during a drag, a window blur during a drag and a drag on a refused note write nothing',
+    cancelRows.length === 4 &&
+      cancelRows.every((row) => row.ok) &&
+      cancelRows[0].peakGhosts === 1 &&
+      cancelRows[0].backGhosts === 0 &&
+      cancelRows[1].peakGhosts === 1 &&
+      cancelRows[1].duringGhosts === 0 &&
+      cancelRows[1].duringDragging === null &&
+      cancelRows[2].peakGhosts === 1 &&
+      cancelRows[2].duringGhosts === 0 &&
+      cancelRows[3].duringGhosts === 0 &&
+      cancelRows[3].duringDragging === 'refused' &&
+      cancelRows[3].state === 'Not editable' &&
+      cancelRows[3].line === 'Release to ask Claude: raise this note by 2 semitones.',
+    JSON.stringify(cancelRows),
+  );
+
+  // The pointer only confirms what the words say: a cross over empty lane area, a hand over a note, up-and-down arrows while an
+  // editable note is dragged and the plain arrow while a note the page cannot edit is dragged.
+  // A note a quarter of a cycle long on each lane, so half way into a cycle is empty lane area.
+  const cursorCode = 't1: note("c3 ~ ~ ~").gain(0)\nt2: n("0 ~ ~ ~").scale(\'C3:major\').gain(0)';
+  await showPiece(cursorCode, 'probe timeline cursor', 2);
+  const cursorAt = (point) => evaluateExpr(cdp, `(() => { const el = document.elementFromPoint(${point.x}, ${point.y}); return { cursor: getComputedStyle(el).cursor, tag: el.tagName, cls: String(el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className), id: el.id, hover: document.getElementById('timeline-lanes').getAttribute('data-hover') }; })()`);
+  const hoverAt = async (point) => {
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x - 6, y: point.y, button: 'none', buttons: 0 });
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y, button: 'none', buttons: 0 });
+    return cursorAt(point);
+  };
+  // The window is small, so the first lane starts at the top of the lanes.
+  await evaluateExpr(cdp, `(() => { document.getElementById('timeline-lanes').scrollTop = 0; return true; })()`);
+  const cursorNote = await noteCenter(0, 0);
+  const overNote = await hoverAt(cursorNote);
+  const cursorEmpty = await evaluateExpr(cdp, `(() => { const r = document.querySelectorAll('#timeline-lanes .lane .lane-events')[0].getBoundingClientRect(); return { x: r.x + r.width * (9.5 / 32), y: r.y + r.height / 2 }; })()`);
+  const overEmpty = await hoverAt(cursorEmpty);
+  await dragTo(cursorNote, upBy(cursorNote, 1.1));
+  const whileEditable = await cursorAt(upBy(cursorNote, 1.1));
+  const editableLanes = await evaluateExpr(cdp, `getComputedStyle(document.getElementById('timeline-lanes')).cursor`);
+  await pressKey(cdp, 'Escape');
+  await release(upBy(cursorNote, 1.1));
+  const refusedNote = await noteCenter(1, 0);
+  await dragTo(refusedNote, upBy(refusedNote, 1.1));
+  const whileRefused = await cursorAt(upBy(refusedNote, 1.1));
+  const refusedLanes = await evaluateExpr(cdp, `getComputedStyle(document.getElementById('timeline-lanes')).cursor`);
+  await pressKey(cdp, 'Escape');
+  await release(upBy(refusedNote, 1.1));
+  report(
+    'timeline: the pointer is a cross over empty lane area, a hand over a note, up-and-down arrows while an editable note is dragged and the plain arrow while a refused note is dragged',
+    overEmpty.cursor === 'crosshair' &&
+      overEmpty.hover === 'empty' &&
+      overNote.cursor === 'pointer' &&
+      overNote.hover === 'note' &&
+      whileEditable.cursor === 'ns-resize' &&
+      editableLanes === 'ns-resize' &&
+      whileRefused.cursor === 'default' &&
+      refusedLanes === 'default',
+    JSON.stringify({ overEmpty, overNote, whileEditable, editableLanes, whileRefused, refusedLanes }),
+  );
+
+  // The selection follows the redraw an edit causes and clears at a page turn; the sentence of the edit outlives both. The tempo
+  // is fast (a page lasts 8 seconds) and the edit starts early in a page, so the turn cannot come before the redraw.
+  const turnCode = 'setcps(4)\nt1: note("c3 e3 g3").gain(0)\nt2: note("e3").gain(0)';
+  await showPiece(turnCode, 'probe timeline turn', 2);
+  const earlyInPage = await waitFor(
+    cdp,
+    `(() => {
+      const now = document.getElementById('repl').editor.repl.scheduler.now();
+      const start = Number(document.getElementById('timeline-lanes').dataset.pageStart);
+      return now >= start && now < start + 6 ? start : null;
+    })()`,
+    12000,
+  );
+  let restoredAfterEdit = null;
+  let afterTurn = null;
+  let editedPage = null;
+  if (earlyInPage !== null) {
+    editedPage = earlyInPage;
+    await clickAt(await noteCenter(0, 0));
+    const picked = await panelWhen('(read) => read.state === "Editable"');
+    await pressKey(cdp, 'ArrowUp');
+    restoredAfterEdit = await panelWhen('(read) => read.line === "Changed c3 to c#3." && read.rings === 1 && read.pitch === "c#3 · 49" && read.state === "Editable"');
+    if (restoredAfterEdit !== null) restoredAfterEdit = { ...restoredAfterEdit, picked: picked && picked.pitch };
+    afterTurn = await waitFor(
+      cdp,
+      `(() => {
+        const start = Number(document.getElementById('timeline-lanes').dataset.pageStart);
+        if (!(start > ${earlyInPage}) || document.getElementById('timeline-view').dataset.state !== 'ok') return null;
+        const read = ${READ_PANEL};
+        return Object.assign(read, { start });
+      })()`,
+      14000,
+    );
+  }
+  report(
+    'timeline: the selection comes back at the new pitch after the redraw an edit causes, and clears at a page turn, keeping the result sentence',
+    earlyInPage !== null &&
+      restoredAfterEdit !== null &&
+      restoredAfterEdit.lane === 't1' &&
+      restoredAfterEdit.picked === 'c3 · 48' &&
+      afterTurn !== null &&
+      afterTurn.start === editedPage + 32 &&
+      afterTurn.position === 'No note selected' &&
+      afterTurn.rings === 0 &&
+      afterTurn.controlsHidden === true &&
+      afterTurn.line === 'Changed c3 to c#3.',
+    JSON.stringify({ earlyInPage, restoredAfterEdit, afterTurn }),
+  );
+  await callTool(client, 'set_code', { code: 'setcps(0.5)\nt1: note("c3").gain(0)', label: 'probe timeline turn done' });
+
+  // The ring and the ghost sit on their note: the ring's box is the note's drawn rectangle with the outline 0.25rem outside it,
+  // on the first and the last note of a page, and the ghost of a drag is a whole step (half a rem for each semitone) above it.
+  const alignCode = 't1: note("<c3 g3>").gain(0)';
+  await showPiece(alignCode, 'probe timeline align', 1);
+  const alignRows = [];
+  // The low first note is dragged up and the high last note down, so the ghost has room to move a whole step either way.
+  for (const [nth, direction] of [[0, -1], [31, 1]]) {
+    const centre = await noteCenter(0, nth);
+    await clickAt(centre);
+    const ringBox = await waitFor(
+      cdp,
+      `(() => {
+        const ring = document.querySelector('#timeline-lanes .tl-ring');
+        const mark = document.querySelectorAll('#timeline-lanes .lane rect.event[data-kind="note"]')[${nth}];
+        if (!ring || !mark) return null;
+        const a = ring.getBoundingClientRect();
+        const b = mark.getBoundingClientRect();
+        const style = getComputedStyle(ring);
+        return { ring: [a.left, a.top, a.width, a.height], mark: [b.left, b.top, b.width, b.height], outlineOffset: style.outlineOffset, outlineStyle: style.outlineStyle, outlineWidth: style.outlineWidth };
+      })()`,
+      3000,
+    );
+    await dragTo(centre, upBy(centre, -direction * 1.1));
+    const ghostBox = await evaluateExpr(
+      cdp,
+      `(() => {
+        const ghost = document.querySelector('#timeline-lanes .tl-ghost');
+        const mark = document.querySelectorAll('#timeline-lanes .lane rect.event[data-kind="note"]')[${nth}];
+        if (!ghost || !mark) return null;
+        const a = ghost.getBoundingClientRect();
+        const b = mark.getBoundingClientRect();
+        return { ghost: [a.left, a.top, a.width, a.height], mark: [b.left, b.top, b.width, b.height], style: getComputedStyle(ghost).outlineStyle };
+      })()`,
+    );
+    await pressKey(cdp, 'Escape');
+    await release(upBy(centre, -direction * 1.1));
+    alignRows.push({ nth, direction, ringBox, ghostBox });
+  }
+  const sits = (a, b, tolerance) => a.every((value, i) => Math.abs(value - b[i]) <= tolerance);
+  report(
+    'timeline: the ring sits on its note at the first and the last cycle of the page',
+    alignRows.length === 2 &&
+      alignRows.every(
+        ({ direction, ringBox, ghostBox }) =>
+          ringBox !== null &&
+          sits(ringBox.ring, ringBox.mark, 1) &&
+          Math.abs(Number.parseFloat(ringBox.outlineOffset) - 0.25 * remPx) <= 1 &&
+          ringBox.outlineStyle === 'solid' &&
+          ghostBox !== null &&
+          ghostBox.style === 'dashed' &&
+          Math.abs(ghostBox.ghost[0] - ghostBox.mark[0]) <= 1 &&
+          Math.abs(ghostBox.ghost[2] - ghostBox.mark[2]) <= 1 &&
+          Math.abs(ghostBox.ghost[3] - ghostBox.mark[3]) <= 1 &&
+          Math.abs(ghostBox.ghost[1] - (ghostBox.mark[1] + direction * 2 * 0.5 * remPx)) <= 1.5,
+      ),
+    JSON.stringify({ remPx, alignRows }),
+  );
+
+  // Delete turns a literal note into a rest: the tilde is written in the place of the token, the string keeps its step count, the
+  // note leaves the lane at the redraw, nothing is selected any more and the sentence of the edit stays.
+  const restCode = 't1: note("c3 e3 g3").gain(0)';
+  // A lane of another name is drawn first so that no earlier selection comes back into this piece.
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline rest reset', 1);
+  await showPiece(restCode, 'probe timeline rest', 1);
+  const restNotesBefore = await evaluateExpr(cdp, `document.querySelectorAll('#timeline-lanes .lane rect.event[data-kind="note"]').length`);
+  const restHistoryBefore = await historyTop();
+  await clickAt(await noteCenter(0, 1));
+  // The page the Timeline shows depends on how long the music has played, so the note that is the second one drawn is whichever
+  // of the three it is; the expected code is derived from what the panel says.
+  const restSelected = await panelWhen('(read) => read.state === "Editable"');
+  const restToken = restSelected === null ? null : restSelected.pitch.split(' · ')[0];
+  await pressKey(cdp, 'Delete');
+  const restWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(restCode)} ? ${activeCodeExpr} : null`, 8000);
+  const restAfter = await panelWhen(`(read) => read.line === "Changed ${restToken} to a rest." && read.rings === 0`);
+  const restNotesAfter = await waitFor(
+    cdp,
+    `(() => { const n = document.querySelectorAll('#timeline-lanes .lane rect.event[data-kind="note"]').length; return n === ${restNotesBefore} * 2 / 3 ? n : null; })()`,
+    8000,
+  );
+  const restHistoryAfter = await historyTop();
+  const restGetCode = String(await callTool(client, 'get_code', {}));
+  const restDiff = restWritten === null ? null : differingStretch(restCode, restWritten);
+  report(
+    'timeline: Delete turns a literal note into a rest: ~ is written, the string keeps its step count, the note leaves the lane, the selection clears and the result stays',
+    restSelected !== null &&
+      ['c3', 'e3', 'g3'].includes(restToken) &&
+      restWritten === restCode.replace(restToken, '~') &&
+      restDiff !== null &&
+      restDiff.old === restToken &&
+      restDiff.inserted === '~' &&
+      restAfter !== null &&
+      restAfter.position === 'No note selected' &&
+      restAfter.controlsHidden === true &&
+      restNotesBefore === 96 &&
+      restNotesAfter === 64 &&
+      restHistoryAfter.id === restHistoryBefore.id + 1 &&
+      restHistoryAfter.row.includes(`changed t1: ${restToken} to a rest`) &&
+      restGetCode.includes(HAND_EDIT_NOTE),
+    JSON.stringify({ restSelected, restToken, restWritten, restDiff, restAfter, restNotesBefore, restNotesAfter, restHistoryBefore, restHistoryAfter, handEditNote: restGetCode.includes(HAND_EDIT_NOTE) }),
+  );
+
+  // Steps gather: three quick presses of Up and one of Shift+Down are one change after the pause, one history row. The note and its
+  // pitch are whichever the page shows first, so the expected token is worked out from the panel.
+  const stepCode = 't1: note("c3 e3").postgain(0)';
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline steps reset', 1);
+  await showPiece(stepCode, 'probe timeline steps', 1);
+  const stepHistoryBefore = await historyTop();
+  await clickAt(await noteCenter(0, 0));
+  const stepSelected = await panelWhen('(read) => read.state === "Editable"');
+  const stepToken = stepSelected === null ? null : stepSelected.pitch.split(' · ')[0];
+  const stepFrom = stepToken === null ? null : stepPitch(stepToken, 3);
+  const stepTotal = stepToken === null ? null : stepPitch(stepToken, 3 - 12);
+  for (let i = 0; i < 3; i++) await pressKey(cdp, 'ArrowUp');
+  await pressKey(cdp, 'ArrowDown', { shift: true });
+  // The page has not written anything yet: it waits for the pause and says so.
+  const stepWaiting = await evaluateExpr(cdp, `({ code: ${activeCodeExpr}, line: document.getElementById('timeline-note-line').textContent, kind: document.getElementById('timeline-note-line').getAttribute('data-kind') })`);
+  const stepWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(stepCode)} ? ${activeCodeExpr} : null`, 8000);
+  await sleep(1200);
+  const stepHistoryAfter = await historyTop();
+  const stepDiff = stepWritten === null ? null : differingStretch(stepCode, stepWritten);
+  report(
+    'timeline: three quick Up presses and Shift+Down write once, as one history row, after the pause',
+    stepSelected !== null &&
+      stepTotal !== null &&
+      stepTotal.text !== undefined &&
+      stepWaiting.code === stepCode &&
+      stepWaiting.kind === 'preview' &&
+      stepWaiting.line === `${stepToken} → ${stepTotal.text} (-9 semitones). Writing in a moment.` &&
+      stepDiff !== null &&
+      stepDiff.old === stepToken &&
+      stepDiff.inserted === stepTotal.text &&
+      stepHistoryAfter.id === stepHistoryBefore.id + 1 &&
+      stepHistoryAfter.row.includes(`changed t1: ${stepToken} to ${stepTotal.text}`),
+    JSON.stringify({ stepSelected, stepToken, stepFrom, stepTotal, stepWaiting, stepWritten, stepDiff, stepHistoryBefore, stepHistoryAfter }),
+  );
+
+  // Velocity: the number of a velocity string is changed by a tenth of what is shown, read back; at the default gain of a browser
+  // lane (0.8) a tenth of the shown value is a token above 1 or an odd fraction (0.40 to 0.50 writes 0.625); a lane with no velocity
+  // string says the velocity is fixed in the code and the buttons are off.
+  const velocityPiece = (first, third) =>
+    [`t1: note("c3").velocity("${first}").gain(1).postgain(0)`, 't2: note("c3").postgain(0)', `t3: note("c3").velocity("${third}").postgain(0)`].join('\n');
+  const velocityCode = velocityPiece('0.5', '0.5');
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline velocity reset', 1);
+  await showPiece(velocityCode, 'probe timeline velocity', 3);
+  const READ_VELOCITY = `(() => {
+    const panel = document.getElementById('timeline-note');
+    const find = (text) => [...panel.querySelectorAll('.tl-btn')].find((b) => b.textContent === text);
+    const fixed = panel.querySelector('.tl-fixed');
+    return {
+      minusOff: find('\u2212').getAttribute('aria-disabled'),
+      plusOff: find('+').getAttribute('aria-disabled'),
+      pitchOff: find('Pitch up').getAttribute('aria-disabled'),
+      fixed: fixed === null ? null : fixed.textContent,
+    };
+  })()`;
+  const panelButton = (text) =>
+    evaluateExpr(
+      cdp,
+      `(() => { const b = [...document.querySelectorAll('#timeline-note .tl-btn')].find((el) => el.textContent === ${JSON.stringify(text)}); if (!b) return null; const r = b.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+    );
+  const velocityHistory = await historyTop();
+  // Every sentence the slot shows, in order, so a short state (the steps that wait) is caught whatever the polling.
+  const watchSentences = () =>
+    evaluateExpr(
+      cdp,
+      `(() => { const line = document.getElementById('timeline-note-line'); window.__tlSaid = []; if (window.__tlSaidObserver) window.__tlSaidObserver.disconnect(); window.__tlSaidObserver = new MutationObserver(() => window.__tlSaid.push(line.textContent)); window.__tlSaidObserver.observe(line, { childList: true, characterData: true, subtree: true }); })()`,
+    );
+  const noteCountOf = (lane) => evaluateExpr(cdp, `document.querySelectorAll('#timeline-lanes .lane')[${lane}].querySelectorAll('rect.event[data-kind="note"]').length`);
+  // Lane t1: gain 1, so the shown 0.50 is the number itself. The lane draws a note in every cycle of the page, all of them read from
+  // the one number, so the preview and the result say how many notes of the page share it.
+  await clickAt(await noteCenter(0, 0));
+  const v1Selected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const v1Notes = await noteCountOf(0);
+  const v1Buttons = await evaluateExpr(cdp, READ_VELOCITY);
+  await watchSentences();
+  await clickAt(await panelButton('+'));
+  const v1Code = velocityPiece('0.6', '0.5');
+  const v1Written = await waitFor(cdp, `${activeCodeExpr} === ${JSON.stringify(v1Code)} ? true : null`, 8000);
+  const v1After = await panelWhen(`(read) => read.line === "Velocity of c3 is now 0.60, for ${v1Notes} notes on this page." && read.velocity === "0.60"`);
+  const v1Said = await evaluateExpr(cdp, 'window.__tlSaid');
+  const v1History = await historyTop();
+  // Lane t3: the default gain 0.8 shows 0.40, and one tenth more is 0.50, which is the token 0.625.
+  await clickAt(await noteCenter(2, 0));
+  const v3Selected = await panelWhen('(read) => read.lane === "t3" && read.state === "Editable"');
+  const v3Notes = await noteCountOf(2);
+  await clickAt(await panelButton('+'));
+  const v3Code = velocityPiece('0.6', '0.625');
+  const v3Written = await waitFor(cdp, `${activeCodeExpr} === ${JSON.stringify(v3Code)} ? true : null`, 8000);
+  const v3After = await panelWhen(`(read) => read.line === "Velocity of c3 is now 0.50, for ${v3Notes} notes on this page." && read.velocity === "0.50"`);
+  const v3History = await historyTop();
+  // Lane t2: no velocity string at all.
+  await clickAt(await noteCenter(1, 0));
+  const v2Selected = await panelWhen('(read) => read.lane === "t2" && read.state === "Editable"');
+  const v2Buttons = await evaluateExpr(cdp, READ_VELOCITY);
+  await clickAt(await panelButton('\u2212'));
+  const v2Refused = await panelWhen('(read) => read.lineKind === "refused"');
+  await sleep(900);
+  const v2History = await historyTop();
+  report(
+    'timeline: velocity − and + change a velocity string token and read back; a lane without a velocity string says fixed in the code',
+    v1Selected !== null &&
+      v1Selected.velocity === '0.50' &&
+      v1Buttons.minusOff === null &&
+      v1Buttons.plusOff === null &&
+      v1Buttons.fixed === '' &&
+      v1Written === true &&
+      v1After !== null &&
+      v1Notes > 1 &&
+      v3Notes > 1 &&
+      v1Said.includes(`Velocity 0.50 \u2192 0.60, for ${v1Notes} notes on this page. Writing in a moment.`) &&
+      v1History.id === velocityHistory.id + 1 &&
+      v1History.row.includes('changed t1: velocity of c3 to 0.60') &&
+      v3Selected !== null &&
+      v3Selected.velocity === '0.40' &&
+      v3Written === true &&
+      v3After !== null &&
+      v3History.id === velocityHistory.id + 2 &&
+      v3History.row.includes('changed t3: velocity of c3 to 0.50') &&
+      v2Selected !== null &&
+      v2Selected.velocity === '0.80' &&
+      v2Buttons.minusOff === 'true' &&
+      v2Buttons.plusOff === 'true' &&
+      v2Buttons.pitchOff === null &&
+      v2Buttons.fixed === 'fixed in the code' &&
+      v2Refused !== null &&
+      v2Refused.line === TIMELINE_COPY.noteVelocityRefusal &&
+      v2History.id === v3History.id &&
+      (await evaluateExpr(cdp, activeCodeExpr)) === v3Code,
+    JSON.stringify({ v1Selected, v1Notes, v1Said, v1Buttons, v1Written, v1After, v1History, v3Selected, v3Notes, v3Written, v3After, v3History, v2Selected, v2Buttons, v2Refused, v2History }),
+  );
+
+  // A piece without a structure tells a token only when it draws several notes in one cycle (`e3!2` draws two), never a plain loop; the
+  // other notes of the selected token on the page get a dotted ring, and one edit changes all of them.
+  const repeatCode = 't1: note("c3 e3!2").gain(0)';
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline repeat reset', 1);
+  await showPiece(repeatCode, 'probe timeline repeat', 1);
+  const READ_SAME = `(() => {
+    const notes = [...document.querySelectorAll('#timeline-lanes .lane')[0].querySelectorAll('rect.event[data-kind="note"]')];
+    const boxes = notes.map((rect) => { const r = rect.getBoundingClientRect(); return [r.x, r.y, r.width, r.height]; });
+    const dotted = [...document.querySelectorAll('#timeline-lanes .tl-same')].map((el) => { const r = el.getBoundingClientRect(); return { box: [r.x, r.y, r.width, r.height], style: getComputedStyle(el).outlineStyle }; });
+    const onNote = dotted.filter((entry) => boxes.some((box) => Math.abs(box[0] - entry.box[0]) < 0.6 && Math.abs(box[1] - entry.box[1]) < 0.6)).length;
+    return { notes: notes.length, dotted: dotted.length, onNote, allDotted: dotted.every((entry) => entry.style === 'dotted') };
+  })()`;
+  // The marks of a lane are not in time order, so the note of the wanted pitch is looked for by clicking.
+  const selectPitch = async (pitch) => {
+    for (let nth = 0; nth < 96; nth++) {
+      const point = await noteCenter(0, nth);
+      if (point === null) return null;
+      await clickAt(point);
+      const read = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+      if (read !== null && read.pitch.startsWith(pitch)) return read;
+    }
+    return null;
+  };
+  const repeatE = await selectPitch('e3');
+  const repeatEToken = repeatE === null ? null : repeatE.pitch.split(' \u00b7 ')[0];
+  const repeatESame = await evaluateExpr(cdp, READ_SAME);
+  const repeatC = await selectPitch('c3');
+  const repeatCSame = await evaluateExpr(cdp, READ_SAME);
+  // The e3 token again, then one Up: both notes of the cycle change.
+  await selectPitch('e3');
+  const repeatHistoryBefore = await historyTop();
+  await pressKey(cdp, 'ArrowUp');
+  const repeatWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(repeatCode)} ? ${activeCodeExpr} : null`, 8000);
+  const repeatResult = await panelWhen('(read) => read.line.startsWith("Changed")');
+  const repeatHistoryAfter = await historyTop();
+  report(
+    'timeline: a token repeated in one cycle is told, a plain loop is not, and the other notes of the token get a dotted ring',
+    repeatE !== null &&
+      repeatEToken === 'e3' &&
+      repeatE.line === 'This token draws 2 notes in each cycle. An edit changes all of them.' &&
+      repeatE.lineKind === 'standing' &&
+      repeatESame.notes === 96 &&
+      repeatESame.dotted === 63 &&
+      repeatESame.onNote === 63 &&
+      repeatESame.allDotted === true &&
+      repeatE.rings === 1 &&
+      repeatC !== null &&
+      repeatC.line === 'An edit rewrites one token in the code: c3.' &&
+      repeatCSame.dotted === 31 &&
+      repeatCSame.onNote === 31 &&
+      repeatWritten === 't1: note("c3 f3!2").gain(0)' &&
+      repeatResult !== null &&
+      repeatResult.line === 'Changed e3 to f3 in 2 places.' &&
+      repeatHistoryAfter.id === repeatHistoryBefore.id + 1 &&
+      repeatHistoryAfter.row.includes('changed t1: e3 to f3 in 2 places'),
+    JSON.stringify({ repeatE, repeatESame, repeatC, repeatCSame, repeatWritten, repeatResult, repeatHistoryBefore, repeatHistoryAfter }),
+  );
+
+  // A song whose sections add up to more than the count limit (1024 cycles) is counted on the drawn page alone, and the sentence says
+  // so. The sound is stopped, which puts the Timeline on its first page (x, y and the start of z are on it), and the edit that
+  // follows is written without starting the sound.
+  const longCode = songHelperCode({ t1Tail: '.gain(0)' }).replace("['z', 7]", "['z', 1100]");
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline long reset', 1);
+  await showPiece(longCode, 'probe timeline long song', 3);
+  await stopMusic(cdp);
+  await sleep(600);
+  await waitFor(cdp, `document.getElementById('timeline-view').dataset.state === 'ok' ? true : null`, 5000);
+  await clickAt(await noteCenter(0, 0));
+  const longSelected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable" && read.line.startsWith("Plays in")');
+  const longToken = writtenPitch(longSelected);
+  const longNext = NEXT_STEP[longToken];
+  const longHistoryBefore = await historyTop();
+  await pressKey(cdp, 'ArrowUp');
+  const longWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(longCode)} ? ${activeCodeExpr} : null`, 8000);
+  const longResult = await panelWhen('(read) => read.line.startsWith("Changed")');
+  const longHistoryAfter = await historyTop();
+  report(
+    'timeline: a song longer than the count limit is counted on the drawn page and says so',
+    longSelected !== null &&
+      longSelected.line === "Plays in 2 places on this page: sections 'x' and 'z'. An edit changes every place it plays, on this page and after it." &&
+      longSelected.lineKind === 'standing' &&
+      longNext !== undefined &&
+      longWritten === editedVariation(longCode, longToken) &&
+      longResult !== null &&
+      longResult.line === `Changed ${longToken} to ${longNext} in 2 places on this page.` &&
+      longHistoryAfter.id === longHistoryBefore.id + 1,
+    JSON.stringify({ longSelected, longToken, longResult, longHistoryBefore, longHistoryAfter, written: longWritten !== null }),
+  );
+  await playMusic(cdp);
+
+  // A pitch step followed quickly by velocity steps: the pitch write is flushed at once by the velocity press, its redraw arrives while
+  // the velocity steps still wait, and they are kept and written, as their own history row, not lost.
+  const mixedCode = 't1: note("c3").velocity("0.5").gain(1).postgain(0)';
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline mixed reset', 1);
+  await showPiece(mixedCode, 'probe timeline mixed steps', 1);
+  await clickAt(await noteCenter(0, 0));
+  const mixedSelected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const mixedToken = mixedSelected === null ? null : mixedSelected.pitch.split(' \u00b7 ')[0];
+  const mixedNext = mixedToken === null ? null : stepPitch(mixedToken, 1).text;
+  const mixedHistoryBefore = await historyTop();
+  await watchSentences();
+  await pressKey(cdp, 'ArrowUp');
+  await clickAt(await panelButton('+'));
+  const mixedFinal = mixedNext === null ? null : `t1: note(${JSON.stringify(mixedNext)}).velocity("0.6").gain(1).postgain(0)`;
+  const mixedWritten = await waitFor(cdp, `${activeCodeExpr} === ${JSON.stringify(mixedFinal)} ? true : null`, 8000);
+  await sleep(900);
+  const mixedHistoryAfter = await historyTop();
+  const mixedSaid = await evaluateExpr(cdp, 'window.__tlSaid');
+  const mixedPanel = await readPanel();
+  report(
+    'timeline: a pitch step followed quickly by velocity steps writes both, and the velocity steps are not lost to the redraw',
+    mixedSelected !== null &&
+      mixedWritten === true &&
+      mixedHistoryAfter.id === mixedHistoryBefore.id + 2 &&
+      mixedHistoryAfter.row.includes('changed t1: velocity of ' + mixedNext + ' to 0.60') &&
+      mixedSaid.some((text) => text.startsWith('Velocity 0.50 \u2192 0.60')) &&
+      mixedPanel.line.startsWith('Velocity of ' + mixedNext + ' is now 0.60') &&
+      !mixedSaid.includes(TIMELINE_COPY.noteStepsDropped),
+    JSON.stringify({ mixedSelected, mixedToken, mixedNext, mixedWritten, mixedHistoryBefore, mixedHistoryAfter, mixedSaid, line: mixedPanel.line }),
+  );
+
+  // An edit that waits for its line, and an edit while the sound is stopped. The hand-edit timing is the next bar.
+  const editorText = () => evaluateExpr(cdp, `document.getElementById('repl').editor.code`);
+  const EDIT_BUTTONS = ['Pitch down', 'Pitch up', '−', '+', 'Make a rest'];
+  const READ_OFF = `(() => ${JSON.stringify(EDIT_BUTTONS)}.map((text) => { const b = [...document.querySelectorAll('#timeline-note .tl-btn')].find((el) => el.textContent === text); return b ? b.getAttribute('aria-disabled') : 'missing'; }))()`;
+  await pickTiming(cdp, 'bar');
+  // The tempo is slow (a bar lasts 4 seconds), and the edit starts early in a page and early in a bar, so the line is well ahead
+  // and the page cannot turn before the redraw.
+  const waitCode = 'setcps(0.25)\nt1: note("c3 e3 g3").postgain(0)';
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline wait reset', 1);
+  await showPiece(waitCode, 'probe timeline wait', 1);
+  await clickAt(await noteCenter(0, 0));
+  const waitSelected = await panelWhen('(read) => read.state === "Editable"');
+  const waitToken = waitSelected === null ? null : waitSelected.pitch.split(' · ')[0];
+  const waitNext = waitToken === null ? null : stepPitch(waitToken, 1).text;
+  const placed = await waitFor(
+    cdp,
+    `(() => {
+      const now = document.getElementById('repl').editor.repl.scheduler.now();
+      const start = Number(document.getElementById('timeline-lanes').dataset.pageStart);
+      const phase = now - Math.floor(now);
+      return now >= start && now < start + 26 && phase > 0 && phase < 0.1 ? true : null;
+    })()`,
+    40000,
+  );
+  await evaluateExpr(
+    cdp,
+    `(() => {
+      const note = document.getElementById('timeline-note-line');
+      window.__tlSeen = [];
+      new MutationObserver(() => window.__tlSeen.push(note.textContent)).observe(note, { childList: true, characterData: true, subtree: true });
+      return true;
+    })()`,
+  );
+  const waitHistoryBefore = await historyTop();
+  await pressKey(cdp, 'ArrowUp');
+  const waitingWords = `Waiting for the next bar — ${waitToken} becomes ${waitNext}.`;
+  const waiting = await waitFor(cdp, `document.getElementById('timeline-note-line').textContent === ${JSON.stringify(waitingWords)} ? true : null`, 5000);
+  const whileWaiting = { panel: await readPanel(), off: await evaluateExpr(cdp, READ_OFF), history: await historyTop() };
+  const stillWaiting = await evaluateExpr(cdp, `document.getElementById('timeline-note-line').textContent === ${JSON.stringify(waitingWords)}`);
+  const waitDone = await panelWhen(`(read) => read.line === "Changed ${waitToken} to ${waitNext}."`);
+  const waitHistoryAfter = await historyTop();
+  const reselected = await panelWhen(`(read) => read.pitch.startsWith("${waitNext} ") && read.rings === 1 && read.state === "Editable"`);
+  const afterOff = await evaluateExpr(cdp, READ_OFF);
+  const waitSeen = await evaluateExpr(cdp, `window.__tlSeen`);
+  report(
+    'timeline: with the next-bar timing an edit waits with its sentence, records its history row when it takes over, and the note is selected again at its new pitch',
+    waitSelected !== null &&
+      placed === true &&
+      waiting === true &&
+      stillWaiting === true &&
+      whileWaiting.panel.rings === 1 &&
+      whileWaiting.panel.pitch.startsWith(`${waitToken} `) &&
+      whileWaiting.off.every((value) => value === 'true') &&
+      whileWaiting.history.id === waitHistoryBefore.id &&
+      waitDone !== null &&
+      waitHistoryAfter.id === waitHistoryBefore.id + 1 &&
+      waitHistoryAfter.row.includes(`changed t1: ${waitToken} to ${waitNext}`) &&
+      reselected !== null &&
+      // The pitch buttons and Make a rest are on again; the velocity ones stay off because this piece has no velocity string.
+      [0, 1, 4].every((at) => afterOff[at] === null) &&
+      waitSeen.includes(waitingWords),
+    JSON.stringify({ waitSelected, waitToken, waitNext, placed, waiting, stillWaiting, whileWaiting, waitDone: waitDone && waitDone.line, waitHistoryBefore, waitHistoryAfter, reselected: reselected && reselected.pitch, afterOff, waitSeen }),
+  );
+
+  // Stopped: an edit is written and evaluated at once (there is no line ahead, though the timing is the next bar) without
+  // starting the sound.
+  const stopCode = 'setcps(1)\nt1: note("c3 e3 g3").postgain(0)';
+  await showPiece(stopCode, 'probe timeline stopped', 1);
+  const stopHistoryBefore = await historyTop();
+  await stopMusic(cdp);
+  // Stopping moves the Timeline to its first page and clears the selection, as any page turn does: the note is picked again.
+  await sleep(600);
+  await waitFor(cdp, `document.getElementById('timeline-view').dataset.state === 'ok' ? true : null`, 5000);
+  await clickAt(await noteCenter(0, 0));
+  const stopSelected = await panelWhen('(read) => read.state === "Editable"');
+  const stopToken = stopSelected === null ? null : stopSelected.pitch.split(' \u00b7 ')[0];
+  const stopNext = stopToken === null ? null : stepPitch(stopToken, 1).text;
+  await pressKey(cdp, 'ArrowUp');
+  const stopWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(stopCode)} ? ${activeCodeExpr} : null`, 8000);
+  const stopSentence = await panelWhen(`(read) => read.line === "Changed ${stopToken} to ${stopNext}."`);
+  await sleep(700);
+  const stoppedAfter = await evaluateExpr(cdp, `({ word: (${STATE_WORD_EXPR}), started: document.getElementById('repl').editor.repl.scheduler.started === true })`);
+  const stopHistoryAfter = await historyTop();
+  report(
+    'timeline: while stopped an edit is written and evaluated without starting the sound',
+    stopSelected !== null &&
+      stopWritten === stopCode.replace(stopToken, stopNext) &&
+      stopSentence !== null &&
+      stoppedAfter.word === SOUND_LABELS.stopped &&
+      stoppedAfter.started === false &&
+      stopHistoryAfter.id === stopHistoryBefore.id + 1 &&
+      stopHistoryAfter.row.includes(`changed t1: ${stopToken} to ${stopNext}`),
+    JSON.stringify({ stopSelected, stopToken, stopNext, stopWritten, stopSentence: stopSentence && stopSentence.line, stoppedAfter, stopHistoryBefore, stopHistoryAfter }),
+  );
+  await playMusic(cdp);
+  await pickTiming(cdp, 'now');
+
+  // The notices: a change of Claude's that waits for its line, text in the editor that was never evaluated and a closed socket each
+  // switch the five edit controls off with the one sentence that tells why. Keys and buttons then write nothing (the editor, the
+  // playing code and the history stay as they were), selecting still works, and the sentence is written once, not on every tick.
+  const noticeCode = 't1: note("c3 e3").postgain(0)\nt2: note("g3").postgain(0)';
+  const noticeRows = [];
+  const MUTATIONS = `(() => { const note = document.getElementById('timeline-note-line'); window.__tlWrites = 0; new MutationObserver((list) => { window.__tlWrites += list.length; }).observe(note, { childList: true, characterData: true, subtree: true, attributes: true }); return true; })()`;
+  const exerciseNotice = async (name, words) => {
+    const row = { name };
+    row.selected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+    row.line = await waitFor(cdp, `document.getElementById('timeline-note-line').textContent === ${JSON.stringify(words)} ? true : null`, 6000);
+    row.off = await evaluateExpr(cdp, READ_OFF);
+    row.kind = (await readPanel()).lineKind;
+    const before = { editor: await editorText(), active: await evaluateExpr(cdp, activeCodeExpr), history: await historyTop() };
+    await evaluateExpr(cdp, MUTATIONS);
+    await pressKey(cdp, 'ArrowUp');
+    await pressKey(cdp, 'ArrowDown', { shift: true });
+    await pressKey(cdp, 'Delete');
+    await clickAt(await panelButton('Make a rest'));
+    await clickAt(await panelButton('Pitch up'));
+    await sleep(1300);
+    const after = { editor: await editorText(), active: await evaluateExpr(cdp, activeCodeExpr), history: await historyTop() };
+    row.unchanged = before.editor === after.editor && before.active === after.active && before.history.id === after.history.id;
+    // The sentence was not written again while the notice lasted (not on the 250 ms tick, not by the keys and buttons).
+    row.writes = await evaluateExpr(cdp, 'window.__tlWrites');
+    row.lineAfter = (await readPanel()).line;
+    // Selecting another note still works, and the notice stays.
+    await clickAt(await noteCenter(1, 0));
+    row.other = await panelWhen('(read) => read.lane === "t2" && read.state === "Editable"');
+    row.otherLine = row.other && row.other.line;
+    row.otherOff = await evaluateExpr(cdp, READ_OFF);
+    row.ok =
+      row.selected !== null &&
+      row.line === true &&
+      row.kind === 'notice' &&
+      row.off.every((value) => value === 'true') &&
+      row.unchanged &&
+      row.writes === 0 &&
+      row.lineAfter === words &&
+      row.other !== null &&
+      row.other.rings === 1 &&
+      row.otherLine === words &&
+      row.otherOff.every((value) => value === 'true');
+    noticeRows.push(row);
+    return before;
+  };
+
+  // A change of Claude's that waits for its bar line.
+  await showPiece('zz: note("a5").gain(0)', 'probe timeline notice reset', 1);
+  await showPiece(noticeCode, 'probe timeline notices', 2);
+  await clickAt(await noteCenter(0, 0));
+  await callTool(client, 'set_code', { code: `${noticeCode}\n// waiting`, label: 'probe timeline a change waits', at: 'phrase', phraseCycles: 64 });
+  await exerciseNotice('a change waits', TIMELINE_COPY.noteNoticeWaiting);
+  // An immediate change of Claude's replaces the waiting one, and the controls are on again once a note is picked.
+  await callTool(client, 'set_code', { code: noticeCode, label: 'probe timeline the change lands' });
+  await waitActive(noticeCode);
+  await sleep(600);
+  await clickAt(await noteCenter(0, 0));
+  const afterWaiting = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const afterWaitingOff = await evaluateExpr(cdp, READ_OFF);
+
+  // Text in the editor that was never evaluated.
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: '// probe\\n' } })`);
+  await exerciseNotice('unevaluated typing', TIMELINE_COPY.noteNoticeUnevaluated);
+  const typedKept = (await editorText()).startsWith('// probe\n');
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, to: 9, insert: '' } })`);
+  await sleep(600);
+  await clickAt(await noteCenter(0, 0));
+  const afterTyping = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const afterTypingOff = await evaluateExpr(cdp, READ_OFF);
+
+  // A closed socket needs the page to record its sockets from the start, so the page is loaded again.
+  await cdp('Page.enable');
+  const socketRecorder = await cdp('Page.addScriptToEvaluateOnNewDocument', { source: SOCKET_RECORDER_SOURCE });
+  try {
+    await reloadPage(cdp);
+    await showPiece(noticeCode, 'probe timeline closed socket', 2);
+    await clickAt(await noteCenter(0, 0));
+    await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+    await evaluateExpr(cdp, `(() => { window.__probeSockets[0].close(); return true; })()`);
+    await exerciseNotice('a closed socket', TIMELINE_COPY.noteNoticeDisconnected);
+  } finally {
+    await cdp('Page.removeScriptToEvaluateOnNewDocument', { identifier: socketRecorder.identifier });
+  }
+  await reloadPage(cdp);
+  await callTool(client, 'set_code', { code: 'setcps(0.5)\nzz: note("a5").gain(0)', label: 'probe timeline notices done' });
+  await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+  report(
+    'timeline: a closed socket, a change waiting for its bar and an unevaluated editor switch the edit controls off with one notice, and selecting still works',
+    noticeRows.length === 3 &&
+      noticeRows.every((row) => row.ok) &&
+      afterWaiting !== null &&
+      afterWaitingOff.every((value) => value === 'true' || value === null) &&
+      afterWaitingOff[0] === null &&
+      afterWaiting.line === 'An edit rewrites one token in the code: c3.' &&
+      typedKept &&
+      afterTyping !== null &&
+      afterTypingOff[0] === null &&
+      afterTyping.line === 'An edit rewrites one token in the code: c3.',
+    JSON.stringify({ noticeRows, afterWaiting: afterWaiting && afterWaiting.line, afterWaitingOff, typedKept, afterTyping: afterTyping && afterTyping.line, afterTypingOff }),
+  );
+
+  // ---- Notes the page cannot edit: the gesture becomes a request in the Ask box ----
+  // Up on a note in degrees: the page moves nothing and writes nothing; it puts the ready-made request in the Ask box, opened at the
+  // note with the note's moment, and nothing reaches the server until the person presses Enter. Enter then sends the lane
+  // context, the moment (its cycle the cycle of the text, the note among its notes) and the gesture after the moment.
+  const degreesCode = 't2: n("0 2").scale(\'C3:major\').gain(0)';
+  await showPiece(degreesCode, 'probe timeline refused request', 1);
+  await stopAskListeners();
+  const degreesAskListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (degreesAskListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  await clickAt(await noteCenter(0, 0));
+  const degreesAskRead = await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+  const degreesAskPlace = degreesAskRead === null ? null : placeOf(degreesAskRead);
+  const degreesAskNote = degreesAskRead === null ? null : degreesAskRead.pitch.split(' ')[0];
+  const degreesAskBefore = await editorAndHistory();
+  await pressKey(cdp, 'ArrowUp');
+  const degreesAskBox = await waitFor(cdp, `(() => { const box = document.getElementById('ask-box'); return box.hidden ? null : true; })()`, 3000);
+  const degreesAskAsk = await askBoxRead();
+  const degreesAskSentence = await readPanel();
+  await sleep(800);
+  const linesBeforeEnter = degreesAskListener.lines.length;
+  const degreesAskAfterKey = await editorAndHistory();
+  const degreesAskText = degreesAskPlace === null ? null : `Raise note ${degreesAskNote} at cycle ${degreesAskPlace.cycle}, beat ${degreesAskPlace.beat} of 't2' by 1 semitone.`;
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && degreesAskListener.lines.length === 0; waited += 100) await sleep(100);
+  const degreesAskLine = degreesAskListener.lines[0];
+  const degreesAskSent = parsedRequest(degreesAskLine);
+  const degreesAskClosed = await askBoxRead();
+  await stopAskListeners();
+  const degreesAskAfterEnter = await editorAndHistory();
+  report(
+    "timeline: Up on a note in degrees prepares a ready-made request with the note's moment, nothing is sent until Enter, and Enter sends the lane context, the moment and the gesture",
+    degreesAskRead !== null &&
+      degreesAskPlace !== null &&
+      degreesAskBox === true &&
+      degreesAskAsk.open === true &&
+      degreesAskAsk.value === degreesAskText &&
+      degreesAskAsk.start === degreesAskText.length &&
+      degreesAskAsk.end === degreesAskText.length &&
+      degreesAskAsk.focusInField === true &&
+      /^Lane t2 · cycle \d+, beat \d · \d+ notes?$/.test(degreesAskAsk.chip) &&
+      degreesAskAsk.chip.startsWith(`Lane t2 · cycle ${degreesAskPlace.cycle}, beat ${degreesAskPlace.beat} · `) &&
+      degreesAskSentence.line === 'Request ready in the Ask box. Nothing is sent until you press Enter.' &&
+      linesBeforeEnter === 0 &&
+      degreesAskAfterKey.editor === degreesAskBefore.editor &&
+      degreesAskAfterKey.active === degreesAskBefore.active &&
+      degreesAskAfterKey.history.id === degreesAskBefore.history.id &&
+      degreesAskSent !== null &&
+      degreesAskSent.text === degreesAskText &&
+      JSON.stringify(degreesAskSent.context) === JSON.stringify({ kind: 'lane', track: 't2', cycle: degreesAskPlace.cycle }) &&
+      degreesAskSent.moment.cycle === degreesAskPlace.cycle &&
+      degreesAskSent.moment.beat === degreesAskPlace.beat &&
+      degreesAskSent.moment.notes.some((entry) => entry.track === 't2' && Math.floor(entry.start) === degreesAskPlace.cycle && (/^\d/.test(degreesAskNote) || String(entry.note) === degreesAskNote)) &&
+      JSON.stringify(degreesAskSent.gesture) === JSON.stringify({ kind: 'pitch', semitones: 1 }) &&
+      JSON.stringify(Object.keys(degreesAskSent)) === JSON.stringify(['id', 'text', 'context', 'chip', 'current', 'moment', 'gesture']) &&
+      degreesAskClosed.open === false &&
+      degreesAskAfterEnter.editor === degreesAskBefore.editor &&
+      degreesAskAfterEnter.history.id === degreesAskBefore.history.id,
+    JSON.stringify({ degreesAskRead: degreesAskRead && degreesAskRead.position, degreesAskAsk, line: degreesAskSentence.line, linesBeforeEnter, sent: degreesAskSent && { text: degreesAskSent.text, context: degreesAskSent.context, moment: degreesAskSent.moment && { cycle: degreesAskSent.moment.cycle, beat: degreesAskSent.moment.beat, notes: degreesAskSent.moment.notes.length }, gesture: degreesAskSent.gesture, keys: Object.keys(degreesAskSent) }, codeSame: degreesAskAfterEnter.editor === degreesAskBefore.editor, history: [degreesAskBefore.history.id, degreesAskAfterEnter.history.id] }),
+  );
+
+  // A drag, Delete, Backspace, − and + on the same kind of note each put their own ready-made request in the Ask box and change no
+  // code; a draft already in the field is kept and the request follows it after a blank line; nothing reaches the server.
+  await stopAskListeners();
+  const gestureListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (gestureListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await showPiece(degreesCode, 'probe timeline refused gestures', 1);
+  await askReset();
+  await clickAt(await noteCenter(0, 0));
+  const gestureRead = await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+  const gesturePlace = gestureRead === null ? null : placeOf(gestureRead);
+  const gestureNote = gestureRead === null ? null : gestureRead.pitch.split(' ')[0];
+  const gestureAt = gesturePlace === null ? '' : `at cycle ${gesturePlace.cycle}, beat ${gesturePlace.beat} of 't2'`;
+  const gestureBefore = await editorAndHistory();
+  const gestureRows = [];
+  const gestureRem = await evaluateExpr(cdp, `parseFloat(getComputedStyle(document.documentElement).fontSize)`);
+  const readGhosts = () => evaluateExpr(cdp, `document.querySelectorAll('#timeline-lanes .tl-ghost').length`);
+  // The drag: two whole steps up (a rem and a tenth), read while the button is still down, then released.
+  {
+    const from = await noteCenter(0, 0);
+    const to = { x: from.x, y: from.y - 1.1 * gestureRem };
+    await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
+    const distance = Math.abs(to.y - from.y);
+    for (let i = 1; i <= Math.ceil(distance / 3); i++) await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x, y: from.y + ((to.y - from.y) * i) / Math.ceil(distance / 3), button: 'left', buttons: 1 });
+    const held = await readPanel();
+    const heldGhosts = await readGhosts();
+    const heldBox = await askBoxRead();
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const box = await askBoxRead();
+    gestureRows.push({
+      name: 'a drag up',
+      ok:
+        held.line === 'Release to ask Claude: raise this note by 2 semitones.' &&
+        held.lineKind === 'preview' &&
+        heldGhosts === 0 &&
+        heldBox.open === false &&
+        box.open === true &&
+        box.value === `Raise note ${gestureNote} ${gestureAt} by 2 semitones.`,
+      held: held.line,
+      heldGhosts,
+      value: box.value,
+    });
+  }
+  await askReset();
+  const gestureCases = [
+    ['Delete', async () => pressKey(cdp, 'Delete'), `Turn note ${gestureNote} ${gestureAt} into a rest.`],
+    ['Backspace', async () => pressKey(cdp, 'Backspace'), `Turn note ${gestureNote} ${gestureAt} into a rest.`],
+    ['Make a rest', async () => clickAt(await panelButton('Make a rest')), `Turn note ${gestureNote} ${gestureAt} into a rest.`],
+    ['−', async () => clickAt(await panelButton('−')), `Play note ${gestureNote} ${gestureAt} softer.`],
+    ['+', async () => clickAt(await panelButton('+')), `Play note ${gestureNote} ${gestureAt} louder.`],
+    ['Pitch down', async () => clickAt(await panelButton('Pitch down')), `Lower note ${gestureNote} ${gestureAt} by 1 semitone.`],
+    ['Shift+Up', async () => pressKey(cdp, 'ArrowUp', { shift: true }), `Raise note ${gestureNote} ${gestureAt} by 1 octave.`],
+  ];
+  for (const [name, act, expected] of gestureCases) {
+    // The note is picked again so the keys go to the lanes whatever had the focus.
+    await clickAt(await noteCenter(0, 0));
+    await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+    await act();
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const box = await askBoxRead();
+    gestureRows.push({ name, ok: box.open === true && box.value === expected && box.start === expected.length && box.focusInField === true, value: box.value });
+    await askReset();
+  }
+  // A draft that is already in the field is kept and the request follows it after a blank line, once.
+  await clickAt(await noteCenter(0, 0));
+  await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+  await askFieldSet('my draft');
+  await pressKey(cdp, 'Delete');
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const draftBox = await askBoxRead();
+  const draftText = `my draft\n\nTurn note ${gestureNote} ${gestureAt} into a rest.`;
+  await askReset();
+  await sleep(800);
+  const gestureAfter = await editorAndHistory();
+  const gestureLines = gestureListener.lines.length;
+  await stopAskListeners();
+  report(
+    'timeline: a drag, Delete, − and + on a refused note each prepare their request and change no code; a draft already in the field is kept; nothing reaches the server without Enter',
+    gestureRead !== null &&
+      gesturePlace !== null &&
+      gestureRows.length === 8 &&
+      gestureRows.every((row) => row.ok) &&
+      draftBox.value === draftText &&
+      draftBox.start === draftText.length &&
+      gestureAfter.editor === gestureBefore.editor &&
+      gestureAfter.active === gestureBefore.active &&
+      gestureAfter.history.id === gestureBefore.history.id &&
+      gestureLines === 0,
+    JSON.stringify({ failing: gestureRows.filter((row) => !row.ok), checked: gestureRows.length, draft: draftBox.value, codeSame: gestureAfter.editor === gestureBefore.editor, history: [gestureBefore.history.id, gestureAfter.history.id], lines: gestureLines }),
+  );
+
+  // A held Enter that opens the Ask box does not also send what is in it: the repeats of the press land in the field once focus has
+  // moved there, and the field ignores them. A fresh Enter sends.
+  const heldListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (heldListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await showPiece(degreesCode, 'probe timeline held enter', 1);
+  await askReset();
+  await clickAt(await noteCenter(0, 0));
+  const heldRead = await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+  // Up prepares the request in the box; Escape closes it and the request stays as the draft, with the focus back on the lanes.
+  await pressKey(cdp, 'ArrowUp');
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  await pressKey(cdp, 'Escape');
+  const heldEnter = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
+  await cdp('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...heldEnter });
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const heldOpened = await askBoxRead();
+  for (let repeat = 0; repeat < 3; repeat++) await cdp('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...heldEnter, autoRepeat: true });
+  await sleep(1000);
+  const heldStill = await askBoxRead();
+  const heldLinesBefore = heldListener.lines.length;
+  await cdp('Input.dispatchKeyEvent', { type: 'keyUp', ...heldEnter });
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && heldListener.lines.length === 0; waited += 100) await sleep(100);
+  const heldLinesAfter = heldListener.lines.length;
+  await stopAskListeners();
+  report(
+    'timeline: a held Enter that opens the Ask box sends nothing, and a fresh Enter in the box sends the request',
+    heldRead !== null &&
+      heldOpened.open === true &&
+      heldOpened.focusInField === true &&
+      heldOpened.value.startsWith('Raise note ') &&
+      heldStill.open === true &&
+      heldStill.value === heldOpened.value &&
+      heldLinesBefore === 0 &&
+      heldLinesAfter === 1,
+    JSON.stringify({ opened: heldOpened.open, focusInField: heldOpened.focusInField, value: heldOpened.value, stillOpen: heldStill.open, linesBefore: heldLinesBefore, linesAfter: heldLinesAfter }),
+  );
+
+  // Ask Claude, Shift+F10 and Enter on an editable note open the box with the note's lane and moment and an empty field, and the
+  // focus goes back to the lanes when the box is closed after a key.
+  const askCode = 't1: note("c3 e3 g3").gain(0)';
+  await showPiece(askCode, 'probe timeline ask claude', 1);
+  await askReset();
+  await clickAt(await noteCenter(0, 0));
+  const askRead = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const askPlace = askRead === null ? null : placeOf(askRead);
+  const askChipOk = (box) => askPlace !== null && new RegExp(`^Lane t1 · cycle ${askPlace.cycle}, beat ${askPlace.beat} · \\d+ notes?$`).test(box.chip);
+  const askBefore = await editorAndHistory();
+  const askRows = [];
+  const askKey = (key, shiftKey) =>
+    evaluateExpr(cdp, `(() => { const lanes = document.getElementById('timeline-lanes'); lanes.focus(); const event = new KeyboardEvent('keydown', { key: ${JSON.stringify(key)}, shiftKey: ${shiftKey}, bubbles: true, cancelable: true }); lanes.dispatchEvent(event); return event.defaultPrevented; })()`);
+  for (const [name, act] of [
+    ['Shift+F10', () => askKey('F10', true)],
+    ['the Menu key', () => askKey('ContextMenu', false)],
+    ['Enter', () => pressKey(cdp, 'Enter')],
+    ['the Ask Claude button', async () => clickAt(await panelButton('Ask Claude'))],
+  ]) {
+    await clickAt(await noteCenter(0, 0));
+    await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+    const keyedAsk = name === 'Shift+F10' || name === 'the Menu key';
+    const prevented = await act();
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const box = await askBoxRead();
+    await pressKey(cdp, 'Escape');
+    const closed = await askBoxRead();
+    askRows.push({
+      name,
+      ok:
+        box.open === true &&
+        askChipOk(box) &&
+        box.value === '' &&
+        box.focusInField === true &&
+        closed.open === false &&
+        (name === 'the Ask Claude button' || closed.focusOnLanes === true) &&
+        (!keyedAsk || prevented === true),
+      chip: box.chip,
+      value: box.value,
+      focusOnLanes: closed.focusOnLanes,
+    });
+  }
+  const askAfter = await editorAndHistory();
+  report(
+    'timeline: Ask Claude and Shift+F10 on an editable note open the box with the note\'s moment and an empty field, and focus returns to the lanes when it closes',
+    askRead !== null &&
+      askPlace !== null &&
+      askRows.length === 4 &&
+      askRows.every((row) => row.ok) &&
+      askAfter.editor === askBefore.editor &&
+      askAfter.history.id === askBefore.history.id,
+    JSON.stringify({ askPlace, askRows, codeSame: askAfter.editor === askBefore.editor }),
+  );
+
+  // A change waiting for its line, and text in the editor that was never evaluated, switch the edit controls off; a gesture on a
+  // refused note writes nothing, so it still prepares its request.
+  const waitingPiece = 't1: note("c3 e3").postgain(0)\nt2: n("0 2").scale(\'C3:major\').postgain(0)';
+  await showPiece(waitingPiece, 'probe timeline refused while waiting', 2);
+  await askReset();
+  await clickAt(await noteCenter(0, 0));
+  await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  await callTool(client, 'set_code', { code: `${waitingPiece}\n// waiting`, label: 'probe timeline refused waiting', at: 'phrase', phraseCycles: 64 });
+  const waitingNotice = await waitFor(cdp, `document.getElementById('timeline-note-line').textContent === ${JSON.stringify(TIMELINE_COPY.noteNoticeWaiting)} ? true : null`, 6000);
+  const waitingRows = [];
+  const askRefusedUp = async (name) => {
+    await clickAt(await noteCenter(1, 0));
+    const read = await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+    const place = read === null ? null : placeOf(read);
+    const before = await editorAndHistory();
+    await pressKey(cdp, 'ArrowUp');
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const box = await askBoxRead();
+    const after = await editorAndHistory();
+    await askReset();
+    waitingRows.push({
+      name,
+      ok:
+        read !== null &&
+        place !== null &&
+        box.open === true &&
+        box.value === `Raise note ${read.pitch.split(' ')[0]} at cycle ${place.cycle}, beat ${place.beat} of 't2' by 1 semitone.` &&
+        after.editor === before.editor &&
+        after.active === before.active &&
+        after.history.id === before.history.id,
+      value: box.value,
+    });
+  };
+  await askRefusedUp('a change waits for its bar');
+  report(
+    'timeline: with a change waiting for its bar, Up on a refused note still prepares its request',
+    waitingNotice === true && waitingRows.length === 1 && waitingRows.every((row) => row.ok),
+    JSON.stringify({ waitingNotice, waitingRows }),
+  );
+  // An immediate change replaces the waiting one; then text typed into the editor is not evaluated.
+  await callTool(client, 'set_code', { code: waitingPiece, label: 'probe timeline refused lands' });
+  await waitActive(waitingPiece);
+  await sleep(600);
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: '// probe\\n' } })`);
+  await clickAt(await noteCenter(0, 0));
+  const typingNotice = await waitFor(cdp, `document.getElementById('timeline-note-line').textContent === ${JSON.stringify(TIMELINE_COPY.noteNoticeUnevaluated)} ? true : null`, 6000);
+  await askRefusedUp('text in the editor was never evaluated');
+  const typedStill = (await editorText()).startsWith('// probe\n');
+  await evaluateExpr(cdp, `document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, to: 9, insert: '' } })`);
+  await sleep(600);
+  report(
+    'timeline: with unevaluated text in the editor, Up on a refused note still prepares its request and nothing is written',
+    typingNotice === true && typedStill && waitingRows.length === 2 && waitingRows[1].ok,
+    JSON.stringify({ typingNotice, typedStill, row: waitingRows[1] }),
+  );
+  await callTool(client, 'set_code', { code: 'setcps(0.5)\nzz: note("a5").gain(0)', label: 'probe timeline refused done' });
+
+  // Offline: a gesture on a refused note still puts its request in the box, which shows its own disconnected line, and Enter sends
+  // nothing. The page records its sockets from the start so the check can close the one it holds.
+  await cdp('Page.enable');
+  const offlineRecorder = await cdp('Page.addScriptToEvaluateOnNewDocument', { source: SOCKET_RECORDER_SOURCE });
+  let offlineRow = null;
+  try {
+    await reloadPage(cdp);
+    await showPiece(degreesCode, 'probe timeline refused offline', 1);
+    await askReset();
+    await clickAt(await noteCenter(0, 0));
+    const offlineRead = await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"');
+    const offlinePlace = offlineRead === null ? null : placeOf(offlineRead);
+    await evaluateExpr(cdp, `(() => { window.__probeSockets[0].close(); return true; })()`);
+    await sleep(600);
+    await pressKey(cdp, 'ArrowUp');
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const prepared = await askBoxRead();
+    await pressKey(cdp, 'Enter');
+    await sleep(500);
+    const afterEnter = await askBoxRead();
+    offlineRow = {
+      prepared: prepared.value,
+      message: prepared.message,
+      stillOpen: afterEnter.open,
+      kept: afterEnter.value === prepared.value,
+      messageAfter: afterEnter.message,
+      ok:
+        offlineRead !== null &&
+        offlinePlace !== null &&
+        prepared.open === true &&
+        prepared.value === `Raise note ${offlineRead.pitch.split(' ')[0]} at cycle ${offlinePlace.cycle}, beat ${offlinePlace.beat} of 't2' by 1 semitone.` &&
+        prepared.message === ASK_COPY.disconnected &&
+        afterEnter.open === true &&
+        afterEnter.value === prepared.value &&
+        afterEnter.message === ASK_COPY.disconnected,
+    };
+  } finally {
+    await cdp('Page.removeScriptToEvaluateOnNewDocument', { identifier: offlineRecorder.identifier });
+  }
+  await reloadPage(cdp);
+  await callTool(client, 'set_code', { code: 'setcps(0.5)\nzz: note("a5").gain(0)', label: 'probe timeline refused offline done' });
+  await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+  report(
+    'timeline: offline, Up on a refused note still puts its request in the box with the box\'s own disconnected line, and Enter sends nothing',
+    offlineRow !== null && offlineRow.ok,
+    JSON.stringify(offlineRow),
+  );
+
+  // ---- A range of cycles on one lane ----
+  // The piece is slow (setcps(0.05)) so the page stays on one page of cycles while a check runs; every cycle in a check is the page
+  // start the lanes report plus an offset, because the page does not start at cycle 0.
+  const SLOW = 'setcps(0.05)\n';
+  const laneArea = (lane) =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const svg = document.querySelectorAll('#timeline-lanes .lane')[${lane}].querySelector('svg.lane-events');
+        svg.scrollIntoView({ block: 'nearest' });
+        const r = svg.getBoundingClientRect();
+        return { left: r.left, top: r.top, width: r.width, height: r.height, pageStart: Number(document.getElementById('timeline-lanes').dataset.pageStart) };
+      })()`,
+    );
+  /** The x of the middle of `cycle` (an absolute cycle number) in a lane area read by laneArea. */
+  const cycleMiddle = (area, cycle) => area.left + ((cycle + 0.5 - area.pageStart) / 32) * area.width;
+  /** A press at `from`, a move in small steps through `via` points to `to`, and the release at `to` (or no release with hold). */
+  const dragPointer = async (from, to, { hold = false } = {}) => {
+    await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1 });
+    const steps = Math.max(2, Math.ceil(Math.abs(to.x - from.x) / 4));
+    for (let i = 1; i <= steps; i++) {
+      await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps, button: 'left', buttons: 1 });
+    }
+    if (!hold) await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1 });
+  };
+  const releasePointer = (point) => cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 });
+  const READ_WASHES = `(() => {
+    const lanes = [...document.querySelectorAll('#timeline-lanes .lane')];
+    return [...document.querySelectorAll('#timeline-lanes .tl-range')].map((el) => ({
+      lane: lanes.indexOf(el.closest('.lane')),
+      left: el.style.left,
+      width: el.style.width,
+      pixelLeft: el.getBoundingClientRect().left,
+      pixelWidth: el.getBoundingClientRect().width,
+    }));
+  })()`;
+  const readWashes = () => evaluateExpr(cdp, READ_WASHES);
+  const laneTop = (area, share) => area.top + share * area.height;
+  const wholeCycles = (wash, area, from, to) => {
+    // The wash is a whole number of cycles: its box lines up with the cycle lines of the lane area, to a pixel.
+    const left = area.left + ((from - area.pageStart) / 32) * area.width;
+    const width = ((to - from + 1) / 32) * area.width;
+    return wash !== undefined && Math.abs(wash.pixelLeft - left) < 1.5 && Math.abs(wash.pixelWidth - width) < 1.5;
+  };
+
+  // A different number of lanes between pieces, so the check waits for the lanes of the new piece and not for those still drawn.
+  const resetLanes = async (label) => showPiece('zz: note("a5").gain(0)\nzy: note("a5").gain(0)', label, 2);
+  const rangePiece = `${SLOW}t1: note("c3 ~ ~ ~").gain(0)`;
+  await resetLanes('probe timeline range reset');
+  await showPiece(rangePiece, 'probe timeline range', 1);
+  await stopAskListeners();
+  const rangeListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (rangeListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  await clickAt(await laneArea(0).then((area) => ({ x: cycleMiddle(area, area.pageStart + 20), y: laneTop(area, 0.9) })));
+  const rangeArea = await laneArea(0);
+  const rangeFrom = rangeArea.pageStart + 2;
+  const rangeTo = rangeArea.pageStart + 5;
+  const rangeBefore = await editorAndHistory();
+  await dragPointer({ x: cycleMiddle(rangeArea, rangeFrom), y: laneTop(rangeArea, 0.9) }, { x: cycleMiddle(rangeArea, rangeTo), y: laneTop(rangeArea, 0.9) }, { hold: true });
+  const rangeHeld = await readWashes();
+  const rangeHeldBox = await askBoxRead();
+  await releasePointer({ x: cycleMiddle(rangeArea, rangeTo), y: laneTop(rangeArea, 0.9) });
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const rangeBox = await askBoxRead();
+  const rangeAfterRelease = await readWashes();
+  await sleep(800);
+  const rangeLinesBeforeEnter = rangeListener.lines.length;
+  const rangeCodeSame = await editorAndHistory();
+  await askFieldSet('what is in these cycles?');
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && rangeListener.lines.length === 0; waited += 100) await sleep(100);
+  const rangeSent = parsedRequest(rangeListener.lines[0]);
+  const rangeClosed = await askBoxRead();
+  const rangeWashesAfter = await readWashes();
+  await stopAskListeners();
+  const rangeAfter = await editorAndHistory();
+  report(
+    "timeline: a drag across empty lane area opens the Ask box with the range chip, and Enter sends the range context and the notes to Claude's request line",
+    rangeHeld.length === 1 &&
+      rangeHeld[0].lane === 0 &&
+      wholeCycles(rangeHeld[0], rangeArea, rangeFrom, rangeTo) &&
+      rangeHeldBox.open === false &&
+      rangeBox.open === true &&
+      rangeBox.chip === `Range · t1 · cycles ${rangeFrom} to ${rangeTo} · 4 notes` &&
+      rangeBox.value === '' &&
+      rangeBox.focusInField === true &&
+      rangeBox.message === '' &&
+      rangeAfterRelease.length === 1 &&
+      wholeCycles(rangeAfterRelease[0], rangeArea, rangeFrom, rangeTo) &&
+      rangeLinesBeforeEnter === 0 &&
+      rangeCodeSame.editor === rangeBefore.editor &&
+      rangeCodeSame.history.id === rangeBefore.history.id &&
+      rangeSent !== null &&
+      rangeSent.text === 'what is in these cycles?' &&
+      JSON.stringify(rangeSent.context) === JSON.stringify({ kind: 'range', track: 't1', from: rangeFrom, to: rangeTo }) &&
+      rangeSent.moment === undefined &&
+      rangeSent.gesture.kind === 'range' &&
+      Number.isInteger(rangeSent.gesture.version) &&
+      rangeSent.gesture.more === 0 &&
+      JSON.stringify(rangeSent.gesture.notes.map((note) => [note.track, note.note, note.start])) ===
+        JSON.stringify([rangeFrom, rangeFrom + 1, rangeFrom + 2, rangeTo].map((cycle) => ['t1', 'c3', cycle])) &&
+      rangeSent.gesture.notes.every((note) => !('state' in note)) &&
+      JSON.stringify(Object.keys(rangeSent)) === JSON.stringify(['id', 'text', 'context', 'chip', 'current', 'gesture']) &&
+      rangeClosed.open === false &&
+      rangeWashesAfter.length === 0 &&
+      rangeAfter.editor === rangeBefore.editor &&
+      rangeAfter.history.id === rangeBefore.history.id,
+    JSON.stringify({ rangeFrom, rangeTo, rangeHeld, rangeBox: { open: rangeBox.open, chip: rangeBox.chip, value: rangeBox.value, focusInField: rangeBox.focusInField, message: rangeBox.message }, rangeAfterRelease, rangeLinesBeforeEnter, sent: rangeSent && { text: rangeSent.text, context: rangeSent.context, gesture: rangeSent.gesture && { kind: rangeSent.gesture.kind, version: rangeSent.gesture.version, notes: rangeSent.gesture.notes.length, more: rangeSent.gesture.more }, keys: Object.keys(rangeSent) }, closed: rangeClosed.open, washesAfter: rangeWashesAfter.length, codeSame: rangeAfter.editor === rangeBefore.editor }),
+  );
+
+  // A sideways drag that starts on a note is a range, not a pitch drag. A drag that leaves the event area is held at the page edge
+  // and the box says it was cut. In a piece with a song the chip names the section of the first cycle and, across a boundary, the
+  // section of the last one. The song of the helper piece is 15 cycles long (x 3, y 5, z 7) and repeats, so the section of a cycle
+  // is read from its position in the 15.
+  const songRangeCode = songHelperCode({ t1Tail: '.gain(0)', cps: 0.05 });
+  await resetLanes('probe timeline range sections reset');
+  await showPiece(songRangeCode, 'probe timeline range sections', 3);
+  await stopAskListeners();
+  const sectionListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (sectionListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  const sectionArea = await laneArea(0);
+  const ps = sectionArea.pageStart;
+  const middle = laneTop(sectionArea, 0.5);
+  const sectionOf = (cycle) => {
+    const position = ((cycle % 15) + 15) % 15;
+    return position < 3 ? 'x' : position < 8 ? 'y' : 'z';
+  };
+  const sectionWords = (from, to) => (sectionOf(from) === sectionOf(to) ? `section "${sectionOf(from)}"` : `sections "${sectionOf(from)}" to "${sectionOf(to)}"`);
+  // A cycle of the page where the song changes section, and a run of three cycles inside one section.
+  let boundary = ps;
+  while (sectionOf(boundary) === sectionOf(boundary + 1)) boundary++;
+  let inside = ps + 8;
+  while (!(sectionOf(inside) === sectionOf(inside + 2))) inside++;
+  const rangeRows = [];
+  /** Drags from `from` to `to`, reads the wash, the box and the panel, and keeps a row the check compares. */
+  const dragRead = async (name, from, to, expected) => {
+    await askReset();
+    await dragPointer(from, to);
+    const opened = await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const box = await askBoxRead();
+    const washes = await readWashes();
+    const panel = await readPanel();
+    rangeRows.push({ name, ok: opened === true && expected(box, washes, panel), open: box.open, chip: box.chip, message: box.message, washes: washes.length, rings: panel.rings, panel: `${panel.lane}${panel.position}` });
+    return box;
+  };
+  const noteOnPage = await noteCenter(0, 4);
+  const noteCycle = ps + Math.floor(((noteOnPage.x - sectionArea.left) / sectionArea.width) * 32);
+  await dragRead('a sideways drag from a note', noteOnPage, { x: cycleMiddle(sectionArea, noteCycle + 2), y: noteOnPage.y }, (box, washes, panel) =>
+    box.chip === `Range · t1 · cycles ${noteCycle} to ${noteCycle + 2} · ${sectionWords(noteCycle, noteCycle + 2)} · 3 notes` &&
+    box.value === '' &&
+    box.message === '' &&
+    washes.length === 1 &&
+    wholeCycles(washes[0], sectionArea, noteCycle, noteCycle + 2) &&
+    panel.rings === 0,
+  );
+  await dragRead('a drag past the left edge', { x: cycleMiddle(sectionArea, ps + 20), y: middle }, { x: sectionArea.left - 40, y: middle }, (box, washes) =>
+    box.chip === `Range · t1 · cycles ${ps} to ${ps + 20} · ${sectionWords(ps, ps + 20)} · 21 notes` &&
+    box.message === `Cut to the page shown — cycles ${ps} to ${ps + 20}.` &&
+    washes.length === 1 &&
+    wholeCycles(washes[0], sectionArea, ps, ps + 20),
+  );
+  await dragRead('a drag past the right edge', { x: cycleMiddle(sectionArea, ps + 27), y: middle }, { x: sectionArea.left + sectionArea.width + 40, y: middle }, (box, washes) =>
+    box.chip === `Range · t1 · cycles ${ps + 27} to ${ps + 31} · ${sectionWords(ps + 27, ps + 31)} · 5 notes` &&
+    box.message === `Cut to the page shown — cycles ${ps + 27} to ${ps + 31}.` &&
+    washes.length === 1 &&
+    wholeCycles(washes[0], sectionArea, ps + 27, ps + 31),
+  );
+  await dragRead('a drag inside one section', { x: cycleMiddle(sectionArea, inside), y: middle }, { x: cycleMiddle(sectionArea, inside + 2), y: middle }, (box, washes) =>
+    box.chip === `Range · t1 · cycles ${inside} to ${inside + 2} · section "${sectionOf(inside)}" · 3 notes` && box.message === '' && washes.length === 1,
+  );
+  await dragRead('a drag across a section boundary', { x: cycleMiddle(sectionArea, boundary), y: middle }, { x: cycleMiddle(sectionArea, boundary + 1), y: middle }, (box, washes) =>
+    box.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · sections "${sectionOf(boundary)}" to "${sectionOf(boundary + 1)}" · 2 notes` && box.message === '' && washes.length === 1,
+  );
+  const sectionLinesBeforeEnter = sectionListener.lines.length;
+  await askFieldSet('which section is this?');
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && sectionListener.lines.length === 0; waited += 100) await sleep(100);
+  const sectionSent = parsedRequest(sectionListener.lines[0]);
+  await stopAskListeners();
+  report(
+    'timeline: a sideways drag from a note makes a range, a drag past the page edge is cut and the box says so, and a range across a section boundary names both sections',
+    rangeRows.length === 5 &&
+      rangeRows.every((row) => row.ok) &&
+      sectionOf(boundary) !== sectionOf(boundary + 1) &&
+      sectionLinesBeforeEnter === 0 &&
+      sectionSent !== null &&
+      JSON.stringify(sectionSent.context) === JSON.stringify({ kind: 'range', track: 't1', from: boundary, to: boundary + 1, section: sectionOf(boundary), sectionTo: sectionOf(boundary + 1) }) &&
+      sectionSent.gesture.notes.length === 2 &&
+      sectionSent.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · sections "${sectionOf(boundary)}" to "${sectionOf(boundary + 1)}" · 2 notes`,
+    JSON.stringify({ ps, boundary, inside, noteCycle, rangeRows, sectionLinesBeforeEnter, sent: sectionSent && { context: sectionSent.context, chip: sectionSent.chip, notes: sectionSent.gesture.notes.length } }),
+  );
+
+  // The worst case of the request line: a lane with a 200-character name, whose every note carries that name, and a range of 40
+  // notes. The page cuts notes from the end into more until the line is at most 8192 bytes, and the chip keeps its cycles.
+  const longName = `L${'x'.repeat(199)}`;
+  const longPiece = `${SLOW}${longName}: note("c3 d3 e3 f3 g3 a3 b3 c4").s("sawtooth").gain(0)`;
+  await resetLanes('probe timeline range long names reset');
+  await showPiece(longPiece, 'probe timeline range long names', 1);
+  await stopAskListeners();
+  const longListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (longListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  const longArea = await laneArea(0);
+  await dragPointer({ x: cycleMiddle(longArea, longArea.pageStart + 2), y: laneTop(longArea, 0.95) }, { x: cycleMiddle(longArea, longArea.pageStart + 6), y: laneTop(longArea, 0.95) });
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const longBox = await askBoxRead();
+  await askFieldSet('what are these notes?');
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && longListener.lines.length === 0; waited += 100) await sleep(100);
+  const longLine = longListener.lines[0];
+  const longSent = parsedRequest(longLine);
+  await stopAskListeners();
+  const longLineBytes = longLine === undefined ? 0 : new TextEncoder().encode(longLine).length;
+  report(
+    'timeline: a range of 32 long notes on a lane with a 200-character name fits one request line and keeps its cycles in the chip',
+    longBox.open === true &&
+      longBox.chip.length <= 200 &&
+      longBox.chip.endsWith(` · cycles ${longArea.pageStart + 2} to ${longArea.pageStart + 6} · 40 notes`) &&
+      longBox.chip.startsWith('Range · L') &&
+      longSent !== null &&
+      longSent.context.track === longName &&
+      longLineBytes > 0 &&
+      longLineBytes <= 8192 &&
+      longSent.gesture.notes.length > 0 &&
+      longSent.gesture.notes.length < 32 &&
+      longSent.gesture.notes.length + longSent.gesture.more === 40 &&
+      longSent.gesture.notes.every((note) => note.track === longName) &&
+      longSent.chip === longBox.chip,
+    JSON.stringify({ chip: longBox.chip, bytes: longLineBytes, notes: longSent && longSent.gesture.notes.length, more: longSent && longSent.gesture.more, track: longSent && longSent.context.track.length }),
+  );
+
+  // The keyboard: Shift+Right on a selected note makes a range and widens it a cycle a press, Enter opens the box for it, Escape
+  // clears it, and a page turn clears it too. The panel names the range and offers only Ask Claude.
+  const READ_RANGE_PANEL = `(() => {
+    const panel = document.getElementById('timeline-note');
+    return {
+      lane: panel.querySelector('.tl-lane-name').textContent,
+      position: panel.querySelector('.tl-note-position').textContent,
+      controlsHidden: panel.querySelector('.tl-note-controls').hidden,
+      shown: [...panel.querySelectorAll('.tl-btn')].filter((button) => button.getClientRects().length > 0).map((button) => button.textContent),
+      groupsShown: [...panel.querySelectorAll('.tl-group')].filter((group) => group.getClientRects().length > 0).length,
+      hint: panel.querySelector('.tl-note-hint').textContent,
+      line: document.getElementById('timeline-note-line').textContent,
+      washes: document.querySelectorAll('#timeline-lanes .tl-range').length,
+      rings: document.querySelectorAll('#timeline-lanes .tl-ring').length,
+    };
+  })()`;
+  const readRangePanel = () => evaluateExpr(cdp, READ_RANGE_PANEL);
+  const keyPiece = `${SLOW}t1: note("c3 e3 g3 b3").gain(0)`;
+  await resetLanes('probe timeline range keys reset');
+  await showPiece(keyPiece, 'probe timeline range keys', 1);
+  await askReset();
+  await clickAt(await noteCenter(0, 9));
+  const keyNote = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  const keyPlace = keyNote === null ? null : placeOf(keyNote);
+  const keyCode = await editorAndHistory();
+  await pressKey(cdp, 'ArrowRight', { shift: true });
+  await pressKey(cdp, 'ArrowRight', { shift: true });
+  const keyArea = await laneArea(0);
+  const keyPanel = await readRangePanel();
+  const keyWash = await readWashes();
+  const keyFrom = keyPlace === null ? 0 : keyPlace.cycle;
+  const keyChip = `Range · t1 · cycles ${keyFrom} to ${keyFrom + 2} · 12 notes`;
+  await pressKey(cdp, 'Enter');
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const keyBox = await askBoxRead();
+  await pressKey(cdp, 'Escape');
+  const keyBoxClosed = await askBoxRead();
+  const keyAfterBox = await readRangePanel();
+  // The panel's Ask Claude button opens the box again for the same range, with an empty field.
+  const keyButtonPoint = await evaluateExpr(
+    cdp,
+    `(() => {
+      const button = [...document.querySelectorAll('#timeline-note .tl-btn')].find((el) => el.textContent === 'Ask Claude');
+      const r = button.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })()`,
+  );
+  await clickAt(keyButtonPoint);
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const keyBoxAgain = await askBoxRead();
+  await pressKey(cdp, 'Escape');
+  await evaluateExpr(cdp, `document.getElementById('timeline-lanes').focus()`);
+  await pressKey(cdp, 'Escape');
+  const keyCleared = await readRangePanel();
+  const keyWashGone = await readWashes();
+  const keyCodeAfter = await editorAndHistory();
+  // A page turn: the piece is fast, so the page turns within seconds. The range is made as soon as a page is new.
+  const FAST = 'setcps(8)\n';
+  const turnPiece = `${FAST}t1: note("c3 e3 g3 b3").gain(0)`;
+  await resetLanes('probe timeline range page turn reset');
+  await showPiece(turnPiece, 'probe timeline range page turn', 1);
+  const readPageStart = () => evaluateExpr(cdp, `Number(document.getElementById('timeline-lanes').dataset.pageStart)`);
+  const turnBefore = await readPageStart();
+  await waitFor(cdp, `Number(document.getElementById('timeline-lanes').dataset.pageStart) !== ${turnBefore} ? true : null`, 12000);
+  await waitFor(cdp, `document.querySelectorAll('#timeline-lanes .lane').length === 1 && document.getElementById('timeline-view').dataset.state === 'ok' ? true : null`, 6000);
+  const turnStart = await readPageStart();
+  await clickAt(await noteCenter(0, 4));
+  await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+  await pressKey(cdp, 'ArrowRight', { shift: true });
+  const turnMade = await readRangePanel();
+  await waitFor(cdp, `Number(document.getElementById('timeline-lanes').dataset.pageStart) !== ${turnStart} ? true : null`, 12000);
+  const turnAfter = await waitFor(cdp, `(() => { const read = ${READ_RANGE_PANEL}; return read.position === 'No note selected' ? read : null; })()`, 6000);
+  report(
+    'timeline: Shift+Right from a selected note makes a range, Enter asks about it, Escape clears it, and a page turn clears a range',
+    keyNote !== null &&
+      keyPlace !== null &&
+      keyPanel.lane === 'Range · t1' &&
+      keyPanel.position === ` · cycles ${keyFrom} to ${keyFrom + 2} · 12 notes` &&
+      keyPanel.controlsHidden === false &&
+      JSON.stringify(keyPanel.shown) === JSON.stringify(['Ask Claude']) &&
+      keyPanel.groupsShown === 0 &&
+      keyPanel.hint === 'Press Enter or Ask Claude to ask about these cycles. Esc clears the range.' &&
+      keyPanel.line === '' &&
+      keyPanel.rings === 0 &&
+      keyWash.length === 1 &&
+      wholeCycles(keyWash[0], keyArea, keyFrom, keyFrom + 2) &&
+      keyBox.open === true &&
+      keyBox.chip === keyChip &&
+      keyBox.value === '' &&
+      keyBoxClosed.open === false &&
+      keyBoxClosed.focusOnLanes === true &&
+      keyAfterBox.washes === 1 &&
+      keyAfterBox.position.startsWith(' · cycles') &&
+      keyBoxAgain.open === true &&
+      keyBoxAgain.chip === keyChip &&
+      keyBoxAgain.value === '' &&
+      keyCleared.position === 'No note selected' &&
+      keyCleared.washes === 0 &&
+      keyCleared.controlsHidden === true &&
+      keyWashGone.length === 0 &&
+      keyCodeAfter.editor === keyCode.editor &&
+      keyCodeAfter.history.id === keyCode.history.id &&
+      turnMade.washes === 1 &&
+      turnMade.lane === 'Range · t1' &&
+      turnAfter !== null &&
+      turnAfter.washes === 0 &&
+      turnAfter.controlsHidden === true,
+    JSON.stringify({ keyPlace, keyPanel, keyWash: keyWash.length, keyBox: { open: keyBox.open, chip: keyBox.chip, value: keyBox.value }, keyBoxClosed: { open: keyBoxClosed.open, focusOnLanes: keyBoxClosed.focusOnLanes }, keyAfterBox: { washes: keyAfterBox.washes, position: keyAfterBox.position }, keyBoxAgain: { open: keyBoxAgain.open, chip: keyBoxAgain.chip, value: keyBoxAgain.value }, keyCleared, codeSame: keyCodeAfter.editor === keyCode.editor, turnMade: { washes: turnMade.washes, lane: turnMade.lane }, turnAfter }),
+  );
+  {
+    // The keyboard alone: Tab arrives at the lanes and selects nothing; Right, Left and the Page keys walk the notes and the lanes, a
+    // lane with no notes gets the cursor; Up writes one step after the pause; the lanes name the active note through
+    // aria-activedescendant; Escape steps back one thing at a time (steps not written, a range, the selection, then the view); the
+    // keys 1 to 6 and a, b, c keep their page meaning with focus on the lanes. The lanes' sentence slot is the Timeline's only live region.
+    const READ_KEYS = `(() => {
+      const lanes = document.getElementById('timeline-lanes');
+      const id = lanes.getAttribute('aria-activedescendant');
+      const el = id === null ? null : document.getElementById(id);
+      const panel = document.getElementById('timeline-note');
+      const base = ${READ_PANEL};
+      return Object.assign(base, {
+        focused: document.activeElement === lanes,
+        descendant: id,
+        name: el === null ? null : el.getAttribute('aria-label'),
+        role: el === null ? null : el.getAttribute('role'),
+        hiddenFromReaders: el === null ? null : el.closest('[aria-hidden="true"]') !== null,
+        inLanes: el === null ? null : lanes.contains(el),
+        active: lanes.querySelectorAll('.tl-active').length,
+        shown: [...panel.querySelectorAll('.tl-btn')].filter((button) => button.getClientRects().length > 0).map((button) => button.textContent),
+        washes: document.querySelectorAll('#timeline-lanes .tl-range').length,
+        liveRegions: [...document.querySelectorAll('#timeline-view [aria-live], #timeline-view [role="status"], #timeline-view [role="alert"]')].map((node) => node.id),
+        view: document.getElementById('workspace').dataset.view,
+        layout: document.getElementById('workspace').dataset.layout,
+      });
+    })()`;
+    const readKeys = () => evaluateExpr(cdp, READ_KEYS);
+    const keysWhen = (done) => waitFor(cdp, `(() => { const read = ${READ_KEYS}; return (${done})(read) ? read : null; })()`, 5000);
+    const kbPiece = `${SLOW}t1: note("c3 e3 g3 b3").gain(0)\nt2: note("~")\nt3: note("d3 f3").gain(0)`;
+    await resetLanes('probe timeline keys reset');
+    await showPiece(kbPiece, 'probe timeline keys', 3);
+    await askReset();
+    const layoutAtStart = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+    // Tab from the top of the page reaches the lanes as one stop (a real Tab key), and arriving selects nothing.
+    await blurActive();
+    let tabPresses = 0;
+    while (tabPresses < 150 && (await evaluateExpr(cdp, `document.activeElement === document.getElementById('timeline-lanes')`)) !== true) {
+      await pressKey(cdp, 'Tab');
+      tabPresses++;
+    }
+    const arrived = await readKeys();
+    await pressKey(cdp, 'Tab');
+    const afterLanes = await evaluateExpr(cdp, `(() => { const a = document.activeElement; return { insidePanel: a !== null && document.getElementById('timeline-note').contains(a), insideLanes: a !== null && document.getElementById('timeline-lanes').contains(a), id: a ? a.id : null }; })()`);
+    await pressKey(cdp, 'Tab', { shift: true });
+    const backOnLanes = await readKeys();
+    const kbBefore = await editorAndHistory();
+    await pressKey(cdp, 'ArrowRight');
+    const first = await keysWhen('(read) => read.lane === "t1" && read.state !== ""');
+    const firstPlace = first === null ? null : placeOf(first);
+    await pressKey(cdp, 'ArrowRight');
+    const second = await keysWhen('(read) => read.lane === "t1" && read.pitch !== undefined && read.pitch.startsWith("e3")');
+    await pressKey(cdp, 'ArrowLeft');
+    const backToFirst = await keysWhen('(read) => read.lane === "t1" && read.pitch.startsWith("c3")');
+    await pressKey(cdp, 'End');
+    const lastOfLane = await keysWhen('(read) => read.lane === "t1" && read.pitch.startsWith("b3")');
+    await pressKey(cdp, 'Home');
+    await keysWhen('(read) => read.lane === "t1" && read.pitch.startsWith("c3")');
+    await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'ArrowRight');
+    // Lane t2 has no note on the page: Page Down puts the cursor there, at the cycle of the note that was selected.
+    await pressKey(cdp, 'PageDown');
+    const cursorRead = await keysWhen('(read) => read.lane === "t2"');
+    // Enter on the cursor asks about the lane: the box opens with the lane's chip and an empty field, and focus comes back to the lanes.
+    await pressKey(cdp, 'Enter');
+    await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+    const cursorAsk = await askBoxRead();
+    await pressKey(cdp, 'Escape');
+    const cursorAskClosed = await askBoxRead();
+    await pressKey(cdp, 'ArrowUp');
+    await pressKey(cdp, 'Delete');
+    await sleep(900);
+    const cursorKeysCode = await editorAndHistory();
+    await pressKey(cdp, 'PageDown');
+    const onT3 = await keysWhen('(read) => read.lane === "t3" && read.state === "Editable"');
+    const t3Code = await editorAndHistory();
+    await pressKey(cdp, 'ArrowUp');
+    const stepWritten = await waitFor(cdp, `${activeCodeExpr} !== ${JSON.stringify(t3Code.active)} ? ${activeCodeExpr} : null`, 8000);
+    const afterStep = await keysWhen('(read) => read.line.startsWith("Changed")');
+    const stepHistory = await historyTop();
+    const expectedStep = kbPiece.replace('d3 f3', 'd#3 f3');
+    const backAtT3 = afterStep === null ? null : await keysWhen('(read) => read.lane === "t3" && read.pitch.startsWith("d#3")');
+    // Escape steps back: a step not written is dropped (nothing is written after the pause), the selection goes, the view closes.
+    await pressKey(cdp, 'ArrowUp');
+    await sleep(150);
+    await pressKey(cdp, 'Escape');
+    await sleep(1000);
+    const dropped = await editorAndHistory();
+    const afterDrop = await readKeys();
+    await pressKey(cdp, 'Escape');
+    const afterClear = await readKeys();
+    await pressKey(cdp, 'ArrowRight');
+    await keysWhen('(read) => read.lane === "t1"');
+    await pressKey(cdp, 'ArrowRight', { shift: true });
+    const rangeRead = await keysWhen('(read) => read.lane === "Range · t1"');
+    await pressKey(cdp, 'Escape');
+    const afterRange = await readKeys();
+    // The keys of the page keep their meaning with focus on the lanes: b and c change the layout, a brings it back, 3 changes the view.
+    await pressKey(cdp, 'ArrowRight');
+    await keysWhen('(read) => read.lane === "t1"');
+    await pressKey(cdp, 'b');
+    const layoutB = await keysWhen('(read) => read.layout === "b"');
+    await pressKey(cdp, 'c');
+    const layoutC = await keysWhen('(read) => read.layout === "c"');
+    await pressKey(cdp, layoutAtStart);
+    const layoutBack = await keysWhen(`(read) => read.layout === ${JSON.stringify(layoutAtStart)}`);
+    const stillSelected = await readKeys();
+    await pressKey(cdp, 'Escape');
+    await pressKey(cdp, 'Escape');
+    const viewClosed = await keysWhen('(read) => read.view === "none"');
+    await pressKey(cdp, '2');
+    const viewReopened = await keysWhen('(read) => read.view === "timeline"');
+    const kbEnd = await editorAndHistory();
+    // The pieces of these checks play at gain 0, so the velocity the Timeline computes (gain times velocity) is 0.00.
+    const nameOf = (place, lane, note, velocity = '0.00') => `${lane}, cycle ${place.cycle}, beat ${place.beat}: note ${note}, velocity ${velocity}. Editable.`;
+    const rangeStart = rangeRead === null || firstPlace === null ? null : firstPlace.cycle;
+    report(
+      'timeline: the keyboard alone selects, moves across notes and lanes, edits, asks and steps back with Escape, and 1 to 6 and a, b, c still work on the lanes',
+      tabPresses < 150 &&
+        arrived.focused === true &&
+        arrived.position === 'No note selected' &&
+        arrived.rings === 0 &&
+        arrived.descendant === null &&
+        arrived.active === 0 &&
+        arrived.controlsHidden === true &&
+        afterLanes.insidePanel === false &&
+        afterLanes.insideLanes === false &&
+        backOnLanes.focused === true &&
+        backOnLanes.position === 'No note selected' &&
+        first !== null &&
+        first.state === 'Editable' &&
+        first.focused === true &&
+        first.rings === 1 &&
+        first.active === 1 &&
+        first.descendant !== null &&
+        first.role === 'img' &&
+        first.hiddenFromReaders === false &&
+        first.inLanes === true &&
+        first.name === nameOf(firstPlace, 't1', 'c3') &&
+        second !== null &&
+        second.name === `t1, cycle ${placeOf(second).cycle}, beat ${placeOf(second).beat}: note e3, velocity 0.00. Editable.` &&
+        second.active === 1 &&
+        backToFirst !== null &&
+        backToFirst.name === first.name &&
+        lastOfLane !== null &&
+        lastOfLane.active === 1 &&
+        cursorRead !== null &&
+        cursorRead.position === ' · no notes on this page' &&
+        cursorRead.state === '' &&
+        JSON.stringify(cursorRead.shown) === JSON.stringify(['Ask Claude']) &&
+        cursorRead.rings === 0 &&
+        cursorRead.name === `t2, cycle ${placeOf(second).cycle}: no notes on this page.` &&
+        cursorRead.hint === 'Press Enter or Ask Claude to ask about this lane. Shift+Left or Shift+Right selects cycles.' &&
+        cursorAsk.open === true &&
+      cursorAsk.chip.includes('t2') &&
+      cursorAsk.value === '' &&
+      cursorAskClosed.open === false &&
+      cursorAskClosed.focusOnLanes === true &&
+      cursorKeysCode.editor === kbBefore.editor &&
+        cursorKeysCode.active === kbBefore.active &&
+        cursorKeysCode.history.id === kbBefore.history.id &&
+        onT3 !== null &&
+        onT3.name.startsWith(`t3, cycle ${placeOf(second).cycle}, beat 1: note d3, velocity`) &&
+        stepWritten === expectedStep &&
+        afterStep !== null &&
+        stepHistory.id === kbBefore.history.id + 1 &&
+        stepHistory.row.includes('changed t3: d3 to d#3') &&
+        backAtT3 !== null &&
+        dropped.active === stepWritten &&
+        dropped.history.id === stepHistory.id &&
+        afterDrop.position !== 'No note selected' &&
+        afterClear.position === 'No note selected' &&
+        afterClear.rings === 0 &&
+        afterClear.descendant === null &&
+        afterClear.active === 0 &&
+        afterClear.view === 'timeline' &&
+        rangeRead !== null &&
+        rangeRead.washes === 1 &&
+        rangeRead.descendant === null &&
+        afterRange.washes === 0 &&
+        afterRange.position === 'No note selected' &&
+        afterRange.view === 'timeline' &&
+        layoutB !== null &&
+        layoutB.lane === 't1' &&
+        layoutC !== null &&
+        layoutBack !== null &&
+        stillSelected.lane === 't1' &&
+        stillSelected.rings === 1 &&
+        viewClosed !== null &&
+        viewReopened !== null &&
+        kbEnd.history.id === stepHistory.id &&
+        arrived.liveRegions.length === 1 &&
+        arrived.liveRegions[0] === 'timeline-note-line',
+      JSON.stringify({ tabPresses, arrived, afterLanes, backOnLanes: backOnLanes.focused, first, second: second && second.name, lastOfLane: lastOfLane && lastOfLane.name, cursorRead, cursorAsk: { open: cursorAsk.open, chip: cursorAsk.chip, value: cursorAsk.value }, cursorAskClosed: { open: cursorAskClosed.open, focusOnLanes: cursorAskClosed.focusOnLanes }, onT3: onT3 && onT3.name, stepWritten, stepHistory, dropped: dropped.active === stepWritten, afterDrop: afterDrop.position, afterClear, rangeRead: rangeRead && { lane: rangeRead.lane, washes: rangeRead.washes, descendant: rangeRead.descendant }, afterRange: { washes: afterRange.washes, position: afterRange.position }, layouts: { start: layoutAtStart, b: layoutB && layoutB.layout, c: layoutC && layoutC.layout, back: layoutBack && layoutBack.layout }, viewClosed: viewClosed && viewClosed.view, viewReopened: viewReopened && viewReopened.view, rangeStart }),
+    );
+  }
+  // The panel keeps one height whether nothing is selected, a note is selected or a note is being dragged, in layouts a, b and c at
+  // 1024 and 1920 pixels wide, and neither the Timeline nor the document scrolls sideways.
+  {
+    const sizePiece = `${SLOW}t1: note("c3 e3 g3 b3").gain(0)\nt2: note("d3 f3").gain(0)\nt3: note("g3 a3").gain(0)`;
+    await resetLanes('probe timeline sizes reset');
+    await showPiece(sizePiece, 'probe timeline sizes', 3);
+    await askReset();
+    const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+    const sizeCodeBefore = await editorAndHistory();
+    const READ_SIZES = `(() => {
+      const panel = document.getElementById('timeline-note');
+      const view = document.getElementById('timeline-view');
+      const r = panel.getBoundingClientRect();
+      return {
+        layout: document.getElementById('workspace').dataset.layout,
+        width: window.innerWidth,
+        panelHeight: Math.round(r.height * 100) / 100,
+        panelShown: !panel.hidden && r.height > 0,
+        viewFits: view.scrollWidth <= view.clientWidth,
+        docFits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+        panelFits: panel.scrollWidth <= panel.clientWidth,
+        position: panel.querySelector('.tl-note-position').textContent,
+        rings: document.querySelectorAll('#timeline-lanes .tl-ring').length,
+        ghosts: document.querySelectorAll('#timeline-lanes .tl-ghost').length,
+        rem: parseFloat(getComputedStyle(document.documentElement).fontSize),
+      };
+    })()`;
+    const sizeRows = [];
+    try {
+      for (const [width, height] of [[1024, 768], [1920, 1080]]) {
+        await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+        for (const layout of ['a', 'b', 'c']) {
+          await blurActive();
+          await pressKey(cdp, layout);
+          await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(layout)} ? true : null`, 3000);
+          await sleep(400);
+          // A selection left by the layout before is cleared with Escape on the lanes.
+          if ((await readSizes()).position !== 'No note selected') {
+            await evaluateExpr(cdp, `document.getElementById('timeline-lanes').focus()`);
+            await pressKey(cdp, 'Escape');
+          }
+          const none = await readSizes();
+          const point = await noteCenter(0, 0);
+          await clickAt(point);
+          await panelWhen('(read) => read.state === "Editable"');
+          const selected = await readSizes();
+          const from = await noteCenter(0, 0);
+          await dragTo(from, { x: from.x, y: from.y - 1.1 * selected.rem });
+          const dragging = await readSizes();
+          await pressKey(cdp, 'Escape');
+          await release({ x: from.x, y: from.y - 1.1 * selected.rem });
+          sizeRows.push({ width, layout, none, selected, dragging });
+        }
+      }
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+      await blurActive();
+      await pressKey(cdp, startLayout);
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(startLayout)} ? true : null`, 3000);
+    }
+    async function readSizes() {
+      return evaluateExpr(cdp, READ_SIZES);
+    }
+    const sizeCodeAfter = await editorAndHistory();
+    const sameHeight = (row) => Math.abs(row.none.panelHeight - row.selected.panelHeight) < 0.5 && Math.abs(row.none.panelHeight - row.dragging.panelHeight) < 0.5;
+    report(
+      'timeline: in layouts a, b and c at 1024 and 1920 px the panel keeps one height with nothing selected, a note selected and during a drag, and nothing scrolls sideways',
+      sizeRows.length === 6 &&
+        sizeRows.every(
+          (row) =>
+            row.none.layout === row.layout &&
+            row.none.width === row.width &&
+            [row.none, row.selected, row.dragging].every((state) => state.panelShown && state.viewFits && state.docFits && state.panelFits) &&
+            row.none.rings === 0 &&
+            row.selected.rings === 1 &&
+            row.dragging.ghosts === 1 &&
+            sameHeight(row),
+        ) &&
+        sizeCodeAfter.editor === sizeCodeBefore.editor &&
+        sizeCodeAfter.active === sizeCodeBefore.active &&
+        sizeCodeAfter.history.id === sizeCodeBefore.history.id,
+      JSON.stringify(sizeRows.map((row) => ({ width: row.width, layout: row.layout, none: row.none.panelHeight, selected: row.selected.panelHeight, dragging: row.dragging.panelHeight, fits: [row.none, row.selected, row.dragging].every((state) => state.viewFits && state.docFits && state.panelFits), rings: [row.none.rings, row.selected.rings, row.dragging.ghosts] }))),
+    );
+  }
+
+  // Every mark sits on what it marks (the ring on its note, a dotted ring on each note of the same token, the ghost over the note's
+  // columns, a range wash on whole cycle columns of the lane) and none of them, nor the buttons or the sentence, takes the accent,
+  // the second accent, the destructive colour or a Jam colour, in layouts a, b and c.
+  {
+    const markPiece = `${SLOW}t1: note("c3 e3!2 g3").gain(0)\nt2: note("d3 f3").gain(0)`;
+    await resetLanes('probe timeline marks reset');
+    await showPiece(markPiece, 'probe timeline marks', 2);
+    await askReset();
+    const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+    const markCodeBefore = await editorAndHistory();
+    const READ_MARKS = `(() => {
+      const near = (a, b, tolerance) => Math.abs(a - b) <= tolerance;
+      const lane = document.querySelectorAll('#timeline-lanes .lane')[0];
+      const svg = lane.querySelector('svg.lane-events').getBoundingClientRect();
+      const notes = [...lane.querySelectorAll('rect.event[data-kind="note"]')].map((el) => { const r = el.getBoundingClientRect(); return { left: r.left, top: r.top, width: r.width, height: r.height }; });
+      const boxOf = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, top: r.top, width: r.width, height: r.height, bottom: r.bottom }; };
+      // A ring is at least half a rem wide, so a note thinner than that has a ring that starts at its left edge and is wider.
+      const minWidth = parseFloat(getComputedStyle(document.documentElement).fontSize) / 2;
+      const onNote = (box) => notes.some((note) => near(note.left, box.left, 1.5) && near(note.top, box.top, 1.5) && near(note.height, box.height, 1.5) && near(Math.max(note.width, minWidth), box.width, 1.5));
+      const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map((name) => {
+        const probe = document.createElement('div');
+        probe.style.color = 'var(' + name + ')';
+        document.body.append(probe);
+        const color = getComputedStyle(probe).color;
+        probe.remove();
+        return color;
+      });
+      const offenders = [];
+      const selectors = ['.tl-ring', '.tl-same', '.tl-ghost', '.tl-range', '#timeline-note', '.tl-btn', '#timeline-note-line', '.tl-note-hint', '.tl-lane-name', '.tl-value', '.tl-label', '.tl-note-state', '.tl-note-position', '.tl-fixed'];
+      let looked = 0;
+      for (const selector of selectors) {
+        for (const el of document.querySelectorAll(selector)) {
+          looked++;
+          const style = getComputedStyle(el);
+          for (const property of ['color', 'backgroundColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor', 'outlineColor']) {
+            if (reserved.includes(style[property])) offenders.push(selector + ' ' + property);
+          }
+        }
+      }
+      const ring = document.querySelector('#timeline-lanes .tl-ring');
+      const sames = [...document.querySelectorAll('#timeline-lanes .tl-same')].map(boxOf);
+      const ghost = document.querySelector('#timeline-lanes .tl-ghost');
+      const wash = document.querySelector('#timeline-lanes .tl-range');
+      return {
+        notes: notes.length,
+        ring: ring === null ? null : { box: boxOf(ring), onNote: onNote(boxOf(ring)), style: getComputedStyle(ring).outlineStyle, nearest: notes.map((note) => ({ note, gap: Math.hypot(note.left - boxOf(ring).left, note.top - boxOf(ring).top) })).sort((x, y) => x.gap - y.gap)[0] },
+        same: { count: sames.length, onNotes: sames.filter(onNote).length, styles: [...new Set([...document.querySelectorAll('#timeline-lanes .tl-same')].map((el) => getComputedStyle(el).outlineStyle))] },
+        ghost: ghost === null ? null : { box: boxOf(ghost), insideLane: boxOf(ghost).top >= svg.top - 1.5 && boxOf(ghost).bottom <= svg.bottom + 1.5, style: getComputedStyle(ghost).outlineStyle },
+        wash: wash === null ? null : { box: boxOf(wash), area: { left: svg.left, top: svg.top, width: svg.width, height: svg.height }, fullHeight: near(boxOf(wash).top, svg.top, 1.5) && near(boxOf(wash).bottom, svg.bottom, 1.5) },
+        pageStart: Number(document.getElementById('timeline-lanes').dataset.pageStart),
+        position: document.querySelector('#timeline-note .tl-note-position').textContent,
+        looked,
+        offenders,
+        reservedColors: reserved.length,
+      };
+    })()`;
+    const markRows = [];
+    try {
+      for (const layout of ['a', 'b', 'c']) {
+        await blurActive();
+        await pressKey(cdp, layout);
+        await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(layout)} ? true : null`, 3000);
+        await sleep(400);
+        const before = await evaluateExpr(cdp, `document.querySelector('#timeline-note .tl-note-position').textContent`);
+        if (before !== 'No note selected') {
+          await evaluateExpr(cdp, `document.getElementById('timeline-lanes').focus()`);
+          await pressKey(cdp, 'Escape');
+        }
+        const from = await noteCenter(0, 0);
+        await clickAt(from);
+        await panelWhen('(read) => read.state === "Editable"');
+        const selected = await evaluateExpr(cdp, READ_MARKS);
+        const rem = await evaluateExpr(cdp, `parseFloat(getComputedStyle(document.documentElement).fontSize)`);
+        await dragTo(from, { x: from.x, y: from.y - 1.1 * rem });
+        const dragged = await evaluateExpr(cdp, READ_MARKS);
+        await pressKey(cdp, 'Escape');
+        await release({ x: from.x, y: from.y - 1.1 * rem });
+        await evaluateExpr(cdp, `document.getElementById('timeline-lanes').focus()`);
+        await pressKey(cdp, 'ArrowRight', { shift: true });
+        await pressKey(cdp, 'ArrowRight', { shift: true });
+        const ranged = await evaluateExpr(cdp, READ_MARKS);
+        const cycles = /cycles (\d+) to (\d+)/.exec(ranged.position);
+        markRows.push({ layout, selected, dragged, ranged, cycles: cycles === null ? null : [Number(cycles[1]), Number(cycles[2])] });
+        await pressKey(cdp, 'Escape');
+      }
+    } finally {
+      await blurActive();
+      await pressKey(cdp, startLayout);
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(startLayout)} ? true : null`, 3000);
+    }
+    const markCodeAfter = await editorAndHistory();
+    const washOnCycles = (row) => {
+      if (row.cycles === null || row.ranged.wash === null) return false;
+      const area = row.ranged.wash.area;
+      const left = area.left + ((row.cycles[0] - row.ranged.pageStart) / 32) * area.width;
+      const width = ((row.cycles[1] - row.cycles[0] + 1) / 32) * area.width;
+      return Math.abs(row.ranged.wash.box.left - left) < 1.5 && Math.abs(row.ranged.wash.box.width - width) < 1.5 && row.ranged.wash.fullHeight;
+    };
+    const markOk = markRows.map((row) => ({
+      layout: row.layout,
+      ring: row.selected.ring !== null && row.selected.ring.onNote && row.selected.ring.style === 'solid',
+      same: row.selected.same.count > 0 && row.selected.same.onNotes === row.selected.same.count && row.selected.same.styles.length === 1 && row.selected.same.styles[0] === 'dotted',
+      ghost: row.dragged.ghost !== null && row.dragged.ghost.insideLane && row.dragged.ghost.style === 'dashed' && Math.abs(row.dragged.ghost.box.left - row.selected.ring.box.left) < 1.5 && Math.abs(row.dragged.ghost.box.width - row.selected.ring.box.width) < 1.5,
+      wash: washOnCycles(row),
+      colors: [row.selected, row.dragged, row.ranged].every((state) => state.offenders.length === 0 && state.looked > 10 && state.reservedColors === 5),
+    }));
+    report(
+      'timeline: every mark sits on what it marks and takes no reserved colour in any layout',
+      markRows.length === 3 &&
+        markOk.every((row) => Object.values(row).every((value) => value === true || typeof value === 'string')) &&
+        markCodeAfter.editor === markCodeBefore.editor &&
+        markCodeAfter.history.id === markCodeBefore.history.id,
+      JSON.stringify({ markOk, rings: markRows.map((row) => row.selected.ring && { box: row.selected.ring.box, nearest: row.selected.ring.nearest }), offenders: markRows.map((row) => [row.selected.offenders, row.dragged.offenders, row.ranged.offenders]), sames: markRows.map((row) => [row.selected.same.count, row.selected.same.onNotes]) }),
+    );
+  }
+
+  // The cost: a 10-track piece computes its Timeline page with the locations carried well inside the budget (the compute time of
+  // the page is in the detail), and selecting a note of a song near the count limit shows its places sentence without a pause.
+  {
+    const tenPiece = Array.from({ length: 10 }, (_, i) => `t${i + 1}: note("c3 e3 g3 b3 d3 f3 a3 c4").s("sawtooth").gain(0)`).join('\n');
+    await resetLanes('probe timeline ten reset');
+    await showPiece(tenPiece, 'probe timeline ten tracks', 10);
+    const tenState = await evaluateExpr(cdp, `({ state: document.getElementById('timeline-view').dataset.state, computeMs: Number(document.getElementById('timeline-view').dataset.computeMs) })`);
+    await clickAt(await noteCenter(0, 0));
+    const tenSelected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable"');
+    const nearCode = songHelperCode({ t1Tail: '.gain(0)' }).replace("['z', 7]", "['z', 1000]");
+    await showPiece('zz: note("a5").gain(0)', 'probe timeline near-limit reset', 1);
+    await showPiece(nearCode, 'probe timeline near-limit song', 3);
+    await stopMusic(cdp);
+    await sleep(600);
+    await waitFor(cdp, `document.getElementById('timeline-view').dataset.state === 'ok' ? true : null`, 5000);
+    const nearPoint = await noteCenter(0, 0);
+    const nearStarted = Date.now();
+    await clickAt(nearPoint);
+    const nearSelected = await panelWhen('(read) => read.lane === "t1" && read.state === "Editable" && read.line.startsWith("Plays in")');
+    const nearMs = Date.now() - nearStarted;
+    report(
+      'timeline: a 10-track piece computes inside the budget with locations, and a long song\'s places sentence arrives promptly',
+      tenState.state === 'ok' &&
+        Number.isFinite(tenState.computeMs) &&
+        tenState.computeMs < TIMELINE_BUDGET_MS / 2 &&
+        tenSelected !== null &&
+        tenSelected.line === 'An edit rewrites one token in the code: c3.' &&
+        nearSelected !== null &&
+        nearSelected.line.startsWith("Plays in 2 places: sections 'x' and 'z'") &&
+        nearMs < 1000,
+      JSON.stringify({ tenTrackComputeMs: tenState.computeMs, budgetMs: TIMELINE_BUDGET_MS, nearLimitSelectToSentenceMs: nearMs, nearLine: nearSelected && nearSelected.line }),
+    );
+  }
+  // --- Pictures of the Timeline for the person's own eye ---
+  // Off unless MOONTIDE_PROBE_SHOTS names a folder outside the repository. A structured silent piece (stopped, so the page stays on
+  // its first page) is saved with a note selected that plays in two sections, its dotted rings showing ("selected"), with a note in
+  // degrees selected and its reason ("refused"), and with a range of cycles washed and the Ask box open on it ("range"), at 1920 by
+  // 1080 and 3840 by 2160 in the layouts a, b and c. The names are built from the constants below only, never from text of the page.
+  const timelineShotsFolder = shotsFolder();
+  if (timelineShotsFolder !== null) {
+    const TIMELINE_SHOT_STATES = ['selected', 'refused', 'range'];
+    const TIMELINE_SHOT_SIZES = [[1920, 1080], [3840, 2160]];
+    const TIMELINE_SHOT_LAYOUTS = ['a', 'b', 'c'];
+    const written = [];
+    const problems = [];
+    const shotPiece = songHelperCode({ t1Tail: '.gain(0)', cps: 0.05 });
+    await resetLanes('probe timeline pictures reset');
+    await showPiece(shotPiece, 'probe timeline pictures', 3);
+    await stopMusic(cdp);
+    await sleep(600);
+    await waitFor(cdp, `document.getElementById('timeline-view').dataset.state === 'ok' ? true : null`, 5000);
+    const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+    const clearForPicture = async () => {
+      await askReset();
+      if ((await evaluateExpr(cdp, `document.querySelector('#timeline-note .tl-note-position').textContent`)) !== 'No note selected') {
+        await evaluateExpr(cdp, `document.getElementById('timeline-lanes').focus()`);
+        await pressKey(cdp, 'Escape');
+      }
+    };
+    try {
+      for (const state of TIMELINE_SHOT_STATES) {
+        for (const layout of TIMELINE_SHOT_LAYOUTS) {
+          for (const [width, height] of TIMELINE_SHOT_SIZES) {
+            await blurActive();
+            await pressKey(cdp, layout);
+            await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(layout)} ? true : null`, 3000);
+            await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+            await sleep(600);
+            await clearForPicture();
+            let ready = false;
+            if (state === 'selected') {
+              // The first note of t1 that lies in a section the variation plays in twice (x and z).
+              for (let nth = 0; nth < 40 && !ready; nth++) {
+                const point = await noteCenter(0, nth);
+                if (point === null) break;
+                await clickAt(point);
+                const read = await panelWhen('(read) => read.lane === "t1"');
+                ready = read !== null && read.state === 'Editable' && / · section '[xz]'$/.test(read.position) && read.line.startsWith('Plays in') && (await evaluateExpr(cdp, `document.querySelectorAll('#timeline-lanes .tl-same').length`)) > 0;
+              }
+            } else if (state === 'refused') {
+              await clickAt(await noteCenter(1, 0));
+              ready = (await panelWhen('(read) => read.lane === "t2" && read.state === "Not editable"')) !== null;
+            } else {
+              const area = await laneArea(0);
+              const y = area.top + 0.5 * area.height;
+              await dragPointer({ x: area.left + ((2.5 / 32) * area.width), y }, { x: area.left + ((7.5 / 32) * area.width), y });
+              ready = (await waitFor(cdp, `!document.getElementById('ask-box').hidden && document.querySelectorAll('#timeline-lanes .tl-range').length === 1 ? true : null`, 3000)) === true;
+            }
+            if (!ready) problems.push(`${state} ${width}x${height} layout ${layout}: the state was not reached`);
+            await sleep(200);
+            written.push(await saveShot(cdp, timelineShotsFolder, state, width, height, layout, 'timeline'));
+            await clearForPicture();
+          }
+        }
+      }
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+      await blurActive();
+      await pressKey(cdp, startLayout);
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(startLayout)} ? true : null`, 3000);
+    }
+    const expectedPictures = TIMELINE_SHOT_STATES.flatMap((state) => TIMELINE_SHOT_LAYOUTS.flatMap((layout) => TIMELINE_SHOT_SIZES.map(([width, height]) => `timeline-${state}-${width}x${height}-layout-${layout}.png`))).sort();
+    const pictureProblems = [...problems];
+    for (const name of expectedPictures) {
+      const file = path.join(timelineShotsFolder, name);
+      if (!fs.existsSync(file)) pictureProblems.push(`${name} is missing`);
+      else if (fs.readFileSync(file).subarray(0, 4).toString('hex') !== '89504e47') pictureProblems.push(`${name} is not a PNG`);
+    }
+    report(
+      'timeline: pictures of a selected note, a refused note and a range are saved outside the repository',
+      pictureProblems.length === 0 && written.length === 18 && path.relative(REPO_ROOT, timelineShotsFolder).startsWith('..'),
+      JSON.stringify({ written: written.length, problems: pictureProblems.slice(0, 6) }),
+    );
+    console.log('probe:page timeline pictures saved in a scratch folder outside the repository');
+  }
+
+  await callTool(client, 'set_code', { code: 'setcps(0.5)\nzz: note("a5").gain(0)', label: 'probe timeline range done' });
+  await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+}
+
 async function main() {
   let args;
   try {
@@ -7690,6 +15736,26 @@ async function main() {
     }
     if (args.only === 'identity') {
       await identityBlocks({ cdp, client, report, port, pageUrl, tempDirs });
+      summarize();
+      return;
+    }
+    if (args.only === 'song') {
+      await songBlocks({ cdp, client, report });
+      summarize();
+      return;
+    }
+    if (args.only === 'grid') {
+      await gridBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
+    if (args.only === 'mixer') {
+      await mixerGroupBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
+    if (args.only === 'timeline') {
+      await timelineBlocks({ cdp, client, report, port, pageUrl });
       summarize();
       return;
     }
@@ -11362,7 +19428,7 @@ async function main() {
       'an unlabeled branch mutes with .hush() and its S button says why it is off',
       branchButtons.length === 2 &&
         branchButtons.every(
-          (button) => button.soloDisabled && !button.muteDisabled && button.note === 'Solo needs a label — ask Claude to name this track.',
+          (button) => button.soloDisabled && !button.muteDisabled && button.note === 'Solo and the light need a label — ask Claude to name this track.',
         ) &&
         branchHushed !== null &&
         JSON.stringify(soundsBranchMuted) === JSON.stringify(['hh']) &&
@@ -18290,6 +26356,10 @@ async function main() {
     await identityBlocks({ cdp, client, report, port, pageUrl, tempDirs });
     await harmonyBlocks({ cdp, client, report, port, pageUrl });
     await loadFailureBlocks({ cdp, client, report, port, pageUrl });
+    await songBlocks({ cdp, client, report });
+    await gridBlocks({ cdp, client, report, port, pageUrl });
+    await mixerGroupBlocks({ cdp, client, report, port, pageUrl });
+    await timelineBlocks({ cdp, client, report, port, pageUrl });
     summarize();
   } catch (err) {
     if (err instanceof ProbeCouldNotRun) {

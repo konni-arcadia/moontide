@@ -64,7 +64,7 @@ export function gatePattern(oldPattern, newPattern, boundary, { TimeSpan, leadCy
  * The waiting change of the page: one record at most (a newer change replaces it, last wins). The factory
  * only keeps the record and calls the injected hooks; the page decides what follows the takeover.
  *   getScheduler() -> the scheduler (started, pattern, cps, lastEnd), getTypes() -> { TimeSpan },
- *   getTiming() -> the parsed timing of the change being evaluated ({ at, lineLength }),
+ *   getTiming() -> the parsed timing of the change being evaluated ({ at, lineLength }, plus atCycle when the change is written for one given line),
  *   getCps() -> the tempo that plays now (cycles per second), for the line and the lead hook; the scheduler's own cps
  *   by default, but a program's setcps has already reached the scheduler when a change is armed, so the page gives the
  *   tempo from before the evaluation,
@@ -138,18 +138,29 @@ export function createTakeover({
   }
 
   return {
-    /** null when the change takes over at once; otherwise { boundary }. Changes no state. */
+    /**
+     * null when the change takes over at once; otherwise { boundary }. A timing that carries `atCycle` (a change written
+     * for one given line, see pinnedTiming) takes that line while it is still at least MIN_TAKEOVER_LEAD_SECONDS ahead
+     * of the scheduler frontier: { boundary: atCycle, pinned: true }; once it is closer, the next line of the timing's
+     * own length is taken and the result says { pinned: false }, so the caller can write its change again for that line.
+     * Changes no state.
+     */
     plan() {
       const timing = getTiming();
       if (timing.at === 'now' || !isPlaying()) return null;
       const scheduler = getScheduler();
+      const cps = getCps();
+      const pinnedLine = timing.atCycle;
+      if (pinnedLine !== undefined && (pinnedLine - scheduler.lastEnd) / cps >= MIN_TAKEOVER_LEAD_SECONDS) {
+        return { boundary: pinnedLine, pinned: true };
+      }
       const boundary = boundaryCycle({
         frontier: scheduler.lastEnd,
-        cps: getCps(),
+        cps,
         lineLength: timing.lineLength,
         minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS,
       });
-      return { boundary };
+      return pinnedLine === undefined ? { boundary } : { boundary, pinned: false };
     },
 
     /**
@@ -242,7 +253,11 @@ export function createTakeover({
       record.finishers.push(fn);
     },
 
-    /** Drops the waiting record (no-op without one); its continuations never run. */
+    /**
+     * Drops the waiting record (no-op without one); its continuations never run. `reason` says why: 'stop' (the sound
+     * stopped), 'replaced' (a newer change took its place), 'superseded' and 'unload' (this tab lost its role or closes) and
+     * 'canceled', the person's own cancel of a waiting section launch.
+     */
     cancel,
 
     /** The poll fallback: finishes the waiting record when the scheduler's cycle has reached its boundary. */

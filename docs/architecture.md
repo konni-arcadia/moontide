@@ -13,6 +13,11 @@ modules that parse it (`page/tracks.js`, `page/timeline.js`, `page/parts.js`,
 shows a Timeline and a Parts view, in three switchable layouts. A part launched from
 the Parts view rewrites the playing code and sends it to the server, which records it
 as a version from the page, the same way it records a hand edit.
+`page/page-rewrite.js` is the single path through which the page changes the code by itself, for a
+Mixer move, a part launch, a section launch from the Song grid and a cell edit of the grid: it runs the
+guards in a fixed order, writes the new text and checks it, makes one evaluation and, when that fails,
+sets the editor back and shows the failed-change banner. Each caller keeps its own wording for a refusal
+and sends its own message to the server.
 
 The page also shows a History view: one row per version, newest first, with what changed
 in each, an inline diff and an optional branching tree. It is built from a pure module
@@ -33,13 +38,53 @@ as the Timeline through a shared reading, and finds the scale and the chords fro
 played in pure modules (`page/jam-analysis.js` for the reading, `page/jam-model.js` for the
 copy and the geometry). A DOM module (`page/jam-view.js`) draws them: a piano, a fretboard, a
 status line and a coming-up list. `page/harmony.js` reads the optional harmony declaration (one
-top-level `const harmony`) from the code text without evaluating it. `buildReading` carries the
+top-level `const harmony`) from the code text without evaluating it. `page/structure.js` reads the
+song structure a piece declares (one top-level `const song` and the helper next to it) in the same way,
+and says in one sentence why when it cannot; `page/structure-check.js` compares what the tracks play at
+the start of each section with what the song declares, within a time budget; `page/structure-view.js`
+draws the lines above the Parts view. A readable song replaces the Parts rows with the Song grid: tracks
+under foldable groups, one column per section, the playing section live. `page/song-grid-model.js`
+builds it as plain data, `page/song-grid-view.js` draws it and routes its gestures to handlers, and
+`page/song-prefs.js` keeps the folded groups in the browser. `page/song-edit.js` is pure: it works out
+the line a section launch takes and the edits that write a shift or change one cell of the plan, and
+`page/song-fit.js` says whether the notes of a fixed variation fit the scale of a section. A launch goes
+through `page/page-rewrite.js` with the takeover (`page/takeover.js`) pinned to the line the shift was
+written for, so the two cannot disagree. The Mixer shows the same groups as frames around its strips:
+`page/mixer-groups.js` is pure and joins the song's groups to the Mixer's strips (the tree of frames, each
+group's fold state, and the mute and solo state of a group worked out from its strips), `page/mixer-model.js`
+carries that layout and the group words next to the strips, which a song never changes, and
+`page/mixer-view.js` draws the frames and routes a group's buttons to one rewrite of the code. The Mixer's lights come from two
+more modules. `page/note-tag.js` tags every labeled statement of Strudel's patterns, so each note carries its track's key, its
+target time and, for a MIDI note, the timestamp its port got (read through `noteStampOf` in `page/midi-out.js`); other code
+listens with `subscribe`. `page/lights.js` is pure: it turns those notes into the brightness of each strip's and group's light,
+frame by frame, with the clocks handed in. The light loop in `page/main.js` runs one animation frame at a time, only while the
+Mixer is open, the tab is visible and sound is playing, and the view writes only the lights that changed. `page/main.js` wires
+them and sends the page's findings to the server in a `structure-note` message. `buildReading` carries the
 declaration, and `page/jam-model.js` shows it as its own field, a Declared line beside the heard
 scale; the declared scale drives nothing else. The reading leaves out the tracks of the rig's rhythm
 channels (`drumTrackIndexes` in `page/timeline.js`), and `applyRig` rebuilds it while Jam is open, only when the drum tracks changed.
 The view is read-only: a right-click on a note or a warning
 sends a `note` or `warning` context through the same box, and the view only says what was
 pointed at while `page/main.js` keeps the one right-click listener.
+
+The Timeline can be edited, and the code stays the only state. Each note the Timeline draws carries, from the
+pinned Strudel, the offsets of the strings it was read from (its code locations), kept with the lane's events.
+`page/note-locate.js` is pure: it parses the playing code once into an index of its strings, then classifies a note by
+looking at those offsets and gives either the one token that holds it or one of eight reasons it cannot be edited; it
+also counts the places a token plays (from the song's section entries and repeats, or from the notes of one cycle) and
+holds the read-back comparison, which says whether edited code gives the same note at the same place with the new value.
+`page/note-edit.js` is pure too: it works out the closed set of token edits (a semitone or an octave step, a rest, a
+velocity step) and writes them through `page/page-rewrite.js`, the same shared path a Mixer move or a section launch takes,
+so the guards, the test query, the read-back, the one evaluation, the history entry and the hand-edit notice are not
+repeated. `page/note-panel.js` holds every word of the panel under the lanes, built from the strings in
+`page/timeline.js`. `page/timeline-gesture.js` holds the numbers behind the pointer and the keys with no DOM: which note
+a press is on, the axis a drag locks to, the semitone step, the gathering of steps, the cycles of a range and the keyboard
+moves along and across lanes. `page/timeline-edit-view.js` is the DOM module: the panel, the ring, the ghost, the dotted
+rings and the range wash, and every gesture; it gets `document` and its handlers injected and writes only what
+`page/main.js` hands it. A gesture the page cannot apply, and a range of cycles on one lane, become a request in the Ask box
+that only the user sends: the `ask` message carries a `gesture` field next to `context` (a pitch change, a rest, a
+velocity step or a range), and a range also has its own `range` context with the lane, the first and last cycle and the
+section of each end, plus the lane's notes in those cycles in the gesture, cut from the end until the request line fits.
 
 The page plays a MIDI instrument through Strudel's own `.midi()`, and three modules keep
 MIDI from failing silently. `page/midi-plan.js` is pure: it reads the `.midi(` calls of the
@@ -313,6 +358,14 @@ next tool reply like the other notices. The `set_code` and `restore_version` rep
 written out or held in a top-level const. This is a text match: the server never parses the code, and changes it only by the exact replacements Claude sends with `edit_code`. The
 functions topic of the reference states the `t` and `f` facts, and `npm run check:reference` pins them.
 
+A `structure-note` message from the page carries the lines about the structure of a version: why it cannot
+be read, that the helper differs, or where the played music differs from the declaration. The server cleans
+each line, keeps the latest note of the active page, and adds it once to the next tool reply, led by the
+fixed phrase "Song structure" and the version number. The `set_code` reply adds `NO_STRUCTURE_NOTE`
+(`src/mcp.ts`) when the code is a new piece without a `const song`; this is a text match as well. `get_code`
+shows the template of the structure topic (`structureTemplateText` in `src/reference.ts`) whenever nothing
+plays yet.
+
 The instruments live on the server in `src/instruments.ts`. It reads `instruments.json` from the
 data folder at every use (never throwing: a problem is a state, with each field and reason), and
 the models: the shipped ones in `instruments/` (read-only package data) and the user's in `models/`
@@ -349,7 +402,12 @@ connect sequence stays as it was. The page shows the path with `textContent` onl
 context kinds are one closed list on the page and the server, and the list has an `instrument` kind
 (an `id` of 1 to 200 characters) for a right-click on an instrument card, and an `error` kind (a `text` of
 1 to 200 characters, the first line of the error) for Ask Claude from the failed-change banner; the page
-also prefills the Ask field with the error, cut at 1500 characters.
+also prefills the Ask field with the error, cut at 1500 characters. A `cell` kind (a section, a track and
+a variation, or `rest: true`, with the fit word the grid showed and the notes outside the scale, every
+name 1 to 200 characters) and a `group` kind (a `name` and the `parent` it sits in) serve a right-click on
+the Song grid; a cell that does not fit also prefills the Ask field with a ready-made request that is
+never sent for the user. The Menu key and Shift+F10 on a focused control of the grid open the same box,
+because the page's one right-click listener leaves a Shift press to the browser.
 
 Sound catalogs extend a model with more sounds than a model file should hold. `src/catalog.ts` holds
 the catalog file format (`catalogs/<model id>.json` in the data folder), its checks against the

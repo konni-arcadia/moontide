@@ -721,6 +721,10 @@ function inspectTrack(code, entry, scope) {
   const sharedRoot =
     (root.type === 'Identifier' && declared.has(root.name)) ||
     (root.type === 'CallExpression' && root.callee.type === 'Identifier' && declared.has(root.callee.name));
+  // A track that starts with play(...) may be built by the song's own helper, whose lines are not shared code the user needs
+  // to hear about. The model drops the "built from shared code" line only when the song reading says that helper is the
+  // canonical one; this read just says the track starts with a call named play.
+  const playRoot = root.type === 'CallExpression' && root.callee.type === 'Identifier' && root.callee.name === 'play';
   for (const call of spine.calls) {
     if (!MIXER_CALLS.has(call.name) && effectOfMethod(call.name) === null) continue;
     const args = call.node.arguments;
@@ -731,6 +735,7 @@ function inspectTrack(code, entry, scope) {
   return {
     spine,
     sharedRoot,
+    playRoot,
     ...readReach(spine, entry.expression, scope),
     gain: readControl(spine.calls, 'gain'),
     postgain: readControl(spine.calls, 'postgain'),
@@ -774,7 +779,7 @@ function publicBus({ orbit, sends, busParams }) {
 /**
  * Parses `code` once and reads every track: `{ tracks, reads }`, `tracks` from extractTracks and
  * `reads` a Map from track identity to `{ ok: true, gain: { kind, value }, postgain: { kind,
- * value }, effects, bus, label, sharedRoot, playsMidi, innerPostgain }` (`sharedRoot` is true when the track's root is a declared name or a call of one; `playsMidi` is true when a `.midi(` call sits anywhere the track's code reaches, `innerPostgain` is true when a `.postgain(` call sits in that code off the spine; `busHidden` is true when the track writes an orbit, a send or a bus value anywhere but on its own chain (inside another call, in shared code it names, through `.set({ ... })` or a bare call), so its bus facts are not trusted; see readReach; kind 'none', 'fixed' or 'pattern'; `bus` is `{ orbit, sends, busParams }`
+ * value }, effects, bus, label, sharedRoot, playRoot, playsMidi, innerPostgain }` (`sharedRoot` is true when the track's root is a declared name or a call of one; `playRoot` is true when the track's own statement starts with a `play(...)` call; `playsMidi` is true when a `.midi(` call sits anywhere the track's code reaches, `innerPostgain` is true when a `.postgain(` call sits in that code off the spine; `busHidden` is true when the track writes an orbit, a send or a bus value anywhere but on its own chain (inside another call, in shared code it names, through `.set({ ... })` or a bare call), so its bus facts are not trusted; see readReach; kind 'none', 'fixed' or 'pattern'; `bus` is `{ orbit, sends, busParams }`
  * of readBusFacts without call positions (kind 'unwritten', 'fixed' or 'pattern'); `effects` is a Map from effect id
  * to `{ calls, params, written, bypassable, bypassWhy }`, see readEffects; `label` is null for a track without one,
  * else `{ raw, ...parseLabel(raw) }`) or `{ ok: false, reason }`. One bad track never throws; an
@@ -798,6 +803,7 @@ export function readProgram(code, { parse }) {
         bus: publicBus(read.bus),
         label: raw === null ? null : { raw, ...parseLabel(raw) },
         sharedRoot: read.sharedRoot,
+        playRoot: read.playRoot,
         playsMidi: read.playsMidi,
         innerPostgain: read.innerPostgain,
         busHidden: read.busHidden,
@@ -1558,6 +1564,29 @@ export function writeTrack(code, identity, change, { parse }) {
       );
     }
     edits = writeVolume(code, entry, read, 'postgain', read.postgain, text, value);
+  }
+  return { code: applyEdits(code, edits), edits };
+}
+
+/**
+ * Writes one mute or solo change on many tracks at once and returns `{ code, edits }`, like writeTrack. `change` is
+ * `{ type: 'mute' | 'solo', on }` and `identities` the tracks to write, each read and written against the SAME base
+ * text. All their edits are joined into one list and applied once, by position, so the result is the same whatever
+ * order the tracks are listed in, no track is written twice (a repeated identity counts once) and two edits that
+ * overlap throw. The first track that cannot be written throws its MixerRewriteError and nothing is returned, so a
+ * refused track never leaves the others half written. A track already in the asked state adds no edit.
+ */
+export function writeTracks(code, identities, change, { parse }) {
+  if (!Array.isArray(identities) || identities.length === 0 || identities.some((identity) => typeof identity !== 'string')) {
+    throw new MixerRewriteError('unsupported-change', 'a group change needs at least one track.');
+  }
+  const type = change ? change.type : undefined;
+  if (type !== 'mute' && type !== 'solo') {
+    throw new MixerRewriteError('unsupported-change', `a group can only be muted or soloed, not '${String(type)}'.`);
+  }
+  const edits = [];
+  for (const identity of new Set(identities)) {
+    edits.push(...writeTrack(code, identity, { identity, type, on: change.on }, { parse }).edits);
   }
   return { code: applyEdits(code, edits), edits };
 }

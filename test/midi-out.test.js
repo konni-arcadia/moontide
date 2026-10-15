@@ -3715,6 +3715,42 @@ test('a timestamp more than NOTE_STAMP_MAX_AHEAD_MS ahead leaves the trigger unc
   assert.match(moontideLines(r)[0].text, /without a timestamp/);
 });
 
+test('noteStampOf gives the timestamp the port got for a stamped note, and null for a note sent without one', async () => {
+  const s = await makeStampRig();
+  const { r } = s;
+  const stamped = { note: 60, duration: 200 };
+  const T = r.ctx.currentTime + 0.25;
+  fire(s, 'Port C', { midichannel: 3 }, stamped, T);
+  runScheduled(r, s.scheduled[0]);
+  const on = noteOnsOf(r.native('Port C'))[0];
+  assert.ok(Math.abs(r.out.noteStampOf(stamped) - on.ts) < 0.5, 'the stamp is the timestamp the port got');
+  assert.ok(Math.abs(r.out.noteStampOf(stamped) - r.time.strudelPerf(T)) < 0.5);
+  // A note that never went through a stamped trigger, and values that are not notes.
+  assert.equal(r.out.noteStampOf({ note: 61 }), null);
+  for (const bad of [null, undefined, 5, 'a']) assert.equal(r.out.noteStampOf(bad), null);
+  // A stamp too far ahead goes out unstamped: no stamp is kept.
+  const far = { note: 62 };
+  fire(s, 'Port C', {}, far, r.ctx.currentTime + 1.5);
+  assert.equal(r.out.noteStampOf(far), null);
+  // Web MIDI not enabled, and a suspended context: no stamp either.
+  r.webMidi.enabled = false;
+  const disabled = { note: 63 };
+  fire(s, 'Port C', {}, disabled, r.ctx.currentTime + 0.25);
+  assert.equal(r.out.noteStampOf(disabled), null);
+  r.webMidi.enabled = true;
+  r.ctx.suspend();
+  const suspended = { note: 64 };
+  fire(s, 'Port C', {}, suspended, r.ctx.currentTime + 0.25);
+  assert.equal(r.out.noteStampOf(suspended), null);
+  // No page clock at all.
+  const cold = await makeClockRig();
+  const coldStrudel = makeFakeStrudel(cold.webMidi);
+  cold.out.installNoteStamps(coldStrudel.Pattern);
+  const coldHap = { note: 60 };
+  fire(coldStrudel, 'Port C', {}, coldHap, cold.ctx.currentTime + 0.25);
+  assert.equal(cold.out.noteStampOf(coldHap), null);
+});
+
 test('WebMidi.outputs that is not a list, and a stamp that throws, leave the trigger unchanged and say so once each', async () => {
   const s = await makeStampRig();
   const { r } = s;

@@ -1,5 +1,5 @@
-// Static contracts of the Jam view's declared harmony: four
-// new ids in the markup (the Declared line and the Heard label, both hidden at the start, none a control), the CSS
+// Static contracts of the Jam view's declared harmony: five
+// new ids in the markup (the Declared line with the section it speaks for, and the Heard label, both hidden at the start, none a control), the CSS
 // that draws them (rem sizes, the two palette greys only, a [hidden] rule for each, no motion, no at-rule) and the
 // view's text-only rule (the declared text comes from the code and is not trusted). These tests read the sources;
 // the live behavior is proved by `npm run probe:page -- --only harmony` in real Chrome.
@@ -19,7 +19,7 @@ function codeOf(source) {
 }
 const viewCode = codeOf(read('../page/jam-view.js'));
 
-const IDS = ['jam-declared', 'jam-declared-label', 'jam-declared-value', 'jam-scale-label'];
+const IDS = ['jam-declared', 'jam-declared-label', 'jam-declared-value', 'jam-declared-section', 'jam-scale-label'];
 
 // The opening tag of the element with this id.
 function tagOf(id) {
@@ -28,7 +28,7 @@ function tagOf(id) {
   return { name: match[1], attributes: match[2], at: match.index, length: match[0].length };
 }
 
-test('the markup holds each of the four ids exactly once', () => {
+test('the markup holds each of the five ids exactly once', () => {
   for (const id of IDS) {
     assert.equal(html.match(new RegExp(`\\bid="${id}"`, 'g'))?.length, 1, `#${id} must appear exactly once`);
   }
@@ -43,10 +43,13 @@ test('#jam-declared is the first child of #jam-info and #jam-scale-label the fir
   assert.match(tagOf('jam-scale-label').attributes, /\bhidden\b/);
   const declared = tagOf('jam-declared');
   const rest = html.slice(declared.at + declared.length);
-  assert.ok(rest.startsWith('<span id="jam-declared-label"></span><span id="jam-declared-value"></span></p>'), 'the line holds its label then its value');
+  assert.ok(
+    rest.startsWith('<span id="jam-declared-label"></span><span id="jam-declared-value"></span><span id="jam-declared-section" hidden></span></p>'),
+    'the line holds its label, its value, then the section it speaks for, hidden at the start',
+  );
 });
 
-test('none of the four elements is a control, a live region or named apart from its text', () => {
+test('none of the five elements is a control, a live region or named apart from its text', () => {
   for (const id of IDS) {
     const { attributes } = tagOf(id);
     for (const forbidden of ['tabindex', 'aria-live', 'aria-label', 'role', 'contenteditable']) {
@@ -56,6 +59,7 @@ test('none of the four elements is a control, a live region or named apart from 
   assert.equal(tagOf('jam-declared').name, 'p');
   assert.equal(tagOf('jam-declared-label').name, 'span');
   assert.equal(tagOf('jam-declared-value').name, 'span');
+  assert.equal(tagOf('jam-declared-section').name, 'span');
   assert.equal(tagOf('jam-scale-label').name, 'span');
 });
 
@@ -76,9 +80,10 @@ function rulesFor() {
   return rules;
 }
 
-test('the stylesheet hides both ids with their own [hidden] rule', () => {
+test('the stylesheet hides all three ids with their own [hidden] rule', () => {
   assert.match(css, /#jam-declared\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
   assert.match(css, /#jam-scale-label\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
+  assert.match(css, /#jam-declared-section\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
 });
 
 test('the new rules use only the two text colors, two rem sizes, weight 400, no px, no motion', () => {
@@ -133,11 +138,12 @@ test('page/jam-view.js writes no markup, sends nothing and stores nothing', () =
   }
 });
 
-test('page/jam-view.js looks the four ids up and writes them only through textContent, title, dataset and hidden', () => {
+test('page/jam-view.js looks the five ids up and writes them only through textContent, title, dataset and hidden', () => {
   const variables = {
     'jam-declared': 'jamDeclared',
     'jam-declared-label': 'jamDeclaredLabel',
     'jam-declared-value': 'jamDeclaredValue',
+    'jam-declared-section': 'jamDeclaredSection',
     'jam-scale-label': 'jamScaleLabel',
   };
   for (const [id, variable] of Object.entries(variables)) {
@@ -150,4 +156,6 @@ test('page/jam-view.js looks the four ids up and writes them only through textCo
   assert.match(viewCode, /jamScaleLabel\.textContent = JAM_COPY\.heardLabel/);
   assert.match(viewCode, /function renderDeclared\(/);
   assert.match(viewCode, /renderDeclared\(model\.declared\)/);
+  assert.match(viewCode, /function renderDeclaredSection\(/);
+  assert.match(viewCode, /renderDeclaredSection\(model\.section\)/);
 });

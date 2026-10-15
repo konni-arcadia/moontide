@@ -147,6 +147,7 @@ test('readViewPrefs returns valid stored values and undefined for invalid ones',
     [STORAGE_KEYS.jamInstrument, 'guitar'],
     [STORAGE_KEYS.jamChordTones, 'on'],
     [STORAGE_KEYS.changeTiming, 'bar'],
+    [STORAGE_KEYS.songLaunch, 'phrase'],
     [STORAGE_KEYS.splitA, '44'],
     [STORAGE_KEYS.splitB, '37.5'],
   ]);
@@ -159,6 +160,7 @@ test('readViewPrefs returns valid stored values and undefined for invalid ones',
     jamInstrument: 'guitar',
     jamChordTones: 'on',
     changeTiming: 'bar',
+    songLaunch: 'phrase',
     splitA: 44,
     splitB: 37.5,
     rejected: [],
@@ -175,6 +177,7 @@ test('readViewPrefs rejects values outside the closed sets', () => {
     [STORAGE_KEYS.jamInstrument, 'banjo'],
     [STORAGE_KEYS.jamChordTones, 'maybe'],
     [STORAGE_KEYS.changeTiming, 'later'],
+    [STORAGE_KEYS.songLaunch, 'sometime'],
     [STORAGE_KEYS.splitA, '90'],
     [STORAGE_KEYS.splitB, 'calc(1px)'],
   ]);
@@ -187,6 +190,7 @@ test('readViewPrefs rejects values outside the closed sets', () => {
     jamInstrument: undefined,
     jamChordTones: undefined,
     changeTiming: undefined,
+    songLaunch: undefined,
     splitA: undefined,
     splitB: undefined,
     rejected: [STORAGE_KEYS.splitA, STORAGE_KEYS.splitB],
@@ -250,6 +254,7 @@ test('readViewPrefs with a throwing storage reports unavailable and every value 
     jamInstrument: undefined,
     jamChordTones: undefined,
     changeTiming: undefined,
+    songLaunch: undefined,
     splitA: undefined,
     splitB: undefined,
     rejected: [],
@@ -266,6 +271,7 @@ test('readViewPrefs with null storage reports unavailable and every value undefi
     jamInstrument: undefined,
     jamChordTones: undefined,
     changeTiming: undefined,
+    songLaunch: undefined,
     splitA: undefined,
     splitB: undefined,
     rejected: [],
@@ -295,22 +301,22 @@ test('writeViewPref writes and returns true on a working storage', () => {
 
 test('initialViewState with empty prefs and prefersReducedMotion true defaults to the strip, no view, motion off', () => {
   const state = initialViewState({ prefs: {}, prefersReducedMotion: true });
-  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'off', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now' });
+  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'off', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now', songLaunch: 'section' });
 });
 
 test('initialViewState with empty prefs and prefersReducedMotion false defaults motion on', () => {
   const state = initialViewState({ prefs: {}, prefersReducedMotion: false });
-  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'on', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now' });
+  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'on', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now', songLaunch: 'section' });
 });
 
 test('initialViewState with a stored motion wins over the OS setting and marks it chosen', () => {
   const state = initialViewState({ prefs: { motion: 'on' }, prefersReducedMotion: true });
-  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'on', motionChosen: true, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now' });
+  assert.deepEqual(state, { layout: 'a', view: 'none', motion: 'on', motionChosen: true, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now', songLaunch: 'section' });
 });
 
 test('initialViewState with a stored layout and view uses them', () => {
   const state = initialViewState({ prefs: { layout: 'c', view: 'timeline' }, prefersReducedMotion: false });
-  assert.deepEqual(state, { layout: 'c', view: 'timeline', motion: 'on', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now' });
+  assert.deepEqual(state, { layout: 'c', view: 'timeline', motion: 'on', motionChosen: false, historyMode: 'list', jamInstrument: 'piano', jamChordTones: 'off', changeTiming: 'now', songLaunch: 'section' });
 });
 
 const BUTTON_VIEW_LISTS = [
@@ -335,6 +341,16 @@ test('viewButtonParts names only the given built views, in key order, whatever o
   assert.deepEqual(views.viewButtonParts(['timeline']).map((part) => part.label), ['2 Timeline']);
   assert.deepEqual(views.viewButtonParts(['parts', 'timeline']).map((part) => part.label), ['2 Timeline', '4 Parts']);
   assert.deepEqual(views.viewButtonParts([]), []);
+});
+
+test('viewButtonParts can call a view by another name: the key and the order stay, only the name, label and title change', () => {
+  const parts = views.viewButtonParts(BUILT_VIEWS, { ...views.VIEW_TITLES, parts: 'Song' });
+  assert.deepEqual(parts[3], { key: '4', digit: '4', name: 'Song', label: '4 Song', title: 'Song (key 4)' });
+  assert.deepEqual(
+    parts.filter((_, index) => index !== 3),
+    views.viewButtonParts().filter((_, index) => index !== 3),
+  );
+  assert.equal(views.viewButtonParts()[3].name, 'Parts', 'the default titles are unchanged');
 });
 
 test('viewButtonParts keys are the digits of the built views in key order', () => {
@@ -569,4 +585,31 @@ test('setChangeTiming returns a new state for a known timing and throws a Moonti
   assert.notEqual(next, start);
   assert.equal(next.changeTiming, 'bar');
   assert.throws(() => views.setChangeTiming(start, 'later'), /^Error: Moontide:/);
+});
+
+test('readViewPrefs reads the Song launch choice from its closed set and ignores any other stored value', () => {
+  const read = (value) => readViewPrefs({ getItem: (key) => (key === STORAGE_KEYS.songLaunch ? value : null) }).songLaunch;
+  assert.equal(STORAGE_KEYS.songLaunch, 'moontide.songLaunch');
+  assert.deepEqual(views.SONG_LAUNCHES, ['section', 'phrase', 'bar']);
+  assert.equal(views.DEFAULT_SONG_LAUNCH, 'section');
+  assert.equal(read('section'), 'section');
+  assert.equal(read('phrase'), 'phrase');
+  assert.equal(read('bar'), 'bar');
+  for (const bad of ['now', 'later', '', 'Section', '__proto__', null]) assert.equal(read(bad), undefined, String(bad));
+});
+
+test('initialViewState gives the Song launch choice end of section when nothing is stored and the stored value otherwise', () => {
+  assert.equal(initialViewState({ prefs: {}, prefersReducedMotion: false }).songLaunch, 'section');
+  assert.equal(initialViewState({ prefs: { songLaunch: 'bar' }, prefersReducedMotion: false }).songLaunch, 'bar');
+});
+
+test('setSongLaunch returns a new state for a known choice and throws a Moontide error on any other', () => {
+  const start = { songLaunch: 'section', view: 'none' };
+  for (const to of ['section', 'phrase', 'bar']) {
+    const next = views.setSongLaunch(start, to);
+    assert.equal(next.songLaunch, to);
+    assert.equal(next.view, 'none');
+  }
+  assert.equal(start.songLaunch, 'section');
+  assert.throws(() => views.setSongLaunch(start, 'now'), /^Error: Moontide:/);
 });

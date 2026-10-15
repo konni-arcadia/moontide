@@ -238,6 +238,52 @@ test('plan: null for now, null while nothing plays, otherwise the boundary after
   assert.equal(ctx.takeover.pending(), null);
 });
 
+test('plan: a timing pinned to a line takes that line while it is at least the minimum lead ahead, and says so', () => {
+  const ctx = makeTakeover({ timing: { at: 'section', lineLength: 1, atCycle: 18 } });
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 18, pinned: true });
+  // The scheduler frontier at 2.5 and half a cycle a second: a quarter of a cycle is exactly the half second of minimum lead.
+  ctx.scheduler.lastEnd = 2.5;
+  ctx.state.timing = { at: 'section', lineLength: 1, atCycle: 2.75 };
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 2.75, pinned: true }, 'a lead of exactly 0.5 s still counts');
+  ctx.state.timing = { at: 'section', lineLength: 1, atCycle: 2.7 };
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 3, pinned: false }, 'closer than that: the next line of the timing instead');
+  ctx.state.timing = { at: 'phrase', lineLength: 4, atCycle: 2.7 };
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 4, pinned: false }, 'a phrase falls back to the next phrase line');
+  ctx.state.timing = { at: 'bar', lineLength: 1, atCycle: 3 };
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 3, pinned: true });
+  assert.equal(ctx.takeover.pending(), null, 'planning changes no state');
+});
+
+test('plan: a pinned timing is null for now and while nothing plays, like any timing', () => {
+  const ctx = makeTakeover({ timing: { at: 'now', lineLength: 0, atCycle: 18 } });
+  assert.equal(ctx.takeover.plan(), null);
+  ctx.state.timing = { at: 'section', lineLength: 1, atCycle: 18 };
+  ctx.state.playing = false;
+  assert.equal(ctx.takeover.plan(), null);
+});
+
+test('plan: a pinned line is read against the tempo that plays (getCps)', () => {
+  const ctx = makeTakeover({ timing: { at: 'section', lineLength: 1, atCycle: 3 }, getCps: () => 2 });
+  ctx.scheduler.cps = 0.25;
+  // At 2 cycles a second a line 0.7 cycles ahead is 0.35 s ahead: too close; at the scheduler's own 0.25 it would be fine.
+  assert.deepEqual(ctx.takeover.plan(), { boundary: 4, pinned: false });
+});
+
+test('cancel: a launch the person cancels says why, and nothing of it follows', () => {
+  const ctx = makeTakeover();
+  const { record } = arm(ctx);
+  let followed = false;
+  ctx.takeover.whenFinished(record, () => {
+    followed = true;
+  });
+  ctx.takeover.cancel('canceled');
+  assert.equal(ctx.takeover.pending(), null);
+  assert.equal(record.canceled, true);
+  assert.equal(record.cancelReason, 'canceled');
+  assert.deepEqual(ctx.log.cancel, [[record, 'canceled']]);
+  assert.equal(followed, false);
+});
+
 test('plan and the lead hook use the tempo that plays (getCps), not the scheduler cps a program just set', async () => {
   // The scheduler already holds the new, slower tempo (0.25 cps) while the old music plays at 2 cps.
   const ctx = makeTakeover({ getCps: () => 2 });

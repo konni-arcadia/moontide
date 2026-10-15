@@ -16,8 +16,9 @@ import {
   readReferenceTopic,
   referenceIndexText,
   referenceToolDescription,
+  structureTemplateText,
 } from '../dist/reference.js';
-import { startMcpClient, withoutPageLine } from './helpers.js';
+import { startMcpClient, withoutPageLine, withoutStructureTemplate } from './helpers.js';
 import {
   parsePin,
   extractCalledNames,
@@ -39,6 +40,7 @@ import {
   miniStrings,
   miniFailures,
   PROSE_CLAIMS,
+  CODE_DEFINED_NAMES,
   proseClaimFailures,
   SAMPLE_EXCLUSIONS,
   SOUND_FILE_MANIFESTS,
@@ -50,6 +52,9 @@ import {
   registryFailures,
 } from '../scripts/check-reference.mjs';
 import { VCSL_SAMPLE_BASE } from '../page/ui-state.js';
+import { parse } from 'acorn';
+import { extractTracks } from '../page/tracks.js';
+import { HELPER_TEXT, readStructure } from '../page/structure.js';
 import { TINT_WORDS, STEERING_WORDS, ALLOWED_DEMO_SOUNDS, findWords, fencedBlocks, stripNamesBlocks, fenceTags, demoSoundTokens } from './tint-rules.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -60,7 +65,7 @@ test('reference module: REFERENCE_TOPIC_IDS equals the table ids, in table order
   assert.deepEqual(REFERENCE_TOPIC_IDS, REFERENCE_TOPICS.map((topic) => topic.id));
 });
 
-test('reference module: all eight topics are present, in table order with midi last, and referenceIndexText has ten lines', () => {
+test('reference module: all nine topics are present, in table order with midi last, and referenceIndexText has eleven lines', () => {
   assert.deepEqual(REFERENCE_TOPIC_IDS, [
     'tidal-differences',
     'mini-notation',
@@ -69,9 +74,66 @@ test('reference module: all eight topics are present, in table order with midi l
     'sounds',
     'theory',
     'transitions',
+    'structure',
     'midi',
   ]);
-  assert.equal(referenceIndexText().split('\n').length, 10);
+  assert.equal(referenceIndexText().split('\n').length, 11);
+});
+
+test('structure topic: the template get_code shows is a structure the page reads, with a canonical helper', () => {
+  const template = structureTemplateText();
+  assert.ok(template.includes(HELPER_TEXT), 'the template holds the helper text verbatim');
+  const reading = readStructure(template, { parse, tracks: extractTracks(template, { parse }) });
+  assert.equal(reading.state, 'read', JSON.stringify(reading));
+  assert.equal(reading.helper, 'canonical');
+  assert.equal(reading.sections.length, 1);
+  assert.equal(reading.tracks.length, 1);
+  // It is the first js block of the topic file, as it stands.
+  assert.equal(template, fencedBlocks(readReferenceTopic('structure'), 'js')[0]);
+});
+
+test('structure topic: every example is a structure the page reads, in a shape of its own, once the helper lines are in place', () => {
+  const blocks = fencedBlocks(readReferenceTopic('structure'), 'js');
+  assert.equal(blocks.length, 3, 'the template and two more shapes');
+  const shapes = new Set();
+  for (const block of blocks) {
+    const code = block.replace('// (the helper lines of the first block go here)', HELPER_TEXT);
+    const reading = readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+    assert.equal(reading.state, 'read', `${JSON.stringify(reading)}\n${block}`);
+    assert.equal(reading.helper, 'canonical');
+    shapes.add(`${reading.sections.length} sections, ${reading.tracks.length} tracks, ${reading.total} cycles`);
+  }
+  assert.equal(shapes.size, 3, `the examples differ in shape: ${[...shapes].join(' | ')}`);
+});
+
+test('structure topic: teaches shape only, with placeholder names and no style, section role or fixed recipe', () => {
+  const text = readReferenceTopic('structure');
+  assert.deepEqual(
+    findWords(text, ['intro', 'verse', 'chorus', 'bridge', 'outro', 'drop', 'breakdown', 'hook']),
+    [],
+    'no section-role word',
+  );
+  assert.deepEqual(findWords(text, STEERING_WORDS), [], 'no steering word');
+  // No name that the probes of the page used, as a quoted name.
+  assert.doesNotMatch(text, /'(x|y|z|p|q|t1|t2|t3|va|vb|wa|wb)'/);
+  // No section is declared with a length of 4, 8 or 16 cycles, and no example names a sound.
+  assert.doesNotMatch(text, /\[ *'[^']*' *, *(4|8|16) *[\],]/);
+  for (const block of fencedBlocks(text, 'js')) {
+    assert.deepEqual(demoSoundTokens(block), [], 'no example calls s() or sound()');
+  }
+});
+
+test('structure topic: a missing template block, or one without a song, is a loud error', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moontide-structure-test-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'structure.md'), '# Song structure\n\nNo block here.\n');
+    assert.throws(() => structureTemplateText(dir), /the structure topic has no template block/);
+    fs.writeFileSync(path.join(dir, 'structure.md'), '# Song structure\n\n```js\ns("bd")\n```\n');
+    assert.throws(() => structureTemplateText(dir), /the structure topic has no template block/);
+    assert.throws(() => structureTemplateText(path.join(dir, 'missing')), /Strudel reference unavailable/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('reference module: referenceIndexText has the two fixed lines then one row per topic, in order', () => {
@@ -201,7 +263,7 @@ test('get_strudel_reference: listed with readOnlyHint, returns the index and top
 
   // The reference tool never touches session/page state.
   const codeResult = await client.callTool({ name: 'get_code', arguments: {} });
-  assert.equal(withoutPageLine(codeResult.content[0].text), 'Nothing is playing yet.');
+  assert.equal(withoutStructureTemplate(withoutPageLine(codeResult.content[0].text)), 'Nothing is playing yet.');
 });
 
 test('midi topic: the drum kit paragraph follows the pinned drum-notes example, through get_strudel_reference', async (t) => {
@@ -741,7 +803,7 @@ const CLAIMS_BUNDLE_PARTS = {
     'function arrange(...o){const e=o.reduce((l,[d])=>l+d,0);return o=o.map(([l,d])=>[l,d.fast(l)]),stepcat(...o).slow(e)}',
   cyclist: 'class Cyclist{constructor({onSchedule}){this.started=!1,this.beforeStart=se,this.cps=.5,this.other=1}}',
   soloLabel:
-    'Pattern.prototype.p=function(os){return typeof os=="string"&&(os.startsWith("_")||os.endsWith("_"))?silence:this};const cr=us.length>1&&us.startsWith("S")',
+    '$s=()=>{Pattern$1.prototype.p=function(os){return typeof os=="string"&&(os.startsWith("_")||os.endsWith("_"))?silence:(os.includes("$")&&(os=`${os}${kn}`,kn++),_n[os]=this,this)},Pattern$1.prototype.q=function(os){return silence};const cr=us.length>1&&us.startsWith("S")',
   delaytime:
     'delayfeedback:_n=getDefaultValue("delayfeedback"),delaysync:kn=getDefaultValue("delaysync"),delaytime:Dn,orbit:Ln=getDefaultValue("orbit")}=o;Dn=Dn??cycleToSeconds(kn,d)',
   // The transpiler's two string rules, reify's string parser that is never set, mini$1 and its export
@@ -778,6 +840,13 @@ const CLAIMS_BUNDLE_PARTS = {
   midiTriggerEnd: "sendSysex(Nn,Qn,Ln,R)}}})};async function _initialize(",
   midiOnTrigger: "onTrigger(e,l=!0){return this.withHap(d=>d.setContext({...d.context,onTrigger:(...p)=>{d.context.onTrigger?.(...p),e(...p)},dominantTrigger:d.context.dominantTrigger||l}))}",
   midiGetTrigger: "const getTrigger=({getTime:o,defaultOutput:e})=>async(l,d,p,b,R)=>{try{(!l.context.onTrigger||!l.context.dominantTrigger)&&await e(l,d,p,b,R),l.context.onTrigger&&await l.context.onTrigger(l,o(),b,R)}catch(I){errorLogger$1(I,\"getTrigger\")}}",
+  // What the page's note tag relies on, besides the soloLabel excerpt above (the repl's p with its silence for an underscore label,
+  // its counter for a dollar label and the store) and the onTrigger and getTrigger excerpts: the call of that assignment at
+  // the start of each evaluation, and the reset of the counter and the store when an evaluation hushes. True excerpts of
+  // @strudel/repl@1.3.0.
+  noteTagEvaluate:
+    'evaluate:async(cs,os=!0,xs=!0)=>{if(!cs)throw new Error("no code to evaluate");try{vn({code:cs,pending:!0}),await $s(),setTime(()=>wn.now()),',
+  noteTagReset: 'Ln=function(){return _n={},kn=0,Dn=void 0,silence}',
   midiClip: "{clip:clip$1,legato}=registerControl(\"clip\",\"legato\")",
   midiHapDuration: "get duration(){let e;return typeof this.value?.duration==\"number\"?e=fraction$1(this.value.duration):e=this.whole.end.sub(this.whole.begin),typeof this.value?.clip==\"number\"?e.mul(this.value.clip):e}",
   midiPlayNote: "playNote(e,l={}){this.sendNoteOn(e,l);const d=Array.isArray(e)?e:[e];for(let p of d)if(parseInt(p.duration)>0){const b={time:(Utilities.toTimestamp(l.time)||wm.time)+parseInt(p.duration),release:p.release,rawRelease:p.rawRelease};this.sendNoteOff(p,b)}",
@@ -818,6 +887,22 @@ const CLAIMS_BUNDLE_PARTS = {
   // default, per-event read and own gain node after the effects. Verbatim excerpts of the pinned bundle.
   gainReplaces:
     '{set:[(l,d)=>d],keep:[l=>l],keepif:[];p=function(b,R){return R?typeof b>"u"?R.fmap(d):R.set(reify(b).withValue(d)):reify(b).withValue(d)};{gain}=registerControl("gain"),{postgain}=registerControl("postgain"),{amp}=registerControl("amp");{s:"triangle",gain:.8,postgain:1,density:".03"};{postgain:sn=getDefaultValue("postgain")};const cr=new GainNode(R,{gain:sn});if(b.main.post=[cr],us.connect(cr),wn>0&&Dn>0&&_n>0){',
+  // The facts the song structure's code relies on (the arrange part above also holds arrange's .fast on each item).
+  // pickRestart and the join that shifts the chosen pattern late by the start of the outer event.
+  pickRestart:
+    'pickRestart=register("pickRestart",function(o,e){return _pick(o,e,!1).restartJoin()});resetJoin(e=!1){const l=this;return new mr(d=>l.discreteOnly().query(d).map(p=>p.value.late(e?p.whole.begin:p.whole.begin.cyclePos()).query(d).map(b=>new Hap(b.whole?b.whole.intersection(p.whole):void 0,b.part.intersection(p.part),b.value).setContext(p.combineContext(b))).filter(b=>b.part)).flat())}restartJoin(){return this.resetJoin(!0)}',
+  // pick's lookup: the object read by the key, no default.
+  pickLookup:
+    '_pick=function(o,e,l=!0){const d=Array.isArray(o),p=Object.keys(o).length;return o=objectMap(o,reify),p===0?silence:e.fmap(b=>{let R=b;return d&&(R=l?Math.round(R)%p:clamp$1(Math.round(R),0,o.length-1)),o[R]})}',
+  // scale registered with its argument as a pattern (the last two flags set).
+  scalePatterned:
+    'const scale=register("scale",function(o,e){return Array.isArray(o)&&(o=o.flat().join(" ")),e.withHaps(l=>(l=l.map(d=>{let p=d.value;const b=typeof p=="object";p=b?p:{n:p};const{note:R,n:I,value:z,...se}=p,le=R??I??z;if(le===void 0)return d;return d.value=b?{...se,note:tn}:tn,d.setContext({...d.context,scale:o})}),removeUndefineds(l)))},!0,!0);',
+  // The operator that wraps a bare number as { value } and the merge that refuses a lone value with a warning.
+  addNumberControl:
+    'function _composeOp(o,e,l){return _nonArrayObject(o)||_nonArrayObject(e)?(_nonArrayObject(o)||(o={value:o}),_nonArrayObject(e)||(e={value:e}),unionWithObj(o,e,l)):l(o,e)}function unionWithObj(o,e,l){if(e?.value!==void 0&&Object.keys(e).length===1)return logger$2("[warn]: Can\'t do arithmetic on control pattern."),o;const d=Object.keys(o).filter(p=>Object.keys(e).includes(p));return Object.assign({},o,e,Object.fromEntries(d.map(p=>[p,l(o[p],e[p])])))}',
+  // The duckorbit control with its alias and the sound engine's read of it.
+  duckorbit:
+    '{duck}=registerControl("duckorbit","duck"),{duckdepth}=registerControl("duckdepth");let{s:se=getDefaultValue("s"),postgain:sn=getDefaultValue("postgain"),duckorbit:rn,duckonset:ln,duckattack:dn,duckdepth:pn,djf:bn,release:vn=getDefaultValue("release")}=o;',
 };
 const CLAIMS_BUNDLE_FIXTURE = Object.values(CLAIMS_BUNDLE_PARTS).join(';');
 
@@ -884,6 +969,24 @@ const MIDI_SENTENCES = {
 const GAIN_REPLACES_SENTENCE =
   '- A later `.gain(n)` replaces every gain set earlier in the track (in its pattern strings, its `stack` branches and its echoes), so loud and quiet notes end up at one level. On a browser track with no post-gain of its own, `.postgain(n)` scales what the track plays after its effects and keeps that difference; a later `.postgain(n)` replaces an earlier one the same way, and a MIDI track ignores `postgain` (use `.gain(n)` or `.velocity(n)` there).';
 
+// The structure topic's checked sentences, in the exact wording reference/structure.md states them.
+const STRUCTURE_SENTENCES = {
+  helper:
+    "The helper plays each track's variation for the section the clock names, starts it at its first cycle, and throws, naming the section and the track, for a missing cell or an unknown variation.",
+  pickRestart:
+    "A section plays each track's variation from its first cycle every time the section comes round, also when the same name is used twice.",
+  pickMissingKey: 'A cell that names no variation is refused when the code is evaluated, with the section and the track named.',
+  singleQuotes:
+    'Write section names, track names and harmonies in single quotes inside the song declaration: a double-quoted string is a mini-notation pattern and the clock then fails with a message about `late`.',
+  scalePatterned:
+    'A variation in degrees is written as a function of the section\'s harmony, `(h) => n("0 2 4").scale(h)`; do not read a global harmony pattern inside a variation.',
+  addNumber: 'To move a pattern of degrees up, add `n(k)`, not the bare number `k`.',
+};
+const ARRANGE_SENTENCE =
+  '`arrange` takes patterns: it calls `.fast` on each item without turning it into a pattern, so a single-quoted string item throws when the code is evaluated.';
+const structureText = (sentences = STRUCTURE_SENTENCES, helperText = HELPER_TEXT) =>
+  `# Song structure\n\n\`\`\`js\n${helperText}\n\`\`\`\n\n${Object.values(sentences).join('\n\n')}\n`;
+
 const CLAIMS_TEXTS_TRUE = {
   'theory.md': [
     'the octave is 3 when none is written',
@@ -897,7 +1000,7 @@ const CLAIMS_TEXTS_TRUE = {
     'a sharp is `#` or `s`, a flat is `b` or `f`',
   ].join('. '),
   'functions.md':
-    'arrange repeats every total cycles. No function of this Strudel reads `t` or `f` as a boolean: in mini-notation `t`, `f`, `true` and `false` are plain strings (`f` is also a note name), so `struct`, `mask` and `when` treat each of them as true. The false values are `0` and `~` (a rest) for `struct` and `mask`. `when` needs `1`/`0`. A label longer than one character that starts with a capital `S` plays alone: while one exists, every other label is silent; a label that also starts or ends with `_` is silenced instead.',
+    ARRANGE_SENTENCE + ' arrange repeats every total cycles. No function of this Strudel reads `t` or `f` as a boolean: in mini-notation `t`, `f`, `true` and `false` are plain strings (`f` is also a note name), so `struct`, `mask` and `when` treat each of them as true. The false values are `0` and `~` (a rest) for `struct` and `mask`. `when` needs `1`/`0`. A label longer than one character that starts with a capital `S` plays alone: while one exists, every other label is silent; a label that also starts or ends with `_` is silenced instead.',
   'transitions.md': [
     'one cycle lasts 2 seconds at the default 0.5 cycles per second',
     'arrange repeats every total cycles',
@@ -914,9 +1017,10 @@ const CLAIMS_TEXTS_TRUE = {
     GAIN_REPLACES_SENTENCE,
   ].join('\n'),
   'midi.md': Object.values(MIDI_SENTENCES).flat().join(' '),
+  'structure.md': structureText(),
 };
 
-test('check-reference: PROSE_CLAIMS has exactly twenty-nine entries with the expected ids', () => {
+test('check-reference: PROSE_CLAIMS has exactly thirty-eight entries with the expected ids', () => {
   assert.deepEqual(
     PROSE_CLAIMS.map((c) => c.id),
     [
@@ -945,10 +1049,19 @@ test('check-reference: PROSE_CLAIMS has exactly twenty-nine entries with the exp
       'midi-clock-cyclist',
       'midi-transport',
       'midi-trigger-seam',
+      'note-tag-seam',
       'takeover-gate',
       'mini-atoms-not-boolean',
       'truthy-flags',
       'gain-replaces',
+      'structure-helper',
+      'structure-single-quotes',
+      'pick-restart-shift',
+      'pick-missing-key',
+      'arrange-needs-patterns',
+      'scale-patterned',
+      'add-number-control',
+      'duckorbit-exists',
     ],
   );
 });
@@ -1046,6 +1159,150 @@ test('check-reference: proseClaimFailures flags a bundle without the gain facts 
   assert.ok(proseClaimFailures(midiReadsPostgain, CLAIMS_TEXTS_TRUE).some((f) => f.startsWith('gain-replaces: cannot find the MIDI trigger reading its level')));
   // The true fixture passes as a whole.
   assert.deepEqual(proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, CLAIMS_TEXTS_TRUE), []);
+});
+
+// The bundle-only claims of the song structure: each has no reference file, so only the bundle text can fail it.
+const bundleWithout = (key) =>
+  Object.entries(CLAIMS_BUNDLE_PARTS)
+    .filter(([name]) => name !== key)
+    .map(([, value]) => value)
+    .join(';');
+const claimFailureStarts = (bundle, id) =>
+  proseClaimFailures(bundle, CLAIMS_TEXTS_TRUE).filter((f) => f.startsWith(`${id}: cannot find`) && f.endsWith('in the bundle (the pin changed?)'));
+
+test('check-reference: proseClaimFailures flags a bundle without the pickRestart join with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'pick-restart-shift').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('pickRestart'), 'pick-restart-shift').length, 1);
+  // The join no longer shifts the chosen pattern by the start of the outer event.
+  const noShift = CLAIMS_BUNDLE_FIXTURE.replace('p.value.late(e?p.whole.begin:p.whole.begin.cyclePos())', 'p.value');
+  assert.notEqual(noShift, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(noShift, 'pick-restart-shift').length, 1);
+  // pickRestart joins its picks another way.
+  const otherJoin = CLAIMS_BUNDLE_FIXTURE.replace('_pick(o,e,!1).restartJoin()', '_pick(o,e,!1).innerJoin()');
+  assert.equal(claimFailureStarts(otherJoin, 'pick-restart-shift').length, 1);
+});
+
+test('check-reference: proseClaimFailures flags a bundle without the pick lookup with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'pick-missing-key').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('pickLookup'), 'pick-missing-key').length, 1);
+  // A missing key now falls back to a default.
+  const withDefault = CLAIMS_BUNDLE_FIXTURE.replace('),o[R]})}', '),o[R]??silence})}');
+  assert.notEqual(withDefault, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(withDefault, 'pick-missing-key').length, 1);
+});
+
+test('check-reference: proseClaimFailures flags a bundle whose arrange no longer calls .fast on its items with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'arrange-needs-patterns').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('arrange'), 'arrange-needs-patterns').length, 1);
+  // Each item is turned into a pattern first.
+  const reified = CLAIMS_BUNDLE_FIXTURE.replace('[l,d.fast(l)]', '[l,reify(d).fast(l)]');
+  assert.notEqual(reified, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(reified, 'arrange-needs-patterns').length, 1);
+});
+
+test('check-reference: proseClaimFailures flags a bundle whose scale is not registered as a pattern with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'scale-patterned').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('scalePatterned'), 'scale-patterned').length, 1);
+  // The registration no longer sets the patternify flag.
+  const plain = CLAIMS_BUNDLE_FIXTURE.replace('removeUndefineds(l)))},!0,!0);', 'removeUndefineds(l)))},!1,!0);');
+  assert.notEqual(plain, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(plain, 'scale-patterned').length, 1);
+});
+
+test('check-reference: proseClaimFailures flags a bundle whose operators treat a bare number differently with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'add-number-control').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('addNumberControl'), 'add-number-control').length, 1);
+  // The merge no longer refuses a lone value.
+  const noGuard = CLAIMS_BUNDLE_FIXTURE.replace('if(e?.value!==void 0&&Object.keys(e).length===1)return logger$2("[warn]: Can\'t do arithmetic on control pattern."),o;', '');
+  assert.notEqual(noGuard, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(noGuard, 'add-number-control').length, 1);
+  // A bare number is no longer wrapped as { value }.
+  const noWrap = CLAIMS_BUNDLE_FIXTURE.replace('(o={value:o})', '(o=o)');
+  assert.notEqual(noWrap, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(noWrap, 'add-number-control').length, 1);
+});
+
+test('check-reference: structure-helper fails when the topic block lacks a line of the helper text, or the sentence naming what it does is reworded', () => {
+  assert.deepEqual(proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, CLAIMS_TEXTS_TRUE), []);
+  const lines = HELPER_TEXT.split('\n');
+  for (const [i, line] of lines.entries()) {
+    const shorter = lines.filter((_, at) => at !== i).join('\n');
+    const texts = { ...CLAIMS_TEXTS_TRUE, 'structure.md': structureText(STRUCTURE_SENTENCES, shorter) };
+    const failures = proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, texts);
+    assert.ok(
+      failures.some((f) => f.startsWith('structure-helper: cannot find') && f.includes('structure.md')),
+      `missing line ${JSON.stringify(line)} -> ${failures.join(' | ')}`,
+    );
+  }
+  // The helper text anywhere but the first js block does not count.
+  const moved = `# Song structure\n\n\`\`\`js\nconst song = {};\n\`\`\`\n\n\`\`\`js\n${HELPER_TEXT}\n\`\`\`\n\n${Object.values(STRUCTURE_SENTENCES).join('\n\n')}\n`;
+  assert.ok(
+    proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, { ...CLAIMS_TEXTS_TRUE, 'structure.md': moved }).some((f) => f.startsWith('structure-helper: cannot find')),
+  );
+  const reworded = { ...STRUCTURE_SENTENCES, helper: 'The helper plays the variations.' };
+  assert.ok(
+    proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, { ...CLAIMS_TEXTS_TRUE, 'structure.md': structureText(reworded) }).includes(
+      'structure.md: no longer states structure-helper in the checked form',
+    ),
+  );
+});
+
+test('check-reference: structure-single-quotes needs the transpiler double-quote rule in the bundle and its sentence in the topic', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'structure-single-quotes').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('stringForms'), 'structure-single-quotes').length, 1);
+  const reworded = { ...STRUCTURE_SENTENCES, singleQuotes: 'Use single quotes.' };
+  assert.ok(
+    proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, { ...CLAIMS_TEXTS_TRUE, 'structure.md': structureText(reworded) }).includes(
+      'structure.md: no longer states structure-single-quotes in the checked form',
+    ),
+  );
+});
+
+test('check-reference: each bound song sentence fails naming its file when it is removed from a copy of the topic', () => {
+  const bound = {
+    'pick-restart-shift': 'pickRestart',
+    'pick-missing-key': 'pickMissingKey',
+    'scale-patterned': 'scalePatterned',
+    'add-number-control': 'addNumber',
+    'structure-single-quotes': 'singleQuotes',
+    'structure-helper': 'helper',
+  };
+  for (const [id, key] of Object.entries(bound)) {
+    const without = { ...STRUCTURE_SENTENCES };
+    delete without[key];
+    const failures = proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, { ...CLAIMS_TEXTS_TRUE, 'structure.md': structureText(without) });
+    assert.ok(failures.includes(`structure.md: no longer states ${id} in the checked form`), `${id} -> ${failures.join(' | ')}`);
+  }
+  // The arrange sentence lives in the functions topic.
+  const texts = { ...CLAIMS_TEXTS_TRUE, 'functions.md': CLAIMS_TEXTS_TRUE['functions.md'].replace(ARRANGE_SENTENCE, '') };
+  assert.notEqual(texts['functions.md'], CLAIMS_TEXTS_TRUE['functions.md']);
+  assert.ok(
+    proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, texts).includes('functions.md: no longer states arrange-needs-patterns in the checked form'),
+  );
+});
+
+test('check-reference: the helper names play, Error and reduce pass the called-name check through a reasoned exemption, in structure.md only', () => {
+  const helper = `\`\`\`js\n${HELPER_TEXT}\n\`\`\`\n`;
+  const defined = ['play', 'Error', 'reduce'];
+  assert.deepEqual(extractCalledNames(helper, 'structure.md').filter((name) => defined.includes(name)), []);
+  assert.deepEqual([...CODE_DEFINED_NAMES.keys()].sort(), ['Error', 'play', 'reduce']);
+  for (const [name, reason] of CODE_DEFINED_NAMES) {
+    assert.ok(typeof reason === 'string' && reason.length > 20, `${name} needs a reason`);
+  }
+  // The exemption is only for those names: another called name in the same block is still checked.
+  assert.ok(extractCalledNames('```js\nplay(a); lpf(300); new Error(1);\n```\n', 'structure.md').includes('lpf'));
+  // And only for the file that defines them: anywhere else the same calls are checked like any other name.
+  assert.deepEqual(extractCalledNames('```js\nplay(a); x.reduce(f); new Error(1);\n```\n', 'functions.md'), ['Error', 'play', 'reduce']);
+  assert.deepEqual(extractCalledNames('```js\nplay(a);\n```\n'), ['play']);
+});
+
+test('check-reference: proseClaimFailures flags a bundle without the duckorbit control with "cannot find"', () => {
+  assert.equal(claimFailureStarts(CLAIMS_BUNDLE_FIXTURE, 'duckorbit-exists').length, 0);
+  assert.equal(claimFailureStarts(bundleWithout('duckorbit'), 'duckorbit-exists').length, 1);
+  // The control is registered without its alias.
+  const noAlias = CLAIMS_BUNDLE_FIXTURE.replace('registerControl("duckorbit","duck")', 'registerControl("duckorbit")');
+  assert.notEqual(noAlias, CLAIMS_BUNDLE_FIXTURE);
+  assert.equal(claimFailureStarts(noAlias, 'duckorbit-exists').length, 1);
 });
 
 test('check-reference: proseClaimFailures flags a reference file that no longer states solo-label', () => {
@@ -1200,18 +1457,23 @@ test('check-reference: each MIDI claim names itself with "cannot find" when its 
   assert.equal(Object.keys(MIDI_DRIFT).length, 13);
   for (const [id, mutate] of Object.entries(MIDI_DRIFT)) {
     const bundle = Object.values(mutate({ ...CLAIMS_BUNDLE_PARTS })).join(';');
+    // The trigger excerpts of midi-dominant are also read by note-tag-seam, which names itself as well.
+    const shared = id === 'midi-dominant' ? 1 : 0;
     const failures = proseClaimFailures(bundle, CLAIMS_TEXTS_TRUE);
-    assert.equal(failures.length, 1, `${id}: ${failures.join(' | ')}`);
+    assert.equal(failures.length, 1 + shared, `${id}: ${failures.join(' | ')}`);
     assert.ok(failures[0].startsWith(`${id}: cannot find`), failures[0]);
     assert.ok(failures[0].endsWith('in the bundle (the pin changed?)'), failures[0]);
+    if (shared === 1) assert.ok(failures[1].startsWith('note-tag-seam: cannot find'), failures[1]);
   }
 });
 
 test('check-reference: proseClaimFailures flags each other piece of MIDI evidence the claims read, one claim at a time', () => {
-  const cannotFind = (id, mutate) => {
+  // `alsoNamed`: another claim that reads the same excerpt and names itself too.
+  const cannotFind = (id, mutate, alsoNamed = null) => {
     const failures = proseClaimFailures(Object.values(mutate({ ...CLAIMS_BUNDLE_PARTS })).join(';'), CLAIMS_TEXTS_TRUE);
-    assert.equal(failures.length, 1, `${id}: ${failures.join(' | ')}`);
+    assert.equal(failures.length, alsoNamed === null ? 1 : 2, `${id}: ${failures.join(' | ')}`);
     assert.ok(failures[0].startsWith(`${id}: cannot find`), failures[0]);
+    if (alsoNamed !== null) assert.ok(failures[1].startsWith(`${alsoNamed}: cannot find`), failures[1]);
   };
   // The IAC default, the ccv scaling, the legato control, the clip multiplication, the note-off time,
   // the velocity error, the dominant trigger flag and the two callers.
@@ -1221,7 +1483,8 @@ test('check-reference: proseClaimFailures flags each other piece of MIDI evidenc
   cannotFind('midi-note-length', (p) => ({ ...p, midiHapDuration: p.midiHapDuration.replace('e.mul(this.value.clip)', 'e') }));
   cannotFind('midi-note-off', (p) => ({ ...p, midiPlayNote: p.midiPlayNote.replace('+parseInt(p.duration)', '') }));
   cannotFind('midi-gain-velocity', (p) => ({ ...p, midiSendNote: p.midiSendNote.replace('velocity must be a number between 0 and 1', 'velocity is bad') }));
-  cannotFind('midi-dominant', (p) => ({ ...p, midiOnTrigger: p.midiOnTrigger.replace('dominantTrigger:d.context.dominantTrigger||l', 'dominantTrigger:l') }));
+  // The note tag reads the same onTrigger excerpt, so it names itself too.
+  cannotFind('midi-dominant', (p) => ({ ...p, midiOnTrigger: p.midiOnTrigger.replace('dominantTrigger:d.context.dominantTrigger||l', 'dominantTrigger:l') }), 'note-tag-seam');
   cannotFind('midi-dominant', (p) => ({ ...p, midiTriggerEnd: p.midiTriggerEnd.replace('}}})};', '}}},!1)};') }));
   cannotFind('midi-same-instant', (p) => ({ ...p, midiCalls: p.midiCalls.replace('sendProgramChange(Mn,Ln,sn,R)', 'sendProgramChange(Mn,Ln,sn,0)') }));
   cannotFind('midi-same-instant', (p) => ({ ...p, midiProgNum: p.midiProgNum.replace('scheduleAtTime(()=>{e.sendProgramChange(o,l)},d)', 'e.sendProgramChange(o,l)') }));
@@ -1335,6 +1598,44 @@ test('check-reference: a .midi() trigger whose seam changed fails midi-trigger-s
     assert.equal(failures.length, 1, `${part}: ${failures.join(' | ')}`);
     assert.ok(failures[0].startsWith('midi-trigger-seam: cannot find'), failures[0]);
   }
+});
+
+test('check-reference: a bundle whose note tag facts changed fails note-tag-seam', () => {
+  // [the part holding the change, what to change, its replacement, the other claims that read the same excerpt].
+  // The counter and the store of p, its call at each evaluation, the reset and the scheduler's call of the note's trigger
+  // are read by this claim alone; the underscore rule is also read by solo-label, and the onTrigger composition and the
+  // default-output rule by midi-dominant, so a change there names both claims.
+  const changes = [
+    ['soloLabel', 'os.endsWith("_")', 'os.endsWith("-")', ['solo-label']],
+    ['soloLabel', 'os.includes("$")&&(os=`${os}${kn}`,kn++)', 'os.includes("$")&&(os=`${os}${kn}`)', []],
+    ['soloLabel', '_n[os]=this,this', '_n[os]=os,this', []],
+    ['soloLabel', 'Pattern$1.prototype.p=function', 'Pattern$1.prototype.pp=function', []],
+    ['noteTagEvaluate', 'await $s()', 'await $x()', []],
+    ['noteTagReset', 'kn=0', 'kn=1', []],
+    ['noteTagReset', '_n={}', '_m={}', []],
+    ['midiGetTrigger', 'l.context.onTrigger(l,o(),b,R)', 'l.context.onTrigger(l,o(),b)', []],
+    ['midiOnTrigger', 'd.context.onTrigger?.(...p),e(...p)', 'e(...p),d.context.onTrigger?.(...p)', ['midi-dominant']],
+    ['midiOnTrigger', 'dominantTrigger:d.context.dominantTrigger||l', 'dominantTrigger:l', ['midi-dominant']],
+    ['midiGetTrigger', '(!l.context.onTrigger||!l.context.dominantTrigger)&&await e(l,d,p,b,R)', '(!l.context.onTrigger)&&await e(l,d,p,b,R)', ['midi-dominant']],
+  ];
+  for (const [part, from, to, alsoNamed] of changes) {
+    assert.ok(CLAIMS_BUNDLE_PARTS[part].includes(from), `${part}: the true excerpt has no "${from}"`);
+    const parts = { ...CLAIMS_BUNDLE_PARTS, [part]: CLAIMS_BUNDLE_PARTS[part].replace(from, to) };
+    const failures = proseClaimFailures(Object.values(parts).join(';'), CLAIMS_TEXTS_TRUE);
+    const ids = failures.map((failure) => failure.split(': ')[0]).sort();
+    assert.deepEqual(ids, ['note-tag-seam', ...alsoNamed].sort(), `${part} ${from}: ${failures.join(' | ')}`);
+    const own = failures.find((failure) => failure.startsWith('note-tag-seam: cannot find'));
+    assert.ok(own?.endsWith('in the bundle (the pin changed?)'), `${part} ${from}: ${failures.join(' | ')}`);
+  }
+  // A bundle without one of the note tag's own excerpts fails the claim and only that claim.
+  for (const part of ['noteTagEvaluate', 'noteTagReset']) {
+    const { [part]: _removed, ...rest } = CLAIMS_BUNDLE_PARTS;
+    const failures = proseClaimFailures(Object.values(rest).join(';'), CLAIMS_TEXTS_TRUE);
+    assert.equal(failures.length, 1, `${part}: ${failures.join(' | ')}`);
+    assert.ok(failures[0].startsWith('note-tag-seam: cannot find'), failures[0]);
+  }
+  // The true excerpts pass.
+  assert.deepEqual(proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, CLAIMS_TEXTS_TRUE), []);
 });
 
 test('check-reference: a Cyclist whose gate facts changed fails takeover-gate, and only that claim', () => {

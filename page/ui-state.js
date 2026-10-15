@@ -61,8 +61,11 @@ export const VCSL_MANIFEST_COMMIT = '9eacfc86ec4393e68a463ff52b01c19cfaa77f38';
 export const VCSL_MANIFEST_URL = 'https://raw.githubusercontent.com/felixroos/dough-samples/' + VCSL_MANIFEST_COMMIT + '/vcsl.json';
 export const VCSL_SAMPLE_BASE = 'https://cdn.jsdelivr.net/gh/sgossner/VCSL@' + VCSL_COMMIT + '/';
 
+/** What every sound-load failure text ends with; the reply adds the final period. */
+const REPLACED_SOUND_DUTY = '; if you replace it, tell the user which one and what replaced it, never silently';
+
 /** How many candidate sound names soundLoadFailureText lists before "and N more". */
-export const MAX_NAMED_SOUNDS = 8;
+export const MAX_NAMED_SOUNDS = 7;
 
 /**
  * How long the page waits for AudioContext.resume() to reach 'running' after
@@ -219,20 +222,22 @@ export function isFetchFailure(text) {
  * The page names a sound only when it is the single candidate — a wrong name misled
  * Claude in an earlier user test. With several it lists them, sorted and de-duplicated so the text is
  * stable for any arrival order, capped at MAX_NAMED_SOUNDS so the server's 500 code point
- * cleanErrorDetail cap never cuts a name in half. With none, it says the page could not tell.
+ * cleanErrorDetail cap never cuts a name in half. With none, it says the page could not tell. Every variant ends
+ * with the duty to say which sound was replaced and by what: it lives here, where Claude reads about the failure,
+ * and not in the server instructions, which have a fixed length.
  */
 export function soundLoadFailureText(detail, names) {
   const distinct = [...new Set(names)].sort();
   if (distinct.length === 1) {
-    return `sound "${distinct[0]}" failed to load (${detail}); it plays nothing until the page is reloaded`;
+    return `sound "${distinct[0]}" failed to load (${detail}); it plays nothing until the page is reloaded${REPLACED_SOUND_DUTY}`;
   }
   if (distinct.length === 0) {
-    return `a sound failed to load (${detail}), and the page could not tell which one`;
+    return `a sound failed to load (${detail}), and the page could not tell which one${REPLACED_SOUND_DUTY}`;
   }
   const shown = distinct.slice(0, MAX_NAMED_SOUNDS);
   const rest = distinct.length - shown.length;
   const list = rest > 0 ? `${shown.join(', ')} and ${rest} more` : shown.join(', ');
-  return `one of these sounds failed to load (${detail}): ${list}; the one that failed plays nothing until the page is reloaded`;
+  return `one of these sounds failed to load (${detail}): ${list}; the one that failed plays nothing until the page is reloaded${REPLACED_SOUND_DUTY}`;
 }
 
 /**

@@ -16,6 +16,7 @@ import {
   sampleLoadName,
   isFetchFailure,
   soundLoadFailureText,
+  MAX_NAMED_SOUNDS,
   createSoundLoadTracker,
   QUERY_ERROR_LEAD,
   isQueryErrorText,
@@ -246,13 +247,15 @@ test('isFetchFailure is false for a non-fetch error, a decode error and an empty
 test('soundLoadFailureText names the single distinct candidate, de-duplicated', () => {
   assert.equal(
     soundLoadFailureText('Failed to fetch', ['kalimba', 'kalimba']),
-    'sound "kalimba" failed to load (Failed to fetch); it plays nothing until the page is reloaded',
+    'sound "kalimba" failed to load (Failed to fetch); it plays nothing until the page is reloaded' +
+      '; if you replace it, tell the user which one and what replaced it, never silently',
   );
 });
 
 test('soundLoadFailureText lists several distinct candidates sorted, regardless of input order', () => {
   const expected =
-    'one of these sounds failed to load (Failed to fetch): kalimba, steinway; the one that failed plays nothing until the page is reloaded';
+    'one of these sounds failed to load (Failed to fetch): kalimba, steinway; the one that failed plays nothing until the page is reloaded' +
+    '; if you replace it, tell the user which one and what replaced it, never silently';
   assert.equal(soundLoadFailureText('Failed to fetch', ['steinway', 'kalimba', 'steinway']), expected);
   assert.equal(soundLoadFailureText('Failed to fetch', ['kalimba', 'steinway']), expected);
 });
@@ -263,15 +266,26 @@ test('soundLoadFailureText caps the list at MAX_NAMED_SOUNDS names, sorted, then
   const text = soundLoadFailureText('Failed to fetch', names);
   assert.equal(
     text,
-    'one of these sounds failed to load (Failed to fetch): a, b, c, d, e, f, g, h and 2 more; the one that failed plays nothing until the page is reloaded',
+    'one of these sounds failed to load (Failed to fetch): a, b, c, d, e, f, g and 3 more; the one that failed plays nothing until the page is reloaded' +
+      '; if you replace it, tell the user which one and what replaced it, never silently',
   );
 });
 
 test('soundLoadFailureText says the page could not tell which one, for zero candidates', () => {
   assert.equal(
     soundLoadFailureText('Load failed', []),
-    'a sound failed to load (Load failed), and the page could not tell which one',
+    'a sound failed to load (Load failed), and the page could not tell which one' +
+      '; if you replace it, tell the user which one and what replaced it, never silently',
   );
+});
+
+test('soundLoadFailureText stays within the 500 code points the server keeps, in the worst case', () => {
+  // MAX_NAMED_SOUNDS names of 30 characters, a rest count, a detail of 60 characters.
+  const names = Array.from({ length: MAX_NAMED_SOUNDS + 12 }, (_, i) => String.fromCharCode(97 + i).repeat(30));
+  const text = soundLoadFailureText('d'.repeat(60), names);
+  assert.ok(text.includes(' and 12 more;'), text);
+  assert.ok([...text].length <= 500, `the worst case is ${[...text].length} code points`);
+  assert.ok(text.endsWith('tell the user which one and what replaced it, never silently'));
 });
 
 test('createSoundLoadTracker forgets a url once it loads successfully', () => {

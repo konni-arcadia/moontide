@@ -44,6 +44,8 @@ export const JAM_COPY = {
   heardLabel: 'Heard:',
   noFitDeclared: 'The notes fit none of the nine scales.',
   heardUnclearLabel: 'The heard scale is not clear.',
+  // The muted words after the Declared value of a piece with sections: the section whose harmony the line shows.
+  declaredSection: 'section {section}',
   declaredReasons: {
     'not-const': 'Not readable: harmony is declared with let or var; the page reads only const.',
     computed: 'Not readable: harmony is computed ({source}); the page reads only written text.',
@@ -473,9 +475,13 @@ function statusOf(position, paused) {
  * (even an unreadable declaration) no sentence says 'No clear scale', and a reading with no pitched note is a ready
  * model of kind 'none' instead of the message model, so the Declared line stays on screen. The heard scale, the
  * degrees, the status, the rows and the instrument roles are the ones of the same notes without a declaration.
+ * A piece with sections shows the harmony of the section that plays: `declaredOverride` (the same shapes as a reading's
+ * `declared`) replaces the one in the reading, and `section` is that section's name as the page shows it, quoted; every
+ * ready model carries `section`, the words 'section {name}' for a piece with sections and null otherwise.
  */
-export function buildJamModel({ position, chordTones = false }) {
-  const declaredState = position.reading.declared ?? { state: 'none' };
+export function buildJamModel({ position, chordTones = false, declaredOverride, section = null }) {
+  const declaredState = declaredOverride ?? position.reading.declared ?? { state: 'none' };
+  const sectionText = section === null || section === undefined ? null : JAM_COPY.declaredSection.replace('{section}', () => section);
   const declaredMode = declaredState.state !== 'none';
   const declared = declaredLine(declaredState);
   if (position.reading.status === 'none' && !declaredMode) {
@@ -507,6 +513,7 @@ export function buildJamModel({ position, chordTones = false }) {
       chordLine,
       noteScaleName,
       declared,
+      section: sectionText,
     };
   }
   if (scale.status === 'clear') {
@@ -536,6 +543,7 @@ export function buildJamModel({ position, chordTones = false }) {
       chordLine,
       noteScaleName,
       declared,
+      section: sectionText,
     };
   }
   if (scale.status === 'ambiguous' || scale.status === 'no-fit') {
@@ -551,6 +559,7 @@ export function buildJamModel({ position, chordTones = false }) {
       chordLine,
       noteScaleName,
       declared,
+      section: sectionText,
     };
   }
   throw new Error(`Moontide: the Jam model cannot draw a scale reading with status '${String(scale.status)}'`);

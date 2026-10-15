@@ -17,10 +17,16 @@ import {
   createTrackColors,
   curvePoints,
   momentAt,
+  rangeNotes,
+  MAX_RANGE_CYCLES,
+  PAGE_CYCLES,
   MIN_DRAWN_WIDTH,
   cycleAt,
   MAX_MOMENT_NOTES,
   SIXTEENTHS_PER_CYCLE,
+  noteNameToMidi,
+  toLaneEvent,
+  velocityOf,
 } from '../page/timeline.js';
 
 /** A fake hap shaped like a real Strudel hap: { whole: { begin, end }, hasOnset(), value }. */
@@ -731,4 +737,159 @@ test('sameIndexSet is true only for the same indexes, whatever the order', () =>
   assert.equal(sameIndexSet(new Set([1]), new Set([1, 2])), false);
   assert.equal(sameIndexSet(new Set([1, 2]), new Set([1])), false);
   assert.equal(sameIndexSet(new Set([1, 2]), new Set([1, 3])), false);
+});
+
+// --- the places in the code that the lanes' notes carry ---
+
+/** A fake hap that also carries the context a real Strudel hap has: the offsets of the strings its note was read from. */
+function hapWithLocations({ begin, end, value, locations }) {
+  return { ...fakeHap({ begin, end, value }), context: { locations } };
+}
+
+async function lanesOf(realHaps, trackHaps) {
+  return computeTimeline({
+    tracks: [{ index: 0, muted: false }],
+    soloPattern: async () => fakePattern(trackHaps),
+    combinedPattern: fakePattern(realHaps),
+    pageStart: 0,
+    pageCycles: 4,
+    budgetMs: Infinity,
+    sliceCycles: 4,
+    clock: () => 0,
+    yieldToPage: async () => {},
+    isCancelled: () => false,
+  });
+}
+
+test('lane events carry plain copies of the places in the code of their notes', async () => {
+  const locations = [{ start: 10, end: 12 }];
+  const hap = hapWithLocations({ begin: 0, end: 1, value: { note: 'c3' }, locations });
+  const result = await lanesOf([hap], [hap]);
+  assert.equal(result.state, 'ok');
+  const [event] = result.lanes[0].events;
+  assert.deepEqual(event.locations, [{ start: 10, end: 12 }]);
+  // Copies: changing the hap afterwards, or the list the event holds, changes nothing in the other.
+  locations[0].start = 99;
+  assert.deepEqual(event.locations, [{ start: 10, end: 12 }]);
+  assert.notEqual(event.locations, locations);
+  assert.notEqual(event.locations[0], locations[0]);
+});
+
+test('a hap with no context, or with no list of places, gives locations null', async () => {
+  const bare = fakeHap({ begin: 0, end: 1, value: { note: 'c3' } });
+  const noList = { ...fakeHap({ begin: 1, end: 2, value: { note: 'e3' } }), context: {} };
+  const result = await lanesOf([bare, noList], [bare, noList]);
+  assert.equal(result.state, 'ok');
+  assert.deepEqual(result.lanes[0].events.map((event) => event.locations), [null, null]);
+  assert.deepEqual(toLaneEvent(bare), { begin: 0, end: 1, value: { note: 'c3' }, locations: null });
+});
+
+test('the union check does not look at the places: the real pattern has none and the lanes still add up to it', async () => {
+  const real = fakeHap({ begin: 0, end: 1, value: { note: 'c3' } });
+  const lane = hapWithLocations({ begin: 0, end: 1, value: { note: 'c3' }, locations: [{ start: 1, end: 3 }] });
+  const result = await lanesOf([real], [lane]);
+  assert.equal(result.state, 'ok');
+  assert.equal(result.lanes[0].events.length, 1);
+  // The same notes with other places are the same notes.
+  assert.ok(sameEvents([{ begin: 0, end: 1, value: { note: 'c3' }, locations: [{ start: 1, end: 3 }] }], [{ begin: 0, end: 1, value: { note: 'c3' }, locations: null }]));
+});
+
+test('noteNameToMidi and velocityOf are the helpers the note panel reads with', () => {
+  assert.equal(noteNameToMidi('c3'), 48);
+  assert.equal(noteNameToMidi('C#3'), 49);
+  assert.equal(noteNameToMidi('bd'), null);
+  assert.equal(velocityOf({ gain: 0.5, velocity: 0.5 }, false), 0.25);
+  assert.equal(velocityOf({}, true), 0.9);
+});
+
+// --- rangeNotes ---
+
+/** A lane as the Timeline draws it, with events starting at the given times (the pitch follows the order given). */
+function rangeLane(starts, extra = {}) {
+  return {
+    track: 't1',
+    midi: false,
+    instrument: undefined,
+    drumMap: null,
+    events: starts.map((begin, at) => ({ begin, end: begin + 0.25, value: { note: 48 + at } })),
+    ...extra,
+  };
+}
+
+test('rangeNotes: the notes that start from the first cycle up to before the one after the last', () => {
+  const lane = rangeLane([1.5, 2, 3.25, 5.9, 6]);
+  const { notes, more } = rangeNotes(lane, 2, 5);
+  assert.deepEqual(notes.map((note) => note.start), [2, 3.25, 5.9]);
+  assert.equal(more, 0);
+  // A note shaped like a moment note, without a state, with the lane's shown name.
+  assert.deepEqual(notes[0], { track: 't1', note: 49, velocity: 0.8, start: 2, end: 2.25 });
+  assert.ok(notes.every((note) => !('state' in note)));
+});
+
+test('rangeNotes: a note that starts exactly at the first cycle is in, one that starts exactly after the last cycle is out, one that began before and still sounds is out', () => {
+  const lane = rangeLane([1.5, 2, 6]);
+  lane.events[0].end = 4;
+  const { notes } = rangeNotes(lane, 2, 5);
+  assert.deepEqual(notes.map((note) => note.start), [2]);
+  // The same note with a one-cycle range ends exactly where the next cycle starts.
+  assert.deepEqual(rangeNotes(lane, 5, 5).notes, []);
+  assert.deepEqual(rangeNotes(lane, 6, 6).notes.map((note) => note.start), [6]);
+  // Float noise at an edge does not move a note across it: just before the first cycle is the first cycle, just before the
+  // cycle after the last is that cycle.
+  assert.deepEqual(rangeNotes(rangeLane([2 - 1e-12, 6 - 1e-12]), 2, 5).notes.map((note) => Math.round(note.start)), [2]);
+});
+
+test('rangeNotes: a lane with no notes in the range gives no notes and more 0', () => {
+  assert.deepEqual(rangeNotes(rangeLane([]), 0, 31), { notes: [], more: 0 });
+  assert.deepEqual(rangeNotes(rangeLane([10, 11]), 0, 3), { notes: [], more: 0 });
+});
+
+test('rangeNotes: notes at the same start come lower pitch first, and the order is start then pitch', () => {
+  const lane = {
+    ...rangeLane([]),
+    events: [
+      { begin: 3, end: 3.5, value: { note: 'g3' } },
+      { begin: 2, end: 2.5, value: { note: 'e3' } },
+      { begin: 2, end: 2.5, value: { note: 'c3' } },
+      { begin: 2, end: 2.5, value: { s: 'bd' } },
+      { begin: 3, end: 3.5, value: { note: 40 } },
+    ],
+  };
+  const { notes } = rangeNotes(lane, 2, 3);
+  assert.deepEqual(notes.map((note) => [note.start, note.note ?? note.sound]), [[2, 'c3'], [2, 'e3'], [2, 'bd'], [3, 40], [3, 'g3']]);
+});
+
+test('rangeNotes: 40 notes give 32 and more 8, the first 32 in order', () => {
+  const lane = rangeLane(Array.from({ length: 40 }, (_, at) => 2 + at / 20));
+  const { notes, more } = rangeNotes(lane, 2, 5);
+  assert.equal(notes.length, MAX_MOMENT_NOTES);
+  assert.equal(more, 8);
+  assert.deepEqual(notes.map((note) => note.start), lane.events.slice(0, 32).map((event) => event.begin));
+});
+
+test('rangeNotes: a MIDI lane keeps its instrument and a drum lane names the drums, like the moment', () => {
+  const midi = rangeLane([2], { midi: true, instrument: 'jx ch 1', events: [{ begin: 2, end: 2.5, value: { note: 'c3', velocity: 0.5 } }] });
+  assert.deepEqual(rangeNotes(midi, 2, 2).notes, [{ track: 't1', instrument: 'jx ch 1', note: 'c3', velocity: 0.5, start: 2, end: 2.5 }]);
+  const drums = rangeLane([], { drumMap: { name: 'GM', byNote: new Map([[36, 'Kick']]) }, events: [{ begin: 2, end: 2.25, value: { note: 36 } }] });
+  assert.equal(rangeNotes(drums, 2, 2).notes[0].drum, 'Kick');
+});
+
+test('rangeNotes: the input is not changed, and bad input is a loud TypeError', () => {
+  const lane = rangeLane([3, 2]);
+  const before = JSON.stringify(lane);
+  rangeNotes(lane, 2, 3);
+  assert.equal(JSON.stringify(lane), before);
+  assert.equal(MAX_RANGE_CYCLES, 32);
+  assert.throws(() => rangeNotes(null, 0, 1), TypeError);
+  assert.throws(() => rangeNotes({ track: 't' }, 0, 1), TypeError);
+  assert.throws(() => rangeNotes(lane, -1, 1), TypeError);
+  assert.throws(() => rangeNotes(lane, 1.5, 3), TypeError);
+  assert.throws(() => rangeNotes(lane, 3, 2), TypeError);
+  assert.throws(() => rangeNotes(lane, 0, 32), TypeError);
+  assert.doesNotThrow(() => rangeNotes(lane, 0, 31));
+});
+
+test('a range covering the whole page is never longer than the most cycles a range may cover', () => {
+  // The edit view clamps a range to the cycles of the page; the notes of a range and the server limit it to MAX_RANGE_CYCLES.
+  assert.ok(PAGE_CYCLES <= MAX_RANGE_CYCLES);
 });

@@ -11,6 +11,9 @@ import { REFUSAL_REASONS } from '../page/mixer-rewrite.js';
 import { fill } from '../page/midi-plan.js';
 import { rigFromReadFailure, withBuildMismatch } from '../page/midi-rig.js';
 import { gainToPosition } from '../page/mixer-registry.js';
+import { HELPER_TEXT, readStructure } from '../page/structure.js';
+import { extractTracks, labelKey } from '../page/tracks.js';
+import { createLights, lightLayout } from '../page/lights.js';
 
 const colorOf = (identity) => (identity === 'label:hats' ? 2 : 1);
 const build = (code) => buildMixerModel({ code, parse, colorOf });
@@ -273,7 +276,7 @@ test('MIXER_COPY holds the mute and solo strings', () => {
   assert.equal(MIXER_COPY.mute, 'Mute');
   assert.equal(MIXER_COPY.solo, 'Solo');
   assert.equal(MIXER_COPY.soloByName, 'Starts with a capital S — Strudel plays this track alone.');
-  assert.equal(MIXER_COPY.soloNeedsLabel, 'Solo needs a label — ask Claude to name this track.');
+  assert.equal(MIXER_COPY.soloNeedsLabel, 'Solo and the light need a label — ask Claude to name this track.');
 });
 
 test('mixerHistoryLabel names mute and solo presses', () => {
@@ -327,6 +330,44 @@ test('an unlabeled track has S disabled with its reason and M enabled; a $ track
   const dollar = build('$: s("bd")').strips[0];
   assert.equal(dollar.solo.disabled, false);
   assert.equal(dollar.mute.disabled, false);
+});
+
+test('lightKey is the identity of a labeled track, $ and its number for a $ track, and null for a track without a label', () => {
+  const keys = (code) => build(code).strips.map((strip) => strip.lightKey);
+  assert.deepEqual(keys('t1: s("bd")\nS_t2: s("hh")'), ['label:t1', 'label:t2']);
+  // The tag counts $ statements in code order from 0, and a statement an underscore silences is not counted.
+  const dollars = build('$: s("bd")\n_$: s("hh")\n$: s("sd")');
+  assert.deepEqual(dollars.strips.map((strip) => strip.lightKey).filter((key) => key.startsWith('$')), ['$0', '$1']);
+  assert.equal(dollars.strips.length, 3);
+  assert.equal(dollars.strips[1].lightKey, dollars.strips[1].identity, 'a silenced $ statement keeps a key no note names');
+  assert.deepEqual(keys('stack(s("bd"), s("hh"))'), [null, null]);
+  assert.deepEqual(keys('s("bd")'), [null]);
+  // A mute or a solo mark never changes the key.
+  assert.deepEqual(keys('_t1: s("bd")'), ['label:t1']);
+});
+
+test('a muted copy next to a track of the same base name shares its light key, and only the audible track blinks', () => {
+  for (const code of ['hats_: s("hh*8")\nhats: s("hh*4")', 'hats: s("hh*4")\nhats_: s("hh*8")', 'S_hats: s("hh*4")\nhats_: s("hh*8")']) {
+    const model = build(code);
+    // The note tag reports the audible track under labelKey of its label, which is the key of both strips.
+    assert.deepEqual(model.strips.map((strip) => strip.lightKey), ['label:hats', 'label:hats'], code);
+    assert.equal(labelKey('hats'), 'label:hats');
+    assert.equal(new Set(model.strips.map((strip) => strip.identity)).size, 2, 'the identities stay unique');
+    const audible = model.strips.find((strip) => strip.sounding);
+    const dark = model.strips.find((strip) => !strip.sounding);
+    const lights = createLights();
+    lights.setLayout(lightLayout(model, { webMidi: true }));
+    lights.noteSeen('label:hats', { at: 100 });
+    const changes = lights.frame(100, { motion: 'on', cps: 1, toPerf: (target) => target * 1000 });
+    assert.deepEqual(changes, [{ kind: 'track', id: audible.identity, value: 1 }], `${code}: only the audible strip lights`);
+    assert.notEqual(dark.identity, audible.identity);
+  }
+});
+
+test('the light titles and the unlabeled-track sentence are pinned', () => {
+  assert.equal(MIXER_COPY.lightTrackTitle, 'Blinks when {name} plays a note');
+  assert.equal(MIXER_COPY.lightGroupTitle, 'Blinks when any track of {group} plays a note');
+  assert.equal(MIXER_COPY.soloNeedsLabel, 'Solo and the light need a label — ask Claude to name this track.');
 });
 
 test('a hushed unlabeled track shows M pressed and does not sound', () => {
@@ -1106,6 +1147,64 @@ test('a MIDI strip rooted in a constant says it is built from shared code', () =
   assert.equal(plain.sharedRootText, null);
 });
 
+/** A song piece whose play() is the page's canonical helper (or `helper` instead), t1 played with play() and kick built from a constant. */
+function playPiece({ helper = HELPER_TEXT, midi = '' } = {}) {
+  return [
+    "const harmony = 'C3:major';",
+    "const song = { shift: 0, sections: [['x', 2]], plan: { x: { t1: 'va' } } };",
+    helper,
+    "const t1 = { va: note('c3') };",
+    "const base = note('d3');",
+    `t1: play('t1', t1)${midi}`,
+    'kick: base.fast(2)',
+  ].join('\n');
+}
+const readingOf = (code) => readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+const buildWithSong = (code, rig) => buildMixerModel({ code, parse, colorOf, song: readingOf(code), ...(rig === undefined ? {} : { rig }) });
+
+test('a track written with play() shows no shared-code line when play is the song helper, a track built from another constant still does', () => {
+  const code = playPiece();
+  assert.equal(readingOf(code).helper, 'canonical');
+  const byName = Object.fromEntries(buildWithSong(code).strips.map((strip) => [strip.name, strip]));
+  assert.equal(byName.t1.sharedRoot, false);
+  assert.equal(byName.t1.sharedRootText, null);
+  assert.equal(byName.t1.sharedRootTitle, null);
+  assert.equal(byName.t1.editable, true);
+  assert.equal(byName.kick.sharedRoot, true);
+  assert.equal(byName.kick.sharedRootText, MIXER_COPY.sharedRoot);
+});
+
+test('a track written with play() keeps the shared-code line when the helper was changed, is missing, or the song is not read', () => {
+  const changed = playPiece({ helper: HELPER_TEXT.replace('throw new Error(', 'throw new TypeError(') });
+  assert.equal(readingOf(changed).helper, 'changed');
+  assert.equal(buildWithSong(changed).strips.find((strip) => strip.name === 't1').sharedRootText, MIXER_COPY.sharedRoot);
+  // The user's own play() with no song at all is some other function: the line stays.
+  const own = "const play = (name, track) => track.va;\nconst t1 = { va: note('c3') };\nt1: play('t1', t1).gain(0)";
+  assert.equal(build(own).strips[0].sharedRoot, true);
+  assert.equal(build(own).strips[0].sharedRootText, MIXER_COPY.sharedRoot);
+  assert.equal(buildMixerModel({ code: own, parse, colorOf, song: { state: 'none' } }).strips[0].sharedRoot, true);
+  // A song the page cannot read still has the canonical helper, so the line stays off there.
+  const unreadable = playPiece().replace("sections: [['x', 2]]", "sections: [['x', 1 + 1]]");
+  assert.equal(readingOf(unreadable).state, 'unreadable');
+  assert.equal(buildWithSong(unreadable).strips.find((strip) => strip.name === 't1').sharedRoot, false);
+  const missing = playPiece({ helper: '' }).replace("plan: { x: { t1: 'va' } } };", "plan: { x: { t1: 'va' } } };\nconst play = (name, track) => track.va;");
+  assert.notEqual(readingOf(missing).helper, 'canonical');
+  assert.equal(buildWithSong(missing).strips.find((strip) => strip.name === 't1').sharedRoot, true);
+});
+
+test('a MIDI strip written with play() shows no shared-code line when play is the song helper, and keeps it when the helper was changed', () => {
+  const midi = ".midi('Port A', { midichannel: 3, controls: { volume: 90 } })";
+  const canonical = buildWithSong(playPiece({ midi }), RIG).strips.find((strip) => strip.name === 't1');
+  assert.notEqual(canonical.midi, null);
+  assert.equal(canonical.sharedRoot, false);
+  assert.equal(canonical.sharedRootText, null);
+  assert.equal(canonical.sharedRootTitle, null);
+  const changed = buildWithSong(playPiece({ helper: HELPER_TEXT.replace('throw new Error(', 'throw new TypeError('), midi }), RIG).strips.find((strip) => strip.name === 't1');
+  assert.notEqual(changed.midi, null);
+  assert.equal(changed.sharedRoot, true);
+  assert.equal(changed.sharedRootText, MIXER_COPY.sharedRoot);
+});
+
 test('a track with a post-gain set inside it or in its shared code gets a refused fader', () => {
   const code = [
     'const beat = s("bd").postgain(.5)',
@@ -1427,14 +1526,14 @@ test('a member whose controls are not plain gives its reason to every member of 
   }
 });
 
-test('the group is the port and the channel: another channel or another port is another group', () => {
+test('channel mates share a port and a channel: another channel or another port means other tracks', () => {
   const otherPort = { setup: 'valid', instruments: [instrumentWith(MT32_CONTROLS), { ...instrumentWith(MT32_CONTROLS), id: 'sc55', port: 'Port B' }] };
   const model = buildWithRig(`${KICK}\nlead: note("c3").midi('Port A', { midichannel: 3 })\nbell: note("c5").midi('Port B', { midichannel: 10 })`, otherPort);
   for (const identity of ['label:kick', 'label:lead', 'label:bell']) assert.deepEqual(sharedStrip(model, identity).midi.sharedWith, [], identity);
   // Without a rig the port is the key, so two tracks on the same port and channel still share.
   const noRig = buildWithRig(`${KICK}\n${HAT}`, { setup: 'absent' });
   assert.deepEqual(sharedStrip(noRig, 'label:kick').midi.sharedWith, ['hat']);
-  // A track whose channel the page cannot read is in no group.
+  // A track whose channel the page cannot read has no channel mates.
   const unreadable = buildWithRig(`${KICK}\nhat: note("f#2*8").midi('Port A', { midichannel: ch })`);
   assert.deepEqual(sharedStrip(unreadable, 'label:kick').midi.sharedWith, []);
 });
@@ -1526,4 +1625,268 @@ test('the empty and unreadable models are as before and carry no line', () => {
   assert.equal(noNotesModel('').noNotesText, undefined);
   assert.equal(noNotesModel('pad: note("c3"').noNotesText, undefined);
   assert.equal(noNotesModel('setcps(1)').noNotesText, undefined);
+});
+
+// --- The groups of a song and the index of every strip ---
+
+const SONG_PIECE = [
+  "const harmony = 'C3:major';",
+  "const song = { shift: 0, sections: [['x', 3]], groups: { g1: ['t1', 't2'], g2: { g3: ['t3'] } }, plan: { x: { t1: 'va', t2: 'va', t3: 'va' } } };",
+  HELPER_TEXT,
+  "const t1 = { va: note('c3') };",
+  "const t2 = { va: note('d3') };",
+  "const t3 = { va: note('e3') };",
+  "t1: play('t1', t1)\nt2: play('t2', t2)\nt3: play('t3', t3)",
+  "t4: note('c3').gain(0)",
+].join('\n');
+
+const songOf = (code) => readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+
+test('a ready model with a song has a layout with the words of each group', () => {
+  const model = buildMixerModel({ code: SONG_PIECE, parse, colorOf, song: songOf(SONG_PIECE), folds: new Set() });
+  assert.equal(model.status, 'ready');
+  const [g1, g2, g3] = model.layout.groups;
+  assert.deepEqual(
+    [g1.text, g1.title, g1.label, g1.foldTitle, g1.count, g1.countText],
+    ['g1', 'g1', 'Group g1', "Fold 'g1'", 2, '2 tracks'],
+  );
+  assert.equal(g3.countText, '1 track');
+  assert.equal(g3.label, 'Group g3');
+  assert.equal(g2.members.length, 1);
+});
+
+test('a folded group offers to open, in the grid\'s words', () => {
+  const model = buildMixerModel({ code: SONG_PIECE, parse, colorOf, song: songOf(SONG_PIECE), folds: new Set(['["g1"]']) });
+  assert.equal(model.layout.groups[0].open, false);
+  assert.equal(model.layout.groups[0].foldTitle, "Open 'g1'");
+});
+
+test('a long group name is cut in its sentences and kept whole in its title', () => {
+  const name = 'n'.repeat(60);
+  const code = SONG_PIECE.replace('g1:', `${name}:`);
+  const model = buildMixerModel({ code, parse, colorOf, song: songOf(code), folds: new Set() });
+  const group = model.layout.groups[0];
+  assert.equal(group.title, name);
+  assert.equal(group.text, `${'n'.repeat(39)}\u2026`);
+  assert.equal(group.label, `Group ${'n'.repeat(39)}\u2026`);
+  assert.equal(group.foldTitle, `Fold '${'n'.repeat(39)}\u2026'`);
+});
+
+test('without a song the layout is null, and the empty and unreadable models keep their shapes', () => {
+  assert.equal(build(SONG_PIECE).layout, null);
+  assert.equal(buildMixerModel({ code: SONG_PIECE, parse, colorOf, song: { state: 'none' } }).layout, null);
+  assert.deepEqual(build(''), { status: 'empty', strips: [], buses: [], busMemory: new Map() });
+  assert.equal(build('drums: s("bd"').status, 'unreadable');
+  assert.equal(Object.hasOwn(build('drums: s("bd"'), 'layout'), false);
+});
+
+test('every strip has the index of its track', () => {
+  const model = buildMixerModel({ code: SONG_PIECE, parse, colorOf, song: songOf(SONG_PIECE) });
+  const tracks = extractTracks(SONG_PIECE, { parse });
+  assert.deepEqual(model.strips.map((strip) => [strip.identity, strip.index]), tracks.map((track) => [track.identity, track.index]));
+  assert.deepEqual(model.strips.map((strip) => strip.index), [0, 1, 2, 3]);
+});
+
+// --- Mute and solo on a group ---
+
+/** A structured piece whose group g1 holds t1 to t3 (each written as `lines` say) and g2 holds `Snare`. */
+function groupPiece(lines, groups = "{ g1: ['t1', 't2', 't3'], g2: ['Snare'] }") {
+  return [
+    "const harmony = 'C3:major';",
+    `const song = { shift: 0, sections: [['x', 3]], groups: ${groups}, plan: { x: { t1: 'va', t2: 'va', t3: 'va', Snare: 'va' } } };`,
+    HELPER_TEXT,
+    ...['t1', 't2', 't3', 'Snare'].map((name) => `const ${name} = { va: note('c3') };`),
+    lines,
+  ].join('\n');
+}
+const PLAIN_LINES = "t1: play('t1', t1)\nt2: play('t2', t2)\nt3: play('t3', t3)\nSnare: play('Snare', Snare)";
+const groupsOf = (code) => buildMixerModel({ code, parse, colorOf, song: songOf(code), folds: new Set() }).layout.groups;
+
+test('the group copy is the pinned text and never blames the person', () => {
+  const pinned = {
+    groupMuteName: 'Mute {group}',
+    groupMuteNamePartial: 'Mute {group}, {k} of {n} tracks muted',
+    groupSoloName: 'Solo {group}',
+    groupSoloNamePartial: 'Solo {group}, {k} of {n} tracks soloed',
+    groupMuteTitle: 'Mute {tracks}',
+    groupUnmuteTitle: 'Unmute {tracks}',
+    groupMutePartialTitle: '{k} of {n} tracks muted. A click mutes all {n}.',
+    groupSoloTitle: 'Solo {tracks}',
+    groupEndSoloTitle: 'End the solo of {tracks}',
+    groupSoloPartialTitle: '{k} of {n} tracks soloed. A click solos all {n}.',
+    groupCountMuted: '{k} of {n} muted',
+    groupCountSolo: '{k} of {n} solo',
+    groupCountBoth: '{k} of {n} muted, {j} of {n} solo',
+    groupSkipOne: "Skips 1 track the mixer can't change.",
+    groupSkipMany: "Skips {n} tracks the mixer can't change.",
+    groupEmpty: 'No track of this group is in the code.',
+  };
+  for (const [key, text] of Object.entries(pinned)) {
+    assert.equal(MIXER_COPY[key], text, key);
+    assert.doesNotMatch(text, /\b(wrong|error|should|try)\b/i, key);
+  }
+});
+
+test('a group mute or solo records a label that names the group, cut to 40 characters, and an unknown kind still throws', () => {
+  assert.equal(mixerHistoryLabel({ kind: 'group-mute', group: 'drums', on: true }), 'mixer: group drums muted');
+  assert.equal(mixerHistoryLabel({ kind: 'group-mute', group: 'drums', on: false }), 'mixer: group drums unmuted');
+  assert.equal(mixerHistoryLabel({ kind: 'group-solo', group: 'drums', on: true }), 'mixer: group drums solo on');
+  assert.equal(mixerHistoryLabel({ kind: 'group-solo', group: 'drums', on: false }), 'mixer: group drums solo off');
+  assert.equal(mixerHistoryLabel({ kind: 'group-mute', group: 'n'.repeat(60), on: true }), `mixer: group ${'n'.repeat(39)}… muted`);
+  assert.ok(clipMixerLabel(mixerHistoryLabel({ kind: 'group-solo', group: 'n'.repeat(60), on: false })).length <= MAX_MIXER_LABEL_LENGTH);
+  assert.throws(() => mixerHistoryLabel({ kind: 'group-pan', group: 'drums', on: true }), /^Error: Moontide: unknown mixer action/);
+});
+
+test('a group with no track muted or soloed reads as the plain count, with the plain names and titles', () => {
+  const [g1, g2] = groupsOf(groupPiece(PLAIN_LINES));
+  assert.deepEqual([g1.countText, g1.countTitle, g1.noteText], ['3 tracks', '3 tracks', null]);
+  assert.deepEqual(g1.mute, { pressed: false, on: true, identities: ['label:t1', 'label:t2', 'label:t3'], disabled: false, name: 'Mute g1', title: 'Mute 3 tracks' });
+  assert.deepEqual(g1.solo, { pressed: false, on: true, identities: ['label:t1', 'label:t2', 'label:t3'], disabled: false, name: 'Solo g1', title: 'Solo 3 tracks' });
+  // Snare starts with a capital S, so Strudel plays it alone by itself and the mixer never solos it.
+  assert.equal(g2.mute.title, 'Mute 1 track');
+  assert.deepEqual([g2.solo.disabled, g2.solo.title], [true, 'Solo']);
+  const [one] = groupsOf(groupPiece(PLAIN_LINES, "{ g1: ['t1'] }"));
+  assert.deepEqual([one.mute.title, one.solo.title, one.countText], ['Mute 1 track', 'Solo 1 track', '1 track']);
+});
+
+test('a group with some tracks muted is mixed: the count line, the title and the accessible name say how many', () => {
+  const [g1] = groupsOf(groupPiece(PLAIN_LINES.replace('t1: play', '_t1: play')));
+  assert.deepEqual([g1.mute.pressed, g1.mute.on, g1.mute.disabled], ['mixed', true, false]);
+  assert.equal(g1.mute.name, 'Mute g1, 1 of 3 tracks muted');
+  assert.equal(g1.mute.title, '1 of 3 tracks muted. A click mutes all 3.');
+  assert.deepEqual([g1.countText, g1.countTitle], ['1 of 3 muted', '1 of 3 muted']);
+  assert.deepEqual([g1.solo.pressed, g1.solo.name, g1.solo.title], [false, 'Solo g1', 'Solo 3 tracks']);
+});
+
+test('a group with some tracks soloed is mixed the same way, with the solo words', () => {
+  const [g1] = groupsOf(groupPiece(PLAIN_LINES.replace('t2: play', 'S_t2: play').replace('t1: play', 'S_t1: play')));
+  assert.equal(g1.solo.pressed, 'mixed');
+  assert.equal(g1.solo.name, 'Solo g1, 2 of 3 tracks soloed');
+  assert.equal(g1.solo.title, '2 of 3 tracks soloed. A click solos all 3.');
+  assert.equal(g1.countText, '2 of 3 solo');
+});
+
+test('a group partly muted and partly soloed reads both in one count line', () => {
+  const [g1] = groupsOf(groupPiece(PLAIN_LINES.replace('t1: play', '_t1: play').replace('t2: play', 'S_t2: play')));
+  assert.deepEqual([g1.mute.pressed, g1.solo.pressed], ['mixed', 'mixed']);
+  assert.equal(g1.countText, '1 of 3 muted, 1 of 3 solo');
+  assert.equal(g1.countTitle, g1.countText);
+});
+
+test('a group with every track muted is pressed and offers to unmute, and the same for solo', () => {
+  const [g1] = groupsOf(groupPiece(PLAIN_LINES.replace('t1: play', '_t1: play').replace('t2: play', '_t2: play').replace('t3: play', '_t3: play')));
+  assert.deepEqual([g1.mute.pressed, g1.mute.on, g1.mute.title, g1.mute.name], [true, false, 'Unmute 3 tracks', 'Mute g1']);
+  assert.equal(g1.countText, '3 tracks');
+  const [soloed] = groupsOf(groupPiece(PLAIN_LINES.replace('t1: play', 'S_t1: play').replace('t2: play', 'S_t2: play').replace('t3: play', 'S_t3: play')));
+  assert.deepEqual([soloed.solo.pressed, soloed.solo.on, soloed.solo.title], [true, false, 'End the solo of 3 tracks']);
+});
+
+test('a track with a native capital S name is skipped by solo, kept by mute, and counted in the note', () => {
+  const [g1, g2] = groupsOf(groupPiece(PLAIN_LINES, "{ g1: ['t1', 't2', 'Snare'], g2: ['t3'] }"));
+  assert.deepEqual([g1.mute.identities, g1.solo.identities, g1.solo.disabled], [['label:t1', 'label:t2', 'label:Snare'], ['label:t1', 'label:t2'], false]);
+  assert.equal(g1.noteText, "Skips 1 track the mixer can't change.");
+  assert.equal(g2.noteText, null);
+  const [lone] = groupsOf(groupPiece(PLAIN_LINES, "{ g2: ['Snare'] }"));
+  assert.deepEqual([lone.solo.disabled, lone.solo.identities, lone.mute.disabled], [true, [], false]);
+  assert.equal(lone.noteText, "Skips 1 track the mixer can't change.");
+});
+
+test('the note counts the tracks left out and the empty group says it has no track', () => {
+  const groups = groupsOf(groupPiece(PLAIN_LINES, "{ g1: ['t1', 't2', 't3'], g2: [], g3: ['Snare'] }"));
+  assert.deepEqual(groups.map((group) => group.noteText), [null, 'No track of this group is in the code.', "Skips 1 track the mixer can't change."]);
+  const empty = groups[1];
+  assert.deepEqual([empty.mute.disabled, empty.solo.disabled, empty.mute.identities, empty.countText], [true, true, [], '0 tracks']);
+  assert.deepEqual([empty.mute.title, empty.solo.title, empty.mute.pressed, empty.mute.name], ['Mute', 'Solo', false, 'Mute g2']);
+});
+
+test('a group mute that is set while the other tracks are muted by .hush() still counts them as muted', () => {
+  const [g1] = groupsOf(groupPiece(PLAIN_LINES.replace("t1: play('t1', t1)", "t1: play('t1', t1).hush()")));
+  assert.equal(g1.mute.pressed, 'mixed');
+  assert.equal(g1.countText, '1 of 3 muted');
+});
+
+test('names in the group words stay the written text: a 60-character name is cut to 40 in the names and titles', () => {
+  const long = 'n'.repeat(60);
+  const [group] = groupsOf(groupPiece(PLAIN_LINES, `{ ${long}: ['t1', 't2'] }`));
+  assert.equal(group.mute.name, `Mute ${'n'.repeat(39)}…`);
+  assert.equal(group.solo.name, `Solo ${'n'.repeat(39)}…`);
+});
+
+test('the note says how many tracks are left out when there are several', () => {
+  const code = [
+    "const harmony = 'C3:major';",
+    "const song = { shift: 0, sections: [['x', 3]], groups: { g1: ['t1', 'Snare', 'Sub'] }, plan: { x: { t1: 'va', Snare: 'va', Sub: 'va' } } };",
+    HELPER_TEXT,
+    ...['t1', 'Snare', 'Sub'].map((name) => `const ${name} = { va: note('c3') };`),
+    "t1: play('t1', t1)\nSnare: play('Snare', Snare)\nSub: play('Sub', Sub)",
+  ].join('\n');
+  const [g1] = groupsOf(code);
+  assert.equal(g1.noteText, "Skips 2 tracks the mixer can't change.");
+  assert.deepEqual(g1.solo.identities, ['label:t1']);
+  assert.equal(g1.solo.title, 'Solo 1 track');
+  assert.equal(g1.mute.title, 'Mute 3 tracks');
+});
+
+// --- The structure never changes a strip ---
+
+/** A structured piece of `count` tracks, the first half in g1 and the rest in g2 > g3, each played with play(). */
+function bigPiece(count, trackLine = (name) => `${name}: play('${name}', ${name})`) {
+  const names = Array.from({ length: count }, (_, i) => `t${i + 1}`);
+  const half = Math.ceil(count / 2);
+  const list = (items) => `[${items.map((name) => `'${name}'`).join(', ')}]`;
+  const groups = `{ g1: ${list(names.slice(0, half))}, g2: { g3: ${list(names.slice(half))} } }`;
+  return [
+    "const harmony = 'C3:major';",
+    `const song = { shift: 0, sections: [['x', 3]], groups: ${groups}, plan: { x: { ${names.map((name) => `${name}: 'va'`).join(', ')} } } };`,
+    HELPER_TEXT,
+    ...names.map((name) => `const ${name} = { va: note('c3') };`),
+    ...names.map(trackLine),
+  ].join('\n');
+}
+
+/**
+ * The model of `code` with the song reading and a fold, and without its groups (the same reading with no group, which keeps what
+ * the reading says about the helper, so a play() strip reads the same either way).
+ */
+function withAndWithoutSong(code, rig = undefined) {
+  const extra = rig === undefined ? {} : { rig };
+  const withSong = buildMixerModel({ code, parse, colorOf, ...extra, song: songOf(code), folds: new Set(['["g1"]']) });
+  const plain = buildMixerModel({ code, parse, colorOf, ...extra, song: { ...songOf(code), groups: [] } });
+  return { withSong, plain };
+}
+
+test('the song only places strips: every strip, bus and note of the model is the same with and without it', () => {
+  const pieces = [
+    groupPiece(`${PLAIN_LINES}\nloose: note('c3').room(0.3).gain(0.4)`),
+    bigPiece(12),
+    bigPiece(4, (name) => `${name}: play('${name}', ${name}).lpf(800).room(0.2).postgain(0.5)`),
+  ];
+  for (const code of pieces) {
+    const { withSong, plain } = withAndWithoutSong(code);
+    assert.equal(withSong.status, 'ready');
+    assert.notEqual(withSong.layout, null);
+    assert.equal(plain.layout, null);
+    assert.deepEqual(withSong.strips, plain.strips);
+    assert.deepEqual(withSong.buses, plain.buses);
+    assert.deepEqual(withSong.busMemory, plain.busMemory);
+    assert.equal(withSong.noNotesText, plain.noNotesText);
+  }
+});
+
+test('a MIDI strip in a structured piece is the same with and without the song', () => {
+  const code = bigPiece(3, (name) => (name === 't2' ? `t2: play('t2', t2).midi('Port A', { midichannel: 3, controls: { volume: 90 } })` : `${name}: play('${name}', ${name})`));
+  const { withSong, plain } = withAndWithoutSong(code, RIG);
+  const midi = withSong.strips.find((strip) => strip.identity === 'label:t2');
+  assert.notEqual(midi.midi, null);
+  assert.deepEqual(withSong.strips, plain.strips);
+  assert.equal(midi.sharedRoot, false);
+});
+
+test('a structured piece whose song names no groups has no layout and the same strips', () => {
+  const code = groupPiece(PLAIN_LINES).replace(/groups: \{[^\n]*?\}, plan/, 'plan');
+  assert.doesNotMatch(code, /groups:/);
+  const { withSong, plain } = withAndWithoutSong(code);
+  assert.equal(withSong.status, 'ready');
+  assert.equal(withSong.layout, null);
+  assert.deepEqual(withSong.strips, plain.strips);
 });

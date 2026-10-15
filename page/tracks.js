@@ -365,6 +365,17 @@ export function parseLabel(label) {
 }
 
 /**
+ * The identity of a labeled track that has no `$` in its label: `label:` and the label without
+ * its mute underscore and solo marker, or the raw label when the mixer cannot read it. The
+ * mixer and the note tag both use this one rule, so a note is always reported under the same
+ * key as the strip it belongs to.
+ */
+export function labelKey(label) {
+  const parsed = parseLabel(label);
+  return `label:${parsed.safe ? parsed.base : label}`;
+}
+
+/**
  * Every labeled statement in the code, in source order (after the last-statement-wins dedup
  * above). A track is `{ index, kind: 'label', label, name, identity, muted, start, end, ... }`:
  * - `label` is the label text verbatim; `name` is the label text too (a `$` label's `name` comes
@@ -407,7 +418,7 @@ function buildLabelTracks(statements, topLevelDecls) {
       kind: 'label',
       label,
       name: isDollar ? displayNameFromSound(expression) : label,
-      identity: isDollar ? structuralIdentity(expression) : `label:${baseLabel}`,
+      identity: isDollar ? structuralIdentity(expression) : labelKey(label),
       baseLabel,
       hushed,
       ownMuted,
@@ -650,13 +661,10 @@ export function soloSource(code, trackIndex, { parse }) {
   const edits = [];
   collectStringEdits(ast, edits);
 
-  const declarationTexts = [];
   const allCalls = [];
   let lastEachCall = null;
   for (const statement of ast.body) {
-    if (statement.type === 'VariableDeclaration' || statement.type === 'FunctionDeclaration' || statement.type === 'ClassDeclaration') {
-      declarationTexts.push(applyEdits(code, edits, statement.start, statement.end));
-    } else if (topLevelCallNamed(statement, 'all')) {
+    if (topLevelCallNamed(statement, 'all')) {
       allCalls.push(statement.expression);
     } else if (topLevelCallNamed(statement, 'each')) {
       lastEachCall = statement.expression;
@@ -701,10 +709,31 @@ export function soloSource(code, trackIndex, { parse }) {
     wrapped = wrapEachAll(applyEdits(code, [...keptEdits, ...silenceEdits], programExpr.start, programExpr.end));
   }
 
+  return `${preludeOf(code, ast, edits)}return (${wrapped});`;
+}
+
+/** True for a top-level statement that declares a name: a variable, a function or a class. */
+function isDeclaration(statement) {
+  return statement.type === 'VariableDeclaration' || statement.type === 'FunctionDeclaration' || statement.type === 'ClassDeclaration';
+}
+
+/** The prelude text for an already parsed program and its string edits. */
+function preludeOf(code, ast, edits) {
   let body = '"use strict";\n';
-  for (const declarationText of declarationTexts) {
-    body += declarationText + '\n';
+  for (const statement of ast.body) {
+    if (isDeclaration(statement)) body += applyEdits(code, edits, statement.start, statement.end) + '\n';
   }
-  body += `return (${wrapped});`;
   return body;
+}
+
+/**
+ * The text every solo program starts with, and the declared-against-played check starts with too: "use strict"; and every
+ * top-level declaration in source order, each followed by a newline, with the same string rewrites soloSource applies.
+ * Evaluated, it defines the code's own constants and helper functions and nothing else runs.
+ */
+export function soloPrelude(code, { parse }) {
+  const ast = parse(code, PARSE_OPTIONS);
+  const edits = [];
+  collectStringEdits(ast, edits);
+  return preludeOf(code, ast, edits);
 }

@@ -9,7 +9,10 @@
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parse } from 'acorn';
 import { resolveDataDir, HISTORY_FILE_NAME } from '../dist/history.js';
+import { readStructure, HELPER_TEXT } from '../page/structure.js';
+import { extractTracks } from '../page/tracks.js';
 
 function fail(message) {
   const err = new Error(message.startsWith('tint:report:') ? message : `tint:report: ${message}`);
@@ -166,6 +169,14 @@ export function demoLines(markdownTexts) {
   return lines;
 }
 
+const HELPER_LINES = new Set(HELPER_TEXT.split('\n').map((line) => line.trim()));
+
+/** `lines` without the lines of the song-structure helper, which a structured piece carries as written by design
+ * and which therefore say nothing about tint. Every other line stays. */
+export function withoutHelperLines(lines) {
+  return lines.filter((line) => !HELPER_LINES.has(line));
+}
+
 /** The subset of `lines` that appear verbatim (as a substring) in `code`. */
 export function reusedDemoLines(code, lines) {
   return lines.filter((line) => code.includes(line));
@@ -214,8 +225,123 @@ export function identicalLines(a, b) {
   return count;
 }
 
+/** The deepest nesting of the groups the page read: 0 without groups, 1 for groups that hold no group, and so on.
+ * Walked without recursion. */
+function groupDepth(groups) {
+  let deepest = 0;
+  const stack = groups.map((group) => ({ group, depth: 1 }));
+  while (stack.length > 0) {
+    const { group, depth } = stack.pop();
+    if (depth > deepest) deepest = depth;
+    for (const item of group.items) {
+      if (item.group) stack.push({ group: item.group, depth: depth + 1 });
+    }
+  }
+  return deepest;
+}
+
+/**
+ * What the page's own reader makes of the song structure in `code`, as plain numbers:
+ * - `{ state: 'none' }` for a piece without a structure;
+ * - `{ state: 'unreadable', reason }` for a structure the page cannot read (`reason` is the reader's reason id, or
+ *   'parse' when the code does not parse);
+ * - `{ state: 'read', lengths, tracks, kinds: { other, degrees, fixed }, rests, groupDepth, sectionHarmonies,
+ *   sectionNames, helper, signature }`. `kinds` counts the distinct variations the plan uses, by kind; `rests` counts
+ *   the rest cells; `sectionHarmonies` counts the sections with a harmony of their own; `signature` is the lengths
+ *   joined by commas, a bar and the track count, the shape of the piece.
+ */
+export function structureMetrics(code) {
+  let reading;
+  try {
+    reading = readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
+  } catch (err) {
+    // Only code that does not parse counts as 'parse'; any other error is a bug in the reader and must show.
+    if (err instanceof SyntaxError) return { state: 'unreadable', reason: 'parse' };
+    throw err;
+  }
+  if (reading.state === 'none') return { state: 'none' };
+  if (reading.state === 'unreadable') return { state: 'unreadable', reason: reading.reason };
+  const lengths = reading.sections.map((section) => section.length);
+  const kinds = { other: 0, degrees: 0, fixed: 0 };
+  let rests = 0;
+  for (const track of reading.tracks) {
+    const used = new Map();
+    for (const cell of track.cells) {
+      if (cell.kind === 'rest') rests += 1;
+      else used.set(cell.key, cell.kind);
+    }
+    for (const kind of used.values()) kinds[kind] += 1;
+  }
+  return {
+    state: 'read',
+    lengths,
+    tracks: reading.tracks.length,
+    kinds,
+    rests,
+    groupDepth: groupDepth(reading.groups),
+    sectionHarmonies: reading.sections.filter((section) => section.harmony.from === 'own').length,
+    sectionNames: [...new Set(reading.sections.map((section) => section.name))],
+    helper: reading.helper,
+    signature: `${lengths.join(',')}|${reading.tracks.length}`,
+  };
+}
+
+/** The `  structure:` line of one version in the report. */
+export function structureLine(metrics) {
+  if (metrics.state === 'none') return '  structure: none';
+  if (metrics.state === 'unreadable') return `  structure: unreadable (${metrics.reason})`;
+  const { other, degrees, fixed } = metrics.kinds;
+  const variations = other + degrees + fixed;
+  return (
+    `  structure: ${metrics.lengths.length} sections (${metrics.lengths.join(', ')}), ${metrics.tracks} tracks, ` +
+    `${variations} variations (other ${other}, degrees ${degrees}, fixed ${fixed}), ${metrics.rests} rests, ` +
+    `groups depth ${metrics.groupDepth}, ${metrics.sectionHarmonies} section harmonies, helper ${metrics.helper}`
+  );
+}
+
+/** The shapes of the examples in the structure topic: the signature of each js block that reads as a structure once the
+ * helper lines are in place (a block may carry a comment line where they go). */
+export function structureTopicSignatures(markdown) {
+  const signatures = [];
+  const re = new RegExp(JS_FENCE_RE);
+  let match;
+  while ((match = re.exec(markdown))) {
+    const code = match[1].replace(/^\/\/ \(the helper lines of the first block go here\)$/m, HELPER_TEXT);
+    const metrics = structureMetrics(code);
+    if (metrics.state === 'read') signatures.push(metrics.signature);
+  }
+  return signatures;
+}
+
+/**
+ * The lines that close the structure block across the selected versions: how many are structured, each distinct shape
+ * with its count, the highest share of one shape, how many equal a shape of the structure topic, and the section names
+ * that appear in more than one version. `metricsList` is one structureMetrics result per version.
+ */
+export function structureSummary(metricsList, topicSignatures) {
+  const read = metricsList.filter((metrics) => metrics.state === 'read');
+  const unreadable = metricsList.filter((metrics) => metrics.state === 'unreadable').length;
+  const counts = new Map();
+  for (const metrics of read) counts.set(metrics.signature, (counts.get(metrics.signature) ?? 0) + 1);
+  const shapes = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  const highest = shapes.length === 0 ? 0 : Math.round((shapes[0][1] / read.length) * 100);
+  const topic = new Set(topicSignatures);
+  const sameAsTopic = read.filter((metrics) => topic.has(metrics.signature)).length;
+  const versionsWithName = new Map();
+  for (const metrics of read) {
+    for (const name of metrics.sectionNames) versionsWithName.set(name, (versionsWithName.get(name) ?? 0) + 1);
+  }
+  const repeated = [...versionsWithName.entries()].filter(([, count]) => count > 1).map(([name]) => name).sort();
+  const lines = [`structured: ${read.length} of ${metricsList.length}${unreadable > 0 ? ` (${unreadable} more unreadable)` : ''}`];
+  for (const [signature, count] of shapes) lines.push(`  shape ${signature}: ${count}`);
+  lines.push(`highest share of one shape: ${highest}%`);
+  lines.push(`same shape as a structure-topic example: ${sameAsTopic}`);
+  lines.push(`section names used in more than one version: ${repeated.length > 0 ? repeated.join(', ') : 'none'}`);
+  return lines;
+}
+
 /** Renders the report text (no trailing process concerns): the exact line shapes the CLI prints. */
-export function formatReport({ file, unreadable, versions, ids }) {
+export function formatReport({ file, unreadable, versions, ids, topicSignatures = [] }) {
   const lines = [];
   const suffix = unreadable > 0 ? ` (${unreadable} unreadable lines skipped)` : '';
   lines.push(`Tint report for ${versions.length} versions from ${file}${suffix}`);
@@ -230,6 +356,7 @@ export function formatReport({ file, unreadable, versions, ids }) {
     for (const reusedLine of v.reused) {
       lines.push(`    ${reusedLine}`);
     }
+    lines.push(structureLine(v.structure ?? structureMetrics(v.code)));
   }
   if (ids && ids.length >= 2) {
     lines.push('Similarity (same request):');
@@ -244,6 +371,10 @@ export function formatReport({ file, unreadable, versions, ids }) {
       }
     }
   }
+  lines.push('Structure across versions:');
+  for (const line of structureSummary(versions.map((v) => v.structure ?? structureMetrics(v.code)), topicSignatures)) {
+    lines.push(line);
+  }
   lines.push('Measurement only: nothing in this report is sent to Claude.');
   return lines.join('\n') + '\n';
 }
@@ -257,7 +388,19 @@ function readDemoLines(scriptDir) {
     return [];
   }
   const markdownTexts = files.map((name) => readFileSync(path.join(referenceDir, name), 'utf8'));
-  return demoLines(markdownTexts);
+  return withoutHelperLines(demoLines(markdownTexts));
+}
+
+/** The shapes of the structure topic's examples; a topic file that cannot be read is an error, not zero shapes. */
+export function readTopicSignatures(scriptDir) {
+  const topicPath = path.join(scriptDir, '..', 'reference', 'structure.md');
+  let text;
+  try {
+    text = readFileSync(topicPath, 'utf8');
+  } catch (err) {
+    throw fail(`cannot read the structure topic at ${topicPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return structureTopicSignatures(text);
 }
 
 async function main(argv) {
@@ -310,9 +453,16 @@ async function main(argv) {
     tempo: tempoUsed(v.code),
     flute: hasFlute(v.code, v.label),
     reused: reusedDemoLines(v.code, demo),
+    structure: structureMetrics(v.code),
   }));
 
-  const report = formatReport({ file: historyPath, unreadable, versions: analyzed, ids: args.ids });
+  const report = formatReport({
+    file: historyPath,
+    unreadable,
+    versions: analyzed,
+    ids: args.ids,
+    topicSignatures: readTopicSignatures(scriptDir),
+  });
   process.stdout.write(report);
   process.exitCode = 0;
 }

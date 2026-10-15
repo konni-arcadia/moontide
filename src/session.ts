@@ -280,6 +280,27 @@ export function earlierRuntimeErrorLine(message: string, count: number, versionI
     : `Runtime error from an earlier version (#${versionId}, not the code playing now): ${message}.`;
 }
 
+/** Every structure-note line in a reply starts with this, so no line of the page can start a reply line itself. */
+export const STRUCTURE_NOTE_LEAD = 'Song structure';
+
+/**
+ * Cleans one structure-note line from the page: every run of whitespace, control, format, line and paragraph
+ * separator characters becomes one space, then the text is cleaned like an error detail (trailing periods off, cut at
+ * MAX_DETAIL_CODE_POINTS code points). Returns null for a line with nothing left, which is dropped.
+ */
+export function cleanStructureLine(text: string): string | null {
+  const collapsed = text.replace(/[\s\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, ' ').trim();
+  if (collapsed === '') {
+    return null;
+  }
+  return cleanErrorDetail(collapsed);
+}
+
+/** One structure-note line as it appears in a reply: the fixed lead, the version when it is known, the cleaned sentence. */
+export function structureNoteLine(line: string, versionId: number | null = null): string {
+  return versionId === null ? `${STRUCTURE_NOTE_LEAD}: ${line}.` : `${STRUCTURE_NOTE_LEAD} in #${versionId}: ${line}.`;
+}
+
 /**
  * The note Claude gets, once per distinct report, when a page could not load a script from unpkg.com. The fix is on
  * the user's side, so the note says so: Claude cannot repair a blocked network.
@@ -421,6 +442,9 @@ export class Session {
   // already-counted overflow message, so it's just tallied — this only slightly over-counts
   // the rare tail past MAX_RUNTIME_ERRORS + MAX_DROPPED_RUNTIME_ERRORS distinct messages.
   private droppedRuntimeErrorOverflowCount = 0;
+  // The latest structure note of the active page (see handleStructureNote): one slot, replaced by every note and
+  // emptied by the drain. The lines are already cleaned; the version id is looked up at drain time.
+  private structureNote: { tag: string | null; lines: string[] } | null = null;
   // True once a stop is confirmed by the page; cleared by the next
   // successful evaluate() reply from the active page.
   private stopped = false;
@@ -765,6 +789,10 @@ export class Session {
     }
     if (msg.type === 'runtime-error') {
       this.handleRuntimeError(conn, msg);
+      return;
+    }
+    if (msg.type === 'structure-note') {
+      this.handleStructureNote(conn, msg);
       return;
     }
     if (msg.type === 'stop-result') {
@@ -1771,6 +1799,27 @@ export class Session {
   }
 
   /**
+   * What the page read from the song structure of the code that plays. Accepted only from the active page, like a
+   * runtime error. The latest note replaces the earlier one (an empty list clears it); every line is cleaned here and
+   * the drain puts a fixed lead and the version in front of it. A note is a fact about the structure, never a runtime
+   * error, so it never changes the status of a reply.
+   */
+  private handleStructureNote(conn: PageConnection, msg: Extract<PageMessage, { type: 'structure-note' }>): void {
+    if (conn !== this.activePage) {
+      console.error('[moontide] Ignoring a structure note from a non-active page');
+      return;
+    }
+    const lines: string[] = [];
+    for (const raw of msg.lines) {
+      const cleaned = cleanStructureLine(raw);
+      if (cleaned !== null) {
+        lines.push(cleaned);
+      }
+    }
+    this.structureNote = { tag: msg.evaluateId ?? null, lines };
+  }
+
+  /**
    * The MIDI facts of the page. Used only from the active page, like a runtime error:
    * a stale page's facts do not describe what is playing.
    */
@@ -2033,6 +2082,14 @@ export class Session {
           ? 'Note: 1 more distinct runtime error was not shown.'
           : `Note: ${n} more distinct runtime errors were not shown.`,
       );
+    }
+    if (this.structureNote !== null) {
+      const { tag, lines: noteLines } = this.structureNote;
+      const versionId = tag !== null ? this.versionByEvaluateId.get(tag) ?? null : null;
+      for (const line of noteLines) {
+        lines.push(structureNoteLine(line, versionId));
+      }
+      this.structureNote = null;
     }
     this.runtimeErrors.clear();
     this.droppedRuntimeErrors.clear();

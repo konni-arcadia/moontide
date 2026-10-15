@@ -315,6 +315,10 @@ export type PageMessage =
   // error was raised; absent when that code came from a hand evaluation or the page's
   // reload replay. page/main.js mirrors this field by hand.
   | { type: 'runtime-error'; message: string; evaluateId?: string }
+  // What the page read from the song structure of the code that plays: up to MAX_STRUCTURE_NOTE_LINES plain
+  // sentences the page wrote itself (the server never reads code). An empty list clears an earlier note. evaluateId
+  // is the evaluate id whose code was playing, like runtime-error's. page/main.js mirrors this shape by hand.
+  | { type: 'structure-note'; lines: string[]; evaluateId?: string }
   | { type: 'stop-result'; id: string }
   | { type: 'takeover'; id: string }
   // A waiting change will not take over: Stop canceled it, or a newer change replaced it. The page sends
@@ -358,7 +362,9 @@ export type PageMessage =
   // One request from the page's right-click box. `chip` is the context text the user saw,
   // `current` the version id the top bar showed at Enter (null before any version). `moment` is
   // the Timeline's music under the pointer at the click, facts only (absent when nothing was drawn there).
-  | { type: 'ask'; id: string; text: string; context: AskContext; chip: string; current: number | null; moment?: AskMoment }
+  // `gesture` is what the user did to a note of the Timeline before asking, only with a lane context and a moment, or the
+  // notes of a range of cycles, only with a range context and no moment.
+  | { type: 'ask'; id: string; text: string; context: AskContext; chip: string; current: number | null; moment?: AskMoment; gesture?: AskGesture }
   // The MIDI facts of the page, sent when they change and before `evaluated`
   // (facts only, never wording). page/main.js mirrors this shape by hand.
   | ({ type: 'midi-state' } & MidiFacts)
@@ -396,6 +402,10 @@ export const MAX_ASK_CONTEXT_LENGTH = 200;
 // hand (test/ask.test.js checks both sides).
 export const MAX_MOMENT_NOTES = 32;
 
+// The most cycles one range may cover: the cycles of one Timeline page. page/timeline.js mirrors it by hand
+// (test/ask.test.js checks both sides).
+export const MAX_RANGE_CYCLES = 32;
+
 // The most bytes (UTF-8) one request line may have, the whole line Claude's Monitor reads: the prefix and the
 // JSON with the text, the context, the chip and the moment. Text of 2000 characters in a script that takes 3
 // bytes per character still fits with the rest of the line, but not every text of MAX_ASK_TEXT_LENGTH characters
@@ -430,6 +440,9 @@ export const ASK_CONTEXT_KINDS = [
   'warning',
   'instrument',
   'error',
+  'cell',
+  'group',
+  'range',
 ] as const;
 
 // One note of a moment: an event the Timeline drew at the instant. `track` is the lane's shown name,
@@ -462,6 +475,26 @@ export type AskMoment = {
   more: number;
 };
 
+// The kinds of gesture a request can carry: what the user did to a note of the Timeline that the page could not
+// apply itself. page/ask.js mirrors the list by hand (test/ask.test.js checks both sides).
+export const GESTURE_KINDS = ['pitch', 'rest', 'velocity', 'range'] as const;
+
+// The most semitones one gesture may carry, up or down: the span of the note range.
+export const MAX_GESTURE_SEMITONES = 127;
+
+// One note of a range: a moment note without its state (a range has no instant to be sounding at).
+export type AskRangeNote = Omit<AskMomentNote, 'state'>;
+
+// `pitch` moves the note by `semitones` (positive is higher), `rest` turns it into a rest and `velocity` plays it
+// softer or louder. `range` lists the notes of the range's lane that start in its cycles (at most MAX_MOMENT_NOTES, in order
+// of start then pitch), `more` counts the rest, and `version` is the version that was playing (null when unknown). Facts
+// about what the user did; the page changed no code.
+export type AskGesture =
+  | { kind: 'pitch'; semitones: number }
+  | { kind: 'rest' }
+  | { kind: 'velocity'; direction: 'softer' | 'louder' }
+  | { kind: 'range'; version: number | null; notes: AskRangeNote[]; more: number };
+
 // `track`, `effect`, `parameter`, `name` and `owner` are the names the views show (display names,
 // never the `label:` identity); `value` is the text the control shows.
 export type AskContext =
@@ -481,8 +514,17 @@ export type AskContext =
   | { kind: 'bus-param'; bus: 'reverb' | 'delay'; orbit: number; parameter: string; value: string }
   | { kind: 'part'; name: string; owner?: string }
   | { kind: 'lane'; track: string; cycle?: number }
+  // Whole cycles `from` to `to` (both included) of one lane; `section` is the section of `from` and `sectionTo` the section of
+  // `to` when it differs, both only for a piece with a song.
+  | { kind: 'range'; track: string; from: number; to: number; section?: string; sectionTo?: string }
   | { kind: 'note'; note: string; role?: 'root' | 'scale' | 'avoid' | 'outside' | 'off'; scale?: string }
-  | { kind: 'warning'; chord: string; outside: string; avoid?: string; seconds: number; scale: string };
+  | { kind: 'warning'; chord: string; outside: string; avoid?: string; seconds: number; scale: string }
+  // One cell of the Song grid: the section, the track and the variation it plays (or `rest: true` for a rest, with no
+  // variation). `fit` is what the grid said about a fixed variation at the moment of the right-click, `outside` the notes
+  // that do not fit (only with 'does-not-fit'); both are absent while the grid has no answer.
+  | { kind: 'cell'; section: string; track: string; variation?: string; rest?: true; fit?: 'fits' | 'does-not-fit' | 'cannot-check'; outside?: string }
+  // A group row of the Song grid; `parent` is the group it sits in, absent at the top.
+  | { kind: 'group'; name: string; parent?: string };
 
 // Why the server refused a request; the page maps each to its own line.
 // 'too-long' is the text over MAX_ASK_TEXT_LENGTH characters; 'line-too-long' is a whole line over
@@ -519,6 +561,11 @@ export const askMomentNoteShape = {
 
 const askMomentNote = z.object(askMomentNoteShape);
 
+// A note of a range is a moment note without its state; derived from the moment note, so the two cannot drift apart.
+// test/ask.test.js pins the keys equal to the ones page/ask.js's RANGE_NOTE_FIELDS may copy.
+const askRangeNote = askMomentNote.omit({ state: true });
+export const askRangeNoteShape = askRangeNote.shape;
+
 // More notes, a longer string or a number out of range is rejected, never trimmed.
 const askMomentSchema = z.object({
   cycle: z.number().int().nonnegative(),
@@ -528,6 +575,28 @@ const askMomentSchema = z.object({
   notes: z.array(askMomentNote).max(MAX_MOMENT_NOTES),
   more: z.number().int().nonnegative(),
 });
+
+// A closed union: a kind the page does not know, a direction or an amount out of bounds is rejected, never
+// trimmed. z.object drops a key it does not name, so every key of every kind is named here.
+export const askGestureSchema = z.discriminatedUnion('kind', [
+  z.object({
+    kind: z.literal('pitch'),
+    semitones: z
+      .number()
+      .int()
+      .min(-MAX_GESTURE_SEMITONES)
+      .max(MAX_GESTURE_SEMITONES)
+      .refine((semitones) => semitones !== 0, { message: 'a pitch gesture moves the note' }),
+  }),
+  z.object({ kind: z.literal('rest') }),
+  z.object({ kind: z.literal('velocity'), direction: z.enum(['softer', 'louder']) }),
+  z.object({
+    kind: z.literal('range'),
+    version: z.number().int().positive().nullable(),
+    notes: z.array(askRangeNote).max(MAX_MOMENT_NOTES),
+    more: z.number().int().nonnegative(),
+  }),
+]);
 
 const askContextSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session') }),
@@ -557,6 +626,20 @@ const askContextSchema = z.discriminatedUnion('kind', [
   }),
   z.object({ kind: z.literal('part'), name: askName, owner: askName.optional() }),
   z.object({ kind: z.literal('lane'), track: askName, cycle: z.number().int().nonnegative().optional() }),
+  // Whole cycles of one lane, `to` at least `from` and less than MAX_RANGE_CYCLES cycles after it; a name or a number out of
+  // bounds is rejected, never trimmed.
+  z
+    .object({
+      kind: z.literal('range'),
+      track: askName,
+      from: z.number().int().nonnegative(),
+      to: z.number().int().nonnegative(),
+      section: askName.optional(),
+      sectionTo: askName.optional(),
+    })
+    .refine((range) => range.to >= range.from && range.to - range.from < MAX_RANGE_CYCLES, {
+      message: `a range covers 1 to ${MAX_RANGE_CYCLES} whole cycles, to not before from`,
+    }),
   // `note` is a pitch class name, never an octave, string or fret; `role` and `scale` are both present or
   // both absent (the page enforces that), absent while the scale is not clear.
   z.object({ kind: z.literal('note'), note: askName, role: askNoteRole.optional(), scale: askName.optional() }),
@@ -570,7 +653,31 @@ const askContextSchema = z.discriminatedUnion('kind', [
     seconds: z.number().int().nonnegative(),
     scale: askName,
   }),
+  // A cell holds a variation or is a rest, never both and never neither; a rest has no fit; the notes outside the scale
+  // come only with a fit of does-not-fit. The page sends nothing else, and the server rejects the rest, never trims it.
+  z
+    .object({
+      kind: z.literal('cell'),
+      section: askName,
+      track: askName,
+      variation: askName.optional(),
+      rest: z.literal(true).optional(),
+      fit: z.enum(['fits', 'does-not-fit', 'cannot-check']).optional(),
+      outside: askName.optional(),
+    })
+    .refine((cell) => (cell.variation === undefined) !== (cell.rest === undefined), {
+      message: 'a cell has a variation or is a rest, not both and not neither',
+    })
+    .refine((cell) => !(cell.rest !== undefined && cell.fit !== undefined), { message: 'a rest cell has no fit' })
+    .refine((cell) => cell.outside === undefined || cell.fit === 'does-not-fit', {
+      message: 'outside notes come only with a fit of does-not-fit',
+    }),
+  z.object({ kind: z.literal('group'), name: askName, parent: askName.optional() }),
 ]);
+
+/** A structure note holds at most this many lines, each at most this many characters. */
+export const MAX_STRUCTURE_NOTE_LINES = 3;
+export const MAX_STRUCTURE_NOTE_LINE = 600;
 
 /** The longest wait the server accepts in a pending reply: a day. */
 export const MAX_PENDING_SECONDS = 86400;
@@ -612,6 +719,11 @@ const pageMessageSchema = z.union([
   z.object({
     type: z.literal('runtime-error'),
     message: z.string(),
+    evaluateId: z.string().min(1).max(64).optional(),
+  }),
+  z.object({
+    type: z.literal('structure-note'),
+    lines: z.array(z.string().max(MAX_STRUCTURE_NOTE_LINE)).max(MAX_STRUCTURE_NOTE_LINES),
     evaluateId: z.string().min(1).max(64).optional(),
   }),
   z.object({
@@ -672,9 +784,20 @@ const pageMessageSchema = z.union([
     context: askContextSchema,
     chip: z.string().min(1).max(MAX_ASK_CONTEXT_LENGTH),
     current: z.number().int().positive().nullable(),
-    // z.object drops a key it does not name, so the moment must be named here to reach Claude.
+    // z.object drops a key it does not name, so the moment and the gesture must be named here to reach Claude.
     moment: askMomentSchema.optional(),
-  }),
+    gesture: askGestureSchema.optional(),
+  })
+    // A gesture about one note of a lane rides only on a lane context that carries a moment; the range gesture and the range
+    // context come together and carry no moment (the notes of the range are in the gesture).
+    .refine(
+      (ask) => {
+        const isRange = ask.gesture?.kind === 'range';
+        if (isRange || ask.context.kind === 'range') return isRange && ask.context.kind === 'range' && ask.moment === undefined;
+        return ask.gesture === undefined || (ask.context.kind === 'lane' && ask.moment !== undefined);
+      },
+      { message: 'a gesture needs a lane context and a moment, and a range gesture goes only with a range context' },
+    ),
   z.object({
     type: z.literal('midi-state'),
     access: z.enum(['idle', 'pending', 'enabled', 'denied', 'unsupported', 'failed']),
