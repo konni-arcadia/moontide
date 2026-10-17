@@ -27,17 +27,29 @@ test('newPieceWithoutStructureLines: a first piece without a song gives the note
   assert.deepEqual(newPieceWithoutStructureLines('', 'const \t song={};'), []);
 });
 
-test('newPieceWithoutStructureLines: songs, song2, let song and a commented-out line are not a structure', () => {
+test('newPieceWithoutStructureLines: songs, song2 and a commented-out line are not a structure; let and var song are left to the page', () => {
   for (const code of [
     'const songs = {};\na: s("bd")',
     'const song2 = {};\na: s("bd")',
     'const song_ = {};\na: s("bd")',
-    'let song = {};\na: s("bd")',
+    'let songs = {};\na: s("bd")',
+    'var song2 = {};\na: s("bd")',
     '// const song = {};\na: s("bd")',
+    '// let song = {};\na: s("bd")',
     'a: s("bd") // const song = {};',
     'constsong = 1',
+    'letsong = 1',
   ]) {
     assert.deepEqual(newPieceWithoutStructureLines('', code), NOTE, JSON.stringify(code));
+  }
+  // The page names a song declared with let or var by itself, so the server says nothing and the two never disagree.
+  for (const code of [
+    'let song = { sections: [] }\nlead: note("c3")',
+    'var song = { sections: [] }\nlead: note("c3")',
+    '  let \t song={};',
+    '\tvar song = {};',
+  ]) {
+    assert.deepEqual(newPieceWithoutStructureLines('', code), [], JSON.stringify(code));
   }
 });
 
@@ -83,6 +95,8 @@ test('newPieceWithoutStructureLines: a 200,000-character adversarial input retur
     `${'\n'.repeat(200000)}const`,
     'const '.repeat(Math.ceil(200000 / 6)),
     'const song'.repeat(Math.ceil(200000 / 10)),
+    'let '.repeat(Math.ceil(200000 / 4)),
+    `var${' \t'.repeat(100000)}songs`,
     'const song\n'.repeat(Math.ceil(200000 / 11)).replace(/song/g, 'songs'),
     `\t${' '.repeat(200000)}const song`,
     `const${' '.repeat(200000)}x`,

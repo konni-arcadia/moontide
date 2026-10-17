@@ -63,7 +63,108 @@ export const JAM_COPY = {
     outside: { word: 'Outside', title: 'Chord note outside the scale, fine to play' },
     chord: { word: 'Chord tone', title: 'Note of the chord sounding now' },
   },
+  // The line that says why a scale is in use when several fit: a bold lead and a sentence that always names the scale and
+  // the reason. {scale} is the page's own name for it ('D Dorian'), {root} its spelled root ('D').
+  reason: {
+    proposedLead: 'Proposed:',
+    chosenLead: 'Your pick:',
+    section: ' {scale}, declared by the section.',
+    code: ' {scale}, declared by the code.',
+    'bass-chords': ' {scale}, the bass and chords lean on {root}.',
+    'most-heard': ' {scale}, {root} is the note heard most.',
+    nothing: ' {scale}, nothing in the notes says which scale is the key.',
+    chosen: ' {scale}. It holds while these same scales fit.',
+  },
+  // The scales that fit, listed under the scale in use: a caption, then one item per scale (buttons while one can be chosen,
+  // plain text when none can) and, past the eighth, the count of the rest.
+  candidates: {
+    pickCaption: 'Scales that fit, click to switch:',
+    listCaption: 'Scales that fit:',
+    more: 'and {n} more',
+  },
+  // The sentences an instrument's accessible name adds to its lead: where the scale in use comes from, the chord notes
+  // outside it, the notes of the chord sounding now, and why nothing is coloured when no scale can be chosen. The role words
+  // are the ones a piano key's hover title says.
+  instrument: {
+    proposedScale: 'Proposed scale: {scale}.',
+    chosenScale: 'Chosen scale: {scale}.',
+    outside: 'Outside: {notes}.',
+    chordTones: 'Chord tones: {notes}.',
+    cannotChoose: 'Several scales fit with different notes, so none is coloured.',
+  },
+  roleWords: { scale: 'scale', root: 'root', avoid: 'avoid', outside: 'outside', chord: 'chord tone' },
+  // Several scales fit with different notes and none can be used: the sentence for each cause, and the line under it.
+  cannotChoose: {
+    'nothing-declared': 'Several scales fit, with different notes, and nothing is declared.',
+    'declared-not-among': 'Several scales fit, with different notes, and none of them is the declared scale.',
+    sub: 'Warnings are off until a scale is declared or the notes settle on one.',
+  },
 };
+
+/**
+ * A sentence of the copy with each `{name}` replaced by its value in `values`. A placeholder with no value throws, so a
+ * sentence is never shown with a hole in it. The values are put in as plain text.
+ */
+export function fillJam(template, values) {
+  return template.replace(/\{(\w+)\}/g, (match, name) => {
+    if (!Object.hasOwn(values, name)) throw new Error(`Moontide: the Jam copy has no value for {${name}} in '${template}'`);
+    return String(values[name]);
+  });
+}
+
+/**
+ * The line that says why a scale is in use, `{ lead, rest }`, or null for a scale that was simply heard. A proposed scale
+ * reads 'Proposed:' and a sentence naming the scale and what decided (its reason code: 'declared' is the section's or the
+ * code's declaration, `section` being the section's words or null; 'bass-chords', 'most-heard' or 'nothing'); a scale the
+ * user picked reads 'Your pick:'. The word alone is never returned. An unknown source or reason throws.
+ */
+export function reasonLine(scale, { section = null } = {}) {
+  const source = scale.source ?? 'heard';
+  if (source === 'heard') return null;
+  const values = { scale: scale.name, root: scale.spell[scale.root] };
+  if (source === 'chosen') return { lead: JAM_COPY.reason.chosenLead, rest: fillJam(JAM_COPY.reason.chosen, values) };
+  if (source !== 'proposed') throw new Error(`Moontide: no reason line for a scale whose source is '${String(source)}'`);
+  const key = scale.reason === 'declared' ? (section === null || section === undefined ? 'code' : 'section') : scale.reason;
+  if (!['section', 'code', 'bass-chords', 'most-heard', 'nothing'].includes(key)) {
+    throw new Error(`Moontide: no reason line for the reason '${String(scale.reason)}'`);
+  }
+  return { lead: JAM_COPY.reason.proposedLead, rest: fillJam(JAM_COPY.reason[key], values) };
+}
+
+/** How many of the scales that fit are drawn as items; the rest are only counted. */
+export const MAX_CANDIDATES_SHOWN = 8;
+
+/**
+ * The list of the scales that fit, or null when no list is due. A scale that was heard (clear, no fit, none) has none. A
+ * proposed or chosen scale gives `mode: 'pick'` (buttons: the user can switch) and an unresolved one `mode: 'list'` (plain
+ * text: nothing can be chosen). `items` are the first MAX_CANDIDATES_SHOWN candidates in the order the resolver gave them
+ * (the order never changes with a pick), each `{ key, name, pressed }`; `pressed` is true only for the scale in use in pick
+ * mode, which takes the last place drawn when it comes later in the order. `more` says how many candidates are not drawn,
+ * or is null. `setKey` names the set of candidates a choice is made for.
+ */
+function candidatesOf(scale) {
+  const source = scale.source ?? 'heard';
+  if (source === 'heard') return null;
+  const pick = source === 'proposed' || source === 'chosen';
+  const all = scale.candidates;
+  if (!Array.isArray(all) || typeof scale.setKey !== 'string') {
+    throw new Error(`Moontide: the Jam model needs the candidates and the set key of a scale whose source is '${source}'`);
+  }
+  let shown = all.slice(0, MAX_CANDIDATES_SHOWN);
+  if (pick) {
+    const inUse = all.findIndex((candidate) => candidate.key === scale.key);
+    if (inUse === -1) throw new Error(`Moontide: the scale in use '${String(scale.key)}' is not among the candidates`);
+    if (inUse >= MAX_CANDIDATES_SHOWN) shown = [...all.slice(0, MAX_CANDIDATES_SHOWN - 1), all[inUse]];
+  }
+  const rest = all.length - shown.length;
+  return {
+    mode: pick ? 'pick' : 'list',
+    caption: pick ? JAM_COPY.candidates.pickCaption : JAM_COPY.candidates.listCaption,
+    setKey: scale.setKey,
+    items: shown.map((candidate) => ({ key: candidate.key, name: candidate.name, pressed: pick && candidate.key === scale.key })),
+    more: rest > 0 ? fillJam(JAM_COPY.candidates.more, { n: rest }) : null,
+  };
+}
 
 // --- the piano ---
 
@@ -173,24 +274,55 @@ export function legendEntries(chordTones) {
 }
 
 /**
- * The accessible name of an instrument ('piano' or 'guitar'): 'Piano, two octaves from C3.' or
- * 'Guitar fretboard, standard tuning, 12 frets.' and then, with a clear scale,
- * 'Scale notes: D, E, F. Root D. Avoid: C.' ('Avoid: none.' when nothing is to be avoided), or 'No
- * clear scale.' The marks repeat in every octave, so the label names pitch classes. With `declared` (the
- * code declares a harmony) an unclear scale reads 'The heard scale is not clear.' instead, and a reading with no
- * pitched note reads the nothing-pitched sentence.
+ * The hover title of one piano key: the spelled note and its role word ('D, root', 'C#, outside', 'B, scale'), with ', root'
+ * added for an avoided root and ', chord tone' for a chord tone. An 'off' key that is no chord tone has no title (''), and an
+ * 'off' chord tone reads 'F#, chord tone'. `names` are the position's spelled names, `chordPcs` the optional 12 chord-tone
+ * flags, `rootPc` the scale's root or null. The title only repeats what the marks and the instrument's name already say.
  */
-export function instrumentLabel(kind, position, { declared = false } = {}) {
+export function keyTitle(key, roles, names, chordPcs = null, rootPc = null) {
+  const role = roles[key.pc];
+  const chord = chordPcs !== null && chordPcs[key.pc] === true;
+  if (role === 'off' && !chord) return '';
+  const words = [names[key.pc]];
+  if (role !== 'off') words.push(JAM_COPY.roleWords[role]);
+  if (role === 'avoid' && key.pc === rootPc) words.push(JAM_COPY.roleWords.root);
+  if (chord) words.push(JAM_COPY.roleWords.chord);
+  return words.join(', ');
+}
+
+/**
+ * The accessible name of an instrument ('piano' or 'guitar'): 'Piano, two octaves from C3.' or
+ * 'Guitar fretboard, standard tuning, 12 frets.' and then, with a clear scale, in this order and each sentence only when it
+ * applies: 'Proposed scale: C major.' or 'Chosen scale: C major.' (none for a scale that was simply heard),
+ * 'Scale notes: D, E, F. Root D. Avoid: C.' ('Avoid: none.' when nothing is to be avoided), 'Outside: C#.' while the current
+ * warning has chord notes outside the scale. A scale that cannot be chosen reads that several scales fit with different notes,
+ * so none is coloured; no clear scale reads 'No clear scale.' The marks repeat in every octave, so the label names pitch
+ * classes. With `declared` (the code declares a harmony) an unclear scale reads 'The heard scale is not clear.' instead, and a
+ * reading with no pitched note reads the nothing-pitched sentence. With `chordTones` on and a chord sounding, 'Chord tones:
+ * D, F, A, C.' (from the bass up) comes last, in every state the overlay draws chord marks. A label with none of these facts is
+ * the label of a heard scale, unchanged.
+ */
+export function instrumentLabel(kind, position, { declared = false, chordTones = false } = {}) {
   let lead;
   if (kind === 'piano') lead = 'Piano, two octaves from C3.';
   else if (kind === 'guitar') lead = 'Guitar fretboard, standard tuning, 12 frets.';
   else throw new Error(`Moontide: no accessible name for an instrument called '${String(kind)}'`);
+  const chordPart = chordTones && position.chord !== null ? ` ${fillJam(JAM_COPY.instrument.chordTones, { notes: position.chord.notes.join(', ') })}` : '';
   const scale = position.scale;
   // With a declaration the label never says 'No clear scale'; a reading with no pitched note has nothing heard to call unclear.
-  if (declared && scale.status === 'none') return `${lead} ${JAM_COPY.noPitched}`;
-  if (scale.status !== 'clear') return `${lead} ${declared ? JAM_COPY.heardUnclearLabel : 'No clear scale.'}`;
+  if (declared && scale.status === 'none') return `${lead} ${JAM_COPY.noPitched}${chordPart}`;
+  if (scale.status === 'ambiguous' && scale.source === 'unresolved') return `${lead} ${JAM_COPY.instrument.cannotChoose}${chordPart}`;
+  if (scale.status !== 'clear') return `${lead} ${declared ? JAM_COPY.heardUnclearLabel : 'No clear scale.'}${chordPart}`;
   const avoid = position.warning === null || position.warning.avoid.length === 0 ? 'none' : position.warning.avoid.join(', ');
-  return `${lead} Scale notes: ${scale.notes.map((note) => note.name).join(', ')}. Root ${scale.spell[scale.root]}. Avoid: ${avoid}.`;
+  const source =
+    scale.source === 'proposed' ? ` ${fillJam(JAM_COPY.instrument.proposedScale, { scale: scale.name })}`
+    : scale.source === 'chosen' ? ` ${fillJam(JAM_COPY.instrument.chosenScale, { scale: scale.name })}`
+    : '';
+  const outside =
+    position.warning !== null && position.warning.outside.length > 0
+      ? ` ${fillJam(JAM_COPY.instrument.outside, { notes: position.warning.outside.join(', ') })}`
+      : '';
+  return `${lead}${source} Scale notes: ${scale.notes.map((note) => note.name).join(', ')}. Root ${scale.spell[scale.root]}. Avoid: ${avoid}.${outside}${chordPart}`;
 }
 
 // The 12 chord-tone flags: the pitch classes of the chord sounding now while the overlay is on.
@@ -202,15 +334,15 @@ function chordFlags(position, chordTones) {
 
 // The instrument part of a ready model: roles and names by pitch class, the root, the chord
 // tones and the labels.
-function instrumentOf(position, chordPcs, declared) {
+function instrumentOf(position, chordPcs, declared, chordTones) {
   const clear = position.scale.status === 'clear';
   return {
     roles: rolesByPc(position),
     names: pcNames(position),
     rootPc: clear ? position.scale.root : null,
     chordPcs,
-    pianoLabel: instrumentLabel('piano', position, { declared }),
-    guitarLabel: instrumentLabel('guitar', position, { declared }),
+    pianoLabel: instrumentLabel('piano', position, { declared, chordTones }),
+    guitarLabel: instrumentLabel('guitar', position, { declared, chordTones }),
   };
 }
 
@@ -248,23 +380,14 @@ export function messageModel(text, sub = null) {
 }
 
 /**
- * The plain sentence for a scale that cannot be named: 'No clear scale: the notes fit C major and
- * A minor equally.' (two names joined by 'and', three as 'A, B and C', more as the first three then
- * 'and {N} more'; 'almost equally' for a near tie), or the no-fit sentence. With `declared` (the code
- * declares a harmony) the 'No clear scale: ' prefix is dropped and the sentence starts 'The notes fit'.
+ * The plain sentence for notes that fit none of the nine scales: 'No clear scale: the notes fit none of the nine scales.',
+ * or, with `declared` (the code declares a harmony), 'The notes fit none of the nine scales.' without the verdict prefix.
+ * Several scales that fit are never said here: the resolver (page/jam-resolve.js) uses one of them, or says why it cannot.
+ * Any other reading throws.
  */
 export function ambiguitySentence(scale, { declared = false } = {}) {
   if (scale.status === 'no-fit') return declared ? JAM_COPY.noFitDeclared : JAM_COPY.noFit;
-  if (scale.status !== 'ambiguous') {
-    throw new Error(`Moontide: no ambiguity sentence for a scale reading with status '${String(scale.status)}'`);
-  }
-  const names = scale.candidates.map((candidate) => candidate.name);
-  let list;
-  if (names.length <= 1) list = names.join('');
-  else if (names.length === 2) list = `${names[0]} and ${names[1]}`;
-  else if (names.length === 3) list = `${names[0]}, ${names[1]} and ${names[2]}`;
-  else list = `${names[0]}, ${names[1]}, ${names[2]} and ${names.length - 3} more`;
-  return `${declared ? 'The' : 'No clear scale: the'} notes fit ${list} ${scale.kind === 'near' ? 'almost equally' : 'equally'}.`;
+  throw new Error(`Moontide: no ambiguity sentence for a scale reading with status '${String(scale.status)}'`);
 }
 
 /** The longest declared text shown on the Declared line, in UTF-16 units; the title keeps the whole text. */
@@ -475,6 +598,14 @@ function statusOf(position, paused) {
  * (even an unreadable declaration) no sentence says 'No clear scale', and a reading with no pitched note is a ready
  * model of kind 'none' instead of the message model, so the Declared line stays on screen. The heard scale, the
  * degrees, the status, the rows and the instrument roles are the ones of the same notes without a declaration.
+ * The position comes from a resolved reading (page/jam-resolve.js resolveReading): when several scales fit, a proposed
+ * scale is a clear scale carrying its `source` ('proposed') and `reason`, and the model draws it like a heard one (kind 'clear',
+ * seven degrees, status, rows, roles, warnings on) and adds `reason` (`{ lead, rest }` of reasonLine, null for a heard scale) and
+ * `scaleSource` ('heard', 'proposed' or 'chosen'; 'heard' for none, no-fit and cannot-choose); scales with different notes that
+ * cannot be chosen give kind 'ambiguous', the sentence for their `why` and the sub-line that says warnings are off. An
+ * ambiguous scale with no `why` was never resolved and throws. A scale that was not heard (proposed, chosen or cannot be chosen)
+ * also gives `candidates`: `{ mode, caption, setKey, items, more }`, the list of the scales that fit (see candidatesOf; 'pick'
+ * mode for a scale in use, 'list' mode when none can be chosen), and null for a heard scale. A chosen scale reads 'Your pick:'.
  * A piece with sections shows the harmony of the section that plays: `declaredOverride` (the same shapes as a reading's
  * `declared`) replaces the one in the reading, and `section` is that section's name as the page shows it, quoted; every
  * ready model carries `section`, the words 'section {name}' for a piece with sections and null otherwise.
@@ -488,10 +619,16 @@ export function buildJamModel({ position, chordTones = false, declaredOverride, 
     return messageModel(JAM_COPY.noPitched, JAM_COPY.noPitchedSub);
   }
   const scale = position.scale;
+  const scaleSource = scale.status === 'clear' ? (scale.source ?? 'heard') : 'heard';
+  if (!['heard', 'proposed', 'chosen'].includes(scaleSource)) {
+    throw new Error(`Moontide: the Jam model cannot draw a scale whose source is '${String(scaleSource)}'`);
+  }
+  const reason = scale.status === 'clear' ? reasonLine(scale, { section: sectionText }) : null;
+  const candidates = candidatesOf(scale);
   const paused = position.playing === false;
   const rows = rowsFor(position, paused);
   const chordPcs = chordFlags(position, chordTones);
-  const instrument = instrumentOf(position, chordPcs, declaredMode);
+  const instrument = instrumentOf(position, chordPcs, declaredMode, chordTones);
   const chordLine = chordTones ? chordLineText(position.chord) : null;
   // The scale a note context names: only a clear scale, never a guess.
   const noteScaleName = position.scale.status === 'clear' ? position.scale.name : null;
@@ -514,6 +651,9 @@ export function buildJamModel({ position, chordTones = false, declaredOverride, 
       noteScaleName,
       declared,
       section: sectionText,
+      reason,
+      scaleSource,
+      candidates,
     };
   }
   if (scale.status === 'clear') {
@@ -544,13 +684,26 @@ export function buildJamModel({ position, chordTones = false, declaredOverride, 
       noteScaleName,
       declared,
       section: sectionText,
+      reason,
+      scaleSource,
+      candidates,
     };
   }
   if (scale.status === 'ambiguous' || scale.status === 'no-fit') {
-    const sentence = ambiguitySentence(scale, { declared: declaredMode });
+    let sentence;
+    let sub = JAM_COPY.warningsOff;
+    if (scale.status === 'no-fit') {
+      sentence = ambiguitySentence(scale, { declared: declaredMode });
+    } else {
+      if (scale.why !== 'nothing-declared' && scale.why !== 'declared-not-among') {
+        throw new Error(`Moontide: the Jam model needs a resolved scale: several scales fit and the reading says no reason it cannot choose (why: '${String(scale.why)}')`);
+      }
+      sentence = JAM_COPY.cannotChoose[scale.why];
+      sub = JAM_COPY.cannotChoose.sub;
+    }
     return {
       state: 'ready',
-      scale: { kind: 'ambiguous', text: sentence, title: sentence, sub: JAM_COPY.warningsOff },
+      scale: { kind: 'ambiguous', text: sentence, title: sentence, sub },
       degrees: [],
       status: OFF_STATUS,
       paused,
@@ -560,6 +713,9 @@ export function buildJamModel({ position, chordTones = false, declaredOverride, 
       noteScaleName,
       declared,
       section: sectionText,
+      reason,
+      scaleSource,
+      candidates,
     };
   }
   throw new Error(`Moontide: the Jam model cannot draw a scale reading with status '${String(scale.status)}'`);

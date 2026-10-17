@@ -2048,7 +2048,7 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
       mixerStrips.replaceChildren();
       renderInspector();
       refreshNotice();
-      return;
+      return { created: 0 };
     }
     mixerMessage.hidden = true;
     mixerBody.hidden = false;
@@ -2058,6 +2058,9 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
     if (noNotesText === null) mixerNoNotes.removeAttribute('title');
     else mixerNoNotes.title = MIXER_COPY.noNotesTitle;
     mixerNoNotes.hidden = noNotesText === null;
+    // How many strips and group frames this render built new. A new element starts dark, so the caller makes the lights write
+    // their lit values again when it is more than 0.
+    let created = 0;
     const seen = new Set();
     // The strips placed in the DOM whose fader the hand holds: they are not moved or removed until it lets go.
     const held = new Set();
@@ -2081,6 +2084,7 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
       if (!ref) {
         ref = createStrip(strip);
         refs.set(strip.identity, ref);
+        created += 1;
       }
       updateStrip(ref, strip);
     });
@@ -2124,6 +2128,7 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
           if (groupRef === undefined) {
             groupRef = createGroupFrame(item);
             groupRefs.set(item.key, groupRef);
+            created += 1;
           }
           updateGroupFrame(groupRef, item);
           desired.push(groupRef.el);
@@ -2169,6 +2174,7 @@ export function createMixerView({ document, gesture, midiPreview, onStripSelect 
       refs.delete(identity);
     }
     refreshDisabled();
+    return { created };
   }
 
   return {

@@ -134,23 +134,55 @@ test('the keyboard cursor on a lane without notes: the identity line and the nam
   assert.throws(() => activeCursorName({ lane: 'bass', cycle: 1.5 }), /whole cycle/);
 });
 
-test('the identity line of a range: the lane, the cycles (cycle for one), the section or the two sections, and the notes', () => {
+test('the identity line of a range: the lane, the cycles (cycle for one), the sections it crosses in playing order, and the notes', () => {
   assert.equal(rangeWhereText('t1'), 'Range · t1');
   assert.equal(rangePositionText({ from: 2, to: 5, count: 3 }), ' · cycles 2 to 5 · 3 notes');
   assert.equal(`${rangeWhereText('t1')}${rangePositionText({ from: 2, to: 5, count: 3 })}`, 'Range · t1 · cycles 2 to 5 · 3 notes');
   assert.equal(rangePositionText({ from: 12, to: 12, count: 1 }), ' · cycle 12 · 1 note');
   assert.equal(rangePositionText({ from: 12, to: 12, count: 0 }), ' · cycle 12 · no notes');
-  assert.equal(rangePositionText({ from: 12, to: 15, section: 'y', count: 14 }), " · cycles 12 to 15 · section 'y' · 14 notes");
-  assert.equal(rangePositionText({ from: 12, to: 15, section: 'x', sectionTo: 'z', count: 0 }), " · cycles 12 to 15 · sections 'x' to 'z' · no notes");
-  assert.equal(rangePositionText({ from: 12, to: 15, section: null, sectionTo: null, count: 2 }), ' · cycles 12 to 15 · 2 notes');
+  assert.equal(rangePositionText({ from: 12, to: 15, sections: ['y'], count: 14 }), " · cycles 12 to 15 · section 'y' · 14 notes");
+  assert.equal(rangePositionText({ from: 2, to: 4, sections: ['x'], count: 3 }), " · cycles 2 to 4 · section 'x' · 3 notes");
+  assert.equal(rangePositionText({ from: 13, to: 18, sections: ['z', 'x', 'y'], count: 0 }), " · cycles 13 to 18 · sections 'z', 'x', 'y' · no notes");
+  // A section that comes back after another is named again.
+  assert.equal(rangePositionText({ from: 13, to: 18, sections: ['verse', 'chorus', 'verse'], count: 2 }), " · cycles 13 to 18 · sections 'verse', 'chorus', 'verse' · 2 notes");
+  // A piece without a song has no section part.
+  assert.equal(rangePositionText({ from: 12, to: 15, count: 2 }), ' · cycles 12 to 15 · 2 notes');
+  assert.equal(rangePositionText({ from: 12, to: 15, sections: null, moreSections: 0, count: 2 }), ' · cycles 12 to 15 · 2 notes');
   // Names from the code are cut and cleaned like every name in a sentence.
-  assert.ok(rangePositionText({ from: 1, to: 2, section: 's'.repeat(80), count: 1 }).includes(`'${'s'.repeat(39)}…'`));
+  assert.ok(rangePositionText({ from: 1, to: 2, sections: ['s'.repeat(80)], count: 1 }).includes(`'${'s'.repeat(39)}…'`));
   // A range that cannot be told throws, never a blank.
   assert.throws(() => rangeWhereText(''), /name of its lane/);
   assert.throws(() => rangePositionText({ from: 5, to: 4, count: 1 }), /whole cycles/);
   assert.throws(() => rangePositionText({ from: 1.5, to: 4, count: 1 }), /whole cycles/);
   assert.throws(() => rangePositionText({ from: 1, to: 4, count: -1 }), /count of notes/);
-  assert.throws(() => rangePositionText({ from: 1, to: 4, sectionTo: 'z', count: 1 }), /first one/);
+  assert.throws(() => rangePositionText({ from: 1, to: 4, sections: [], count: 1 }), /at least one section/);
+  assert.throws(() => rangePositionText({ from: 1, to: 4, moreSections: 2, count: 1 }), /more sections without/);
+});
+
+test('the identity line of a range cuts a long list of sections to 200 characters and says how many more', () => {
+  // The section part is everything between the cycles and the notes.
+  const sectionPart = (range) => {
+    const text = rangePositionText({ from: 0, to: 30, count: 0, ...range });
+    return text.slice(' · cycles 0 to 30'.length, text.length - ' · no notes'.length);
+  };
+  const names = Array.from({ length: 31 }, (_, at) => `${String(at).padStart(2, '0')}${'n'.repeat(38)}`);
+  const part = sectionPart({ sections: names });
+  assert.ok(part.length <= 200, `the section part is ${part.length} characters`);
+  const shown = part.match(/'\d\d/g).length;
+  assert.ok(shown >= 1 && shown < 31);
+  assert.ok(part.endsWith(` and ${31 - shown} more`), part);
+  assert.ok(part.startsWith(` · sections '00${'n'.repeat(38)}', '01`));
+  // One more name would not have fitted.
+  const withOneMore = ` · sections ${names.slice(0, shown + 1).map((name) => `'${name}'`).join(', ')} and ${31 - shown - 1} more`;
+  assert.ok(withOneMore.length > 200);
+  // Names the list already left out are counted too.
+  assert.equal(sectionPart({ sections: names, moreSections: 4 }).match(/ and (\d+) more$/)[1], String(31 - shown + 4));
+  // A list that fits says nothing of more, and a count alone ends the list.
+  assert.equal(sectionPart({ sections: ['a', 'b'] }), " · sections 'a', 'b'");
+  assert.equal(sectionPart({ sections: ['a', 'b'], moreSections: 3 }), " · sections 'a', 'b' and 3 more");
+  assert.equal(sectionPart({ sections: ['a'], moreSections: 3 }), " · sections 'a' and 3 more");
+  // The first name stays even when it alone is long.
+  assert.ok(sectionPart({ sections: ['q'.repeat(300), 'b'] }).startsWith(" · sections 'q"));
 });
 
 test('the notices come in the order of the Mixer and an unknown one throws', () => {

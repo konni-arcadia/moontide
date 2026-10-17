@@ -193,6 +193,8 @@ export function createMidiOut({
   getScheduler,
   getAudioContext,
   perfNow,
+  // (fromCycle, toCycle) => { seconds, lagSeconds } through a running tempo ramp, or null: lines far ahead are stamped through it.
+  rampSeconds = () => null,
   onClockState = () => {},
   resetSettleMs = RESET_SETTLE_MS,
   now = () => Date.now(),
@@ -1550,6 +1552,7 @@ export function createMidiOut({
           getScheduler,
           getAudioContext,
           perfNow,
+          rampSeconds,
           setTimer,
           clearTimer,
           isPlaying,
@@ -1899,7 +1902,7 @@ export function createMidiOut({
 
   /**
    * The timestamp for the setup of a change that waits for cycle `atCycle`: the page clock's stamp of that line minus
-   * SETUP_BEFORE_LINE_MS. When no stamp can be given or it is more than NOTE_STAMP_MAX_AHEAD_MS ahead (a far timestamp
+   * SETUP_BEFORE_LINE_MS (while a tempo ramp runs, the earliest the line can be heard: the setup must land before it). When no stamp can be given or it is more than NOTE_STAMP_MAX_AHEAD_MS ahead (a far timestamp
    * would park bytes in the OS queue, which cannot take them back), says so in one Moontide: line, waits until the
    * line through the injected timer and resolves undefined: the setup then goes out without a timestamp. `track` gets
    * { cancel } while that wait runs, so a dropped plan ends it. Never rejects.
@@ -1907,7 +1910,7 @@ export function createMidiOut({
   async function timedSetupAt(atCycle, track) {
     let line = null;
     try {
-      line = pageClock === null ? null : pageClock.stampOfCycle(atCycle);
+      line = pageClock === null ? null : pageClock.stampOfCycle(atCycle, { early: true });
     } catch (err) {
       onError('Moontide: the page clock could not give the timestamp of the line:', err);
     }

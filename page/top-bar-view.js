@@ -32,7 +32,7 @@ export function createTopBarView({ document, ResizeObserver }) {
   }
 
   // What each item shows now, so only what changed is written (no rebuild on every poll).
-  let shownTempo = null;
+  let shownTempo = null; // the parts of the tempo readout as last written, or null before the first write
   let shownCountdown = null;
   let shownStatus = '';
   let shownCycleBeat = '';
@@ -55,20 +55,25 @@ export function createTopBarView({ document, ResizeObserver }) {
 
   /**
    * The tempo readout from the model (`tempoText` in page/bar-model.js). It is never hidden: nothing playing shows the
-   * dash in muted text. The number, the arrow part (only while a change with a new tempo waits), the unit, the
-   * accessible name and the title are written only when they changed. The spaces between the parts are written here.
+   * dash in muted text. The number, the arrow part (while a change with a new tempo waits or a tempo ramp runs), the
+   * unit, the accessible name and the title are each written only when they changed, so a ramp that steps the number
+   * once per BPM rewrites the number alone. The spaces between the parts are written here. The bar is measured again
+   * (fit) only when the readout's text length or its idle state changed: the digits are mono, so a number of the same
+   * length never changes the bar's width.
    */
   function showTempo(model) {
-    const key = `${model.text}|${model.name}|${model.title}|${model.idle}`;
-    if (key === shownTempo) return;
-    tempoNum.textContent = model.num;
-    tempoArrow.textContent = model.arrow === '' ? '' : ` ${model.arrow}`;
-    tempoUnit.textContent = ` ${model.unit}`;
-    tempoReadout.dataset.idle = String(model.idle);
-    tempoReadout.setAttribute('aria-label', model.name);
-    tempoReadout.setAttribute('title', model.title);
-    shownTempo = key;
-    fit();
+    const arrow = model.arrow === '' ? '' : ` ${model.arrow}`;
+    const unit = ` ${model.unit}`;
+    const before = shownTempo;
+    if (before !== null && before.num === model.num && before.arrow === arrow && before.unit === unit && before.name === model.name && before.title === model.title && before.idle === model.idle) return;
+    if (before === null || before.num !== model.num) tempoNum.textContent = model.num;
+    if (before === null || before.arrow !== arrow) tempoArrow.textContent = arrow;
+    if (before === null || before.unit !== unit) tempoUnit.textContent = unit;
+    if (before === null || before.idle !== model.idle) tempoReadout.dataset.idle = String(model.idle);
+    if (before === null || before.name !== model.name) tempoReadout.setAttribute('aria-label', model.name);
+    if (before === null || before.title !== model.title) tempoReadout.setAttribute('title', model.title);
+    shownTempo = { num: model.num, arrow, unit, name: model.name, title: model.title, idle: model.idle, length: model.text.length };
+    if (before === null || before.length !== shownTempo.length || before.idle !== model.idle) fit();
   }
 
   /**

@@ -1,5 +1,5 @@
 // Pure module for the Ask Claude box: the copy, the length rules, the context
-// descriptors, the box placement and the request status sequencing. No DOM access at import time,
+// descriptors and the box placement. No DOM access at import time,
 // so node:test and page/main.js import it directly with no build step. The box's own DOM lives in
 // page/ask-view.js.
 
@@ -25,12 +25,6 @@ export const PAGE_TOKEN_PLACEHOLDER = '__MOONTIDE_PAGE_TOKEN__';
 /** No answer from the server within this long: the request is reported as not confirmed. */
 export const ASK_CONFIRM_TIMEOUT_MS = 5000;
 
-/** A non-error status stays readable at least this long before the next one replaces it. */
-export const STATUS_MIN_SHOWN_MS = 600;
-
-/** "Claude received it" is shown this long, then the status hides. */
-export const RECEIVED_SHOWN_MS = 4000;
-
 /** From this many characters the box shows a counter, so the limit is seen before it is hit. */
 export const COUNTER_FROM = 1800;
 
@@ -52,9 +46,6 @@ export const ASK_COPY = {
   disconnected: 'Disconnected — asking Claude is off until Moontide reconnects.',
   notSent: 'This request was not sent. Press Enter to try again.',
   notSentToken: 'This request was not sent.',
-  sent: 'Sent to Claude',
-  received: 'Claude received it',
-  waiting: 'Claude will see it on its next action',
   tooLong: 'request too long — 2000 characters at most.',
   lineTooLong: 'request too long to send — some characters take extra room, so shorten the text.',
   rateLimit: 'too many requests — wait a moment, then send again.',
@@ -121,33 +112,6 @@ export function pageRequestsText(live) {
   throw new Error(`Moontide: the page-requests state must be true or false, got ${JSON.stringify(live)}.`);
 }
 
-/** The status text for requests handed to Claude: one, or a count. */
-export function receivedText(count) {
-  return count === 1 ? ASK_COPY.received : `Claude received ${count} requests`;
-}
-
-/** The status text for requests that wait on the server: one, or a count. */
-export function waitingText(count) {
-  return count === 1 ? ASK_COPY.waiting : `Claude will see ${count} requests on its next action`;
-}
-
-/**
- * The short forms of the status texts, shown at fit step 3 of the top bar when the long
- * sentence no longer fits. They are made here, next to the long texts, and travel with them: nothing shortens a long
- * text by matching strings afterwards. The long text stays in the accessibility tree.
- */
-export const ASK_SHORT_COPY = Object.freeze({ sent: 'Sent', received: 'Received', waiting: 'Waiting' });
-
-/** The short form of receivedText(count). */
-export function receivedShortText(count) {
-  return count === 1 ? ASK_SHORT_COPY.received : `${count} received`;
-}
-
-/** The short form of waitingText(count). */
-export function waitingShortText(count) {
-  return count === 1 ? ASK_SHORT_COPY.waiting : `${count} waiting`;
-}
-
 /** 'empty' | 'too-long' | null for the text the user typed (counted on the trimmed text, in UTF-16 units,
  * the same count the server uses). */
 export function askTextProblem(text) {
@@ -190,8 +154,8 @@ export function askMessage({ connected, length, notSent, tokenRefused, lineTooLo
 
 /**
  * The Parts view's "Ask Claude to add sections" button: disabled while asking is off or its request is
- * pending, with the line under it saying why. `statusText` is the top-bar
- * status text of that request, or null.
+ * pending, with the line under it saying why. `statusText` is the state phrase of that request's row in the
+ * Requests list, or null.
  */
 export function partsAskState({ connected, pending, statusText }) {
   if (!connected) return { disabled: true, line: ASK_COPY.disconnected };
@@ -241,6 +205,28 @@ function optionalText(descriptor, field) {
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value !== 'string') throw missing(descriptor.kind, `${field} as a string`);
   return cutText(value);
+}
+
+/**
+ * The section names of a range: undefined when the descriptor has none, else a list of 1 to MAX_RANGE_CYCLES non-empty strings
+ * (a range crosses at most one section per cycle). A name is not cut here.
+ */
+function rangeSectionNames(descriptor) {
+  const names = descriptor.sections;
+  if (names === undefined || names === null) return undefined;
+  if (!Array.isArray(names) || names.length < 1 || names.length > MAX_RANGE_CYCLES || names.some((name) => typeof name !== 'string' || name === '')) {
+    throw missing(descriptor.kind, `sections as 1 to ${MAX_RANGE_CYCLES} non-empty names`);
+  }
+  return names;
+}
+
+/** The count of sections a range leaves out: undefined when absent, else a whole number from 1 to MAX_RANGE_CYCLES - 1. */
+function rangeMoreSections(descriptor, names) {
+  const more = descriptor.moreSections;
+  if (more === undefined || more === null) return undefined;
+  if (names === undefined) throw missing(descriptor.kind, 'moreSections only with sections');
+  if (!Number.isInteger(more) || more < 1 || more > MAX_RANGE_CYCLES - 1) throw missing(descriptor.kind, `moreSections as a whole number from 1 to ${MAX_RANGE_CYCLES - 1}`);
+  return more;
 }
 
 function requiredInteger(descriptor, field, min) {
@@ -465,6 +451,47 @@ function momentChipPart(moment) {
 /** The longest section name the chip of a range shows; the context carries the whole name (cut at the context limit). */
 const MAX_RANGE_CHIP_SECTION = 40;
 
+/** The words of the sections part of a range chip: one section, a list of them, and the sections the chip does not show. */
+const RANGE_SECTION_WORDS = Object.freeze({ one: 'section', list: 'sections', more: (n) => `and ${n} more` });
+
+/** The shortest lane part a range chip keeps, so the tail never takes its room: 'Range', the separator and one character. */
+const SHORTEST_RANGE_LANE_PART = `Range${SEPARATOR}x`;
+
+/**
+ * The section names of a range cut to what the context holds: names from the start while they and their ', ' separators stay
+ * within MAX_ASK_CONTEXT_LENGTH characters. The first name is always kept (cut with cutText when it is longer). Gives
+ * `{ names, more }` with `more` the count of names left out. The server rejects a longer list and never trims.
+ */
+export function fitSectionNames(names) {
+  if (names.length === 0) throw new Error('Moontide: a section list to fit needs at least one name');
+  const kept = [cutText(names[0])];
+  let length = kept[0].length;
+  for (let at = 1; at < names.length; at++) {
+    length += 2 + names[at].length;
+    if (length > MAX_ASK_CONTEXT_LENGTH) break;
+    kept.push(names[at]);
+  }
+  return { names: kept, more: names.length - kept.length };
+}
+
+/**
+ * The sections part of a range chip, built around `others` (the chip's other parts, as they will be joined): the most names
+ * that keep the tail within the room left after the shortest lane part, each cut to MAX_RANGE_CHIP_SECTION, and 'and N more' for
+ * every name not shown. `more` counts the names the context already leaves out. At least one name stays.
+ */
+function rangeSectionsPart(names, more, assemble) {
+  const total = names.length + more;
+  const room = MAX_ASK_CONTEXT_LENGTH - SEPARATOR.length - SHORTEST_RANGE_LANE_PART.length;
+  let part = '';
+  for (let shown = names.length; shown >= 1; shown--) {
+    const quoted = names.slice(0, shown).map((name) => `"${cutText(name, MAX_RANGE_CHIP_SECTION)}"`).join(', ');
+    const hidden = total - shown;
+    part = total === 1 ? `${RANGE_SECTION_WORDS.one} ${quoted}` : `${RANGE_SECTION_WORDS.list} ${quoted}${hidden > 0 ? ` ${RANGE_SECTION_WORDS.more(hidden)}` : ''}`;
+    if (assemble(part).length <= room) break;
+  }
+  return part;
+}
+
 /**
  * What a right-click pointed at, as the context the server receives and the chip the user sees.
  * `descriptor` is what a view reports about an element:
@@ -616,24 +643,29 @@ export function describeContext(descriptor) {
       const from = requiredInteger(descriptor, 'from', 0);
       const to = requiredInteger(descriptor, 'to', from);
       if (to - from >= MAX_RANGE_CYCLES) throw missing(kind, `at most ${MAX_RANGE_CYCLES} cycles`);
-      const section = optionalText(descriptor, 'section');
-      const sectionTo = optionalText(descriptor, 'sectionTo');
-      if (sectionTo !== undefined && (section === undefined || sectionTo === section)) throw missing(kind, 'a sectionTo only when it differs from the section');
+      const sections = rangeSectionNames(descriptor);
+      const moreSections = rangeMoreSections(descriptor, sections);
       if (gesture === undefined || gesture.kind !== 'range') throw missing(kind, 'a range gesture with its notes');
       gesture = checkedGesture(gesture);
       const cut = descriptor.cut === undefined || descriptor.cut === null ? null : { from: descriptor.cut.from, to: descriptor.cut.to };
       if (cut !== null) rangeCutText(cut);
       context = { kind, track, from, to };
-      if (section !== undefined) context.section = section;
-      if (sectionTo !== undefined) context.sectionTo = sectionTo;
+      let fitted;
+      if (sections !== undefined) {
+        // The page cuts the list to what the context holds; the cut and a cut the descriptor already made are one count.
+        fitted = fitSectionNames(sections);
+        const left = fitted.more + (moreSections ?? 0);
+        if (left > MAX_RANGE_CYCLES - 1) throw missing(kind, `at most ${MAX_RANGE_CYCLES - 1} moreSections`);
+        context.sections = fitted.names;
+        if (left > 0) context.moreSections = left;
+      }
       // The cycles, the section and the notes are built first and the lane name is cut to the room left, so a long name never
       // costs the cycles.
-      const parts = [from === to ? `cycle ${from}` : `cycles ${from} to ${to}`];
-      if (section !== undefined) {
-        const shown = (name) => `"${cutText(name, MAX_RANGE_CHIP_SECTION)}"`;
-        parts.push(sectionTo === undefined ? `section ${shown(section)}` : `sections ${shown(section)} to ${shown(sectionTo)}`);
-      }
-      parts.push(notesWords(gesture.notes.length + gesture.more));
+      const cycles = from === to ? `cycle ${from}` : `cycles ${from} to ${to}`;
+      const notes = notesWords(gesture.notes.length + gesture.more);
+      const parts = [cycles];
+      if (fitted !== undefined) parts.push(rangeSectionsPart(fitted.names, context.moreSections ?? 0, (part) => [cycles, part, notes].join(SEPARATOR)));
+      parts.push(notes);
       const tail = parts.join(SEPARATOR);
       chip = `${cutText(`Range${SEPARATOR}${track}`, MAX_ASK_CONTEXT_LENGTH - SEPARATOR.length - tail.length)}${SEPARATOR}${tail}`;
       return { context, chip: cutText(chip), gesture, ...(cut === null ? {} : { rangeCut: cut }) };
@@ -837,119 +869,4 @@ export function placeBox({ pointerX, pointerY, boxWidth, boxHeight, maxBoxHeight
 /** A request id the page makes up so answers can be matched: at most 64 characters. */
 export function newAskId(counter, nowMs) {
   return `ask-${nowMs.toString(36)}-${counter}`;
-}
-
-/**
- * The top-bar status of the latest request, as a small state machine with injected time (the
- * page/mixer-gesture.js style). `render(text, short)` receives a string or null and, with a string, its short form (the
- * second argument is left out when hiding). `onTimeout(id)` is called
- * for a request the server did not answer in time, or whose connection dropped.
- *
- * Every non-error text becomes visible no sooner than `minShownMs` after the previous non-error text
- * appeared (a later text is scheduled, never lost); hiding for an error or a refusal is immediate and
- * cancels anything scheduled.
- */
-export function createAskStatus({
-  render,
-  onTimeout,
-  setTimer,
-  clearTimer,
-  now,
-  minShownMs = STATUS_MIN_SHOWN_MS,
-  receivedShownMs = RECEIVED_SHOWN_MS,
-  confirmTimeoutMs = ASK_CONFIRM_TIMEOUT_MS,
-}) {
-  // The request the status describes.
-  let latestId = null;
-  // Requests sent and not yet answered: id -> confirm timer.
-  const unconfirmed = new Map();
-  // When the text on screen appeared; null while nothing shows.
-  let shownAt = null;
-  let scheduled = null;
-  let hideTimer = null;
-
-  function cancelScheduled() {
-    if (scheduled !== null) clearTimer(scheduled);
-    scheduled = null;
-  }
-
-  function cancelHide() {
-    if (hideTimer !== null) clearTimer(hideTimer);
-    hideTimer = null;
-  }
-
-  function hideNow() {
-    cancelScheduled();
-    cancelHide();
-    shownAt = null;
-    render(null);
-  }
-
-  function reveal(text, short, hideAfterMs) {
-    scheduled = null;
-    render(text, short);
-    shownAt = now();
-    if (hideAfterMs !== null) {
-      hideTimer = setTimer(() => {
-        hideTimer = null;
-        hideNow();
-      }, hideAfterMs);
-    }
-  }
-
-  /** Shows a non-error text now, or as soon as the text on screen has been readable long enough. */
-  function present(text, short, hideAfterMs) {
-    cancelScheduled();
-    cancelHide();
-    const wait = shownAt === null ? 0 : Math.max(0, minShownMs - (now() - shownAt));
-    if (wait === 0) {
-      reveal(text, short, hideAfterMs);
-    } else {
-      scheduled = setTimer(() => reveal(text, short, hideAfterMs), wait);
-    }
-  }
-
-  function forget(id) {
-    const timer = unconfirmed.get(id);
-    if (timer === undefined) return;
-    clearTimer(timer);
-    unconfirmed.delete(id);
-  }
-
-  function expire(id) {
-    unconfirmed.delete(id);
-    onTimeout(id);
-    if (id === latestId) hideNow();
-  }
-
-  return {
-    /** A request was sent: it becomes the latest and waits for the server's answer. */
-    sent(id) {
-      latestId = id;
-      unconfirmed.set(id, setTimer(() => expire(id), confirmTimeoutMs));
-      present(ASK_COPY.sent, ASK_SHORT_COPY.sent, null);
-    },
-    /** The server's ask-result for a request. */
-    answered(msg) {
-      forget(msg.id);
-      if (msg.id !== latestId) return;
-      if (msg.status === 'received') present(receivedText(1), receivedShortText(1), receivedShownMs);
-      else if (msg.status === 'waiting') present(waitingText(msg.waiting), waitingShortText(msg.waiting), null);
-      else hideNow();
-    },
-    /** The server's ask-received: waiting requests were just handed to Claude. */
-    handedOver(ids) {
-      for (const id of ids) forget(id);
-      if (latestId !== null && ids.includes(latestId)) present(receivedText(ids.length), receivedShortText(ids.length), receivedShownMs);
-    },
-    /** The connection is gone: nothing sent and unanswered will be answered any more. */
-    dropAll() {
-      for (const [id, timer] of unconfirmed) {
-        clearTimer(timer);
-        onTimeout(id);
-      }
-      unconfirmed.clear();
-      hideNow();
-    },
-  };
 }

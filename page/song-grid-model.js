@@ -354,6 +354,21 @@ export function playingSection(reading, cycle) {
 }
 
 /**
+ * The names of the sections that play in the whole cycles `from` to `to` (both included), in playing order: a section that
+ * plays twice in a row is listed once, and one that comes back after another section is listed again. A range across the end
+ * of the song goes on from its start (the rule of playingSection). A range is at most MAX_RANGE_CYCLES cycles long, so
+ * walking it cycle by cycle is cheap.
+ */
+export function sectionsCrossed(reading, from, to) {
+  const names = [];
+  for (let cycle = from; cycle <= to; cycle++) {
+    const name = String(reading.sections[playingSection(reading, cycle).index].name);
+    if (names[names.length - 1] !== name) names.push(name);
+  }
+  return names;
+}
+
+/**
  * The harmony the Jam view's Declared line shows while `section` (an entry of a read song) plays, in the shape of a
  * reading's `declared`: the section's own text or the piece's, `{ state: 'none' }` when neither is declared, and for a
  * piece harmony the page cannot read `pieceDeclared`, the reading of the piece's harmony, which holds the reason. A

@@ -216,7 +216,7 @@ export function createTimelineEditView({ document, lanes, panel, line, rootFontP
   // The range of cycles that is selected (`{ laneIndex, from, to, cut, wash, anchor, head, info }`): whole cycles of one lane, drawn
   // as `wash`, a span in that lane's mark layer. `cut` is null or `{ from, to }` when the pointer left the event area and the range
   // was held at the page's edge. `anchor` is the cycle the range began at and `head` the cycle its other end follows (the keys move
-  // the head); `info` is what the page says of it (`{ track, section, sectionTo, count }`), shown in the panel. A range drag in
+  // the head); `info` is what the page says of it (`{ track, sections, moreSections, count }`), shown in the panel. A range drag in
   // progress holds its own range in `press.range` until it is released. A range and a selected note never exist together.
   let range = null;
   // The keyboard cursor on a lane that has no note on the page (`{ laneIndex, cycle }`), or null. It is a place to stand, not a

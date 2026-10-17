@@ -271,6 +271,80 @@ test('tempoText: the number part of the idle form and of a tempo share one round
   }
 });
 
+// The tempo readout while a tempo ramp runs: the live tempo to a whole BPM, the arrow and the target, the bars left in the title.
+test('tempoText: a ramp that rises reads the whole live number, the arrow and the target, with the bars left in the title', () => {
+  const ramp = tempoText({ playing: true, bpm: 111.6, ramp: { targetBpm: 120, barsLeft: 3 } });
+  assert.deepEqual(ramp, {
+    idle: false,
+    num: '112',
+    arrow: '→ 120',
+    unit: 'BPM',
+    text: '112 → 120 BPM',
+    name: 'Tempo 112 BPM, rising to 120 BPM',
+    title: 'Tempo moving up to 120 BPM. 3 bars left.',
+  });
+});
+
+test('tempoText: a ramp that falls says falling and moving down', () => {
+  const ramp = tempoText({ playing: true, bpm: 108.2, ramp: { targetBpm: 100, barsLeft: 2 } });
+  assert.equal(ramp.text, '108 → 100 BPM');
+  assert.equal(ramp.name, 'Tempo 108 BPM, falling to 100 BPM');
+  assert.equal(ramp.title, 'Tempo moving down to 100 BPM. 2 bars left.');
+});
+
+test('tempoText: a ramp keeps the decimal of its target and drops the arrow when the number reads like the target', () => {
+  const half = tempoText({ playing: true, bpm: 119.6, ramp: { targetBpm: 120.5, barsLeft: 1 } });
+  assert.equal(half.text, '120 → 120.5 BPM');
+  const last = tempoText({ playing: true, bpm: 119.6, ramp: { targetBpm: 120, barsLeft: 1 } });
+  assert.equal(last.num, '120');
+  assert.equal(last.arrow, '');
+  assert.equal(last.text, '120 BPM');
+  assert.equal(last.name, 'Tempo 120 BPM, rising to 120 BPM');
+  assert.equal(last.title, 'Tempo moving up to 120 BPM. 1 bar left.');
+});
+
+test('tempoText: a ramp that says its direction keeps it when the live tempo reads like the target', () => {
+  const rising = tempoText({ playing: true, bpm: 120, ramp: { targetBpm: 120, barsLeft: 1, rising: true } });
+  assert.equal(rising.name, 'Tempo 120 BPM, rising to 120 BPM');
+  const falling = tempoText({ playing: true, bpm: 100, ramp: { targetBpm: 100, barsLeft: 1, rising: false } });
+  assert.equal(falling.title, 'Tempo moving down to 100 BPM. 1 bar left.');
+  assert.throws(() => tempoText({ playing: true, bpm: 110, ramp: { targetBpm: 120, barsLeft: 1, rising: 'up' } }), /Moontide: .*rising/);
+});
+
+test('tempoText: the bars left are a whole number from 1, singular for one', () => {
+  assert.equal(tempoText({ playing: true, bpm: 110, ramp: { targetBpm: 120, barsLeft: 1 } }).title, 'Tempo moving up to 120 BPM. 1 bar left.');
+  assert.equal(tempoText({ playing: true, bpm: 110, ramp: { targetBpm: 120, barsLeft: 64 } }).title, 'Tempo moving up to 120 BPM. 64 bars left.');
+  for (const bad of [0, 2.5, -1, NaN, Infinity, '3', null, undefined]) {
+    assert.throws(() => tempoText({ playing: true, bpm: 110, ramp: { targetBpm: 120, barsLeft: bad } }), /Moontide: .*bars left/, `barsLeft ${String(bad)}`);
+  }
+});
+
+test('tempoText: a ramp with a bad target or a bad live tempo throws', () => {
+  for (const bad of [0, -1, NaN, Infinity, '120', null, undefined]) {
+    assert.throws(() => tempoText({ playing: true, bpm: 110, ramp: { targetBpm: bad, barsLeft: 2 } }), /Moontide: /, `target ${String(bad)}`);
+    assert.throws(() => tempoText({ playing: true, bpm: bad, ramp: { targetBpm: 120, barsLeft: 2 } }), /Moontide: /, `bpm ${String(bad)}`);
+  }
+  assert.throws(() => tempoText({ playing: true, bpm: 110, ramp: 'up' }), /Moontide: .*ramp/);
+});
+
+test('tempoText: a ramp wins over a waiting change, and nothing plays is still the dash', () => {
+  const both = tempoText({ playing: true, bpm: 111.6, waitingBpm: 90, ramp: { targetBpm: 120, barsLeft: 3 } });
+  assert.equal(both.text, '112 → 120 BPM');
+  assert.deepEqual(tempoText({ playing: false, bpm: 110, ramp: { targetBpm: 120, barsLeft: 3 } }), tempoText({ playing: false }));
+});
+
+test('tempoText: a call with no ramp returns what it returned before, for a null or an absent ramp', () => {
+  for (const args of [{ playing: true, bpm: 118 }, { playing: true, bpm: 118.5, waitingBpm: 124 }, { playing: true, bpm: 118, waitingBpm: null }]) {
+    assert.deepEqual(tempoText({ ...args, ramp: null }), tempoText(args));
+    assert.deepEqual(tempoText({ ...args, ramp: undefined }), tempoText(args));
+  }
+});
+
+test('tempoText: the ramp form is no wider than the widest waiting form', () => {
+  const widest = tempoText({ playing: true, bpm: 118.5, waitingBpm: 1000.5 }).text.length;
+  assert.ok(tempoText({ playing: true, bpm: 999.6, ramp: { targetBpm: 1000.5, barsLeft: 64 } }).text.length <= widest);
+});
+
 // The failed-change banner: the lead, the one sentence that is true about the music, the line, the capped
 // text. The consequence is chosen in a fixed order and mirrors the server's three tails by hand.
 const FAILED = { kind: 'change', message: 'SyntaxError: Unexpected token', plays: true, pageStopped: false, hasEvaluatedSuccessfully: true };

@@ -291,6 +291,42 @@ test('no Mixer group selector uses a reserved color', () => {
   }
 });
 
+// The Requests chip, its panel, its rows and their marks are plain text and shapes in the text colors. A request that was applied
+// is not "live now", one that waits for its line is not the pending-change countdown, and one that failed is not the failed-change
+// banner, so none of them takes a reserved color or a Jam hue. Nothing animates.
+test('no Requests selector uses a reserved color or animates', () => {
+  const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...stripped.matchAll(/([^{}]+)\{([^}]*)\}/g)].map((match) => ({ selectors: match[1].split(',').map((raw) => raw.trim().replace(/\s+/g, ' ')), body: match[2] }));
+  const selectors = [
+    '#requests-toggle',
+    '#requests-panel',
+    '#requests-live',
+    '.rq-count',
+    '.rq-list',
+    '.rq-item',
+    '.rq-row',
+    '.rq-text',
+    '.rq-time',
+    '.rq-mark',
+    '.rq-state',
+    '.rq-recent',
+    '.rq-recent-head',
+    '.rq-recent-body',
+    '.rq-detail',
+  ];
+  const reserved = ['var(--accent)', 'var(--accent-2)', 'var(--destructive)', 'var(--jam-avoid)', 'var(--jam-outside)'];
+  for (const selector of selectors) {
+    const own = new RegExp(`(^|[^\\w-])${selector.replace('.', '\\.')}(?![\\w-])`);
+    const matching = rules.filter((rule) => rule.selectors.some((candidate) => own.test(candidate)));
+    assert.ok(matching.length > 0, `page/style.css has no rule for ${selector}`);
+    for (const rule of matching) {
+      for (const color of reserved) assert.ok(!rule.body.includes(color), `${rule.selectors.join(', ')} must not use ${color}`);
+      assert.ok(!/transition|animation/.test(rule.body), `${rule.selectors.join(', ')} does not animate`);
+      assert.ok(!rule.selectors.some((candidate) => candidate.includes('data-motion')), `${rule.selectors.join(', ')} does not depend on the motion mode`);
+    }
+  }
+});
+
 // The note panel under the Timeline lanes, its buttons and the marks on the lanes (the ring, the ghost, the other places of a
 // token, the range) are outlines, a wash and plain text in the text colors. None takes a reserved color: a selection is not
 // "live now", a refusal is information and an edit can be undone from the history, so nothing here looks like the accent, the

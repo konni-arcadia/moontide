@@ -16,7 +16,7 @@ const MAX_INDENT_LEVELS = 4;
 const LIST_NOTE_ID = 'song-cell-list-note';
 
 /** True for the two keyboard gestures that mean a right-click: the Menu key, and F10 with Shift (and no other modifier). */
-function isAskKey(event) {
+export function isAskKey(event) {
   if (event.altKey || event.metaKey || event.ctrlKey) return false;
   if (event.key === 'ContextMenu') return !event.shiftKey;
   return event.key === 'F10' && event.shiftKey === true;

@@ -254,17 +254,24 @@ test('music requests start Moontide: no page within the wait fails, names the ad
   assert.ok(took >= 295, `waited the limit, took ${took} ms`);
   assert.ok(took < 3000, `did not wait longer, took ${took} ms`);
 
-  // A page that connects afterwards gets nothing: the request was never sent.
+  // A page that connects afterwards gets nothing from the request that timed out. The server writes to one
+  // page socket in order, so an evaluate left over from that request would arrive before the marker; the
+  // marker is the only code this page answers, and it must be the only evaluate the page ever received.
   const received = [];
   const late = await createFakePage(server.port, {
     responder: (msg) => {
       received.push(msg);
-      return null;
+      return msg.code === 's("hh")' ? answer('playing')(msg) : null;
     },
   });
   t.after(() => late.ws.close());
-  await sleep(200);
-  assert.equal(received.length, 0, 'a late page receives no evaluate');
+  const marker = await h.call('set_code', { code: 's("hh")' });
+  assert.ok(!marker.isError, textOf(marker));
+  assert.deepEqual(
+    received.map((msg) => msg.code),
+    ['s("hh")'],
+    'the marker is the only evaluate the late page received',
+  );
 });
 
 test('music requests start Moontide: start and set_code sent at once share one start and one tab', async (t) => {

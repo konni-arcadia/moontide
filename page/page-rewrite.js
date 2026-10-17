@@ -46,7 +46,7 @@ function refused(reason) {
  *   evalError() -> the evaluation's error or null,
  *   revertAndReport(error) -> { errorText, line }: sets the editor back to the committed code and shows the banner,
  *   markPageOrigin() -> the playing code now has no Claude evaluate id,
- *   whenFinished(record, fn) -> runs fn when the waiting change takes over (or is dropped),
+ *   whenFinished(record, fn) -> runs fn when the waiting change takes over; never when it is canceled (replaced or stopped),
  *   markPageOriginAtTakeover() -> the same mark, for the moment a waiting change takes over.
  */
 export function createPageRewrite(deps) {

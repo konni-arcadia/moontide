@@ -365,8 +365,9 @@ test('favorite_version and list_history filter/favorites: naming, renaming, filt
 
   const { tools } = await client.listTools();
   const names = tools.map((tool) => tool.name).sort();
-  // Fourteen tools, including start, set_page_requests, get_strudel_reference, get_midi_instruments, save_midi_model, search_midi_sounds, save_midi_catalog and edit_code.
+  // Fifteen tools, including answer_request, start, set_page_requests, get_strudel_reference, get_midi_instruments, save_midi_model, search_midi_sounds, save_midi_catalog and edit_code.
   assert.deepEqual(names, [
+    'answer_request',
     'edit_code',
     'favorite_version',
     'get_code',

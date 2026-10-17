@@ -19,6 +19,16 @@
 //     --tail             instead of the grid run, measure the note-ons that still arrive after Stop, after muting a
 //                        track and after a sound change; prints one JSON line per scenario. Not combinable with
 //                        --busy or --clock.
+//     --ramp MS          instead of the grid run, step the tempo about 20 times from 100 to 120 BPM, MS milliseconds apart
+//                        (a whole number from 50 to 100), while the code holds 120, and measure the clock ticks around the
+//                        steps: the arrival intervals (largest, smallest, holes, doubled ticks), the ticks in every cycle, and
+//                        from the page's send log the late sends. Implies --clock; not combinable with --tail or --per-cycle.
+//                        --busy loads the page's main thread during the ramp. The steps come from the measurement driver of
+//                        scripts/probe-midi.mjs (RAMP_DRIVER_SOURCE), injected into the bench's own browser tab: it is not
+//                        page code. Prints one JSON line.
+//     --driver NAME      with --ramp: "interval" (default) wakes on a short timer and reads the scheduler's position, "query"
+//                        hooks the scheduler's query path and sets each step in the task of the tick that found it, and
+//                        "query-late" does the same but sets each step 25 ms after that tick
 //     --headful          a real browser window instead of headless
 //     --browser PATH     the Chromium-based browser to drive (default: found like the probes do)
 //
@@ -57,15 +67,17 @@ import {
   spawnBrowser,
   startServerAndClient,
   waitConnected,
+  waitFor,
   waitSocketOpen,
 } from './probe-page.mjs';
+import { RAMP_DRIVER_SOURCE, rampTickStats } from './probe-midi.mjs';
 
 const NAME = 'bench:midi';
 const DEFAULT_PORT = 'IAC Driver Bus 1';
 
 /** Parses the bench's own options. Throws an Error that names the problem (the caller prints it, exit code 2). */
 function parseBenchArgs(argv) {
-  const result = { port: DEFAULT_PORT, seconds: 10, cpm: 25, perCycle: 96, busy: false, clock: false, tail: false, headful: false, browserPath: null };
+  const result = { port: DEFAULT_PORT, seconds: 10, cpm: 25, perCycle: 96, busy: false, clock: false, tail: false, ramp: null, driver: null, headful: false, browserPath: null };
   const need = (flag, i) => {
     const value = argv[i];
     if (value === undefined || value.startsWith('--') || value.trim() === '') throw new Error(`${flag} needs a value`);
@@ -79,20 +91,39 @@ function parseBenchArgs(argv) {
     }
     return value;
   };
+  let perCycleGiven = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--busy') result.busy = true;
     else if (arg === '--clock') result.clock = true;
     else if (arg === '--tail') result.tail = true;
     else if (arg === '--headful') result.headful = true;
-    else if (arg === '--port') result.port = need(arg, ++i);
+    else if (arg === '--ramp') {
+      const raw = need(arg, ++i);
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < 50 || value > 100) throw new Error(`--ramp needs a whole number of milliseconds from 50 to 100, got "${raw}"`);
+      result.ramp = value;
+    } else if (arg === '--driver') {
+      const raw = need(arg, ++i);
+      if (raw !== 'interval' && raw !== 'query' && raw !== 'query-late') throw new Error(`--driver needs "interval", "query" or "query-late", got "${raw}"`);
+      result.driver = raw;
+    } else if (arg === '--port') result.port = need(arg, ++i);
     else if (arg === '--seconds') result.seconds = positive(arg, ++i, false);
     else if (arg === '--cpm') result.cpm = positive(arg, ++i, false);
-    else if (arg === '--per-cycle') result.perCycle = positive(arg, ++i, true);
-    else if (arg === '--browser') result.browserPath = need(arg, ++i);
+    else if (arg === '--per-cycle') {
+      result.perCycle = positive(arg, ++i, true);
+      perCycleGiven = true;
+    } else if (arg === '--browser') result.browserPath = need(arg, ++i);
     else throw new Error(`unknown option "${arg}"`);
   }
   if (result.tail && (result.busy || result.clock)) throw new Error('--tail cannot be combined with --busy or --clock');
+  if (result.driver !== null && result.ramp === null) throw new Error('--driver only goes with --ramp');
+  if (result.ramp !== null) {
+    if (result.tail) throw new Error('--ramp cannot be combined with --tail');
+    if (perCycleGiven) throw new Error('--ramp cannot be combined with --per-cycle');
+    result.clock = true;
+    result.driver ??= 'interval';
+  }
   // The port name goes into a Strudel string: keep it free of characters that would end the string.
   if (/['\\\n\r]/.test(result.port)) throw new Error('--port must not contain a quote, a backslash or a line break');
   return result;
@@ -281,6 +312,77 @@ async function runTiming(args, { client, cdp, browser }) {
   return out;
 }
 
+/**
+ * The ramp run: the code holds 120 BPM, a silent track makes the port a clock instrument, a track plays one quiet note on every cycle
+ * line, and the measurement driver steps the tempo from 100 to 120 BPM in 20 steps `args.ramp` ms apart. The loopback listener
+ * sees every tick and note (arrival time); the page's own send log shows which sends were late. Returns the JSON object.
+ */
+async function runRamp(args, { client, cdp, browser }) {
+  const { port, ramp: spacingMs, driver, busy } = args;
+  const fromBpm = 100;
+  const toBpm = 120;
+  const steps = 20;
+  const slowestCycleMs = 2400;
+  // The last track is a sine far below what anyone hears: Chrome stops the audio output of a page that makes no sound at all
+  // after about 25 seconds, and the clock's tick timestamps then jitter whatever the tempo does.
+  const code = `setcpm(120/4)\nclock: silence.midi('${port}', { midichannel: 2 })\nbeat: note("c3").midi('${port}', { midichannel: 3, velocity: 0.01 })\nkeepalive: s("sine").gain(0.0006).slow(2)`;
+  console.error(`${NAME}: ${(await callTool(client, 'set_code', { code, label: 'bench ramp' })).split('\n').slice(0, 3).join(' | ')}`);
+  // The page-wide alignment warms up first: the clock's first tick on the port is the sign it runs.
+  const ticking = await waitFor(cdp, 'window.__arrivals.some((a) => a.bytes.length === 1 && a.bytes[0] === 0xf8) ? true : null', 15000);
+  if (ticking !== true) throw new ProbeCouldNotRun(`no clock tick arrived on "${port}" within 15 seconds; the page did not treat the port as a clock instrument`);
+  await evaluateExpr(cdp, RAMP_DRIVER_SOURCE);
+  await evaluateExpr(cdp, 'window.__arrivals.length = 0; window.__sends.length = 0; true');
+  // One beat note per cycle on the loopback: three notes after a mark are two whole cycles.
+  const waitTwoCycles = async (what) => {
+    const mark = await evaluateExpr(cdp, 'window.__arrivals.length');
+    const arrived = await waitFor(
+      cdp,
+      `window.__arrivals.slice(${mark}).filter((a) => a.bytes.length === 3 && (a.bytes[0] & 0xf0) === 0x90 && a.bytes[2] > 0).length >= 3 ? true : null`,
+      4 * slowestCycleMs + 5000,
+    );
+    if (arrived !== true) throw new ProbeCouldNotRun(`two cycles of beat notes did not arrive on "${port}" ${what}`);
+  };
+  await evaluateExpr(cdp, `window.__rampProbe.set(${fromBpm})`);
+  await waitTwoCycles('after the start tempo was set');
+  const windowFrom = await evaluateExpr(cdp, 'performance.now()');
+  const pageDriver = driver === 'interval' ? 'interval' : 'query';
+  const applyDelayMs = driver === 'query-late' ? 25 : 0;
+  await evaluateExpr(cdp, `window.__rampProbe.start(${JSON.stringify({ driver: pageDriver, fromBpm, toBpm, steps, spacingMs, busy, applyDelayMs })})`);
+  const deadline = steps * spacingMs + slowestCycleMs + 5000;
+  if ((await waitFor(cdp, 'window.__rampProbe.state().done ? true : null', deadline)) !== true) {
+    throw new ProbeCouldNotRun(`the ${driver} ramp driver did not apply its last step within ${deadline} ms`);
+  }
+  await waitTwoCycles('after the last step');
+  const windowTo = (await evaluateExpr(cdp, 'performance.now()')) - 500;
+  const { log, errors } = await evaluateExpr(cdp, 'window.__rampProbe.state()');
+  await evaluateExpr(cdp, 'window.__rampProbe.stop()');
+  const { arrivals, sends } = JSON.parse(await evaluateExpr(cdp, 'JSON.stringify({ arrivals: window.__arrivals, sends: window.__sends })'));
+  await callTool(client, 'stop', {});
+
+  // Both logs go through the probe's tick statistics under one port name; the arrival log has no requested timestamp, so a
+  // message counts at its arrival time (on a loopback, a stamped message arrives at the time it asked for).
+  const entriesOf = (list, stamped) => list.map((entry) => ({ t: entry.t, port: 'loop', bytes: entry.bytes, ts: stamped ? entry.ts : null }));
+  const options = { clockPort: 'loop', beatPort: 'loop', steps: log.map((step) => ({ landPerf: step.landPerf, bpm: step.bpm })), fromBpm, windowFrom, windowTo };
+  const arrived = rampTickStats(entriesOf(arrivals, false), options);
+  const sent = rampTickStats(entriesOf(sends, true), options);
+  const sortedErrors = log.map((step) => step.lastEnd - step.plannedCycle).sort((a, b) => a - b);
+  return {
+    mode: 'ramp',
+    driver,
+    spacingMs,
+    load: busy ? 'busy' : 'idle',
+    steps: log.length,
+    merged: log.filter((step) => step.merged).length,
+    anchorsSeen: log.filter((step) => step.landed).length,
+    stepErrorCycles: sortedErrors.length === 0 ? null : { p50: Math.round(sortedErrors[Math.floor((sortedErrors.length - 1) / 2)] * 1000) / 1000, max: Math.round(Math.max(...sortedErrors.map(Math.abs)) * 1000) / 1000 },
+    arrival: { ticks: arrived.ticks, maxGapMs: arrived.maxGapMs, minGapMs: arrived.minGapMs, holes: arrived.holes, doubled: arrived.doubled, ticksPerCycle: { cycles: arrived.ticksPerCycle.cycles, min: arrived.ticksPerCycle.min, max: arrived.ticksPerCycle.max } },
+    send: { ticks: sent.ticks, late: sent.late, aheadMs: sent.aheadMs, starts: sent.starts },
+    driverErrors: errors,
+    port,
+    browser,
+  };
+}
+
 /** The tail scenarios: the note-ons that still arrive after Stop, after muting a track and after a sound change. */
 async function runTail(args, { client, cdp }) {
   const { port, cpm, perCycle } = args;
@@ -368,6 +470,8 @@ async function main() {
     await withBenchPage(args, rig, async (page) => {
       if (args.tail) {
         for (const line of await runTail(args, page)) console.log(JSON.stringify({ ...line, port: args.port, browser: page.browser }));
+      } else if (args.ramp !== null) {
+        console.log(JSON.stringify(await runRamp(args, page)));
       } else {
         console.log(JSON.stringify(await runTiming(args, page)));
       }

@@ -46,7 +46,8 @@ place:
   say it too, and the entry wins; the shipped models say `"clock": false`). Moontide then sends the
   clock while the code names that instrument in a `.midi()` call, even in a silent track such as
   `silence.midi('UM-ONE', { midichannel: 3 })`. The clock counts 4 beats per cycle, so `setcpm(120/4)`
-  is 120 BPM. Stop stops the instrument too.
+  is 120 BPM. Stop stops the instrument too. The clock follows a tempo ramp step by step; how a hardware
+  instrument that follows the clock reacts to a ramp has not been verified.
 - The Instruments view switches each instrument on or off. An instrument that is off goes silent
   like an unplug, and comes back with its reset and setup when switched on. The choice is kept in
   its own small file next to `instruments.json`, and Claude is told about each change once.

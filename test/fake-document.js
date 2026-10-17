@@ -132,6 +132,9 @@ export function fakeNode(tagName, doc) {
       node.children.forEach((child) => (child.parentNode = null));
       node.children = [];
     },
+    get firstChild() {
+      return node.children[0] ?? null;
+    },
     get nextSibling() {
       if (node.parentNode === null) return null;
       const siblings = node.parentNode.children;

@@ -8,15 +8,12 @@ import {
   askTextProblem,
   cellFitPrefill,
   counterText,
-  createAskStatus,
   cutText,
   describeContext,
   cycleAt,
   lineAtY,
   placeBox,
-  receivedText,
   refusalText,
-  waitingText,
 } from '../page/ask.js';
 // Namespace import for partsAskState: a named import of a missing export is a
 // module-load SyntaxError that crashes the whole file.
@@ -397,9 +394,6 @@ test('every ASK_COPY string equals its pinned text exactly', () => {
     disconnected: 'Disconnected — asking Claude is off until Moontide reconnects.',
     notSent: 'This request was not sent. Press Enter to try again.',
     notSentToken: 'This request was not sent.',
-    sent: 'Sent to Claude',
-    received: 'Claude received it',
-    waiting: 'Claude will see it on its next action',
     tooLong: 'request too long — 2000 characters at most.',
     lineTooLong: 'request too long to send — some characters take extra room, so shorten the text.',
     rateLimit: 'too many requests — wait a moment, then send again.',
@@ -447,13 +441,6 @@ test('an unreadable right-click context reaches the error line as one plain line
   const line = 'Error: could not read what was right-clicked — this request is about the whole session.';
   assert.equal(errorLineText(ASK_COPY.contextUnreadable), line);
   assert.equal(errorLineText(`${ASK_COPY.contextUnreadable}\nMoontide: ask context part needs a non-empty name`), line);
-});
-
-test('receivedText and waitingText use the singular copy for one and a count for several', () => {
-  assert.equal(receivedText(1), 'Claude received it');
-  assert.equal(waitingText(1), 'Claude will see it on its next action');
-  assert.equal(receivedText(3), 'Claude received 3 requests');
-  assert.equal(waitingText(2), 'Claude will see 2 requests on its next action');
 });
 
 test('askTextProblem: empty, too long, or fine, counted on the trimmed text', () => {
@@ -542,36 +529,36 @@ test('the range chip reads cycle for one, no notes and 1 note, the sections in d
   const chipOf = (overrides, gesture) => describeContext(rangeDescriptor(overrides, gesture)).chip;
   assert.equal(chipOf({ from: 2, to: 2 }, { notes: [] }), 'Range · t1 · cycle 2 · no notes');
   assert.equal(chipOf({ from: 2, to: 2 }, { notes: sampleRangeNotes(1) }), 'Range · t1 · cycle 2 · 1 note');
-  assert.equal(chipOf({ section: 'y' }), 'Range · t1 · cycles 2 to 5 · section "y" · 3 notes');
-  assert.equal(chipOf({ section: 'x', sectionTo: 'y' }), 'Range · t1 · cycles 2 to 5 · sections "x" to "y" · 3 notes');
+  assert.equal(chipOf({ sections: ['y'] }), 'Range · t1 · cycles 2 to 5 · section "y" · 3 notes');
+  assert.equal(chipOf({ sections: ['x', 'y'] }), 'Range · t1 · cycles 2 to 5 · sections "x", "y" · 3 notes');
+  assert.equal(chipOf({ sections: ['z', 'x', 'y'] }), 'Range · t1 · cycles 2 to 5 · sections "z", "x", "y" · 3 notes');
   assert.equal(chipOf({}, { notes: sampleRangeNotes(32), more: 8 }), 'Range · t1 · cycles 2 to 5 · 40 notes');
-  const described = describeContext(rangeDescriptor({ section: 'x', sectionTo: 'y' }));
-  assert.deepEqual(described.context, { kind: 'range', track: 't1', from: 2, to: 5, section: 'x', sectionTo: 'y' });
-  // Without a section the context has neither key.
+  const described = describeContext(rangeDescriptor({ sections: ['z', 'x', 'y'] }));
+  assert.deepEqual(described.context, { kind: 'range', track: 't1', from: 2, to: 5, sections: ['z', 'x', 'y'] });
+  // Without sections the context has no section key.
   assert.deepEqual(Object.keys(describeContext(rangeDescriptor()).context), ['kind', 'track', 'from', 'to']);
 });
 
 test('a 200-character lane name is cut first in the range chip; the cycles, the sections and the notes stay', () => {
   const long = 'n'.repeat(200);
-  const { chip, context } = describeContext(rangeDescriptor({ track: long, from: 40, to: 63, section: 'verse', sectionTo: 'chorus' }, { notes: sampleRangeNotes(32), more: 8 }));
-  const tail = 'cycles 40 to 63 · sections "verse" to "chorus" · 40 notes';
+  const { chip, context } = describeContext(rangeDescriptor({ track: long, from: 40, to: 63, sections: ['verse', 'chorus'] }, { notes: sampleRangeNotes(32), more: 8 }));
+  const tail = 'cycles 40 to 63 · sections "verse", "chorus" · 40 notes';
   assert.ok(chip.endsWith(` · ${tail}`), chip);
   assert.ok(chip.length <= MAX_ASK_CONTEXT_LENGTH);
   assert.ok(chip.startsWith('Range · nnnn') && chip.includes('\u2026 · cycles'), chip);
   assert.equal(context.track, long, 'the context keeps the whole name');
   // Long section names are cut in the chip (40 characters each) but not in the context.
-  const sections = describeContext(rangeDescriptor({ track: long, section: 's'.repeat(200), sectionTo: 'e'.repeat(200) }));
+  const sections = describeContext(rangeDescriptor({ track: long, sections: ['s'.repeat(90), 'e'.repeat(90)] }));
   assert.ok(sections.chip.length <= MAX_ASK_CONTEXT_LENGTH);
-  assert.ok(sections.chip.endsWith(`sections "${'s'.repeat(39)}\u2026" to "${'e'.repeat(39)}\u2026" · 3 notes`), sections.chip);
-  assert.equal(sections.context.section, 's'.repeat(200));
-  assert.equal(sections.context.sectionTo, 'e'.repeat(200));
+  assert.ok(sections.chip.endsWith(`sections "${'s'.repeat(39)}\u2026", "${'e'.repeat(39)}\u2026" · 3 notes`), sections.chip);
+  assert.deepEqual(sections.context.sections, ['s'.repeat(90), 'e'.repeat(90)], 'the context keeps the whole names');
 });
 
 test('a range of 32 notes with long names on a 200-character lane gives notes up to more until the line is at most 8192 bytes, and the chip keeps its cycles', () => {
   const name = (letter) => letter.repeat(150);
   const notes = Array.from({ length: 32 }, (_, at) => ({ track: name('t'), instrument: name('i'), note: name('n'), sound: name('s'), velocity: 0.9, start: 40 + at / 10, end: 40.5 + at / 10 }));
-  const described = describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, section: 'verse', sectionTo: 'chorus' }, { notes }));
-  assert.ok(described.chip.endsWith('cycles 40 to 71 · sections "verse" to "chorus" · 32 notes'), described.chip);
+  const described = describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, sections: ['verse', 'chorus'] }, { notes }));
+  assert.ok(described.chip.endsWith('cycles 40 to 71 · sections "verse", "chorus" · 32 notes'), described.chip);
   const fields = { id: 'ask-1', text: 'what is here?', context: described.context, chip: described.chip, current: 4, gesture: described.gesture };
   assert.ok(ask.requestLineBytes(fields) > 8192, 'the long names push the whole range over one line');
   const fitted = ask.fitGestureToLine(fields);
@@ -580,7 +567,66 @@ test('a range of 32 notes with long names on a 200-character lane gives notes up
   assert.equal(fitted.notes.length + fitted.more, 32, 'the notes left out are counted, none is lost');
   assert.equal(ask.requestFitsLine(fields), true);
   // The chip counted the notes before the cut and still reads the same after it: notes and more are one count.
-  assert.equal(describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, section: 'verse', sectionTo: 'chorus' }, { notes: fitted.notes, more: fitted.more })).chip, described.chip);
+  assert.equal(describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 71, sections: ['verse', 'chorus'] }, { notes: fitted.notes, more: fitted.more })).chip, described.chip);
+});
+
+test('fitSectionNames keeps the names that fit 200 characters with their separators, always the first, and counts the rest', () => {
+  assert.deepEqual(ask.fitSectionNames(['a', 'b']), { names: ['a', 'b'], more: 0 });
+  const forty = Array.from({ length: 31 }, (_, at) => String.fromCharCode(97 + (at % 26)).repeat(40));
+  const fitted = ask.fitSectionNames(forty);
+  assert.deepEqual(fitted.names, forty.slice(0, 4), 'four names and their separators are 166 characters, a fifth would pass 200');
+  assert.equal(fitted.more, 27);
+  assert.equal(ask.fitSectionNames(['a'.repeat(200)]).more, 0);
+  const exact = ask.fitSectionNames(['a'.repeat(99), 'b'.repeat(99)]);
+  assert.equal(exact.names.length, 2, '99 + 2 + 99 is 200 characters, which fit');
+  const first = ask.fitSectionNames(['x'.repeat(300), 'y']);
+  assert.deepEqual(first, { names: [`${'x'.repeat(199)}\u2026`], more: 1 }, 'the first name is always kept, cut to 200 characters');
+  assert.throws(() => ask.fitSectionNames([]), /section/);
+});
+
+test('a range across many sections cuts the list to 200 characters, says how many more, and keeps the chip within 200 characters', () => {
+  const named = (length, count) => Array.from({ length: count }, (_, at) => `${String.fromCharCode(97 + (at % 26))}${'-'.repeat(length - 1)}`);
+  const forty = named(40, 31);
+  const described = describeContext(rangeDescriptor({ from: 0, to: 30, sections: forty }));
+  assert.deepEqual(described.context.sections, forty.slice(0, 4));
+  assert.equal(described.context.moreSections, 27);
+  assert.ok(described.chip.length <= MAX_ASK_CONTEXT_LENGTH, described.chip);
+  const shown = described.chip.match(/"[^"]*"/g).length;
+  assert.equal(described.chip, `Range · t1 · cycles 0 to 30 · sections ${forty.slice(0, shown).map((name) => `"${name}"`).join(', ')} and ${31 - shown} more · 3 notes`);
+  // A list that fits has no moreSections and no 'and N more'.
+  const fits = describeContext(rangeDescriptor({ sections: named(10, 5) }));
+  assert.equal(Object.hasOwn(fits.context, 'moreSections'), false);
+  assert.ok(!fits.chip.includes(' more'), fits.chip);
+  // The cut the page made before the descriptor reached the box is counted as well.
+  const counted = describeContext(rangeDescriptor({ sections: ['z', 'x'], moreSections: 3 }));
+  assert.deepEqual(counted.context, { kind: 'range', track: 't1', from: 2, to: 5, sections: ['z', 'x'], moreSections: 3 });
+  assert.equal(counted.chip, 'Range · t1 · cycles 2 to 5 · sections "z", "x" and 3 more · 3 notes');
+  assert.equal(describeContext(rangeDescriptor({ sections: ['z'], moreSections: 2 })).chip, 'Range · t1 · cycles 2 to 5 · sections "z" and 2 more · 3 notes');
+  // 200-character names on a 200-character lane: the first name only, and the chip keeps its cycles and its notes words.
+  const worst = describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 70, sections: named(200, 31) }, { notes: sampleRangeNotes(32), more: 8 }));
+  assert.equal(worst.context.sections.length, 1);
+  assert.equal(worst.context.sections[0].length, 200);
+  assert.equal(worst.context.moreSections, 30);
+  assert.ok(worst.chip.length <= MAX_ASK_CONTEXT_LENGTH, worst.chip);
+  assert.ok(worst.chip.endsWith(` · cycles 40 to 70 · sections "a${'-'.repeat(38)}\u2026" and 30 more · 40 notes`), worst.chip);
+  // More than the descriptor and the page could count together is a bug.
+  assert.throws(() => describeContext(rangeDescriptor({ sections: named(200, 3), moreSections: 31 })), /moreSections/);
+});
+
+test('the line of a range across 31 sections with 200-character names stays within 8192 bytes once its notes are cut, and keeps the list', () => {
+  const name = (letter) => letter.repeat(150);
+  const notes = Array.from({ length: 32 }, (_, at) => ({ track: name('t'), instrument: name('i'), note: name('n'), sound: name('s'), velocity: 0.9, start: 40 + at / 10, end: 40.5 + at / 10 }));
+  const sections = Array.from({ length: 31 }, (_, at) => `${String.fromCharCode(97 + (at % 26))}${'-'.repeat(199)}`);
+  const described = describeContext(rangeDescriptor({ track: 'n'.repeat(200), from: 40, to: 70, sections }, { notes }));
+  const fields = { id: 'ask-1', text: 'what is here?', context: described.context, chip: described.chip, current: 4, gesture: described.gesture };
+  assert.ok(ask.requestLineBytes(fields) > 8192, 'the long names push the whole range over one line');
+  const fitted = ask.fitGestureToLine(fields);
+  assert.ok(ask.requestLineBytes({ ...fields, gesture: fitted }) <= 8192);
+  assert.equal(fitted.notes.length + fitted.more, 32, 'the notes leave first and are counted');
+  assert.equal(ask.requestFitsLine(fields), true);
+  assert.equal(described.context.sections.length, 1);
+  assert.equal(described.context.moreSections, 30, 'the list and its count stay');
+  assert.ok(described.chip.length <= MAX_ASK_CONTEXT_LENGTH && described.chip.includes('cycles 40 to 70') && described.chip.endsWith(' · 32 notes'), described.chip);
 });
 
 test('describeContext throws for a range the server would refuse or the page got wrong', () => {
@@ -590,8 +636,15 @@ test('describeContext throws for a range the server would refuse or the page got
     [rangeDescriptor({ from: 1.5 }), /from/],
     [rangeDescriptor({ to: 1 }), /to/],
     [rangeDescriptor({ from: 0, to: 32 }), /at most 32 cycles/],
-    [rangeDescriptor({ sectionTo: 'y' }), /sectionTo/],
-    [rangeDescriptor({ section: 'x', sectionTo: 'x' }), /sectionTo/],
+    [rangeDescriptor({ sections: [] }), /sections/],
+    [rangeDescriptor({ sections: 'x' }), /sections/],
+    [rangeDescriptor({ sections: ['x', ''] }), /sections/],
+    [rangeDescriptor({ sections: ['x', 3] }), /sections/],
+    [rangeDescriptor({ sections: Array.from({ length: 33 }, (_, at) => `s${at}`) }), /sections/],
+    [rangeDescriptor({ moreSections: 2 }), /moreSections/],
+    [rangeDescriptor({ sections: ['x'], moreSections: 0 }), /moreSections/],
+    [rangeDescriptor({ sections: ['x'], moreSections: 32 }), /moreSections/],
+    [rangeDescriptor({ sections: ['x'], moreSections: 1.5 }), /moreSections/],
     [rangeDescriptor({ moment: sampleMoment() }), /cannot carry a moment/],
     [rangeDescriptor({ cut: { from: 5, to: 2 } }), /cut range/],
     [{ ...rangeDescriptor(), gesture: undefined }, /range gesture/],
@@ -619,154 +672,6 @@ test('a range note keeps the named keys without a state, and cuts its strings at
   assert.deepEqual(Object.keys(kept), ['track', 'instrument', 'sound', 'note', 'drum', 'velocity', 'start', 'end']);
   assert.equal(kept.track.length, MAX_ASK_CONTEXT_LENGTH);
   assert.ok(!('state' in kept) && !('stray' in kept));
-});
-
-/** A manual clock and timer list for the status machine: timers fire in time order. */
-function statusHarness() {
-  let clock = 0;
-  let nextTimer = 1;
-  const timers = new Map();
-  const shown = [];
-  const timedOut = [];
-  const status = createAskStatus({
-    render: (text) => shown.push({ at: clock, text }),
-    onTimeout: (id) => timedOut.push(id),
-    setTimer: (fn, ms) => {
-      const id = nextTimer++;
-      timers.set(id, { fn, at: clock + ms });
-      return id;
-    },
-    clearTimer: (id) => timers.delete(id),
-    now: () => clock,
-  });
-  function advance(ms) {
-    const end = clock + ms;
-    for (;;) {
-      let dueId = null;
-      let dueAt = Infinity;
-      for (const [id, timer] of timers) {
-        if (timer.at <= end && timer.at < dueAt) {
-          dueId = id;
-          dueAt = timer.at;
-        }
-      }
-      if (dueId === null) break;
-      const { fn } = timers.get(dueId);
-      timers.delete(dueId);
-      clock = dueAt;
-      fn();
-    }
-    clock = end;
-  }
-  return { status, advance, shown, timedOut, timers, at: () => clock };
-}
-
-test('status: sent shows Sent to Claude at once', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  assert.deepEqual(h.shown, [{ at: 0, text: 'Sent to Claude' }]);
-});
-
-test('status: Claude received it waits for the 600 ms minimum, then hides 4 s later', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(5);
-  h.status.answered({ id: 'a', status: 'received' });
-  h.advance(594);
-  assert.equal(h.shown.length, 1, 'Sent to Claude is still the text on screen at 599 ms');
-  h.advance(1);
-  assert.deepEqual(h.shown[1], { at: 600, text: 'Claude received it' });
-  h.advance(3999);
-  assert.equal(h.shown.length, 2);
-  h.advance(1);
-  assert.deepEqual(h.shown[2], { at: 4600, text: null });
-});
-
-test('status: several waiting requests read the count form and stay past 10 s', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(700);
-  h.status.answered({ id: 'a', status: 'waiting', waiting: 2 });
-  assert.deepEqual(h.shown[1], { at: 700, text: 'Claude will see 2 requests on its next action' });
-  h.advance(10000);
-  assert.equal(h.shown.length, 2, 'the waiting text is never hidden by a timer');
-});
-
-test('status: a hand-over after waiting shows Claude received it at least 600 ms after the waiting text', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(700);
-  h.status.answered({ id: 'a', status: 'waiting', waiting: 1 });
-  h.advance(100);
-  h.status.handedOver(['a']);
-  h.advance(500);
-  assert.deepEqual(h.shown[2], { at: 1300, text: 'Claude received it' });
-  h.advance(4000);
-  assert.deepEqual(h.shown[3], { at: 5300, text: null });
-});
-
-test('status: a hand-over of two requests reads Claude received 2 requests', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(700);
-  h.status.answered({ id: 'a', status: 'waiting', waiting: 1 });
-  h.advance(700);
-  h.status.sent('b');
-  h.advance(700);
-  h.status.answered({ id: 'b', status: 'waiting', waiting: 2 });
-  h.advance(700);
-  h.status.handedOver(['a', 'b']);
-  assert.equal(h.shown.at(-1).text, 'Claude received 2 requests');
-});
-
-test('status: a refusal hides at once and cancels a scheduled text', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(5);
-  h.status.answered({ id: 'a', status: 'received' });
-  h.advance(100);
-  h.status.sent('b');
-  h.status.answered({ id: 'b', status: 'refused', reason: 'rate-limit' });
-  assert.equal(h.shown.at(-1).text, null);
-  const count = h.shown.length;
-  h.advance(10000);
-  assert.equal(h.shown.length, count, 'nothing scheduled comes back after the refusal');
-  assert.equal(h.timers.size, 0);
-});
-
-test('status: no answer within 5000 ms calls onTimeout and hides', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(4999);
-  assert.deepEqual(h.timedOut, []);
-  h.advance(1);
-  assert.deepEqual(h.timedOut, ['a']);
-  assert.equal(h.shown.at(-1).text, null);
-});
-
-test('status: an answer for an older id clears its timer but does not change the display', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(10);
-  h.status.sent('b');
-  h.advance(700);
-  const count = h.shown.length;
-  h.status.answered({ id: 'a', status: 'received' });
-  h.advance(700);
-  assert.equal(h.shown.length, count, 'the display still describes the latest request');
-  h.advance(4000);
-  assert.deepEqual(h.timedOut, ['b'], 'only the latest request is left to time out');
-});
-
-test('status: dropAll calls onTimeout for each unconfirmed id and hides', () => {
-  const h = statusHarness();
-  h.status.sent('a');
-  h.advance(10);
-  h.status.sent('b');
-  h.status.dropAll();
-  assert.deepEqual(h.timedOut.sort(), ['a', 'b']);
-  assert.equal(h.shown.at(-1).text, null);
-  assert.equal(h.timers.size, 0);
 });
 
 // boxHeight is the box's height now (one field line); maxBoxHeight its height at six field lines.
@@ -857,10 +762,10 @@ test('partsAskState: disconnected disables the button and gives the disconnected
   });
 });
 
-test('partsAskState: pending disables the button and repeats the status', () => {
-  assert.deepEqual(ask.partsAskState({ connected: true, pending: true, statusText: 'Sent to Claude' }), {
+test('partsAskState: pending disables the button and repeats the state phrase of its request', () => {
+  assert.deepEqual(ask.partsAskState({ connected: true, pending: true, statusText: 'Sent' }), {
     disabled: true,
-    line: 'Sent to Claude',
+    line: 'Sent',
   });
 });
 
@@ -1142,63 +1047,6 @@ test('describeContext refuses a bad moment on a session or a part, loudly', () =
     assert.throws(() => describeContext({ ...descriptor, moment: sampleMoment({ beat: 5 }) }), (err) => err instanceof Error && err.message.startsWith(`Moontide: ask context ${descriptor.kind}`));
     assert.throws(() => describeContext({ ...descriptor, moment: sampleMoment({ notes: Array.from({ length: 33 }, () => sampleMoment().notes[0]) }) }), /at most 32/);
   }
-});
-
-// The short forms shown at fit step 3. They are produced where the long text is
-// produced, never by matching strings afterwards, and the long strings stay byte for byte.
-test('the ask status short forms: Sent, Received, Waiting, and a count for several', () => {
-  assert.deepEqual({ ...ask.ASK_SHORT_COPY }, { sent: 'Sent', received: 'Received', waiting: 'Waiting' });
-  assert.equal(ask.receivedShortText(1), 'Received');
-  assert.equal(ask.waitingShortText(1), 'Waiting');
-  assert.equal(ask.receivedShortText(3), '3 received');
-  assert.equal(ask.waitingShortText(12), '12 waiting');
-  assert.equal(Object.isFrozen(ask.ASK_SHORT_COPY), true);
-});
-
-test('the ask status long strings are byte for byte what they were', () => {
-  assert.equal(ASK_COPY.sent, 'Sent to Claude');
-  assert.equal(ASK_COPY.received, 'Claude received it');
-  assert.equal(ASK_COPY.waiting, 'Claude will see it on its next action');
-  assert.equal(receivedText(12), 'Claude received 12 requests');
-  assert.equal(waitingText(12), 'Claude will see 12 requests on its next action');
-});
-
-test('status: the render callback also receives the short form as a second argument', () => {
-  let clock = 0;
-  const timers = new Map();
-  let next = 1;
-  const calls = [];
-  const status = createAskStatus({
-    render: (...args) => calls.push(args),
-    onTimeout: () => {},
-    setTimer: (fn, ms) => {
-      const id = next++;
-      timers.set(id, { fn, at: clock + ms });
-      return id;
-    },
-    clearTimer: (id) => timers.delete(id),
-    now: () => clock,
-  });
-  const advance = (ms) => {
-    clock += ms;
-    for (const [id, timer] of [...timers]) {
-      if (timer.at <= clock) {
-        timers.delete(id);
-        timer.fn();
-      }
-    }
-  };
-  status.sent('a');
-  advance(700);
-  status.answered({ id: 'a', status: 'waiting', waiting: 12 });
-  advance(700);
-  status.handedOver(['a']);
-  advance(700);
-  assert.deepEqual(calls[0], ['Sent to Claude', 'Sent']);
-  assert.deepEqual(calls[1], ['Claude will see 12 requests on its next action', '12 waiting']);
-  assert.deepEqual(calls[2], ['Claude received it', 'Received']);
-  advance(5000);
-  assert.deepEqual(calls[calls.length - 1], [null], 'hiding passes no text and no short form');
 });
 
 test('describeContext cell: a fixed variation says its fit at the end, a rest says rest, and no fit gives no suffix', () => {

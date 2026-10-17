@@ -267,19 +267,40 @@ export function rangeWhereText(track) {
   return fill(TIMELINE_COPY.noteRangeWhere, { lane: track });
 }
 
+/** The longest section part of a range's identity line, the same 200 characters as every text of a request. */
+const MAX_RANGE_SECTIONS_TEXT = 200;
+
 /**
- * The muted part of the identity line of a range: ` · cycles 12 to 15` (` · cycle 12` for one), the section when the piece has a
- * song (` · section 'y'`, ` · sections 'x' to 'z'` when the range crosses a boundary) and the notes (` · 14 notes`, ` · 1 note`,
- * ` · no notes`). `range` is `{ from, to, section, sectionTo, count }`; `section` and `sectionTo` are names or absent.
+ * The section part of a range's identity line for `sections` (names in playing order) and the `moreSections` names a list already
+ * left out. A list that fits shows whole; a longer one keeps the first names that, with ' and N more', fit 200 characters (at least
+ * the first), and N counts every name not shown.
  */
-export function rangePositionText({ from, to, section = null, sectionTo = null, count }) {
+function rangeSectionsText(sections, moreSections) {
+  const quoted = sections.map((name) => `'${displayName(name)}'`);
+  if (sections.length === 1 && moreSections === 0) return fill(TIMELINE_COPY.noteSection, { section: displayName(sections[0]) });
+  const build = (shown) => {
+    const left = sections.length - shown + moreSections;
+    return fill(TIMELINE_COPY.noteRangeSectionList, { list: quoted.slice(0, shown).join(', ') }) + (left > 0 ? fill(TIMELINE_COPY.noteRangeSectionsMore, { n: left }) : '');
+  };
+  let shown = sections.length;
+  while (shown > 1 && build(shown).length > MAX_RANGE_SECTIONS_TEXT) shown--;
+  return build(shown);
+}
+
+/**
+ * The muted part of the identity line of a range: ` · cycles 12 to 15` (` · cycle 12` for one), the sections it crosses when the
+ * piece has a song (` · section 'y'`, ` · sections 'z', 'x', 'y'` in playing order, a section that comes back named again) and the
+ * notes (` · 14 notes`, ` · 1 note`, ` · no notes`). `range` is `{ from, to, sections, moreSections, count }`; `sections` is a
+ * list of names or absent (a piece without a song) and `moreSections` counts the names the list left out.
+ */
+export function rangePositionText({ from, to, sections = null, moreSections = 0, count }) {
   if (!Number.isInteger(from) || !Number.isInteger(to) || to < from) throw new Error('Moontide: a range has whole cycles, the last not before the first.');
   if (!Number.isInteger(count) || count < 0) throw new Error('Moontide: a range has a count of notes of at least 0.');
-  if (sectionTo !== null && section === null) throw new Error('Moontide: a range that ends in a second section starts in a first one.');
+  if (!Number.isInteger(moreSections) || moreSections < 0) throw new Error('Moontide: a range has a count of more sections of at least 0.');
+  if (sections !== null && sections.length === 0) throw new Error('Moontide: a range that names its sections names at least one section.');
+  if (sections === null && moreSections > 0) throw new Error('Moontide: a range cannot have more sections without a list of sections.');
   let text = from === to ? fill(TIMELINE_COPY.noteRangeCycle, { a: from }) : fill(TIMELINE_COPY.noteRangeCycles, { a: from, b: to });
-  if (section !== null) {
-    text += sectionTo === null ? fill(TIMELINE_COPY.noteSection, { section: displayName(section) }) : fill(TIMELINE_COPY.noteRangeSections, { first: displayName(section), last: displayName(sectionTo) });
-  }
+  if (sections !== null) text += rangeSectionsText(sections, moreSections);
   if (count === 0) return text + TIMELINE_COPY.noteRangeNoNotes;
   return text + (count === 1 ? TIMELINE_COPY.noteRangeOneNote : fill(TIMELINE_COPY.noteRangeNotes, { n: count }));
 }

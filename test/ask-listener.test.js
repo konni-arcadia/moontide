@@ -140,13 +140,17 @@ test('listener: silent on connect, one line per request, each acknowledged, one 
 
   const listener = spawnListener([String(web.port), session.ask.listenerToken], cleanup);
   await waitUntil(() => session.ask.hasListener(), 'the listener to connect');
-  await sleep(300);
-  assert.equal(listener.stdout, '', 'the listener must print nothing when it connects');
 
   const plain = 'make the drums shorter';
   const multiline = 'make the hats quieter\nand shorter';
   session.handlePageMessage(page, askFrom('req-1', plain));
-  await waitUntil(() => listener.lines().length === 1, 'the first request line');
+  await waitUntil(() => listener.lines().some((line) => line.includes('"id":"req-1"')), 'the first request line');
+  // The listener prints on one ordered stdout, so a line printed on connect would come before the first
+  // request line. The request line arriving first proves nothing was printed on connect, without a pause.
+  assert.ok(
+    listener.lines().length === 1 && listener.stdout.startsWith(`${REQUEST_LINE_PREFIX} `),
+    `the listener printed nothing before the first request line, got ${JSON.stringify(listener.lines())}`,
+  );
   session.handlePageMessage(page, askFrom('req-2', multiline));
   await waitUntil(() => listener.lines().length === 2, 'the second request line');
 

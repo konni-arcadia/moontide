@@ -164,6 +164,7 @@ test('readViewPrefs returns valid stored values and undefined for invalid ones',
     splitA: 44,
     splitB: 37.5,
     rejected: [],
+    songLaunchRejected: false,
     available: true,
   });
 });
@@ -194,6 +195,7 @@ test('readViewPrefs rejects values outside the closed sets', () => {
     splitA: undefined,
     splitB: undefined,
     rejected: [STORAGE_KEYS.splitA, STORAGE_KEYS.splitB],
+    songLaunchRejected: true,
     available: true,
   });
 });
@@ -258,6 +260,7 @@ test('readViewPrefs with a throwing storage reports unavailable and every value 
     splitA: undefined,
     splitB: undefined,
     rejected: [],
+    songLaunchRejected: false,
     available: false,
   });
 });
@@ -275,6 +278,7 @@ test('readViewPrefs with null storage reports unavailable and every value undefi
     splitA: undefined,
     splitB: undefined,
     rejected: [],
+    songLaunchRejected: false,
     available: false,
   });
 });
@@ -596,6 +600,31 @@ test('readViewPrefs reads the Song launch choice from its closed set and ignores
   assert.equal(read('phrase'), 'phrase');
   assert.equal(read('bar'), 'bar');
   for (const bad of ['now', 'later', '', 'Section', '__proto__', null]) assert.equal(read(bad), undefined, String(bad));
+});
+
+test('readViewPrefs flags a stored launch choice outside the list, and nothing for a valid or missing one', () => {
+  const read = (value) => readViewPrefs({ getItem: (key) => (key === STORAGE_KEYS.songLaunch ? value : null) });
+  const bad = read('sometime');
+  assert.equal(bad.songLaunch, undefined);
+  assert.equal(bad.songLaunchRejected, true);
+  assert.deepEqual(bad.rejected, [], 'rejected keeps meaning the refused split sizes only');
+  assert.equal(read('phrase').songLaunchRejected, false);
+  assert.equal(read(null).songLaunchRejected, false);
+  assert.equal(read(undefined).songLaunchRejected, false);
+  const noStorage = readViewPrefs(null);
+  assert.equal(noStorage.available, false);
+  assert.equal(noStorage.songLaunchRejected, false);
+});
+
+test('VIEW_PREFS_COPY.badSongLaunch names the storage key and the three launch values and holds no stored text', () => {
+  const line = views.VIEW_PREFS_COPY.badSongLaunch;
+  assert.ok(Object.isFrozen(views.VIEW_PREFS_COPY));
+  assert.ok(line.includes(STORAGE_KEYS.songLaunch));
+  for (const value of views.SONG_LAUNCHES) assert.ok(line.includes(value), value);
+  assert.ok(line.includes(`is not ${views.SONG_LAUNCHES.slice(0, -1).join(', ')} or ${views.SONG_LAUNCHES.at(-1)};`), 'the list is built from SONG_LAUNCHES');
+  assert.ok(line.includes('is not section, phrase or bar;'), 'the wording of the sentence');
+  assert.match(line, /sections start at the end of the section that plays/);
+  assert.equal(line.includes('sometime'), false);
 });
 
 test('initialViewState gives the Song launch choice end of section when nothing is stored and the stored value otherwise', () => {

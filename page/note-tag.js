@@ -24,6 +24,9 @@ import { labelKey } from './tracks.js';
 
 const subscribers = new Set();
 
+/** How many different failure messages are printed before one closing line says the rest are not. */
+export const MAX_REPORTED_FAILURES = 20;
+
 /**
  * Calls `listener(event)` for every note of a labeled track, where event is `{ key, hap, target,
  * stamp }`. The key is the track's Mixer identity, or `$n` for the n-th `$` statement of the
@@ -64,14 +67,26 @@ export function installNoteTag(PatternClass, { stampOf } = {}) {
   // Undefined at page start: the repl assigns p only when it evaluates code.
   let repl = PatternClass.prototype.p;
   let dollar = 0;
-  let errorReported = false;
+  // The messages already printed. The tag is installed once per page load, so each different failure is said once per load,
+  // and the set cannot grow past MAX_REPORTED_FAILURES.
+  const reportedMessages = new Set();
+  let boundSaid = false;
   // A note reaches one observer per tag; this keeps a pattern tagged twice under one key to one report.
   const reported = new WeakSet();
 
+  // A listener that throws on every note would print on every note; one that fails differently each time would never stop.
+  // So a failure is printed once per message, and after MAX_REPORTED_FAILURES different messages one last line says so.
   function reportOnce(err) {
-    if (errorReported) return;
-    errorReported = true;
-    console.error('Moontide: a note listener or the MIDI timestamp lookup failed; later failures are not repeated:', err);
+    const message = err instanceof Error ? err.message : String(err);
+    if (reportedMessages.has(message)) return;
+    if (reportedMessages.size >= MAX_REPORTED_FAILURES) {
+      if (boundSaid) return;
+      boundSaid = true;
+      console.error('Moontide: more note listener failures happened; they are not reported.');
+      return;
+    }
+    reportedMessages.add(message);
+    console.error('Moontide: a note listener or the MIDI timestamp lookup failed:', err);
   }
 
   function observerFor(key) {

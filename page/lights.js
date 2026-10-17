@@ -78,8 +78,8 @@ export function readOutputPair(audio) {
 
 /**
  * What the lights need to know about a Mixer model: `{ tracks, ancestors }`. `tracks` has one entry
- * `{ key, id, sounding }` for every strip that has a light key (`key` is what a note names, `id` the strip's identity,
- * which the view finds the light by). A strip that plays MIDI cannot sound in a browser without Web MIDI, so it counts as
+ * `{ key, id, sounding, midi }` for every strip that has a light key (`key` is what a note names, `id` the strip's identity,
+ * which the view finds the light by, `midi` whether the strip plays a MIDI instrument). A strip that plays MIDI cannot sound in a browser without Web MIDI, so it counts as
  * not sounding there. `ancestors` maps a strip's id to the keys of the groups above it, outermost first. A model that
  * is not ready gives an empty layout.
  */
@@ -90,7 +90,7 @@ export function lightLayout(model, { webMidi }) {
   for (const strip of model.strips) {
     if (strip.lightKey === null || strip.lightKey === undefined) continue;
     const playsMidi = (strip.midi !== null && strip.midi !== undefined) || strip.playsMidi === true;
-    tracks.push({ key: strip.lightKey, id: strip.identity, sounding: strip.sounding === true && (webMidi === true || !playsMidi) });
+    tracks.push({ key: strip.lightKey, id: strip.identity, sounding: strip.sounding === true && (webMidi === true || !playsMidi), midi: playsMidi });
   }
   if (model.layout !== null && model.layout !== undefined) {
     for (const group of model.layout.groups) {
@@ -108,10 +108,13 @@ export function lightLayout(model, { webMidi }) {
  * The light state. `setLayout(layout)` says which tracks and groups exist (see lightLayout); `noteSeen(key, heard)` queues
  * a note, `heard` being `{ at }` (a time on the page clock, in ms) or `{ target }` (an audio time, in seconds);
  * `frame(ts, { motion, cps, toPerf })` lights what is due at `ts` and returns `[{ kind, id, value }]` for the lights whose
- * value changed since the last frame; `reset()` forgets every note and every lit light.
+ * value changed since the last frame; `reset()` forgets every note and every lit light; `forgetShown()` forgets only which
+ * values were handed out, so the next frame hands out every lit value again and still darkens a light that has gone out
+ * meanwhile (after the view rebuilt some of its lights);
+ * `playsMidi(key)` tells whether the strip that owns `key` plays a MIDI instrument (false for an unknown key).
  */
 export function createLights() {
-  // key -> { id, sounding }
+  // key -> { id, sounding, midi }
   let tracks = new Map();
   // strip id -> keys of the groups above it
   let ancestors = new Map();
@@ -147,7 +150,7 @@ export function createLights() {
       for (const track of layout.tracks) {
         const known = next.get(track.key);
         if (known !== undefined && known.sounding) continue;
-        next.set(track.key, { id: track.id, sounding: track.sounding === true });
+        next.set(track.key, { id: track.id, sounding: track.sounding === true, midi: track.midi === true });
       }
       tracks = next;
       ancestors = layout.ancestors;
@@ -242,8 +245,15 @@ export function createLights() {
       const changes = [];
       for (const [key, value] of trackValues) {
         const shown = shownTracks.get(key);
-        if (shown !== undefined && shown.value === value) continue;
         const id = tracks.get(key).id;
+        // The strip that owns a shared key can change while its light is lit: the old strip goes dark and the new one shows
+        // the current value in this same frame.
+        if (shown !== undefined && shown.id !== id) {
+          changes.push({ kind: 'track', id: shown.id, value: 0 });
+          shown.id = id;
+          shown.value = -1;
+        }
+        if (shown !== undefined && shown.value === value) continue;
         if (shown === undefined) shownTracks.set(key, { id, value });
         else shown.value = value;
         changes.push({ kind: 'track', id, value });
@@ -264,6 +274,18 @@ export function createLights() {
         changes.push({ kind: 'group', id: group, value: 0 });
       }
       return changes;
+    },
+
+    forgetShown() {
+      // Keep the entries but mark their values unknown: a light that is lit gets its value handed out again, and one that
+      // has gone dark by the next frame still falls into the leaving loops and gets its dark change.
+      for (const shown of shownTracks.values()) shown.value = -1;
+      for (const group of shownGroups.keys()) shownGroups.set(group, -1);
+    },
+
+    playsMidi(key) {
+      const track = tracks.get(key);
+      return track !== undefined && track.midi === true;
     },
 
     reset() {

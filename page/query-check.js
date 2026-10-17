@@ -80,8 +80,13 @@ export function captureQueryTypes(kept, globals) {
  *   `onReached` when the gate first queries past the line, because the old music that keeps playing must
  *   not have its errors forwarded a second time and the new pattern's first errors must still count.
  *   `getPlayingCode()` gives the code that plays now, for the waiting record.
+ *
+ * `refuse`, when given, is asked first, for every value handed over, before the pattern is checked or installed: when it
+ * returns a text, setPattern throws an Error with that text. This is the one seam where a change can be refused for
+ * something only the finished program knows (the tempo it set) and still fail the evaluation before the new pattern or a
+ * waiting record exists: the scheduler's pattern and any waiting change stay as they were.
  */
-export function installQueryCheck(scheduler, { getTypes, queryErrors, schedulerQueries, takeover, getPlayingCode }) {
+export function installQueryCheck(scheduler, { getTypes, queryErrors, schedulerQueries, takeover, getPlayingCode, refuse }) {
   const originalSetPattern = scheduler.setPattern;
   if (typeof originalSetPattern !== 'function') {
     throw new Error('Moontide: the scheduler of the pinned @strudel/repl 1.3.0 has no setPattern function.');
@@ -103,6 +108,10 @@ export function installQueryCheck(scheduler, { getTypes, queryErrors, schedulerQ
     return result;
   }
   scheduler.setPattern = function (pattern, autostart) {
+    if (typeof refuse === 'function') {
+      const refusal = refuse();
+      if (typeof refusal === 'string') throw new Error(refusal);
+    }
     // The repl's own handling of a value that is not a pattern stays as before (a waiting change is replaced too).
     if (pattern === null || pattern === undefined || typeof pattern.query !== 'function') {
       queryErrors.reset();
@@ -154,8 +163,11 @@ export function installQueryCheck(scheduler, { getTypes, queryErrors, schedulerQ
  * to `onError` as the bundle's log text (`[query] error: <message>`), then return no events as the
  * bundle does. Every other query keeps the bundle's own `queryArc`, whose log the page ignores.
  * `getTypes()` gives { State, TimeSpan }.
+ * `onSchedulerQuery`, when given, is called once on each of the scheduler's own queries, before the query runs (it is the
+ * tempo ramp's way to learn that the scheduler is playing). It is the scheduler's slice that calls it, so a throw is
+ * caught here, logged as one `Moontide:` line and never reaches the scheduler.
  */
-export function createSchedulerQueryScope({ getTypes, onError }) {
+export function createSchedulerQueryScope({ getTypes, onError, onSchedulerQuery }) {
   const wrapped = new WeakSet();
   return {
     wrap(pattern) {
@@ -168,6 +180,13 @@ export function createSchedulerQueryScope({ getTypes, onError }) {
       pattern.queryArc = function (begin, end, controls) {
         if (controls === null || typeof controls !== 'object' || typeof controls.cyclist !== 'string') {
           return original.call(this, begin, end, controls);
+        }
+        if (typeof onSchedulerQuery === 'function') {
+          try {
+            onSchedulerQuery();
+          } catch (err) {
+            console.error('Moontide: the hook on the scheduler query failed:', err);
+          }
         }
         const { State, TimeSpan } = getTypes();
         try {

@@ -21,6 +21,9 @@
 // the Timeline view against the live page — the pinned acorn parser, a real 32-cycle query whose
 // lanes match the real playing pattern, and that view keys are inert while the code has focus.
 //
+// Jam: the checks of jamBlocks() prove in real Chrome the Jam view (the scale it reads from the playing notes, the status line,
+// the coming-up list, the piano and the guitar with their roles, the chord tones, the ask contexts and the layouts), and why the
+// piano is coloured or not; they run in a full run where they always did, or alone with `--only jam`.
 // Top bar: the bar's contracts (test/bar-inventory.js) run as the "bar invariants" and "bar helpers"
 // checks of barBlocks(), once before the final summary of a full run, or alone with `--only bar` (about a minute).
 // Harmony: the declaration checks of harmonyBlocks() run once before the final summary of a full run, or
@@ -43,6 +46,16 @@
 // panel under the lanes says whether the page can edit it and why not, and that Up and Down rewrite exactly the token of a note
 // the page can edit, after reading the edited track back; they run once after the Mixer checks in a full run, or alone with
 // `--only timeline`.
+// Requests: the checks of requestsBlocks() prove in real Chrome that a request typed in the Ask box shows as one row of the
+// Requests panel that follows what the server says, and that the chip in the top bar counts the requests in flight; they run
+// once after the Timeline checks in a full run, or alone with `--only requests`.
+// Tempo ramp: the checks of rampBlocks() prove in real Chrome that a tempo ramp asked for with glideBars keeps its course through
+// a change that restates its target, a hand edit, a change that fails and a change that waits for its bar, that another tempo or no
+// tempo in the code cancels it, that a new ramp replaces it, that a ramp that cannot be made is refused whole, and that Stop and a
+// reload end it, and that Claude hears about a ramp that goes on, one that starts at a line and one that ended early; they run once after the Requests checks in a full run, or alone with `--only ramp`.
+// One check, many times: `--check <name> --times <n>` runs one named check n times alone after the clock check and prints one
+// tally line, `probe:page check <name>: P of N runs passed`; it is the way to prove that a flaky check is fixed. The names are
+// PAGE_CHECK_NAMES, and the flag cannot be combined with `--only`.
 // Every probe that stops the music calls stopMusic(), which refuses to click unless the state word says Playing.
 
 import fs from 'node:fs';
@@ -54,7 +67,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { BUILD_MISMATCH_COPY, CONNECTION_LABELS, QUERY_ERROR_LEAD, SERVER_UPDATED_COPY, SOUND_LABELS, VCSL_SAMPLE_BASE } from '../page/ui-state.js';
+import { BUILD_MISMATCH_COPY, CONNECTION_LABELS, QUERY_ERROR_LEAD, SERVER_UPDATED_COPY, SOUND_LABELS, VCSL_SAMPLE_BASE, errorLineText as bannerErrorLine } from '../page/ui-state.js';
 import { MIDI_COPY, fill } from '../page/midi-plan.js';
 import { INSTRUMENTS_COPY } from '../page/instruments-model.js';
 import { TIMELINE_BUDGET_MS, TIMELINE_COPY } from '../page/timeline.js';
@@ -66,13 +79,16 @@ import { HELPER_TEXT, differsLine, songMessageText } from '../page/structure.js'
 import { declaredLine } from '../page/jam-model.js';
 import { fitOf, fitText, sectionHarmony } from '../page/song-fit.js';
 import { readHarmonyText } from '../page/harmony.js';
-import { ASK_COPY, PAGE_REQUESTS_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, waitingShortText } from '../page/ask.js';
+import { ASK_COPY, PAGE_REQUESTS_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill } from '../page/ask.js';
 import { QUERY_REFUSAL_LEAD } from '../page/query-check.js';
+import { GLIDE_REFUSALS, glideCpsOf, glideStepAt, planGlide } from '../page/tempo-glide.js';
+import { CLOSE_PROMISED, LINK_PROMISED, QUIET_AFTER_MS, REQUEST_STATUS_COPY, rowText, statePhrase } from '../page/request-status.js';
 import { BAR_COPY, stripModel, tempoText } from '../page/bar-model.js';
-import { CHANGE_COPY, DEFAULT_PHRASE_CYCLES, countdownParts, queuedLine, settingLine, timingOptions } from '../page/change-timing.js';
-import { ACCENT_EXEMPT_TODAY, BAR_INVENTORY, BAR_WIDTHS, SHOT_LAYOUTS, SHOT_SIZES, SHOT_SKIPPED, SHOT_STATES, SIZED_CONTROLS, WORST_CASE, shotFileNames } from '../test/bar-inventory.js';
-import { STILL_PLAYING_TAIL, STILL_STOPPED_TAIL, loadFailureNote } from '../dist/session.js';
-import { HAND_EDIT_NOTE, STOPPED_NOTE } from '../dist/mcp.js';
+import { CHANGE_COPY, DEFAULT_PHRASE_CYCLES, countdownParts, queuedLine, rampLine, settingLine, timingOptions } from '../page/change-timing.js';
+import { ACCENT_EXEMPT_TODAY, BAR_INVENTORY, BAR_WIDTHS, DYNAMIC_CONTROLS, SHOT_LAYOUTS, SHOT_SIZES, SHOT_SKIPPED, SHOT_STATES, SIZED_CONTROLS, WORST_CASE, shotFileNames } from '../test/bar-inventory.js';
+import { STILL_PLAYING_TAIL, STILL_STOPPED_TAIL, glideEndedLine, loadFailureNote } from '../dist/session.js';
+import { HAND_EDIT_NOTE, STOPPED_NOTE, UNKNOWN_ANSWERING_NOTE, glideLine } from '../dist/mcp.js';
+import { MAX_ASK_CONTEXT_LENGTH } from '../dist/protocol.js';
 import { sessionLabel } from '../dist/session-label.js';
 import { LOAD_FAILURE_COPY } from '../page/load-failure.js';
 import { structureTemplateText } from '../dist/reference.js';
@@ -104,6 +120,22 @@ function realPathOfFuture(target) {
   return path.join(fs.realpathSync(current), ...tail);
 }
 
+/** True when `candidate` is outside `root`. path.relative gives an absolute path when the two are on different Windows
+ * drives, which means outside; an exact '..' or '..' plus the separator means a parent folder; anything else, a folder
+ * named like '..shots' included, is inside. `pathApi` lets a test pass the Windows flavor of the path module on any OS. */
+export function leavesFolder(root, candidate, pathApi = path) {
+  const relative = pathApi.relative(root, candidate);
+  return relative === '..' || relative.startsWith('..' + pathApi.sep) || pathApi.isAbsolute(relative);
+}
+
+/** True when `folder` is outside the repository both as written and by its real path (a link into the repository is
+ * seen even when the folder does not exist yet). The one rule behind shotsFolder and the reports that pictures were
+ * saved outside the repository. */
+export function shotsSavedOutside(folder) {
+  const root = fs.realpathSync(REPO_ROOT);
+  return leavesFolder(root, folder) && leavesFolder(root, realPathOfFuture(folder));
+}
+
 /** Where the screenshots go (MOONTIDE_PROBE_SHOTS): null when the variable is unset or empty, so nothing is saved. A
  * folder inside the repository is refused with ProbeCouldNotRun (exit 2) before any browser work, because a picture of
  * the page can show local state and would be committed by accident. Creates the folder; returns its resolved path. */
@@ -113,24 +145,36 @@ export function shotsFolder(env = process.env) {
   const resolved = path.resolve(raw);
   const root = fs.realpathSync(REPO_ROOT);
   for (const candidate of [resolved, realPathOfFuture(resolved)]) {
-    const relative = path.relative(root, candidate);
-    const leaves = relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
-    if (!leaves) throw new ProbeCouldNotRun('MOONTIDE_PROBE_SHOTS must name a folder outside the repository');
+    if (!leavesFolder(root, candidate)) throw new ProbeCouldNotRun('MOONTIDE_PROBE_SHOTS must name a folder outside the repository');
   }
   fs.mkdirSync(resolved, { recursive: true });
   return resolved;
 }
 
+/** The groups of checks `--only` accepts, in the order a full run runs them. */
+export const PAGE_GROUPS = Object.freeze(['jam', 'bar', 'harmony', 'load-failure', 'identity', 'song', 'grid', 'mixer', 'timeline', 'requests', 'ramp']);
+
+/** Quoted names joined with commas and "and" before the last: `"a", "b" and "c"`. */
+function quotedList(names) {
+  const quoted = names.map((name) => `"${name}"`);
+  return quoted.length <= 1 ? quoted.join('') : `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
+}
+
 /** --headful (real window instead of headless), --browser <path> (skip discovery), --only <group> (run only one
- * group of checks after the clock check; the groups are "bar", the top bar invariants, "harmony", the harmony
+ * group of checks after the clock check; the groups are "jam", the Jam view, "bar", the top bar invariants, "harmony", the harmony
  * declaration checks, "load-failure", the notice for a page whose scripts did not load, "identity", the tab
  * title and the Session card row that name the session, "song", the Strudel facts the song structure relies on, and
- * "grid", the Song grid in the Parts view, "mixer", the groups in the Mixer, and "timeline", the notes you edit on the Timeline,
+ * "grid", the Song grid in the Parts view, "mixer", the groups in the Mixer, "timeline", the notes you edit on the Timeline,
+ * "requests", the Requests panel, and "ramp", the tempo ramp in the real page,
  * each about a minute instead of nine:
- * `npm run probe:page -- --only bar`).
- * `only` is null for a full run. */
-export function parseArgs(argv) {
-  const result = { headful: false, browserPath: null, only: null };
+ * `npm run probe:page -- --only bar`), --check <name> (run one named check alone after the clock check) and
+ * --times <n> (run it n times, a whole number from 1 to 200; the default is once):
+ * `npm run probe:page -- --check ask-box-moves --times 30`. --check cannot be combined with --only.
+ * `only` is null for a full run and `check` is null when no check is named. Another probe passes its own lists:
+ * `groups` are the names its --only accepts and `checks` the names its --check accepts (none: the flag is refused). */
+export function parseArgs(argv, { groups = PAGE_GROUPS, checks = PAGE_CHECK_NAMES } = {}) {
+  const result = { headful: false, browserPath: null, only: null, check: null, times: 1 };
+  let timesGiven = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--headful') {
@@ -141,14 +185,31 @@ export function parseArgs(argv) {
       result.browserPath = value;
     } else if (arg === '--only') {
       const value = argv[++i];
-      if (value !== 'bar' && value !== 'harmony' && value !== 'load-failure' && value !== 'identity' && value !== 'song' && value !== 'grid' && value !== 'mixer' && value !== 'timeline') {
-        throw new ProbeCouldNotRun(`--only needs a group name; the groups are "bar", "harmony", "load-failure", "identity", "song", "grid", "mixer" and "timeline" (got ${JSON.stringify(value ?? null)})`);
+      if (!groups.includes(value)) {
+        throw new ProbeCouldNotRun(`--only needs a group name; the groups are ${quotedList(groups)} (got ${JSON.stringify(value ?? null)})`);
       }
       result.only = value;
+    } else if (arg === '--check') {
+      const value = argv[++i];
+      if (checks.length === 0) throw new ProbeCouldNotRun('--check is not available: no check of this probe runs alone');
+      if (!checks.includes(value)) {
+        throw new ProbeCouldNotRun(`--check needs a check name; the checks are ${quotedList(checks)} (got ${JSON.stringify(value ?? null)})`);
+      }
+      result.check = value;
+    } else if (arg === '--times') {
+      const value = argv[++i];
+      const count = value !== undefined && /^[0-9]+$/.test(value) ? Number(value) : NaN;
+      if (!(count >= 1 && count <= 200)) {
+        throw new ProbeCouldNotRun(`--times needs a whole number from 1 to 200 (got ${JSON.stringify(value ?? null)})`);
+      }
+      result.times = count;
+      timesGiven = true;
     } else {
       throw new ProbeCouldNotRun(`unknown flag "${arg}"`);
     }
   }
+  if (timesGiven && result.check === null) throw new ProbeCouldNotRun('--times needs --check');
+  if (result.check !== null && result.only !== null) throw new ProbeCouldNotRun('--check and --only cannot be combined');
   return result;
 }
 
@@ -863,8 +924,8 @@ export async function atWidths(cdp, widths, fn) {
 
 /**
  * Writes the longest real strings of the top bar (WORST_CASE in test/bar-inventory.js) into the live page, layout
- * only: texts and hidden flags, in the throwaway browser. It shows the build line, the ask status, the version
- * indicator, "wait for Claude", the MIDI attention text with six dots, the tempo and the countdown. Returns what
+ * only: texts and hidden flags, in the throwaway browser. It shows the build line, the Requests chip with its
+ * count at two digits, the version indicator, "wait for Claude", the MIDI attention text with six dots, the tempo and the countdown. Returns what
  * it replaced, for restoreWorstCase; the page's own code does not know about the fixture and may rewrite an
  * element on its next poll, so measure at once.
  */
@@ -884,9 +945,8 @@ export async function setWorstCase(cdp) {
     ['#connection-state', WORST_CASE.connection],
     ['#midi-takeover-text', WORST_CASE.takeover],
     ['#build-mismatch', WORST_CASE.build],
-    // The status holds its long sentence and its short form; the fixture writes both.
-    ['#ask-status .ask-long', WORST_CASE.askStatus],
-    ['#ask-status .ask-short', waitingShortText(12)],
+    // The Requests chip keeps its word and shows its count pill at two digits.
+    ['#requests-toggle .rq-count', WORST_CASE.requests],
     // The longest state word is 'Stopped here' (a tab that lost the role): the ' here' part is written too.
     ['#sound-state .state-here', BAR_COPY.stateHere],
     ['#version-indicator', WORST_CASE.version],
@@ -898,7 +958,7 @@ export async function setWorstCase(cdp) {
     ['#pending-change .pending-lead', countdown.lead],
     ['#pending-change .pending-rest', countdown.rest],
   ];
-  const shows = ['#build-mismatch', '#ask-status', '#version-indicator', '#page-requests', '#midi-state', '#midi-dots', '#midi-takeover', '#tempo-readout', '#pending-change'];
+  const shows = ['#build-mismatch', '#requests-toggle', '#requests-toggle .rq-count', '#version-indicator', '#page-requests', '#midi-state', '#midi-dots', '#midi-takeover', '#tempo-readout', '#pending-change'];
   return evaluateExpr(
     cdp,
     `(() => {
@@ -4381,7 +4441,8 @@ async function controlsBlocks(context) {
     );
     report(
       'controls: Tab reaches every bar control in visual order',
-      visited.length === 11 && JSON.stringify(visited) === JSON.stringify(visual) && visited[0] === TRANSPORT_ID && visited[10] === 'session-button',
+      // The Requests chip is in the bar once a request was sent, so the count is whatever the bar shows, never fewer than the 11 fixed controls.
+      visited.length >= 11 && visited.length === visual.length && JSON.stringify(visited) === JSON.stringify(visual) && visited[0] === TRANSPORT_ID && visited[visited.length - 1] === 'session-button',
       JSON.stringify({ visited, visual }),
     );
     await reset();
@@ -4679,8 +4740,10 @@ async function editsTimingBlocks(context) {
 async function sizesBlocks(context) {
   const { cdp, report } = context;
   const BAR_CODE = 'setcps(0.5)\nbar_probe: s("bd*4").gain(0)';
-  const FORCED = ['#session-strip', '#strip-take-back', '#midi-banner', '#midi-takeover', '#midi-state', '#page-requests'];
+  const FORCED = ['#session-strip', '#strip-take-back', '#midi-banner', '#midi-takeover', '#midi-state', '#page-requests', '#requests-toggle', '#requests-panel', '.rq-recent'];
   const WIDTHS = [1024, 1366, 1920];
+  // The buttons the page builds while it runs (the rows of the Requests panel) are measured when there are some.
+  const fixedControls = SIZED_CONTROLS.filter((selector) => !DYNAMIC_CONTROLS.includes(selector)).length;
   const setEditor = (text) => evaluateExpr(cdp, `(() => { document.getElementById('repl').editor.setCode(${JSON.stringify(text)}); return true; })()`);
   const blur = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); return true; })()`);
   const measure = () =>
@@ -4758,14 +4821,14 @@ async function sizesBlocks(context) {
   }
   report(
     'controls: every button of the bar, banner, menu, strip and drawer is at least 24x24 at 1024, 1366 and 1920, and none escapes SIZED_CONTROLS',
-    problems.length === 0 && counts.every((count) => count >= SIZED_CONTROLS.length),
-    JSON.stringify({ problems, buttons: counts, listed: SIZED_CONTROLS.length }),
+    problems.length === 0 && counts.every((count) => count >= fixedControls),
+    JSON.stringify({ problems, buttons: counts, listed: fixedControls }),
   );
 }
 
 /**
  * The fit loop against the live page. `context` is { cdp, client, report, port,
- * pageUrl }, the same object barBlocks gets. The normal state: the music plays, nothing waits, no request status, the
+ * pageUrl }, the same object barBlocks gets. The normal state: the music plays, nothing waits, no request on the board, the
  * drawer closed. The worst case (the longest strings in every item) is checked by the worst-case blocks. It leaves the page as it found it: no
  * view open, layout a, the viewport override cleared.
  */
@@ -4942,54 +5005,60 @@ async function fitBlocks(context) {
       JSON.stringify({ boundaries: [b0, b1, b2, b3], look2, look3, look4 }),
     );
 
-    // Growing the request status while the bar is already at its last step: the observer on the bar's children (no writer of
-    // the page runs here, the text is written straight into the element) brings the bar back inside itself. At the last step
-    // the bar has at most what that step gives back (about 64 px) free, so the text grown here is the one-request status, whose
-    // short form fits there; the 12-request sentence needs steps 1 to 3 and is measured at its own width by the next block.
+    // Growing the Requests chip while the bar is already at its last step: the observer on the bar's children (no writer of
+    // the page runs here, the pill is written straight into the element) brings the bar back inside itself. The chip has no
+    // short form of its own: its word is already short, and only its pill grows.
     {
       await fitAt(b3 - 1);
       const before = await barState();
       await evaluateExpr(
         cdp,
         `(() => {
-          const status = document.getElementById('ask-status');
-          status.querySelector('.ask-long').textContent = ${JSON.stringify(ASK_COPY.waiting)};
-          status.querySelector('.ask-short').textContent = ${JSON.stringify(waitingShortText(1))};
-          status.hidden = false;
+          const chip = document.getElementById('requests-toggle');
+          const count = chip.querySelector('.rq-count');
+          window.__chipBeforeGrowing = { chipHidden: chip.hidden, countHidden: count.hidden, countText: count.textContent };
+          count.textContent = ${JSON.stringify(WORST_CASE.requests)};
+          count.hidden = false;
+          chip.hidden = false;
           return true;
         })()`,
       );
-      await sleep(400);
-      const grown = await evaluateExpr(
+      const grown = await waitFor(
         cdp,
         `(() => {
-          const status = document.getElementById('ask-status');
+          const chip = document.getElementById('requests-toggle');
           const bar = document.getElementById('top-bar');
+          if (bar.scrollWidth > bar.clientWidth || chip.getBoundingClientRect().width === 0) return null;
           return {
             fit: bar.dataset.fit,
-            whole: bar.scrollWidth <= bar.clientWidth,
+            whole: true,
             scrollWidth: bar.scrollWidth,
             clientWidth: bar.clientWidth,
-            statusBox: status.getBoundingClientRect().width,
-            shortShown: getComputedStyle(status.querySelector('.ask-short')).display !== 'none',
-            statusInside: status.getBoundingClientRect().right <= bar.getBoundingClientRect().right,
+            chipBox: chip.getBoundingClientRect().width,
+            word: chip.querySelector('.rq-word').textContent,
+            pill: chip.querySelector('.rq-count').textContent,
+            chipInside: chip.getBoundingClientRect().right <= bar.getBoundingClientRect().right,
           };
         })()`,
+        3000,
       );
       await evaluateExpr(
         cdp,
         `(() => {
-          const status = document.getElementById('ask-status');
-          status.hidden = true;
-          status.querySelector('.ask-long').textContent = '';
-          status.querySelector('.ask-short').textContent = '';
+          const chip = document.getElementById('requests-toggle');
+          const count = chip.querySelector('.rq-count');
+          const saved = window.__chipBeforeGrowing;
+          chip.hidden = saved.chipHidden;
+          count.hidden = saved.countHidden;
+          count.textContent = saved.countText;
+          window.__chipBeforeGrowing = undefined;
           return true;
         })()`,
       );
-      await sleep(300);
+      await waitFor(cdp, `(() => { const bar = document.getElementById('top-bar'); return bar.scrollWidth <= bar.clientWidth ? true : null; })()`, 3000);
       report(
-        'fit: growing the ask status at the last step leaves the bar whole',
-        before.fit === '4' && before.whole === true && grown.fit === '4' && grown.whole === true && grown.shortShown === true && grown.statusBox > 0 && grown.statusInside === true,
+        'fit: growing the Requests chip at the last step leaves the bar whole',
+        before.fit === '4' && before.whole === true && grown !== null && grown.fit === '4' && grown.whole === true && grown.chipBox > 0 && grown.chipInside === true && grown.word === 'Requests' && grown.pill === WORST_CASE.requests,
         JSON.stringify({ width: b3 - 1, before: { fit: before.fit, whole: before.whole }, grown }),
       );
     }
@@ -5001,20 +5070,23 @@ async function fitBlocks(context) {
     await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'none' ? true : null`, 3000);
   }
 
-  // The request status: nothing to say keeps it hidden and takes no width; at step 3 the worst case shows 12 waiting while the
-  // whole sentence stays in the accessibility tree.
+  // The Requests chip: it is hidden and takes no width while no request is on the board, and shows while one is; with the
+  // worst case it keeps its word and its pill at every fit step, and the bar does not overflow.
   {
     const idle = await evaluateExpr(
       cdp,
       `(() => {
-        const status = document.getElementById('ask-status');
-        const r = status.getBoundingClientRect();
-        return { hidden: status.hidden, display: getComputedStyle(status).display, width: r.width, height: r.height, rects: status.getClientRects().length, long: status.querySelector('.ask-long').textContent, short: status.querySelector('.ask-short').textContent };
+        const chip = document.getElementById('requests-toggle');
+        const panel = document.getElementById('requests-panel');
+        const r = chip.getBoundingClientRect();
+        return { rows: panel.querySelectorAll('.rq-item').length, hidden: chip.hidden, display: getComputedStyle(chip).display, width: r.width, rects: chip.getClientRects().length, panelHidden: panel.hidden };
       })()`,
     );
     report(
-      'ask status: nothing to say keeps it hidden and takes no width',
-      idle.hidden === true && idle.display === 'none' && idle.width === 0 && idle.rects === 0 && idle.long === '' && idle.short === '',
+      'requests chip: hidden and taking no width while the board is empty, shown while it holds a request',
+      idle.rows === 0
+        ? idle.hidden === true && idle.display === 'none' && idle.width === 0 && idle.rects === 0 && idle.panelHidden === true
+        : idle.hidden === false && idle.width > 0,
       JSON.stringify(idle),
     );
 
@@ -5025,34 +5097,30 @@ async function fitBlocks(context) {
         cdp,
         `(() => {
           const bar = document.getElementById('top-bar');
-          const status = document.getElementById('ask-status');
-          const long = status.querySelector('.ask-long');
-          const short = status.querySelector('.ask-short');
+          const chip = document.getElementById('requests-toggle');
+          const word = chip.querySelector('.rq-word');
+          const count = chip.querySelector('.rq-count');
           const natural = bar.dataset.fit;
           const read = (step) => {
             bar.setAttribute('data-fit', String(step));
-            const l = getComputedStyle(long);
-            const s = getComputedStyle(short);
-            return { step, longDisplay: l.display, longPosition: l.position, longClip: l.clipPath, longWidth: long.getBoundingClientRect().width, shortDisplay: s.display, shortWidth: short.getBoundingClientRect().width };
+            const w = word.getBoundingClientRect();
+            const c = count.getBoundingClientRect();
+            const box = chip.getBoundingClientRect();
+            return { step, wordWidth: w.width, countWidth: c.width, chipWidth: box.width, wordDisplay: getComputedStyle(word).display, countDisplay: getComputedStyle(count).display, inside: box.right <= bar.getBoundingClientRect().right + 0.5 && box.left >= bar.getBoundingClientRect().left - 0.5 };
           };
           const steps = [0, 1, 2, 3, 4].map(read);
           bar.setAttribute('data-fit', natural);
-          return { role: status.getAttribute('role'), live: status.getAttribute('aria-live'), hidden: status.hidden, shortAriaHidden: short.getAttribute('aria-hidden'), longAriaHidden: long.getAttribute('aria-hidden'), longText: long.textContent, shortText: short.textContent, steps };
+          return { hidden: chip.hidden, word: word.textContent, pill: count.textContent, countAriaHidden: count.getAttribute('aria-hidden'), steps };
         })()`,
       );
     } finally {
       await restoreWorstCase(cdp, saved);
     }
-    await sleep(300);
-    const [s0, s1, s2, s3, s4] = m.steps;
-    const sentence = (s) => s.shortDisplay === 'none' && s.longDisplay !== 'none' && s.longPosition !== 'absolute' && s.longWidth > 1;
-    const shortForm = (s) => s.shortDisplay !== 'none' && s.shortWidth > 0 && s.longDisplay !== 'none' && s.longPosition === 'absolute' && s.longWidth <= 1 && s.longClip.startsWith('inset(');
+    await waitFor(cdp, `(() => { const bar = document.getElementById('top-bar'); return bar.scrollWidth <= bar.clientWidth ? true : null; })()`, 3000);
+    const kept = (s) => s.wordDisplay !== 'none' && s.countDisplay !== 'none' && s.wordWidth > 0 && s.countWidth > 0 && s.inside;
     report(
-      'ask status: at step 3 the worst case shows 12 waiting and the sentence is still in the accessibility tree',
-      m.role === 'status' && m.live === 'polite' && m.hidden === false &&
-        m.longText === WORST_CASE.askStatus && m.shortText === waitingShortText(12) && m.shortText === '12 waiting' &&
-        m.shortAriaHidden === 'true' && m.longAriaHidden === null &&
-        [s0, s1, s2].every(sentence) && [s3, s4].every(shortForm),
+      'requests chip: the worst case keeps its word and its pill at every fit step',
+      m.hidden === false && m.word === 'Requests' && m.pill === WORST_CASE.requests && m.countAriaHidden === 'true' && m.steps.every(kept),
       JSON.stringify(m),
     );
   }
@@ -5107,7 +5175,6 @@ async function worstCaseBlocks(context) {
           wrapped: items.filter((item) => !item.oneLine).map((item) => item.name),
           tempo: { text: tempo.innerText, whole: tempo.scrollWidth <= tempo.clientWidth + 0.5, oneLine: tempo.offsetHeight < lineOf(tempo) * 1.5, unitShown: getComputedStyle(unit).display !== 'none' },
           pending: pending.hidden ? null : pending.innerText,
-          askShown: getComputedStyle(document.getElementById('ask-status').querySelector('.ask-short')).display !== 'none' ? 'short' : 'long',
         };
       })()`,
     );
@@ -6197,7 +6264,7 @@ async function shotsBlocks(context) {
   }
   report(
     'shots: screenshots are saved outside the repository',
-    problems.length === 0 && written.length === expected.length && path.relative(REPO_ROOT, folder).startsWith('..'),
+    problems.length === 0 && written.length === expected.length && shotsSavedOutside(folder),
     JSON.stringify({ folder, written: written.length, expected: expected.length, problems: problems.slice(0, 5) }),
   );
   report(
@@ -6397,18 +6464,18 @@ export async function barBlocks(context) {
   {
     const snapshot = () =>
       // The cycle and beat is live decoration (it moves with the music), so it is left out of the comparison: its own tag and
-      // its text inside the ancestors.
-      evaluateExpr(cdp, `(() => { const bar = document.getElementById('chrome'); const cycle = document.getElementById('cycle-beat'); const live = cycle.textContent; return [bar, ...bar.querySelectorAll('*')].map((el) => el === cycle ? 'cycle-beat' : el.outerHTML.slice(0, el.outerHTML.indexOf('>') + 1) + '|' + (live === '' ? el.textContent : el.textContent.replace(live, '')) + '|' + el.hidden); })()`);
+      // its text inside the ancestors. So are the Requests panel and the spoken line: their rows count the seconds.
+      evaluateExpr(cdp, `(() => { const bar = document.getElementById('chrome'); const cycle = document.getElementById('cycle-beat'); const live = cycle.textContent; const parts = [...bar.children].filter((el) => el.id !== 'requests-panel' && el.id !== 'requests-live'); return parts.flatMap((part) => [part, ...part.querySelectorAll('*')]).map((el) => el === cycle ? 'cycle-beat' : el.outerHTML.slice(0, el.outerHTML.indexOf('>') + 1) + '|' + (live === '' ? el.textContent : el.textContent.replace(live, '')) + '|' + el.hidden); })()`);
     const before = await snapshot();
     const saved = await setWorstCase(cdp);
-    await sleep(300);
+    // Read at once: the page rewrites an element of the fixture on its next change or tick.
     const during = await evaluateExpr(
       cdp,
       `(() => {
         const get = (selector) => document.querySelector(selector);
         const shown = (selector) => !get(selector).hidden;
         return {
-          ask: get('#ask-status .ask-long').textContent,
+          pill: get('#requests-toggle .rq-count').textContent,
           build: get('#build-mismatch').textContent,
           version: get('#version-indicator').textContent,
           requests: get('#page-requests-state').textContent,
@@ -6416,7 +6483,7 @@ export async function barBlocks(context) {
           dots: get('#midi-dots').children.length,
           tempo: get('#tempo-readout').textContent,
           pending: get('#pending-change').textContent,
-          allShown: ['#ask-status', '#build-mismatch', '#version-indicator', '#page-requests', '#midi-state', '#tempo-readout', '#pending-change'].every(shown),
+          allShown: ['#requests-toggle', '#build-mismatch', '#version-indicator', '#page-requests', '#midi-state', '#tempo-readout', '#pending-change'].every(shown),
         };
       })()`,
     );
@@ -6427,7 +6494,7 @@ export async function barBlocks(context) {
     const differing = before.map((line, index) => (line === after[index] ? null : { before: line, after: after[index] })).filter((entry) => entry !== null);
     report(
       'bar helpers: the worst-case fixture sets and restores the page',
-      during.ask === WORST_CASE.askStatus &&
+      during.pill === WORST_CASE.requests &&
         during.build === WORST_CASE.build &&
         during.version === WORST_CASE.version &&
         during.requests === WORST_CASE.pageRequests &&
@@ -6607,7 +6674,9 @@ export async function harmonyBlocks(context) {
 
   // --- Jam: the declared harmony next to the heard one (J1 to J7) ---
   {
-    const TIE_PADS = 'pads: note("<[a3,c4,e4] [f3,a3,c4] [c4,e4,g4] [g3,b3,d4]>").gain(0)';
+    // The four pads fit several scales that share their notes; the drone and the line fit two that do not.
+    const TIE_PADS = JAM_FOUR_PADS;
+    const DIFFERENT_NOTES = JAM_DIFFERENT_NOTES;
     const C_MAJOR = 'lead: n("0 1 2 3 4 5 6 7").scale("C:major").gain(0)';
     const DRUMS = 'drums: s("bd*4").gain(0)';
     const blur = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
@@ -6639,6 +6708,8 @@ export async function harmonyBlocks(context) {
         name: el('jam-scale-name').textContent,
         kind: el('jam-scale-name').dataset.kind || null,
         sub: el('jam-scale-sub').textContent,
+        reasonHidden: el('jam-reason').hidden,
+        reason: el('jam-reason').textContent,
         piano: el('jam-piano').getAttribute('aria-label'),
         guitar: el('jam-guitar').getAttribute('aria-label'),
         verdict: texts.some((text) => /no clear scale/i.test(text)),
@@ -6675,7 +6746,6 @@ export async function harmonyBlocks(context) {
           };
         })()`,
       );
-    const tieSentence = (f) => f.name.startsWith('The notes fit ') && f.name.endsWith(' equally.');
     const brief = (f) => (f === null ? null : { ...f, piano: undefined, guitar: undefined });
 
     await closeViews();
@@ -6684,19 +6754,20 @@ export async function harmonyBlocks(context) {
 
     // J1: without a declaration nothing of the two lines shows; a declaration shows them; removing it hides them again.
     {
-      const first = await jamWith(TIE_PADS, 'probe harmony jam tie', `f.state === 'ready' && f.kind === 'ambiguous' && f.name.startsWith('No clear scale')`);
-      const declared = await jamWith(`const harmony = 'C:major'\n${TIE_PADS}`, 'probe harmony jam tie declared', `f.state === 'ready' && f.declaredHidden === false && f.kind === 'ambiguous'`);
-      const again = await jamWith(TIE_PADS, 'probe harmony jam tie again', `f.state === 'ready' && f.kind === 'ambiguous' && f.declaredHidden === true`);
+      const first = await jamWith(DIFFERENT_NOTES, 'probe harmony jam different notes', `f.state === 'ready' && f.kind === 'ambiguous' && f.name.startsWith('Several scales fit')`);
+      const declared = await jamWith(`const harmony = 'C:major'\n${DIFFERENT_NOTES}`, 'probe harmony jam different notes declared', `f.state === 'ready' && f.declaredHidden === false && f.kind === 'ambiguous'`);
+      const again = await jamWith(DIFFERENT_NOTES, 'probe harmony jam different notes again', `f.state === 'ready' && f.kind === 'ambiguous' && f.declaredHidden === true`);
       report(
-        'harmony jam J1: without a declaration the Declared line and the Heard label are hidden and the tie sentence is unchanged',
+        'harmony jam J1: without a declaration the Declared line and the Heard label are hidden and the heading says several scales fit with different notes and nothing is declared',
         first !== null &&
           first.declaredHidden === true &&
           first.labelHidden === true &&
-          first.name.startsWith('No clear scale: the notes fit ') &&
-          first.name.endsWith(' equally.') &&
-          first.piano.endsWith('No clear scale.') &&
+          first.name === 'Several scales fit, with different notes, and nothing is declared.' &&
+          first.piano === 'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.' &&
+          first.guitar === 'Guitar fretboard, standard tuning, 12 frets. Several scales fit with different notes, so none is coloured.' &&
           declared !== null &&
           declared.labelHidden === false &&
+          declared.name === 'Several scales fit, with different notes, and none of them is the declared scale.' &&
           again !== null &&
           again.declaredHidden === true &&
           again.labelHidden === true &&
@@ -6706,20 +6777,23 @@ export async function harmonyBlocks(context) {
       );
     }
 
-    // J2: a declared tie shows two lines and the words No clear scale are nowhere.
+    // J2: a declared scale among the candidates shows two lines, is the scale in use, and the words No clear scale are nowhere.
     {
-      const f = await jamWith(`const harmony = 'C:major'\n${TIE_PADS}`, 'probe harmony jam tie declared', `f.state === 'ready' && f.declaredHidden === false && f.kind === 'ambiguous'`);
+      const f = await jamWith(`const harmony = 'C:major'\n${TIE_PADS}`, 'probe harmony jam declared proposal', `f.state === 'ready' && f.declaredHidden === false && f.kind === 'clear'`);
       report(
-        'harmony jam J2: a declared scale shows two lines, and a tie drops the words No clear scale everywhere',
+        'harmony jam J2: a declared scale shows two lines, the proposed scale says it is declared by the code, and no sentence says No clear scale',
         f !== null &&
           f.declaredLabel === 'Declared:' &&
           f.declaredValue === 'C major' &&
-          f.labelHidden === false &&
-          f.heardLabel === 'Heard:' &&
-          tieSentence(f) &&
+          f.name === 'C major' &&
+          f.reasonHidden === false &&
+          f.reason === 'Proposed: C major, declared by the code.' &&
+          f.labelHidden === true &&
           f.verdict === false &&
-          f.piano.endsWith('The heard scale is not clear.') &&
-          f.guitar.endsWith('The heard scale is not clear.'),
+          f.piano.startsWith('Piano, two octaves from C3. Proposed scale: C major.') &&
+          f.guitar.startsWith('Guitar fretboard, standard tuning, 12 frets. Proposed scale: C major.') &&
+          !/No clear scale/.test(f.piano) &&
+          !/No clear scale/.test(f.guitar),
         JSON.stringify(brief(f)),
       );
     }
@@ -8239,7 +8313,13 @@ export const MIXER_LIGHT_WATCH_START = (lights, keys) => `(async () => {
   if (window.__lightWatch) throw new Error('the light watch is already running');
   const spec = ${JSON.stringify(lights)};
   const keys = ${JSON.stringify(keys)};
-  const state = (window.__lightWatch = { events: {}, notes: [], observers: [], stop: null });
+  const state = (window.__lightWatch = { events: {}, notes: [], frames: [], observers: [], stop: null, frameId: null });
+  // Every frame the page draws, so a note can be judged against the frame it belongs to.
+  const recordFrame = (ts) => {
+    state.frames.push(ts);
+    state.frameId = requestAnimationFrame(recordFrame);
+  };
+  state.frameId = requestAnimationFrame(recordFrame);
   try {
     for (const [name, selector] of Object.entries(spec)) {
       const light = document.querySelector(selector);
@@ -8269,6 +8349,7 @@ export const MIXER_LIGHT_WATCH_START = (lights, keys) => `(async () => {
       state.notes.push({ key: event.key, heard, seenAt: now });
     });
   } catch (err) {
+    cancelAnimationFrame(state.frameId);
     for (const observer of state.observers) observer.disconnect();
     delete window.__lightWatch;
     throw err;
@@ -8276,14 +8357,15 @@ export const MIXER_LIGHT_WATCH_START = (lights, keys) => `(async () => {
   return true;
 })()`;
 
-/** Page-side text that stops the watch and returns { events, notes } (see MIXER_LIGHT_WATCH_START). */
+/** Page-side text that stops the watch and returns { events, notes, frames } (see MIXER_LIGHT_WATCH_START). */
 export const MIXER_LIGHT_WATCH_STOP = `(() => {
   const state = window.__lightWatch;
   if (!state) return null;
   if (typeof state.stop === 'function') state.stop();
+  cancelAnimationFrame(state.frameId);
   for (const observer of state.observers) observer.disconnect();
   delete window.__lightWatch;
-  return { events: state.events, notes: state.notes };
+  return { events: state.events, notes: state.notes, frames: state.frames };
 })()`;
 
 /**
@@ -8928,6 +9010,8 @@ export async function songBlocks(context) {
       let version = 0;
       for (const target of ['y', 'z', 'x']) {
         let row = null;
+        // Every attempt dropped because its line moved while the page evaluated: kept in the final row, so a slower page shows in the detail.
+        const droppedAttempts = [];
         for (let attempt = 1; attempt <= 3 && (row === null || row.marginLost); attempt++) {
           version += 1;
           const now = await readSchedulerNow(cdp);
@@ -8942,6 +9026,7 @@ export async function songBlocks(context) {
             console.log(
               `probe:page RETRY: the line moved from cycle ${out.line} to ${out.lineAfter} while the ${timing} launch of ${target} was evaluating (${Math.round(out.evaluateMs)} ms), attempt ${attempt} of 3 is not judged`,
             );
+            droppedAttempts.push({ line: out.line, lineAfter: out.lineAfter, evaluateMs: Math.round(out.evaluateMs) });
             row = { timing, target, marginLost: true, line: out.line, lineAfter: out.lineAfter, evaluateMs: Math.round(out.evaluateMs), onLine: false };
             continue;
           }
@@ -8962,6 +9047,7 @@ export async function songBlocks(context) {
             oldAtOrAfter: landing.oldAtOrAfter,
           };
         }
+        row.droppedAttempts = droppedAttempts;
         handLaunches.push(row);
       }
     }
@@ -10453,20 +10539,30 @@ export async function gridBlocks(context) {
   const typedMark = '// probe typing\n';
   await chooseLaunch('bar');
   await startMarkerPiece('probe grid cancel keeps typing', slowTemplate);
-  const typingBase = { code: await editorCode(), history: await historyTop() };
+  let typingBase = { code: await editorCode(), history: await historyTop() };
   let typingRace = null;
+  const typingAttempts = [];
   for (let attempt = 1; attempt <= 4 && typingRace === null; attempt++) {
     const playing = await waitPlayingHeader('the launch that typing interrupts');
     const target = (playing + 1) % 3;
+    // Each attempt starts from what plays now: an attempt given up below can still land at its line before its cancel.
+    const attemptBase = { code: await editorCode(), history: await historyTop() };
     await beforeNextEvaluate(`() => document.getElementById('repl').editor.editor.dispatch({ changes: { from: 0, insert: ${JSON.stringify(typedMark)} } })`, 3200);
     await clickHead(target);
+    const clickedAt = Date.now();
     if ((await raceFired(1500)) === null) {
-      // The section already starts on that line, so nothing was written: hide the countdown and ask again.
+      // The section already starts on that line, so nothing was written and the launch waits for the line: a second click
+      // cancels it and the next attempt asks again. On a busy page the line can come before that click, and the launch then
+      // plays as asked; the next attempt starts from it.
+      const queuedBefore = await evaluateExpr(cdp, `document.querySelectorAll('#parts-rows .song-head[data-state="queued"]').length`);
       await raceRestore();
       await clickHead(target);
       await sleep(400);
+      typingAttempts.push({ attempt, playing: sectionNames[playing], target: sectionNames[target], waitedMs: Date.now() - clickedAt, queuedBefore, firedLate: await evaluateExpr(cdp, `window.__probeRace.fired`), history: await historyTop() });
       continue;
     }
+    typingAttempts.push({ attempt, playing: sectionNames[playing], target: sectionNames[target], fired: true });
+    typingBase = attemptBase;
     await sleep(5000);
     typingRace = {
       target: sectionNames[target],
@@ -10487,7 +10583,7 @@ export async function gridBlocks(context) {
       typingRace.line.kind === 'dirty' &&
       typingRace.history.id === typingBase.history.id &&
       typingRace.word === SOUND_LABELS.playing,
-    JSON.stringify(typingRace),
+    JSON.stringify({ ...typingRace, base: typingBase.history.id, attempts: typingAttempts }),
   );
 
   // A Stop that lands while a launch is prepared must not start the scheduler again: the sound stays stopped, the code that
@@ -11475,7 +11571,7 @@ export async function gridBlocks(context) {
       askParsed = null;
     }
   }
-  const askReceived = await waitFor(cdp, `(() => { const el = document.getElementById('ask-status'); return !el.hidden && el.querySelector('.ask-long').textContent === ${JSON.stringify(ASK_COPY.received)} ? true : null; })()`, 4000);
+  const askReceived = await waitFor(cdp, requestRowReads('make this variation shorter', REQUEST_STATUS_COPY.phrases.received), 4000);
   await stopAskListeners();
   report(
     'grid: a request sent from a cell reaches Claude with the cell context',
@@ -11488,6 +11584,7 @@ export async function gridBlocks(context) {
       askReceived === true,
     JSON.stringify({ lines: askListener.lines.length, context: askParsed && askParsed.context, chip: askParsed && askParsed.chip, text: askParsed && askParsed.text, askReceived }),
   );
+  await foldRequestsPanel(cdp);
 
   // The ready-made request: only a cell that does not fit offers it, it sits in the field with the caret at the end, it is
   // never sent, and a draft the person already wrote is kept with the request after it.
@@ -11500,11 +11597,6 @@ export async function gridBlocks(context) {
   if (fitListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
   await sleep(500);
   await askReset();
-  // The status of the request sent a moment ago ("Claude received it") hides by itself; this check looks at the status after
-  // its own right-click, so it starts from a hidden one.
-  if ((await waitFor(cdp, `document.getElementById('ask-status').hidden ? true : null`, 8000)) !== true) {
-    throw new ProbeCouldNotRun('the status of the earlier request did not hide within 8 seconds');
-  }
   const requestBefore = await askPlayed();
   const notFitAsk = await askAt(cdp, cellAt('t2', 0));
   const notFitBox = await askBoxRead();
@@ -11512,7 +11604,8 @@ export async function gridBlocks(context) {
   await askAt(cdp, cellAt('t2', 0));
   const repeatBox = await askBoxRead();
   await sleep(1500);
-  const sentStatus = await evaluateExpr(cdp, `document.getElementById('ask-status').hidden`);
+  // Nothing was sent, so the Requests panel holds no row for the ready-made request.
+  const sentStatus = await evaluateExpr(cdp, `![...document.querySelectorAll('#requests-panel .rq-text')].some((el) => el.getAttribute('title') === ${JSON.stringify(fitRequestText)})`);
   const sentLines = fitListener.lines.length;
   // A draft: the box closes, the draft stays in the field, the next right-click adds the request after it.
   await askFieldSet('my draft');
@@ -11612,6 +11705,130 @@ export async function gridBlocks(context) {
     JSON.stringify({ keySeen: keySeen.map((item) => [item.name, item.chip, item.expected, item.prevented, item.near]), f10Alone, shiftedMenu, shiftedMouse, history: [keysBefore.history.id, keysAfter.history.id] }),
   );
 
+  // A real Menu key and a real Shift+F10 press (Input.dispatchKeyEvent, not a made-up keydown): the browser raises its own
+  // contextmenu for the same press, and the box must open once, at the control, with no browser menu over it. Whether a headless
+  // browser raises that contextmenu for a driven key varies (the page's record says how many came), so each press runs three
+  // times: as sent, and with the contextmenu a browser raises for the key added by hand between the key going down and up,
+  // once on the element that holds focus by then (the Ask box's field, which the grid has already moved focus to) and once on
+  // the control the key was pressed on.
+  const realAskPress = async (selector, press, raiseContextmenu) => {
+    await askReset();
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        if (typeof window.__askPressCleanup === 'function') window.__askPressCleanup();
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (el === null) throw new Error('realAskPress: no element matches ' + ${JSON.stringify(selector)});
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        el.focus();
+        const box = document.getElementById('ask-box');
+        const record = { focused: document.activeElement === el, contextmenus: [], opens: 0, shown: [], keyUps: 0 };
+        let wasHidden = box.hidden;
+        const observer = new MutationObserver(() => {
+          if (wasHidden && !box.hidden) record.opens += 1;
+          wasHidden = box.hidden;
+          if (!box.hidden) record.shown.push(box.style.left + ',' + box.style.top);
+        });
+        observer.observe(box, { attributes: true, attributeFilter: ['hidden', 'style'] });
+        const onContext = (event) => record.contextmenus.push(event);
+        const onKeyUp = () => { record.keyUps += 1; };
+        document.addEventListener('contextmenu', onContext, true);
+        document.addEventListener('keyup', onKeyUp, true);
+        window.__askPressRecord = record;
+        window.__askPressCleanup = () => {
+          observer.disconnect();
+          document.removeEventListener('contextmenu', onContext, true);
+          document.removeEventListener('keyup', onKeyUp, true);
+          window.__askPressCleanup = undefined;
+        };
+        return true;
+      })()`,
+    );
+    const at = await evaluateExpr(cdp, `(() => { const r = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2, left: r.left, bottom: r.bottom }; })()`);
+    await cdp('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...press.event });
+    if (raiseContextmenu !== null) {
+      await evaluateExpr(
+        cdp,
+        `(() => {
+          const target = ${raiseContextmenu === 'control' ? `document.querySelector(${JSON.stringify(selector)})` : 'document.activeElement'};
+          target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: ${at.left + 3}, clientY: ${at.bottom}, shiftKey: ${press.shift ? 'true' : 'false'} }));
+          return true;
+        })()`,
+      );
+    }
+    const opened = await waitFor(cdp, `window.__askPressRecord.opens >= 1 ? true : null`, 5000);
+    await cdp('Input.dispatchKeyEvent', { type: 'keyUp', ...press.event });
+    const keyUpSeen = await waitFor(cdp, `window.__askPressRecord.keyUps >= 1 ? true : null`, 5000);
+    const read = await evaluateExpr(
+      cdp,
+      `(() => {
+        const record = window.__askPressRecord;
+        window.__askPressCleanup();
+        return {
+          focused: record.focused,
+          opens: record.opens,
+          positions: [...new Set(record.shown)].length,
+          contextmenus: record.contextmenus.length,
+          unprevented: record.contextmenus.filter((event) => !event.defaultPrevented).length,
+        };
+      })()`,
+    );
+    const box = await askBoxRead();
+    const gapX = Math.max(box.left - at.x, 0, at.x - box.right);
+    const gapY = Math.max(box.top - at.y, 0, at.y - box.bottom);
+    return { ...read, opened: opened === true, keyUpSeen: keyUpSeen === true, open: box.open, boxes: box.boxes, near: Math.hypot(gapX, gapY) < 60 };
+  };
+  const askPresses = [
+    { name: 'the Menu key', shift: false, event: { key: 'ContextMenu', code: 'ContextMenu', windowsVirtualKeyCode: 93 } },
+    { name: 'Shift+F10', shift: true, event: { key: 'F10', code: 'F10', windowsVirtualKeyCode: 121, modifiers: 8 } },
+  ];
+  const pressSeen = [];
+  for (const press of askPresses) {
+    for (const raiseContextmenu of [null, 'focused', 'control']) {
+      const answer = await realAskPress(cellAt('t1', 1), press, raiseContextmenu);
+      pressSeen.push({ name: `${press.name}${raiseContextmenu === null ? '' : ` with a contextmenu added on the ${raiseContextmenu} element`}`, ...answer });
+    }
+  }
+  await askReset();
+  // The task that forgets a press after its key up can run late on a busy page, after the next press went down. It must forget
+  // only its own press: the contextmenu of the next press is still kept away. The order is fixed here in one page evaluation:
+  // a press and its release, Esc, a second press before the release's task has run, then (after that task) the contextmenu.
+  const lateRelease = await evaluateExpr(
+    cdp,
+    `new Promise((resolve) => {
+      const cell = document.querySelector(${JSON.stringify(cellAt('t1', 1))});
+      const field = document.getElementById('ask-field');
+      const key = (type, target) => target.dispatchEvent(new KeyboardEvent(type, { key: 'F10', code: 'F10', shiftKey: true, bubbles: true, cancelable: true }));
+      cell.focus();
+      key('keydown', cell);
+      const firstOpen = !document.getElementById('ask-box').hidden;
+      key('keyup', document.activeElement);
+      field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+      const closedBetween = document.getElementById('ask-box').hidden;
+      cell.focus();
+      key('keydown', cell);
+      setTimeout(() => {
+        const r = cell.getBoundingClientRect();
+        const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: r.left + 3, clientY: r.bottom, shiftKey: true });
+        cell.dispatchEvent(event);
+        key('keyup', document.activeElement);
+        resolve({ firstOpen, closedBetween, secondOpen: !document.getElementById('ask-box').hidden, prevented: event.defaultPrevented });
+      }, 50);
+    })`,
+  );
+  await askReset();
+  report(
+    'grid: the Menu key opens the Ask box once, with no browser menu over it',
+    pressSeen.every(
+      (item) => item.focused === true && item.opened === true && item.keyUpSeen === true && item.open === true && item.boxes === 1 && item.opens === 1 && item.positions === 1 && item.near === true && item.unprevented === 0,
+    ) &&
+      lateRelease.firstOpen === true &&
+      lateRelease.closedBetween === true &&
+      lateRelease.secondOpen === true &&
+      lateRelease.prevented === true,
+    JSON.stringify({ pressSeen, lateRelease }),
+  );
+
   // ---- pictures of the grid for the person's own eye ----
   // Off unless MOONTIDE_PROBE_SHOTS names a folder outside the repository. A realistic piece (nested groups, five sections, a
   // folded group, a section that plays and one launch that waits) and a piece whose fixed variations show the three fit words,
@@ -11690,7 +11907,7 @@ export async function gridBlocks(context) {
     }
     report(
       'grid: pictures of the grid are saved outside the repository',
-      gridProblems.length === 0 && gridWritten.length === 8 && path.relative(REPO_ROOT, gridShotsFolder).startsWith('..'),
+      gridProblems.length === 0 && gridWritten.length === 8 && shotsSavedOutside(gridShotsFolder),
       JSON.stringify({ written: gridWritten.length, problems: gridProblems.slice(0, 5) }),
     );
     console.log(`probe:page grid pictures saved in ${gridShotsFolder}`);
@@ -11745,6 +11962,83 @@ export function mixerGroupsCode({ groups = "{ g1: ['t1', 't2'], g2: { g3: ['t3']
     ...names.map((name) => `${name}: play('${name}', ${name}).gain(0)`),
     ...extra,
   ].join('\n');
+}
+
+/** A frame of the Mixer lights lasts about this long (ms) on a 60 Hz screen. */
+const LIGHT_FRAME_MS = 17;
+const T1_LIGHT = '#mixer-strips .mx-strip[data-track="label:t1"] .mx-light';
+
+/** Watches the lights named in `lights` for the notes of `keys` until `seconds` have passed or `enough` notes were heard,
+ * and returns what MIXER_LIGHT_WATCH_STOP returns. */
+export async function watchLights(cdp, lights, keys, seconds, enough) {
+  await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(lights, keys));
+  try {
+    const deadline = Date.now() + seconds * 1000;
+    while (Date.now() < deadline) {
+      if (enough !== undefined && (await evaluateExpr(cdp, `window.__lightWatch.notes.length`)) >= enough) break;
+      await sleep(250);
+    }
+  } catch (err) {
+    // A watch left installed would make every later run of a repeated check fail at its start.
+    await evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP).catch(() => {});
+    throw err;
+  }
+  return evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
+}
+
+/** For each note of `noteKey` when it is heard and when the drawn frames fall around it: `frameAt` is the first recorded
+ * frame at or after the moment it is heard and `nextAt` the frame after that, both in ms after the moment it is heard; `litAfter`
+ * is when the light was first seen at full strength at or after it (null when it was not within `windowMs`). */
+export function lightFrames(watch, name, noteKey, windowMs) {
+  const rows = lightRows(watch, name, noteKey, windowMs);
+  return watch.notes
+    .filter((note) => note.key === noteKey)
+    .map((note, index) => {
+      const at = watch.frames.findIndex((ts) => ts >= note.heard - 1);
+      return {
+        litAfter: rows[index].litAfter,
+        fadeMs: rows[index].fadeMs,
+        frameAt: at === -1 ? null : watch.frames[at] - note.heard,
+        nextAt: at === -1 || at + 1 >= watch.frames.length ? null : watch.frames[at + 1] - note.heard,
+      };
+    });
+}
+
+/** A track's light lights in the first frame at or after its note is heard and fades out in about 180 ms. */
+async function mixerLightTimingCheck({ cdp, client, report }) {
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const waitActive = async (code) => {
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the code of this check within 8 seconds');
+    }
+  };
+  const openMixer = async () => {
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) === 'mixer') return;
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, '3');
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'mixer' ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun('the Mixer did not open');
+    }
+  };
+  const code = 'setcps(1)\nt1: note("c3").gain(0)';
+  await callTool(client, 'set_code', { code, label: 'probe mixer light timing' });
+  await waitActive(code);
+  await openMixer();
+  await waitFor(cdp, `document.querySelector(${JSON.stringify(T1_LIGHT)}) !== null ? true : null`, 5000);
+  // The watch ends a moment after the tenth note is scheduled; that note's light may be cut in the middle of its fade by the end of
+  // the watch, so only the first nine notes, each with a whole second after it, are judged.
+  const watched = await watchLights(cdp, { t1: T1_LIGHT }, ['label:t1'], 20, 10);
+  const timing = { ...watched, notes: watched.notes.slice(0, 9) };
+  const timingRows = lightRows(timing, 't1', 'label:t1', LIGHT_FRAME_MS + 20);
+  const timedOn = timingRows.filter((row) => row.litAfter !== null);
+  const faded = timedOn.filter((row) => row.fadeMs !== null && row.fadeMs >= 150 && row.fadeMs <= 260);
+  const round = (value) => (value === null ? null : Math.round(value));
+  const frames = lightFrames(timing, 't1', 'label:t1', LIGHT_FRAME_MS + 20);
+  report(
+    "mixer: a track's light lights in the first frame at or after its note is heard and fades out in about 180 ms",
+    timingRows.length >= 8 && timedOn.length >= timingRows.length - 1 && timedOn.length >= 7 && faded.length === timedOn.length,
+    JSON.stringify(frames.map((row) => ({ lit: round(row.litAfter), fade: round(row.fadeMs), frame: round(row.frameAt), next: round(row.nextAt) }))),
+  );
 }
 
 /**
@@ -12562,35 +12856,21 @@ export async function mixerGroupBlocks(context) {
   // A silent piece at one cycle a second: a track plays one note a cycle, so the gaps between its notes are long enough to tell
   // one blink from the next. The light must turn on in the first frame at or after the moment the note is heard (worked out
   // here from the output timestamp, apart from the page) and be dark again about 180 ms later.
-  const LIGHT_FRAME_MS = 17;
-  const T1_LIGHT = '#mixer-strips .mx-strip[data-track="label:t1"] .mx-light';
-  const watchFor = async (lights, keys, seconds, enough) => {
-    await evaluateExpr(cdp, MIXER_LIGHT_WATCH_START(lights, keys));
-    const deadline = Date.now() + seconds * 1000;
-    while (Date.now() < deadline) {
-      if (enough !== undefined && (await evaluateExpr(cdp, `window.__lightWatch.notes.length`)) >= enough) break;
-      await sleep(250);
-    }
-    return evaluateExpr(cdp, MIXER_LIGHT_WATCH_STOP);
-  };
-  await showPiece('setcps(1)\nt1: note("c3").gain(0)', 'probe mixer light timing');
-  await waitFor(cdp, `document.querySelector(${JSON.stringify(T1_LIGHT)}) !== null ? true : null`, 5000);
-  const timing = await watchFor({ t1: T1_LIGHT }, ['label:t1'], 20, 9);
-  const timingRows = lightRows(timing, 't1', 'label:t1', LIGHT_FRAME_MS + 20);
-  const timedOn = timingRows.filter((row) => row.litAfter !== null);
-  const faded = timedOn.filter((row) => row.fadeMs !== null && row.fadeMs >= 150 && row.fadeMs <= 260);
-  report(
-    "mixer: a track's light lights in the first frame at or after its note is heard and fades out in about 180 ms",
-    timingRows.length >= 8 && timedOn.length >= timingRows.length - 1 && timedOn.length >= 7 && faded.length === timedOn.length,
-    JSON.stringify(timingRows.map((row) => ({ lit: row.litAfter === null ? null : Math.round(row.litAfter), fade: row.fadeMs === null ? null : Math.round(row.fadeMs) }))),
-  );
+  const watchFor = (lights, keys, seconds, enough) => watchLights(cdp, lights, keys, seconds, enough);
+  await mixerLightTimingCheck({ cdp, client, report });
 
   // A group's light, folded or open, lights in the same way as the light of any track below it. g1 holds t1 (a note at the
   // start of the cycle) and t2 (a note half a cycle later), so the group's light must blink for both.
   const stripLight = (track) => `#mixer-strips .mx-strip[data-track="${track}"] .mx-light`;
   const groupLight = (key) => `.mx-group[data-group='${key}'] > .mx-group-head .mx-group-title > .mx-light`;
   const lightCode = mixerGroupsCode({ cps: 1, patterns: { t2: "note('c3').late(0.5)" } });
-  const lit = (watch, name) => watch.events[name].filter((event) => event.opacity === '1').length;
+  // Lights at full strength from the first recorded note of `key` on. A note scheduled just before the watch started is not recorded
+  // but lights a moment later: that light belongs to no recorded note, so it is not counted against the notes.
+  const lightsFrom = (watch, name, key) => {
+    const first = watch.notes.find((note) => note.key === key);
+    const from = first === undefined ? -Infinity : first.heard - 1;
+    return watch.events[name].filter((event) => event.opacity === '1' && event.t >= from).length;
+  };
   const everLit = (watch, name) => watch.events[name].some((event) => (event.opacity !== '' && Number(event.opacity) > 0) || event.lit === 'true');
   const matched = (watch, name, key, windowMs) => lightRows(watch, name, key, windowMs).filter((row) => row.litAfter !== null).length;
   const noteCount = (watch, key) => watch.notes.filter((note) => note.key === key).length;
@@ -12699,8 +12979,9 @@ export async function mixerGroupBlocks(context) {
     secondNotes: noteCount(dollarWatch, '$1'),
     first: matched(dollarWatch, 'first', '$0', LIGHT_FRAME_MS + 20),
     second: matched(dollarWatch, 'second', '$1', LIGHT_FRAME_MS + 20),
-    firstLit: lit(dollarWatch, 'first'),
-    secondLit: lit(dollarWatch, 'second'),
+    firstLit: lightsFrom(dollarWatch, 'first', '$0'),
+    secondLit: lightsFrom(dollarWatch, 'second', '$1'),
+    litAll: { first: dollarWatch.events.first.filter((event) => event.opacity === '1').length, second: dollarWatch.events.second.filter((event) => event.opacity === '1').length },
   };
   report(
     "mixer: each $ track's light lights for its own notes",
@@ -13190,7 +13471,7 @@ export async function mixerGroupBlocks(context) {
     }
     report(
       'mixer: pictures of nested groups and of lights are saved outside the repository',
-      pictureProblems.length === 0 && written.length === 12 && path.relative(REPO_ROOT, mixerShotsFolder).startsWith('..'),
+      pictureProblems.length === 0 && written.length === 12 && shotsSavedOutside(mixerShotsFolder),
       JSON.stringify({ written: written.length, problems: pictureProblems.slice(0, 5), litLightsAtLightPictures: litAtPicture }),
     );
     console.log('probe:page mixer pictures saved in a scratch folder outside the repository');
@@ -14908,7 +15189,16 @@ export async function timelineBlocks(context) {
     const position = ((cycle % 15) + 15) % 15;
     return position < 3 ? 'x' : position < 8 ? 'y' : 'z';
   };
-  const sectionWords = (from, to) => (sectionOf(from) === sectionOf(to) ? `section "${sectionOf(from)}"` : `sections "${sectionOf(from)}" to "${sectionOf(to)}"`);
+  // The sections the cycles from..to cross in playing order, a section twice in a row once, as the page lists them.
+  const sectionList = (from, to) => {
+    const names = [];
+    for (let cycle = from; cycle <= to; cycle++) if (names[names.length - 1] !== sectionOf(cycle)) names.push(sectionOf(cycle));
+    return names;
+  };
+  const sectionWords = (from, to) => {
+    const names = sectionList(from, to);
+    return `${names.length === 1 ? 'section' : 'sections'} ${names.map((name) => `"${name}"`).join(', ')}`;
+  };
   // A cycle of the page where the song changes section, and a run of three cycles inside one section.
   let boundary = ps;
   while (sectionOf(boundary) === sectionOf(boundary + 1)) boundary++;
@@ -14952,7 +15242,7 @@ export async function timelineBlocks(context) {
     box.chip === `Range · t1 · cycles ${inside} to ${inside + 2} · section "${sectionOf(inside)}" · 3 notes` && box.message === '' && washes.length === 1,
   );
   await dragRead('a drag across a section boundary', { x: cycleMiddle(sectionArea, boundary), y: middle }, { x: cycleMiddle(sectionArea, boundary + 1), y: middle }, (box, washes) =>
-    box.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · sections "${sectionOf(boundary)}" to "${sectionOf(boundary + 1)}" · 2 notes` && box.message === '' && washes.length === 1,
+    box.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · ${sectionWords(boundary, boundary + 1)} · 2 notes` && box.message === '' && washes.length === 1,
   );
   const sectionLinesBeforeEnter = sectionListener.lines.length;
   await askFieldSet('which section is this?');
@@ -14961,16 +15251,51 @@ export async function timelineBlocks(context) {
   const sectionSent = parsedRequest(sectionListener.lines[0]);
   await stopAskListeners();
   report(
-    'timeline: a sideways drag from a note makes a range, a drag past the page edge is cut and the box says so, and a range across a section boundary names both sections',
+    'timeline: a sideways drag from a note makes a range, a drag past the page edge is cut and the box says so, and a range across a section boundary names the sections it crosses',
     rangeRows.length === 5 &&
       rangeRows.every((row) => row.ok) &&
       sectionOf(boundary) !== sectionOf(boundary + 1) &&
       sectionLinesBeforeEnter === 0 &&
       sectionSent !== null &&
-      JSON.stringify(sectionSent.context) === JSON.stringify({ kind: 'range', track: 't1', from: boundary, to: boundary + 1, section: sectionOf(boundary), sectionTo: sectionOf(boundary + 1) }) &&
+      JSON.stringify(sectionSent.context) === JSON.stringify({ kind: 'range', track: 't1', from: boundary, to: boundary + 1, sections: [sectionOf(boundary), sectionOf(boundary + 1)] }) &&
       sectionSent.gesture.notes.length === 2 &&
-      sectionSent.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · sections "${sectionOf(boundary)}" to "${sectionOf(boundary + 1)}" · 2 notes`,
+      sectionSent.chip === `Range · t1 · cycles ${boundary} to ${boundary + 1} · ${sectionWords(boundary, boundary + 1)} · 2 notes`,
     JSON.stringify({ ps, boundary, inside, noteCycle, rangeRows, sectionLinesBeforeEnter, sent: sectionSent && { context: sectionSent.context, chip: sectionSent.chip, notes: sectionSent.gesture.notes.length } }),
+  );
+
+  // A range from the first cycle of a z section to a z section after the next repeat crosses z, x, y and z again: the panel, the chip
+  // and the request name the same list, and the section that comes back after another is named again.
+  let repeatFrom = ps;
+  while (((repeatFrom % 15) + 15) % 15 !== 8) repeatFrom++;
+  const repeatTo = repeatFrom + 16;
+  const repeatNames = sectionList(repeatFrom, repeatTo);
+  await stopAskListeners();
+  const repeatListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (repeatListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  await dragPointer({ x: cycleMiddle(sectionArea, repeatFrom), y: middle }, { x: cycleMiddle(sectionArea, repeatTo), y: middle });
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const repeatBox = await askBoxRead();
+  const repeatPanel = await readPanel();
+  await askFieldSet('which sections are these?');
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && repeatListener.lines.length === 0; waited += 100) await sleep(100);
+  const repeatSent = parsedRequest(repeatListener.lines[0]);
+  await stopAskListeners();
+  const repeatNotes = repeatTo - repeatFrom + 1;
+  report(
+    'timeline: a range across the end of the song and into a repeat names every section it crosses, in the panel, the chip and the request',
+    JSON.stringify(repeatNames) === JSON.stringify(['z', 'x', 'y', 'z']) &&
+      repeatPanel.lane === 'Range · t1' &&
+      repeatPanel.position === ` · cycles ${repeatFrom} to ${repeatTo} · sections ${repeatNames.map((name) => `'${name}'`).join(', ')} · ${repeatNotes} notes` &&
+      repeatBox.open === true &&
+      repeatBox.chip === `Range · t1 · cycles ${repeatFrom} to ${repeatTo} · ${sectionWords(repeatFrom, repeatTo)} · ${repeatNotes} notes` &&
+      repeatSent !== null &&
+      JSON.stringify(repeatSent.context.sections) === JSON.stringify(repeatNames) &&
+      repeatSent.context.moreSections === undefined &&
+      repeatSent.chip === repeatBox.chip,
+    JSON.stringify({ repeatFrom, repeatTo, repeatNames, panel: `${repeatPanel.lane}${repeatPanel.position}`, chip: repeatBox.chip, sent: repeatSent && { sections: repeatSent.context.sections, moreSections: repeatSent.context.moreSections, chip: repeatSent.chip } }),
   );
 
   // The worst case of the request line: a lane with a 200-character name, whose every note carries that name, and a range of 40
@@ -15011,6 +15336,63 @@ export async function timelineBlocks(context) {
       longSent.gesture.notes.every((note) => note.track === longName) &&
       longSent.chip === longBox.chip,
     JSON.stringify({ chip: longBox.chip, bytes: longLineBytes, notes: longSent && longSent.gesture.notes.length, more: longSent && longSent.gesture.more, track: longSent && longSent.context.track.length }),
+  );
+
+  // A range across 31 one-cycle sections with 60-character names: the list is cut where the names stop fitting, the panel and the
+  // chip end it with how many more, and the request line keeps its caps. The names are made from the index only.
+  const manyNames = Array.from({ length: 31 }, (_, at) => `s${String(at).padStart(2, '0')}${'n'.repeat(57)}`);
+  const manyPiece = [
+    SLOW.trim(),
+    `const harmony = '${SONG_DEFAULT_HARMONY}'`,
+    `const song = { shift: 0, sections: [${manyNames.map((name) => `['${name}', 1]`).join(', ')}], plan: { ${manyNames.map((name) => `${name}: { t1: 'va' }`).join(', ')} } };`,
+    SONG_HELPER_TEXT,
+    "const t1 = { va: note('c3') };",
+    "t1: play('t1', t1).gain(0)",
+  ].join('\n');
+  await resetLanes('probe timeline range many sections reset');
+  await showPiece(manyPiece, 'probe timeline range many sections', 1);
+  await stopAskListeners();
+  const manyListener = spawnListener(await callTool(client, 'get_code', {}));
+  if (manyListener === null) throw new ProbeCouldNotRun('get_code gave no line that arms the page-request listener');
+  await sleep(500);
+  await askReset();
+  const manyArea = await laneArea(0);
+  const manyFrom = manyArea.pageStart;
+  const manyTo = manyFrom + 30;
+  await dragPointer({ x: cycleMiddle(manyArea, manyFrom), y: laneTop(manyArea, 0.95) }, { x: cycleMiddle(manyArea, manyTo), y: laneTop(manyArea, 0.95) });
+  await waitFor(cdp, `!document.getElementById('ask-box').hidden ? true : null`, 3000);
+  const manyBox = await askBoxRead();
+  const manyPanel = await readPanel();
+  await askFieldSet('which sections are these?');
+  await pressKey(cdp, 'Enter');
+  for (let waited = 0; waited < 6000 && manyListener.lines.length === 0; waited += 100) await sleep(100);
+  const manyLine = manyListener.lines[0];
+  const manySent = parsedRequest(manyLine);
+  await stopAskListeners();
+  const manyLineBytes = manyLine === undefined ? 0 : new TextEncoder().encode(manyLine).length;
+  const manyPanelRead = /^ · cycles (\d+) to (\d+)( · sections .*) and (\d+) more · (\d+) notes$/.exec(manyPanel.position);
+  const manyChipRead = /^Range · t1 · cycles (\d+) to (\d+) · (sections .*) and (\d+) more · (\d+) notes$/.exec(manyBox.chip);
+  report(
+    'timeline: a range across many long-named sections ends its list with how many more and stays within the caps',
+    manyPanelRead !== null &&
+      manyChipRead !== null &&
+      manyPanelRead[3].length + ` and ${manyPanelRead[4]} more`.length <= 200 &&
+      Number(manyPanelRead[4]) > 0 &&
+      Number(manyPanelRead[1]) === manyFrom &&
+      Number(manyPanelRead[2]) === manyTo &&
+      Number(manyPanelRead[5]) === 31 &&
+      manyBox.chip.length <= 200 &&
+      Number(manyChipRead[1]) === manyFrom &&
+      Number(manyChipRead[2]) === manyTo &&
+      Number(manyChipRead[5]) === 31 &&
+      manySent !== null &&
+      manySent.context.moreSections > 0 &&
+      manySent.context.sections.length + manySent.context.moreSections === 31 &&
+      manySent.context.sections.every((name, at) => name === manyNames[(manyFrom + at) % 31] || name === manyNames[(manyFrom + at) % 31].slice(0, 199)) &&
+      manySent.chip === manyBox.chip &&
+      manyLineBytes > 0 &&
+      manyLineBytes <= 8192,
+    JSON.stringify({ panel: manyPanel.position, chip: manyBox.chip, chipLength: manyBox.chip.length, bytes: manyLineBytes, sent: manySent && { sections: manySent.context.sections.length, moreSections: manySent.context.moreSections } }),
   );
 
   // The keyboard: Shift+Right on a selected note makes a range and widens it a cycle a press, Enter opens the box for it, Escape
@@ -15324,6 +15706,9 @@ export async function timelineBlocks(context) {
     await resetLanes('probe timeline sizes reset');
     await showPiece(sizePiece, 'probe timeline sizes', 3);
     await askReset();
+    // The requests the checks above sent opened the Requests panel by itself, and it stays open while they are in flight. It
+    // overlays the right end of the window, where the Timeline sits in layout b at 1024 px, so a click there would land on it.
+    await foldRequestsPanel(cdp);
     const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
     const sizeCodeBefore = await editorAndHistory();
     const READ_SIZES = `(() => {
@@ -15410,6 +15795,8 @@ export async function timelineBlocks(context) {
     await resetLanes('probe timeline marks reset');
     await showPiece(markPiece, 'probe timeline marks', 2);
     await askReset();
+    // The marks are clicked in every layout, so the Requests panel, which overlays the right end of the window, is folded first.
+    await foldRequestsPanel(cdp);
     const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
     const markCodeBefore = await editorAndHistory();
     const READ_MARKS = `(() => {
@@ -15628,7 +16015,7 @@ export async function timelineBlocks(context) {
     }
     report(
       'timeline: pictures of a selected note, a refused note and a range are saved outside the repository',
-      pictureProblems.length === 0 && written.length === 18 && path.relative(REPO_ROOT, timelineShotsFolder).startsWith('..'),
+      pictureProblems.length === 0 && written.length === 18 && shotsSavedOutside(timelineShotsFolder),
       JSON.stringify({ written: written.length, problems: pictureProblems.slice(0, 6) }),
     );
     console.log('probe:page timeline pictures saved in a scratch folder outside the repository');
@@ -15636,6 +16023,4506 @@ export async function timelineBlocks(context) {
 
   await callTool(client, 'set_code', { code: 'setcps(0.5)\nzz: note("a5").gain(0)', label: 'probe timeline range done' });
   await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+}
+
+/** The small helpers the Ask box checks share, bound to one page connection. */
+function askBoxHelpers(cdp) {
+  const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+  const closeAsk = async () => {
+    if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+    await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+  };
+  // Empties the field the way a person would, then closes the box.
+  const clearField = () =>
+    evaluateExpr(
+      cdp,
+      "(() => { const f = document.getElementById('ask-field'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); })()",
+    );
+  const readField = () =>
+    evaluateExpr(
+      cdp,
+      "(() => { const f = document.getElementById('ask-field'); return { value: f.value, start: f.selectionStart, end: f.selectionEnd, focused: document.activeElement === f }; })()",
+    );
+  const boxRect = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const r = document.getElementById('ask-box').getBoundingClientRect();
+        return {
+          left: r.left,
+          top: r.top,
+          right: r.right,
+          bottom: r.bottom,
+          width: window.innerWidth,
+          height: window.innerHeight,
+          rootPx: parseFloat(getComputedStyle(document.documentElement).fontSize),
+        };
+      })()`,
+    );
+  const insideWindow = (r) => {
+    const margin = r.rootPx * 0.5 - 0.5;
+    return r.left >= margin && r.top >= margin && r.right <= r.width - margin && r.bottom <= r.height - margin;
+  };
+  return { askBoxOpen, closeAsk, clearField, readField, boxRect, insideWindow };
+}
+
+/** Waits until the page is `width` by `height` and its top bar has been laid out for that size: the window size is read
+ * first, then animation frames go by until the bar's fit step and the places of the Views group and of the product name stay the
+ * same for three frames in a row. The page refits its bar in the frame after a size change, so a position read right after
+ * `Emulation.setDeviceMetricsOverride` can still belong to the bar of the earlier size. Bounded by 3 s; returns
+ * `{ settled: true, fit, frames }`. When the size or the layout did not settle within the bound it throws ProbeCouldNotRun
+ * naming what was seen, because a check that reads places of an unsettled bar would pass or fail for the wrong reason. */
+export async function layoutSettled(cdp, width, height) {
+  const result = await evaluateExpr(
+    cdp,
+    `new Promise((resolve) => {
+      const started = performance.now();
+      const place = (id) => {
+        const r = document.getElementById(id).getBoundingClientRect();
+        return [r.x, r.y, r.width, r.height].join(',');
+      };
+      let last = null;
+      let same = 0;
+      let frames = 0;
+      const tick = () => {
+        frames++;
+        const sized = window.innerWidth === ${width} && window.innerHeight === ${height};
+        const fit = document.getElementById('top-bar').dataset.fit;
+        const signature = fit + '|' + place('view-buttons') + '|' + place('product-name');
+        same = sized && signature === last ? same + 1 : 0;
+        last = signature;
+        if (same >= 3) resolve({ settled: true, fit, frames });
+        else if (performance.now() - started > 3000) resolve({ settled: false, fit, frames });
+        else requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    })`,
+  );
+  if (result.settled !== true) {
+    throw new ProbeCouldNotRun(
+      `the page did not settle at ${width}x${height} within 3 s (top bar fit ${JSON.stringify(result.fit ?? null)}, ${result.frames} frames), so the places of the top bar cannot be trusted`,
+    );
+  }
+  return result;
+}
+
+/** Records, for the Ask box check, every pointer, context menu and focus event with its time, its target and whether the document
+ * has focus, and every time the box is hidden or shown: the failing detail then says which event closed the box. */
+const ASK_TRACE_START = `(() => {
+  if (window.__askTrace) window.__askTrace.stop();
+  const log = [];
+  const t0 = performance.now();
+  const name = (node) => (node && node.id) || (node && node.nodeName) || null;
+  const note = (what, extra) => log.push({ what, at: Math.round(performance.now() - t0), focus: document.hasFocus(), active: name(document.activeElement), ...extra });
+  const events = ['mousedown', 'mouseup', 'contextmenu', 'focusin', 'focusout'];
+  const onEvent = (event) => note(event.type, { target: name(event.target), prevented: event.defaultPrevented });
+  for (const type of events) document.addEventListener(type, onEvent, true);
+  const onWindow = (event) => note('window ' + event.type);
+  window.addEventListener('blur', onWindow, true);
+  window.addEventListener('focus', onWindow, true);
+  const box = document.getElementById('ask-box');
+  const observer = new MutationObserver(() => note(box.hidden ? 'box hidden' : 'box shown'));
+  observer.observe(box, { attributes: true, attributeFilter: ['hidden'] });
+  window.__askTrace = {
+    log,
+    stop() {
+      for (const type of events) document.removeEventListener(type, onEvent, true);
+      window.removeEventListener('blur', onWindow, true);
+      window.removeEventListener('focus', onWindow, true);
+      observer.disconnect();
+      window.__askTrace = null;
+    },
+  };
+  return true;
+})()`;
+const ASK_TRACE_STOP = `(() => {
+  const trace = window.__askTrace;
+  if (!trace) return null;
+  const log = trace.log;
+  trace.stop();
+  return log;
+})()`;
+
+/** Clicking elsewhere closes the box and keeps the draft; a second right-click moves it and keeps the text. */
+async function askBoxMovesCheck({ cdp, report }) {
+  const { askBoxOpen, closeAsk, clearField, readField, boxRect } = askBoxHelpers(cdp);
+  const detail = {};
+  try {
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
+    // The bar refits to the new width a frame later: the places read below must be the ones of the bar at this width.
+    detail.layout = await layoutSettled(cdp, 1280, 800);
+    await askAt(cdp, '#product-name');
+    await cdp('Input.insertText', { text: 'moving check' });
+    await evaluateExpr(cdp, ASK_TRACE_START);
+    const first = await boxRect();
+    const viewsRect = await evaluateExpr(
+      cdp,
+      "(() => { const r = document.getElementById('view-buttons').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()",
+    );
+    detail.setup = { first, viewsRect, window: await evaluateExpr(cdp, '({ w: window.innerWidth, h: window.innerHeight })'), fit: await evaluateExpr(cdp, "document.getElementById('top-bar').dataset.fit") };
+    detail.setup.hit = await evaluateExpr(cdp, `(() => { const el = document.elementFromPoint(${viewsRect.x}, ${viewsRect.y}); return el === null ? null : el.id || el.nodeName; })()`);
+    await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: viewsRect.x, y: viewsRect.y, button: 'right', buttons: 2, clickCount: 1 });
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: viewsRect.x, y: viewsRect.y, button: 'right', buttons: 0, clickCount: 1 });
+    // The box moves in the page's own contextmenu handler: wait for the move itself, bounded by 2 s.
+    detail.moved =
+      (await waitFor(
+        cdp,
+        `(() => { const r = document.getElementById('ask-box').getBoundingClientRect(); return r.left !== ${first.left} || r.top !== ${first.top} ? true : null; })()`,
+        2000,
+      )) === true;
+    detail.second = await boxRect();
+    detail.open = await askBoxOpen();
+    detail.field = await readField();
+    detail.trace = await evaluateExpr(cdp, ASK_TRACE_STOP);
+    await clickElement(cdp, '#product-name');
+    detail.closedByClick = (await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000)) === true;
+    await askAt(cdp, '#product-name');
+    detail.draft = await readField();
+  } finally {
+    await evaluateExpr(cdp, ASK_TRACE_STOP);
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await clearField();
+    await closeAsk();
+  }
+  const pass =
+    detail.moved === true &&
+    detail.open === true &&
+    detail.field.value === 'moving check' &&
+    detail.field.focused === true &&
+    detail.closedByClick === true &&
+    detail.draft.value === 'moving check' &&
+    detail.draft.start === 0 &&
+    detail.draft.end === 12;
+  // The event trace is only worth reading when the check failed.
+  if (pass) delete detail.trace;
+  report('clicking elsewhere closes the box and keeps the draft; a second right-click moves it and keeps the text', pass, JSON.stringify(detail));
+}
+
+/** The same check, started from the state the full run leaves: the page was narrow and short a moment ago, so its top bar is
+ * still laid out for the small size when the window grows back. */
+async function askBoxMovesAfterResizeCheck({ cdp, report }) {
+  const { closeAsk, clearField } = askBoxHelpers(cdp);
+  try {
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 900, height: 300, deviceScaleFactor: 1, mobile: false });
+    await layoutSettled(cdp, 900, 300);
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await clearField();
+    await closeAsk();
+  }
+  await askBoxMovesCheck({ cdp, report });
+}
+
+/** The first words of every request line Claude reads; the JSON after them says what the user wrote. */
+const PAGE_REQUEST_LINE = 'Request from the Moontide page: ';
+
+/** Kills every page-request listener this probe started and waits for them to exit, so requests wait for Claude. */
+async function stopSpawnedListeners() {
+  for (const child of spawnedListeners) {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once('exit', resolve));
+      child.kill();
+      await exited;
+    }
+  }
+  await sleep(300);
+}
+
+/** A page expression that is true once the row of the Requests panel for the request written as `text` (or the rows of every
+ * text of a list) reads `phrase` as its state, and null before that (for waitFor). A row is found by the whole request text in
+ * the title of its first line. */
+function requestRowReads(text, phrase) {
+  const texts = Array.isArray(text) ? text : [text];
+  return `((texts) => texts.every((wanted) => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === wanted); return row !== undefined && row.querySelector('.rq-state').textContent === ${JSON.stringify(phrase)}; }) ? true : null)(${JSON.stringify(texts)})`;
+}
+
+/** Folds the Requests panel when it is open, with a real click on the chip. The panel opens by itself when a request is sent and
+ * overlays the top right of the views, so a check that sent one folds it before the checks that follow use that corner. */
+async function foldRequestsPanel(cdp) {
+  if (await evaluateExpr(cdp, `!document.getElementById('requests-panel').hidden`)) await clickElement(cdp, '#requests-toggle');
+}
+
+/** The Requests chip and the row of the request written as `text`, read in one page evaluation: the chip's pill and
+ * accessible name, whether the panel shows, the row's words and shape, and where focus is. */
+function requestsRead(cdp, text) {
+  return evaluateExpr(
+    cdp,
+    `((wanted) => {
+      const chip = document.getElementById('requests-toggle');
+      const panel = document.getElementById('requests-panel');
+      const count = chip.querySelector('.rq-count');
+      const item = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === wanted) ?? null;
+      const active = document.activeElement;
+      return {
+        chipHidden: chip.hidden,
+        expanded: chip.getAttribute('aria-expanded'),
+        label: chip.getAttribute('aria-label'),
+        inflight: chip.getAttribute('data-inflight'),
+        pill: count.hidden ? null : count.textContent,
+        panelHidden: panel.hidden,
+        focusInPanel: active !== null && panel.contains(active),
+        focusOnChip: active === chip,
+        row: item === null ? null : {
+          text: item.querySelector('.rq-text').textContent,
+          state: item.querySelector('.rq-state').textContent,
+          stateTitle: item.querySelector('.rq-state').getAttribute('title'),
+          shape: item.querySelector('.rq-mark').getAttribute('data-shape'),
+          finished: item.getAttribute('data-finished'),
+        },
+      };
+    })(${JSON.stringify(text)})`,
+  );
+}
+
+/** A request typed in the Ask box shows as one row of the Requests panel and follows the server to its end: Sent or Waiting
+ * for Claude's next action at once, Received when a reply hands it over, Claude has started on it after the next call, and
+ * Applied as vN when a change names it (when the page promises that state). The chip counts the requests in flight, and the
+ * panel opens by itself without moving focus. The music is silent. */
+async function requestsRowFollowsServerCheck({ cdp, client, report }) {
+  const detail = {};
+  const stamp = Date.now();
+  const text = `requests probe ${stamp}`;
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const playingWord = JSON.stringify(SOUND_LABELS.playing);
+  const logHook = `(() => {
+    if (window.__requestsConsole === undefined) {
+      const original = console.error;
+      window.__requestsConsole = { lines: [], original };
+      console.error = (...args) => { window.__requestsConsole.lines.push(args.join(' ')); original(...args); };
+    }
+    return true;
+  })()`;
+  const logUnhook = `(() => {
+    if (window.__requestsConsole !== undefined) {
+      console.error = window.__requestsConsole.original;
+      const lines = window.__requestsConsole.lines;
+      window.__requestsConsole = undefined;
+      return lines;
+    }
+    return [];
+  })()`;
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await callTool(client, 'set_code', { code: `setcps(0.5)\nrequests_probe: s("bd*4").gain(0)\n// ${stamp}`, label: 'probe requests start' });
+    if ((await waitFor(cdp, `(${STATE_WORD_EXPR}) === ${playingWord} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not play the silent piece of the requests check within 8 seconds');
+    }
+    // No listener: the page says its requests wait for Claude, so the first answer is Waiting for Claude's next action.
+    await stopSpawnedListeners();
+    const waitsForClaude = await waitFor(
+      cdp,
+      `(() => { const state = document.getElementById('page-requests-state'); return state.textContent === ${JSON.stringify(PAGE_REQUESTS_COPY.waiting)} ? true : null; })()`,
+      3000,
+    );
+    if (waitsForClaude !== true) throw new ProbeCouldNotRun('the page still says a listener takes its requests');
+    await evaluateExpr(cdp, logHook);
+    // Start with the panel folded and read what the chip counts before this request.
+    if ((await requestsRead(cdp, text)).expanded === 'true') await clickElement(cdp, '#requests-toggle');
+    const before = await requestsRead(cdp, text);
+    const baseline = before.pill === null ? 0 : Number(before.pill);
+    detail.before = { chipHidden: before.chipHidden, baseline, panelHidden: before.panelHidden };
+    const flightName = (n) => (n === 0 ? REQUEST_STATUS_COPY.chipNameNone : REQUEST_STATUS_COPY.chipNameFlight.replace('{n}', String(n)));
+
+    // Send it from the Ask box on the whole session.
+    const asked = await askAt(cdp, '#product-name');
+    if (asked.open !== true) throw new ProbeCouldNotRun('the Ask box did not open for the requests check');
+    await cdp('Input.insertText', { text });
+    await pressKey(cdp, 'Enter');
+    const first = await waitFor(
+      cdp,
+      `(() => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === ${JSON.stringify(text)}); return row ? row.querySelector('.rq-state').textContent : null; })()`,
+      3000,
+    );
+    detail.first = first;
+    const sent = await requestsRead(cdp, text);
+    detail.sent = sent;
+    const sentOk =
+      (first === phrases.sent || first === phrases.waiting) &&
+      sent.chipHidden === false &&
+      sent.panelHidden === false &&
+      sent.expanded === 'true' &&
+      sent.focusInPanel === false &&
+      sent.focusOnChip === false &&
+      sent.row !== null &&
+      sent.row.text === rowText(text) &&
+      sent.pill === String(baseline + 1) &&
+      sent.label === flightName(baseline + 1) &&
+      sent.inflight === 'true';
+    const waiting = await waitFor(
+      cdp,
+      `(() => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === ${JSON.stringify(text)}); return row && row.querySelector('.rq-state').textContent === ${JSON.stringify(phrases.waiting)} ? true : null; })()`,
+      3000,
+    );
+    detail.waiting = waiting === true;
+
+    const stateOf = (want) =>
+      waitFor(
+        cdp,
+        `(() => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === ${JSON.stringify(text)}); return row && row.querySelector('.rq-state').textContent === ${JSON.stringify(want)} ? true : null; })()`,
+        4000,
+      );
+
+    // A tool reply that carries the request line hands it over: Received. The line holds the id the change will name.
+    const reply = await callTool(client, 'get_code', {});
+    let id = null;
+    for (const line of reply.split('\n')) {
+      if (!line.startsWith(PAGE_REQUEST_LINE)) continue;
+      const parsed = JSON.parse(line.slice(PAGE_REQUEST_LINE.length));
+      if (parsed.text === text) id = parsed.id;
+    }
+    detail.id = id;
+    if (id === null) throw new ProbeCouldNotRun('the reply of get_code did not carry the request line of the check');
+    detail.received = (await stateOf(phrases.received)) === true;
+    const received = await requestsRead(cdp, text);
+
+    // The next Moontide call shows Claude working: Claude has started on it, with its basis in the title.
+    await callTool(client, 'list_history', {});
+    detail.started = (await stateOf(phrases.started)) === true;
+    const started = await requestsRead(cdp, text);
+
+    // A change that names the request: Applied as vN, N the version the history shows (when the page promises that state).
+    await callTool(client, 'set_code', {
+      code: `setcps(0.5)\nrequests_probe: s("bd*4").gain(0)\n// ${stamp} answer`,
+      label: 'probe requests answer',
+      at: 'now',
+      answering: id,
+    });
+    const historyReply = await callTool(client, 'list_history', {});
+    const top = /^#(\d+) /m.exec(historyReply);
+    if (top === null) throw new ProbeCouldNotRun(`list_history shows no numbered row: ${String(historyReply).slice(0, 200)}`);
+    const version = Number(top[1]);
+    detail.version = version;
+    let linked;
+    if (LINK_PROMISED) {
+      detail.applied = (await stateOf(statePhrase({ state: 'applied', version }))) === true;
+      linked = await requestsRead(cdp, text);
+    } else {
+      // The page does not promise Applied: the row stays on its last honest state and one console line says why.
+      await sleep(1500);
+      detail.applied = (await stateOf(phrases.started)) === true;
+      linked = await requestsRead(cdp, text);
+    }
+    detail.linked = linked;
+    const lines = await evaluateExpr(cdp, logUnhook);
+    detail.consoleLines = lines.filter((line) => line.includes('not shown because it was not measured to hold')).length;
+
+    const flightOk = (read) => read.pill === String(baseline + 1) && read.label === flightName(baseline + 1) && read.inflight === 'true';
+    const endPill = baseline === 0 ? null : String(baseline);
+    const linkedOk = LINK_PROMISED
+      ? detail.applied === true &&
+        linked.row !== null &&
+        linked.row.finished === 'true' &&
+        linked.row.shape === 'done' &&
+        linked.pill === endPill &&
+        linked.label === flightName(baseline) &&
+        detail.consoleLines === 0
+      : detail.applied === true && linked.row !== null && linked.row.finished === 'false' && flightOk(linked) && detail.consoleLines === 1;
+    const pass =
+      sentOk &&
+      detail.waiting === true &&
+      detail.received === true &&
+      received.row !== null &&
+      flightOk(received) &&
+      detail.started === true &&
+      started.row !== null &&
+      started.row.stateTitle === REQUEST_STATUS_COPY.startedBasis &&
+      flightOk(started) &&
+      linkedOk;
+    report('requests: a request typed in the Ask box shows as one row that follows the server, and the chip counts it', pass, JSON.stringify(detail));
+  } finally {
+    await evaluateExpr(cdp, logUnhook);
+    await stopSpawnedListeners();
+  }
+}
+
+/** The keyboard and the neighbours of the Requests panel in the real page. With a view open and one request that Claude has
+ * started on: Tab reaches the chip between the Layout group and the Session button; Enter opens the panel and puts focus on
+ * the first row; Enter on the row opens its detail with the About line and the basis; Esc folds the panel, puts focus back on
+ * the chip and leaves the open view open; opening the Session drawer folds the panel and opening the panel closes the drawer;
+ * a click on the editor does not fold the panel. The music is silent. */
+async function requestsPanelKeysAndDrawerCheck({ cdp, client, report }) {
+  const detail = {};
+  const stamp = Date.now();
+  const text = `requests keys probe ${stamp}`;
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const playingWord = JSON.stringify(SOUND_LABELS.playing);
+  const blur = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); return true; })()`);
+  const read = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const chip = document.getElementById('requests-toggle');
+        const panel = document.getElementById('requests-panel');
+        const drawer = document.getElementById('session-drawer');
+        const active = document.activeElement;
+        const row = [...document.querySelectorAll('#requests-panel .rq-list .rq-row')][0] ?? null;
+        const detailBox = row === null ? null : document.getElementById(row.getAttribute('aria-controls'));
+        return {
+          activeId: active === null ? null : active.id,
+          activeIsFirstRow: active !== null && active === row,
+          firstRowTitle: row === null ? null : row.querySelector('.rq-text').getAttribute('title'),
+          rowExpanded: row === null ? null : row.getAttribute('aria-expanded'),
+          detailShown: detailBox === null ? null : !detailBox.hidden,
+          detailLines: detailBox === null ? [] : [...detailBox.children].map((p) => [p.className, p.textContent]),
+          panelShown: !panel.hidden && panel.getClientRects().length > 0,
+          chipExpanded: chip.getAttribute('aria-expanded'),
+          drawerShown: !drawer.hidden && drawer.getClientRects().length > 0,
+          view: document.getElementById('workspace').dataset.view,
+        };
+      })()`,
+    );
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await callTool(client, 'set_code', { code: `setcps(0.5)\nrequests_keys: s("bd*4").gain(0)\n// ${stamp}`, label: 'probe requests keys start' });
+    if ((await waitFor(cdp, `(${STATE_WORD_EXPR}) === ${playingWord} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not play the silent piece of the requests keys check within 8 seconds');
+    }
+    await stopSpawnedListeners();
+    // A view is open, so Esc can be shown never to close it.
+    await closeDrawer(cdp);
+    await blur();
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) !== 'none') {
+      await pressKey(cdp, 'Escape');
+      await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'none' ? true : null`, 3000);
+    }
+    await pressKey(cdp, '1');
+    const openView = await waitFor(cdp, `document.getElementById('workspace').dataset.view !== 'none' ? document.getElementById('workspace').dataset.view : null`, 3000);
+    detail.openView = openView;
+    if (openView === null) throw new ProbeCouldNotRun('the 1 key did not open a view');
+
+    // One request, handed to Claude, then Claude is seen working: the row reads Claude has started on it.
+    const asked = await askAt(cdp, '#product-name');
+    if (asked.open !== true) throw new ProbeCouldNotRun('the Ask box did not open for the requests keys check');
+    await cdp('Input.insertText', { text });
+    await pressKey(cdp, 'Enter');
+    if ((await waitFor(cdp, requestRowReads(text, phrases.waiting), 4000)) !== true) throw new ProbeCouldNotRun('the request did not wait for Claude');
+    await callTool(client, 'get_code', {});
+    if ((await waitFor(cdp, requestRowReads(text, phrases.received), 4000)) !== true) throw new ProbeCouldNotRun('the request was not handed to Claude');
+    await callTool(client, 'list_history', {});
+    if ((await waitFor(cdp, requestRowReads(text, phrases.started), 4000)) !== true) throw new ProbeCouldNotRun('the request did not reach Claude has started on it');
+    detail.afterSend = await read();
+
+    // Tab: from the last button of the Layout group to the chip, then to the Session button.
+    await blur();
+    await evaluateExpr(cdp, `(() => { const buttons = document.querySelectorAll('#layout-buttons button'); buttons[buttons.length - 1].focus(); return true; })()`);
+    await pressKey(cdp, 'Tab');
+    detail.tabToChip = (await read()).activeId;
+    await pressKey(cdp, 'Tab');
+    detail.tabToSession = (await read()).activeId;
+    await pressKey(cdp, 'Tab', { shift: true });
+    detail.tabBack = (await read()).activeId;
+
+    // Enter on the chip: the panel opened by itself on the send, so the first Enter folds it and the second opens it by keyboard.
+    await pressKey(cdp, 'Enter');
+    detail.afterFirstEnter = await read();
+    await pressKey(cdp, 'Enter');
+    const opened = await waitFor(cdp, `(() => { const panel = document.getElementById('requests-panel'); return !panel.hidden && document.activeElement && panel.contains(document.activeElement) ? true : null; })()`, 3000);
+    detail.keyboardOpen = await read();
+    detail.keyboardOpenFocused = opened === true;
+
+    // Enter on the row: its detail opens, with the context and the basis.
+    await pressKey(cdp, 'Enter');
+    detail.detailOpen = await read();
+
+    // Esc inside the panel: it folds, focus returns to the chip, and the open view stays open.
+    await pressKey(cdp, 'Escape');
+    detail.afterEsc = await read();
+
+    // The panel and the Session drawer never show together.
+    await pressKey(cdp, 'Enter');
+    await pressKey(cdp, 'Escape');
+    await clickElement(cdp, '#requests-toggle');
+    detail.panelBeforeDrawer = await read();
+    await openDrawer(cdp);
+    detail.drawerOpen = await read();
+    await clickElement(cdp, '#requests-toggle');
+    detail.panelOpenAgain = await read();
+
+    // A click on the editor does not fold the panel.
+    await clickElement(cdp, '#editor-area');
+    detail.afterEditorClick = await read();
+
+    const first = detail.afterSend;
+    const tabbed = detail.tabToChip === 'requests-toggle' && detail.tabToSession === 'session-button' && detail.tabBack === 'requests-toggle';
+    const enterFolds = detail.afterFirstEnter.panelShown === false && detail.afterFirstEnter.chipExpanded === 'false';
+    const keyboardOpens =
+      detail.keyboardOpenFocused === true &&
+      detail.keyboardOpen.activeIsFirstRow === true &&
+      detail.keyboardOpen.firstRowTitle === text &&
+      detail.keyboardOpen.chipExpanded === 'true';
+    const lines = Object.fromEntries(detail.detailOpen.detailLines.map(([className, line]) => [className, line]));
+    const detailOk =
+      detail.detailOpen.rowExpanded === 'true' &&
+      detail.detailOpen.detailShown === true &&
+      lines['rq-about'] === 'About: Whole session' &&
+      lines['rq-basis'] === `${REQUEST_STATUS_COPY.basisLead}${REQUEST_STATUS_COPY.startedBasis}`;
+    const escOk =
+      detail.afterEsc.panelShown === false &&
+      detail.afterEsc.activeId === 'requests-toggle' &&
+      detail.afterEsc.view === openView &&
+      detail.afterEsc.chipExpanded === 'false';
+    const exclusive =
+      detail.panelBeforeDrawer.panelShown === true &&
+      detail.drawerOpen.drawerShown === true &&
+      detail.drawerOpen.panelShown === false &&
+      detail.panelOpenAgain.panelShown === true &&
+      detail.panelOpenAgain.drawerShown === false;
+    const clickOk = detail.afterEditorClick.panelShown === true && detail.afterEditorClick.view === openView;
+    report(
+      'requests: Tab reaches the chip, Enter opens the panel on its first row, a row opens its detail, Esc folds without closing the view, and the panel and the Session drawer never show together',
+      first.panelShown === true && tabbed && enterFolds && keyboardOpens && detailOk && escOk && exclusive && clickOk,
+      JSON.stringify(detail),
+    );
+  } finally {
+    await closeDrawer(cdp);
+    const panelOpen = await evaluateExpr(cdp, `!document.getElementById('requests-panel').hidden`);
+    if (panelOpen) await clickElement(cdp, '#requests-toggle');
+    await blur();
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) !== 'none') {
+      await pressKey(cdp, 'Escape');
+      await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'none' ? true : null`, 3000);
+    }
+    await stopSpawnedListeners();
+  }
+}
+
+/** The words a console line of the tracker carries when it ignores a state the page does not promise. */
+const NOT_PROMISED_LINE = 'not shown because it was not measured to hold';
+
+/** Page source: counts the tracker's console lines about a state it does not show, until REQUESTS_CONSOLE_UNHOOK. */
+const REQUESTS_CONSOLE_HOOK = `(() => {
+  if (window.__requestsConsole === undefined) {
+    const original = console.error;
+    window.__requestsConsole = { lines: [], original };
+    console.error = (...args) => { window.__requestsConsole.lines.push(args.join(' ')); original(...args); };
+  }
+  return true;
+})()`;
+const REQUESTS_CONSOLE_UNHOOK = `(() => {
+  if (window.__requestsConsole !== undefined) {
+    console.error = window.__requestsConsole.original;
+    const lines = window.__requestsConsole.lines;
+    window.__requestsConsole = undefined;
+    return lines;
+  }
+  return [];
+})()`;
+
+/** Page source, set before the page loads: the socket recorder, plus every message the page receives and, for each message
+ * before the first request board, whether the Requests chip was hidden when it arrived. The listener is added in the socket's
+ * constructor, so it runs before the page's own handler of the same message. */
+const REQUESTS_SOCKET_RECORDER_SOURCE = `(() => {
+  const Native = window.WebSocket;
+  window.__probeSockets = [];
+  window.__probeSent = [];
+  window.__probeReceived = [];
+  window.__probeChipBeforeBoard = [];
+  window.__probeBoard = undefined;
+  window.WebSocket = class extends Native {
+    constructor(...args) {
+      super(...args);
+      window.__probeSockets.push(this);
+      this.addEventListener('message', (event) => {
+        const data = String(event.data);
+        window.__probeReceived.push(data);
+        let type = null;
+        let parsed = null;
+        try { parsed = JSON.parse(data); type = parsed.type; } catch { type = null; }
+        if (window.__probeBoard !== undefined) return;
+        const chip = document.getElementById('requests-toggle');
+        window.__probeChipBeforeBoard.push(chip === null ? null : chip.hidden);
+        if (type === 'ask-board') window.__probeBoard = parsed;
+      });
+    }
+    send(data) {
+      window.__probeSent.push(String(data));
+      return super.send(data);
+    }
+  };
+})()`;
+
+/** Every request line of a tool reply, as a map from the request text to its id. */
+function requestIdsOf(reply) {
+  const ids = new Map();
+  for (const line of String(reply).split('\n')) {
+    if (!line.startsWith(PAGE_REQUEST_LINE)) continue;
+    const parsed = JSON.parse(line.slice(PAGE_REQUEST_LINE.length));
+    ids.set(parsed.text, parsed.id);
+  }
+  return ids;
+}
+
+/** The helpers the request checks share: a silent piece, a request sent from the Ask box, the hand-over through get_code, and
+ * the words of a row read from the page. */
+function requestsKit(cdp, client) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const rowStateExpr = (text) =>
+    `((wanted) => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === wanted); return row ? row.querySelector('.rq-state').textContent : null; })(${JSON.stringify(text)})`;
+  let lastSend = 0;
+  const kit = {
+    /** Plays `code` (a silent piece) and waits for the Playing word. */
+    async playSilent(code, label) {
+      await callTool(client, 'set_code', { code, label });
+      if ((await waitFor(cdp, `(${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun(`the page did not play the silent piece "${label}" within 8 seconds`);
+      }
+    },
+    /** Stops the probe's listeners, so the page says its requests wait for Claude. */
+    async waitForClaude() {
+      await stopSpawnedListeners();
+      const waits = await waitFor(
+        cdp,
+        `(() => { const state = document.getElementById('page-requests-state'); return state.textContent === ${JSON.stringify(PAGE_REQUESTS_COPY.waiting)} ? true : null; })()`,
+        3000,
+      );
+      if (waits !== true) throw new ProbeCouldNotRun('the page still says a listener takes its requests');
+    },
+    /** The number of requests in flight the chip's pill shows (0 when it shows none). */
+    async inFlight() {
+      const pill = await evaluateExpr(cdp, `(() => { const count = document.querySelector('#requests-toggle .rq-count'); return count.hidden ? null : count.textContent; })()`);
+      return pill === null ? 0 : Number(pill);
+    },
+    /** Sends `text` from the Ask box on the whole session and waits for its row to wait for Claude. Sends are spaced so the
+     * server's limit of five requests a second is never reached. */
+    async send(text) {
+      const since = Date.now() - lastSend;
+      if (since < 300) await sleep(300 - since);
+      lastSend = Date.now();
+      const asked = await askAt(cdp, '#product-name');
+      if (asked.open !== true) throw new ProbeCouldNotRun('the Ask box did not open for a request check');
+      await cdp('Input.insertText', { text });
+      await pressKey(cdp, 'Enter');
+      if ((await waitFor(cdp, requestRowReads(text, phrases.waiting), 4000)) !== true) {
+        throw new ProbeCouldNotRun(`the request "${text}" did not wait for Claude: ${JSON.stringify(await evaluateExpr(cdp, rowStateExpr(text)))}`);
+      }
+    },
+    /** Hands the requests over with get_code and returns the id of `text` from its request line; the row reads Received. */
+    async handOver(text) {
+      const reply = await callTool(client, 'get_code', {});
+      const id = requestIdsOf(reply).get(text);
+      if (id === undefined) throw new ProbeCouldNotRun(`the reply of get_code did not carry the request line of "${text}"`);
+      if ((await waitFor(cdp, requestRowReads(text, phrases.received), 4000)) !== true) {
+        throw new ProbeCouldNotRun(`the request "${text}" was not handed over: ${JSON.stringify(await evaluateExpr(cdp, rowStateExpr(text)))}`);
+      }
+      return id;
+    },
+    /** The words of the row of `text` now, or null when there is no such row. */
+    state: (text) => evaluateExpr(cdp, rowStateExpr(text)),
+    /** Waits until the row of `text` reads `phrase`; returns whether it did. */
+    async waitState(text, phrase, timeoutMs = 4000) {
+      return (await waitFor(cdp, requestRowReads(text, phrase), timeoutMs)) === true;
+    },
+    /** Waits until the words of the row of `text` start with `lead`; returns the words, or null. */
+    waitStarts(text, lead, timeoutMs = 4000) {
+      return waitFor(cdp, `((state) => state !== null && state.startsWith(${JSON.stringify(lead)}) ? state : null)(${rowStateExpr(text)})`, timeoutMs);
+    },
+    /** Waits until the scheduler is just past the start of a cycle, so a change at the next bar waits for most of a cycle. */
+    async nearCycleStart() {
+      const deadline = Date.now() + 15000;
+      while (Date.now() < deadline) {
+        const now = await readSchedulerNow(cdp);
+        const fraction = now - Math.floor(now);
+        if (fraction > 0.02 && fraction < 0.3) return now;
+        await sleep(40);
+      }
+      throw new ProbeCouldNotRun('the scheduler did not reach the start of a cycle within 15 seconds');
+    },
+  };
+  return kit;
+}
+
+/** The lead of a phrase that carries a value, up to its first word in braces ("Applied as v", "Failed: "). */
+function phraseLead(phrase) {
+  return phrase.slice(0, phrase.indexOf('{'));
+}
+
+/** Every state a request can reach, in the real page, one request of each kind, with a silent piece and no listener: two requests
+ * in flight keep their own rows and words; a change at the next bar that names the first waits for its line, then is applied as
+ * vN at it; answer_request answers the second with its sentence; a waiting change that an at-once change replaces says so, and
+ * one that Stop cancels says so; a change that fails says Failed with the first line the failed-change banner shows;
+ * answer_request declines the sixth; and a change that names an id nobody sent goes ahead, its reply says so once, and the
+ * request it was made for is not called applied. The chip's pill counts the rows in flight at every step. States the page does
+ * not promise are expected to stay on the row's last honest state, with one console line. */
+async function requestsEveryStateCheck({ cdp, client, report }) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const kit = requestsKit(cdp, client);
+  const stamp = Date.now();
+  const piece = (tag) => `setcps(0.25)\nrequests_every: s("bd*4").gain(0)\n// ${stamp} ${tag}`;
+  const text = (n) => `every state ${n} ${stamp}`;
+  const steps = {};
+  let baseline = 0;
+  const step = async (name, ok, info = {}) => {
+    const pill = await kit.inFlight();
+    steps[name] = { ok, pill: pill - baseline, ...info };
+    return steps[name];
+  };
+  // A state only a linked change or the closing tool can bring is expected only when the page promises it.
+  const linked = (phrase, honest) => (LINK_PROMISED ? phrase : honest);
+  const closed = (phrase, honest) => (CLOSE_PROMISED ? phrase : honest);
+  let consoleLines = [];
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.playSilent(piece('start'), 'probe requests every start');
+    await kit.waitForClaude();
+    await foldRequestsPanel(cdp);
+    await evaluateExpr(cdp, REQUESTS_CONSOLE_HOOK);
+    baseline = await kit.inFlight();
+
+    // Two requests in flight, each with its own row and words: the second get_code is a call after the first arrived.
+    await kit.send(text(1));
+    const id1 = await kit.handOver(text(1));
+    await kit.send(text(2));
+    const id2 = await kit.handOver(text(2));
+    const twoStarted = await kit.waitState(text(1), phrases.started);
+    const two = await step('twoInFlight', twoStarted && (await kit.state(text(2))) === phrases.received, { one: await kit.state(text(1)), two: await kit.state(text(2)) });
+    two.ok = two.ok && two.pill === 2;
+
+    // A change at the next bar that names the first: Waiting for its line, then Applied as vN at its line.
+    const lineReply = await callTool(client, 'set_code', { code: piece('one'), label: 'probe requests every one', at: 'bar', answering: id1 });
+    const atLine = await kit.waitState(text(1), linked(phrases.line, phrases.started));
+    const line = await step('line', atLine && /takes over at cycle \d+/.test(lineReply), { reply: lineReply.slice(0, 120) });
+    line.ok = line.ok && line.pill === 2;
+    if (LINK_PROMISED) {
+      const appliedWords = await kit.waitStarts(text(1), phraseLead(phrases.applied), 12000);
+      const version = appliedWords === null ? null : Number(appliedWords.slice(phraseLead(phrases.applied).length));
+      const top = /^#(\d+) /m.exec(await callTool(client, 'list_history', {}));
+      const applied = await step('applied', appliedWords !== null && top !== null && version === Number(top[1]) && appliedWords === statePhrase({ state: 'applied', version }), { appliedWords, top: top && top[1] });
+      applied.ok = applied.ok && applied.pill === 1;
+    } else {
+      await sleep(6000);
+      const stays = await step('applied', (await kit.state(text(1))) === phrases.started);
+      stays.ok = stays.ok && stays.pill === 2;
+    }
+    const afterOne = LINK_PROMISED ? 1 : 2;
+
+    // answer_request answers the second: Answered: with Claude's sentence.
+    const answerTwo = 'The answer to the second request.';
+    await callTool(client, 'answer_request', { id: id2, outcome: 'answered', text: answerTwo });
+    const answered = await step('answered', await kit.waitState(text(2), closed(fill(phrases.answered, { sentence: answerTwo }), phrases.started)), { two: await kit.state(text(2)) });
+    const afterTwo = afterOne - (CLOSE_PROMISED ? 1 : 0);
+    answered.ok = answered.ok && answered.pill === afterTwo;
+
+    // A waiting change that an at-once change without the id replaces: Replaced by a newer change, never applied.
+    await kit.send(text(3));
+    const id3 = await kit.handOver(text(3));
+    await kit.nearCycleStart();
+    await callTool(client, 'set_code', { code: piece('three waits'), label: 'probe requests every three waits', at: 'bar', answering: id3 });
+    const threeLine = await kit.waitState(text(3), linked(phrases.line, phrases.started), 3000);
+    await callTool(client, 'set_code', { code: piece('three now'), label: 'probe requests every three now' });
+    const replacedShown = await kit.waitState(text(3), linked(phrases.replaced, phrases.started));
+    await sleep(LINK_PROMISED ? 4500 : 1500);
+    const replaced = await step('replaced', threeLine && replacedShown && (await kit.state(text(3))) === linked(phrases.replaced, phrases.started), { three: await kit.state(text(3)) });
+    const afterThree = afterTwo + (LINK_PROMISED ? 0 : 1);
+    replaced.ok = replaced.ok && replaced.pill === afterThree;
+
+    // A waiting change that Stop cancels: Canceled.
+    await kit.send(text(4));
+    const id4 = await kit.handOver(text(4));
+    await kit.nearCycleStart();
+    await callTool(client, 'set_code', { code: piece('four waits'), label: 'probe requests every four waits', at: 'bar', answering: id4 });
+    const fourLine = await kit.waitState(text(4), linked(phrases.line, phrases.started), 3000);
+    await callTool(client, 'stop', {});
+    const canceledShown = await kit.waitState(text(4), linked(phrases.canceled, phrases.started));
+    const canceled = await step('canceled', fourLine && canceledShown, { four: await kit.state(text(4)) });
+    const afterFour = afterThree + (LINK_PROMISED ? 0 : 1);
+    canceled.ok = canceled.ok && canceled.pill === afterFour;
+
+    // A change that fails to evaluate: Failed: with the first line the failed-change banner shows.
+    await kit.send(text(5));
+    const id5 = await kit.handOver(text(5));
+    let failure = null;
+    try {
+      await callTool(client, 'set_code', { code: 'requests_every: s("bd*4"', label: 'probe requests every five broken', answering: id5 });
+    } catch (err) {
+      failure = err instanceof Error ? err.message : String(err);
+    }
+    const failedWords = LINK_PROMISED ? await kit.waitStarts(text(5), phraseLead(phrases.failed)) : null;
+    const bannerLine = await evaluateExpr(cdp, `document.getElementById('eval-error').textContent`);
+    // The banner labels the first line of the error with its own lead ("Error: "); the row says the same reason after "Failed: ".
+    const rowReason = failedWords === null ? null : failedWords.slice(phraseLead(phrases.failed).length);
+    const failedOk = LINK_PROMISED
+      ? rowReason !== null && rowReason !== '' && bannerLine === bannerErrorLine(rowReason) && failedWords === statePhrase({ state: 'failed', reason: rowReason })
+      : (await kit.state(text(5))) === phrases.started;
+    const failed = await step('failed', failure !== null && failedOk, { failedWords, bannerLine, failure: failure && failure.slice(0, 120) });
+    const afterFive = afterFour + (LINK_PROMISED ? 0 : 1);
+    failed.ok = failed.ok && failed.pill === afterFive;
+    await kit.playSilent(piece('after five'), 'probe requests every after five');
+
+    // answer_request declines the sixth: Declined: with Claude's sentence.
+    await kit.send(text(6));
+    const id6 = await kit.handOver(text(6));
+    const declineSix = 'This page cannot do that.';
+    await callTool(client, 'answer_request', { id: id6, outcome: 'declined', text: declineSix });
+    const declined = await step('declined', await kit.waitState(text(6), closed(fill(phrases.declined, { sentence: declineSix }), phrases.started)), { six: await kit.state(text(6)) });
+    const afterSix = afterFive + (CLOSE_PROMISED ? 0 : 1);
+    declined.ok = declined.ok && declined.pill === afterSix;
+
+    // A change that names an id nobody sent: the music change goes ahead, its reply says so once, and the request it was made for
+    // is not called applied.
+    await kit.send(text(7));
+    const id7 = await kit.handOver(text(7));
+    const unknownReply = await callTool(client, 'set_code', { code: piece('seven'), label: 'probe requests every seven', answering: `never-sent-${stamp}` });
+    const codeAfter = await callTool(client, 'get_code', {});
+    await sleep(1500);
+    const sevenWords = await kit.state(text(7));
+    const unknown = await step(
+      'unknownId',
+      unknownReply.split(UNKNOWN_ANSWERING_NOTE).length === 2 &&
+        codeAfter.includes(`// ${stamp} seven`) &&
+        sevenWords === phrases.started &&
+        !sevenWords.startsWith(phraseLead(phrases.applied)) &&
+        !sevenWords.startsWith(phrases.appliedNoVersion),
+      { sevenWords, noteCount: unknownReply.split(UNKNOWN_ANSWERING_NOTE).length - 1, wentAhead: codeAfter.includes(`// ${stamp} seven`) },
+    );
+    unknown.ok = unknown.ok && unknown.pill === afterSix + 1;
+    // The seventh is closed, so it does not stay in flight after the check.
+    const closeSeven = 'The seventh request is closed.';
+    await callTool(client, 'answer_request', { id: id7, outcome: 'answered', text: closeSeven });
+    const sevenClosed = await step('sevenClosed', await kit.waitState(text(7), closed(fill(phrases.answered, { sentence: closeSeven }), phrases.started)));
+    sevenClosed.ok = sevenClosed.ok && sevenClosed.pill === afterSix + (CLOSE_PROMISED ? 0 : 1);
+
+    consoleLines = (await evaluateExpr(cdp, REQUESTS_CONSOLE_UNHOOK)).filter((entry) => entry.includes(NOT_PROMISED_LINE));
+    const consoleOk = LINK_PROMISED && CLOSE_PROMISED ? consoleLines.length === 0 : consoleLines.length >= 1;
+    report(
+      'requests: one request of each kind walks to its own end state in the real page, and the chip counts the rows in flight at every step',
+      consoleOk && Object.values(steps).every((entry) => entry.ok === true) && Object.keys(steps).length === 10,
+      JSON.stringify({ steps, consoleLines: consoleLines.length, linkPromised: LINK_PROMISED, closePromised: CLOSE_PROMISED }),
+    );
+  } finally {
+    await evaluateExpr(cdp, REQUESTS_CONSOLE_UNHOOK);
+    await stopSpawnedListeners();
+    await foldRequestsPanel(cdp);
+    // The page is left playing a silent piece, as it was found.
+    await kit.playSilent(piece('reset'), 'probe requests every reset');
+  }
+}
+
+/** A request handed to Claude and then left alone reads No change yet with its time after QUIET_AFTER_MS, keeps counting, never
+ * reads Failed, and gives way at once to a change that names it. The music is silent. */
+async function requestsQuietWaitCheck({ cdp, client, report }) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const kit = requestsKit(cdp, client);
+  const stamp = Date.now();
+  const text = `quiet wait ${stamp}`;
+  const piece = (tag) => `setcps(0.5)\nrequests_quiet: s("bd*4").gain(0)\n// ${stamp} ${tag}`;
+  const quietLead = phraseLead(phrases.quiet);
+  const secondsOf = (words) => {
+    if (words === null || !words.startsWith(quietLead)) return null;
+    const match = /^(\d+) s$/.exec(words.slice(quietLead.length));
+    return match === null ? null : Number(match[1]);
+  };
+  const detail = {};
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.playSilent(piece('start'), 'probe requests quiet start');
+    await kit.waitForClaude();
+    await foldRequestsPanel(cdp);
+    // Every word the row shows, in order, so a Failed between two reads would be seen.
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        window.__quietLog = [];
+        const panel = document.getElementById('requests-panel');
+        window.__quietObserver = new MutationObserver(() => {
+          const row = [...panel.querySelectorAll('.rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === ${JSON.stringify(text)});
+          if (row) window.__quietLog.push(row.querySelector('.rq-state').textContent);
+        });
+        window.__quietObserver.observe(panel, { childList: true, characterData: true, subtree: true });
+        return true;
+      })()`,
+    );
+    await kit.send(text);
+    const id = await kit.handOver(text);
+    const receivedAt = Date.now();
+    await sleep(QUIET_AFTER_MS + 1000 - (Date.now() - receivedAt));
+    detail.first = await kit.state(text);
+    await sleep(3000);
+    detail.later = await kit.state(text);
+    await callTool(client, 'set_code', { code: piece('answer'), label: 'probe requests quiet answer', answering: id });
+    const appliedWords = LINK_PROMISED ? await kit.waitStarts(text, phraseLead(phrases.applied), 3000) : null;
+    detail.applied = appliedWords;
+    const log = await evaluateExpr(cdp, `(() => { window.__quietObserver.disconnect(); return window.__quietLog.slice(); })()`);
+    detail.failedSeen = log.some((words) => words.startsWith(phraseLead(phrases.failed)));
+    detail.quietSeen = log.filter((words) => words.startsWith(quietLead)).length;
+    const first = secondsOf(detail.first);
+    const later = secondsOf(detail.later);
+    detail.seconds = [first, later];
+    const quietOk = first !== null && first >= QUIET_AFTER_MS / 1000 && first < QUIET_AFTER_MS / 1000 + 10 && later !== null && later > first;
+    const endOk = LINK_PROMISED ? appliedWords !== null && /^\d+$/.test(appliedWords.slice(phraseLead(phrases.applied).length)) : (await kit.state(text)).startsWith(quietLead);
+    report(
+      'requests: a request left alone reads No change yet with its time after 30 s, keeps counting, never reads Failed, and a change that names it replaces it at once',
+      quietOk && endOk && detail.failedSeen === false,
+      JSON.stringify(detail),
+    );
+  } finally {
+    await evaluateExpr(cdp, `(() => { if (window.__quietObserver) window.__quietObserver.disconnect(); return true; })()`);
+    await stopSpawnedListeners();
+    await foldRequestsPanel(cdp);
+    await kit.playSilent(piece('reset'), 'probe requests quiet reset');
+  }
+}
+
+/** A request Claude has started on reads Connection lost when the page's socket closes. After a reload the chip stays hidden
+ * until the server's board answers, then the row comes back in the state the server holds, with the start of the text the
+ * server kept, and the panel does not open by itself; the request is still the reloaded page's own. The music is silent. */
+async function requestsLostAndReloadCheck({ cdp, client, report }) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const kit = requestsKit(cdp, client);
+  const stamp = Date.now();
+  // Longer than the start the server keeps, so the row after the reload shows the kept start.
+  const text = `lost and reload ${stamp} ${'keep the start of this request and let the rest go. '.repeat(6)}`.trim();
+  const points = Array.from(text);
+  const kept = points.length <= MAX_ASK_CONTEXT_LENGTH ? text : `${points.slice(0, MAX_ASK_CONTEXT_LENGTH).join('')}…`;
+  const piece = (tag) => `setcps(0.5)\nrequests_lost: s("bd*4").gain(0)\n// ${stamp} ${tag}`;
+  const detail = { cut: kept !== text };
+  await cdp('Page.enable');
+  const recorder = await cdp('Page.addScriptToEvaluateOnNewDocument', { source: REQUESTS_SOCKET_RECORDER_SOURCE });
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await reloadPage(cdp);
+    await kit.playSilent(piece('start'), 'probe requests lost start');
+    await kit.waitForClaude();
+    await foldRequestsPanel(cdp);
+    await kit.send(text);
+    const id = await kit.handOver(text);
+    await callTool(client, 'list_history', {});
+    detail.started = await kit.waitState(text, phrases.started);
+
+    // The page's socket closes: the open row reads Connection lost.
+    await evaluateExpr(cdp, `(() => { window.__probeSockets[0].close(); return true; })()`);
+    detail.lost = await kit.waitState(text, phrases.lost);
+    detail.lostRead = await requestsRead(cdp, text);
+
+    // A reload: the chip is hidden until the board answers, then the row comes back as the server holds it.
+    await reloadPage(cdp);
+    const board = await waitFor(cdp, `window.__probeBoard === undefined ? null : window.__probeBoard`, 5000);
+    detail.boardRows = board === null ? null : board.requests.length;
+    detail.boardHasIt = board !== null && board.requests.some((row) => row.id === id && row.text === kept && row.state === 'started');
+    detail.chipBeforeBoard = await evaluateExpr(cdp, `window.__probeChipBeforeBoard.slice()`);
+    detail.back = await kit.waitState(kept, phrases.started);
+    await sleep(600);
+    detail.backRead = await requestsRead(cdp, kept);
+    detail.title = await evaluateExpr(
+      cdp,
+      `((wanted) => { const row = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === wanted); return row ? row.querySelector('.rq-text').getAttribute('title') : null; })(${JSON.stringify(kept)})`,
+    );
+
+    // The reloaded page took the request over: the closing sentence reaches it.
+    const closing = 'The reloaded page has the answer.';
+    await callTool(client, 'answer_request', { id, outcome: 'answered', text: closing });
+    detail.answeredAfterReload = await kit.waitState(kept, CLOSE_PROMISED ? fill(phrases.answered, { sentence: closing }) : phrases.started);
+
+    const back = detail.backRead;
+    report(
+      'requests: a closed socket makes the open row read Connection lost, and after a reload the row comes back from the server board with the text start it kept, without opening the panel',
+      detail.started === true &&
+        detail.lost === true &&
+        detail.lostRead.row !== null &&
+        detail.lostRead.row.shape === 'ended' &&
+        detail.boardHasIt === true &&
+        detail.chipBeforeBoard.length > 0 &&
+        detail.chipBeforeBoard.every((hidden) => hidden === true) &&
+        detail.back === true &&
+        back.row !== null &&
+        back.row.text === rowText(kept) &&
+        detail.title === kept &&
+        back.chipHidden === false &&
+        back.panelHidden === true &&
+        back.expanded === 'false' &&
+        detail.answeredAfterReload === true,
+      JSON.stringify(detail),
+    );
+  } finally {
+    await cdp('Page.removeScriptToEvaluateOnNewDocument', { identifier: recorder.identifier });
+    await reloadPage(cdp);
+    await stopSpawnedListeners();
+    await kit.playSilent(piece('reset'), 'probe requests lost reset');
+  }
+}
+
+/** A second tab that connects while the first tab has a request in flight shows no chip and no row, and a status for the first
+ * tab's request reaches only the first tab. The first tab is reloaded at the end, so it plays again. The music is silent. */
+async function requestsSecondTabCheck({ cdp, client, report, port, pageUrl }) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const kit = requestsKit(cdp, client);
+  const stamp = Date.now();
+  const text = `second tab ${stamp}`;
+  const piece = (tag) => `setcps(0.5)\nrequests_tabs: s("bd*4").gain(0)\n// ${stamp} ${tag}`;
+  const detail = {};
+  const secondTab = { id: null, ws: null, cdp: null };
+  const readSecond = () =>
+    evaluateExpr(
+      secondTab.cdp,
+      `(() => ({
+        chipHidden: document.getElementById('requests-toggle').hidden,
+        rows: document.querySelectorAll('#requests-panel .rq-item').length,
+        panelHidden: document.getElementById('requests-panel').hidden,
+        statuses: window.__probeReceived.filter((data) => { try { return JSON.parse(data).type === 'ask-status'; } catch { return false; } }).length,
+        board: window.__probeBoard === undefined ? null : window.__probeBoard.requests.map((row) => row.id),
+      }))()`,
+    );
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.playSilent(piece('start'), 'probe requests tabs start');
+    await kit.waitForClaude();
+    await foldRequestsPanel(cdp);
+    await kit.send(text);
+    const id = await kit.handOver(text);
+
+    // The second tab, with its received messages recorded from its first frame.
+    const created = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
+    if (!created.ok) throw new ProbeCouldNotRun(`/json/new answered ${created.status}`);
+    const info = await created.json();
+    secondTab.id = info.id;
+    secondTab.ws = new WebSocket(info.webSocketDebuggerUrl);
+    await waitSocketOpen(secondTab.ws);
+    secondTab.cdp = makeCdp(secondTab.ws);
+    await secondTab.cdp('Runtime.enable');
+    await secondTab.cdp('Page.enable');
+    await secondTab.cdp('Page.addScriptToEvaluateOnNewDocument', { source: REQUESTS_SOCKET_RECORDER_SOURCE });
+    await secondTab.cdp('Page.navigate', { url: pageUrl });
+    await waitConnected(secondTab.cdp, 15000);
+    detail.secondBoard = await waitFor(secondTab.cdp, `window.__probeBoard === undefined ? null : true`, 5000);
+    await sleep(500);
+    detail.secondBefore = await readSecond();
+
+    // A status for the first tab's request: the first tab shows it, the second tab is told nothing.
+    const closing = 'Only the first tab hears this.';
+    await callTool(client, 'answer_request', { id, outcome: 'answered', text: closing });
+    detail.firstAnswered = await kit.waitState(text, CLOSE_PROMISED ? fill(phrases.answered, { sentence: closing }) : phrases.received);
+    await sleep(800);
+    detail.secondAfter = await readSecond();
+    const quiet = (read) => read.chipHidden === true && read.rows === 0 && read.panelHidden === true && read.statuses === 0;
+    report(
+      'requests: a second tab shows no chip and no row for a request it did not send, and a status for the first tab reaches only the first tab',
+      detail.secondBoard === true &&
+        Array.isArray(detail.secondBefore.board) &&
+        !detail.secondBefore.board.includes(id) &&
+        quiet(detail.secondBefore) &&
+        detail.firstAnswered === true &&
+        quiet(detail.secondAfter),
+      JSON.stringify(detail),
+    );
+  } finally {
+    if (secondTab.ws !== null) {
+      try {
+        secondTab.ws.close();
+      } catch {
+        // already closed
+      }
+    }
+    if (secondTab.id !== null) await fetch(`http://127.0.0.1:${port}/json/close/${secondTab.id}`).catch(() => {});
+    await cdp('Page.bringToFront');
+    await reloadPage(cdp);
+    await stopSpawnedListeners();
+    await kit.playSilent(piece('reset'), 'probe requests tabs reset');
+  }
+}
+
+/** Clicks the row of the request whose whole text is `text`, with a real mouse click at its centre. */
+async function clickRequestRow(cdp, text) {
+  const rect = await evaluateExpr(
+    cdp,
+    `((wanted) => {
+      const item = [...document.querySelectorAll('#requests-panel .rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === wanted);
+      if (!item) return null;
+      const row = item.querySelector('.rq-row');
+      row.scrollIntoView({ block: 'nearest' });
+      const r = row.getBoundingClientRect();
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    })(${JSON.stringify(text)})`,
+  );
+  if (rect === null) throw new Error(`clickRequestRow: no row for "${text}"`);
+  await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: rect.x, y: rect.y, button: 'left', clickCount: 1 });
+  await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: rect.x, y: rect.y, button: 'left', clickCount: 1 });
+}
+
+/** Page source: where the bar, its items, the Requests panel and the window are, and whether the bar or the document scrolls
+ * sideways. Every length is in pixels; rem is the root font size. */
+const REQUESTS_PLACES_EXPR = `(() => {
+  const bar = document.getElementById('top-bar');
+  const panel = document.getElementById('requests-panel');
+  const box = (el) => { const r = el.getBoundingClientRect(); return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }; };
+  return {
+    width: window.innerWidth,
+    rem: parseFloat(getComputedStyle(document.documentElement).fontSize),
+    layout: document.getElementById('workspace').dataset.layout,
+    fit: bar.dataset.fit,
+    bar: box(bar),
+    barFits: bar.scrollWidth <= bar.clientWidth,
+    docFits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    items: [...bar.children].filter((el) => el.getClientRects().length > 0).map((el) => [el.id || el.className, box(el)]),
+    panelShown: !panel.hidden && panel.getClientRects().length > 0,
+    panel: box(panel),
+    pending: !document.getElementById('pending-change').hidden,
+    pill: (() => { const count = document.querySelector('#requests-toggle .rq-count'); return count.hidden ? null : count.textContent; })(),
+  };
+})()`;
+
+/** Page source: the computed colours of every part of the Requests list that shows, and the computed values of the colours the
+ * list never takes (the accent, the second accent, the destructive red and the two Jam colours). */
+const REQUESTS_COLOURS_EXPR = `(() => {
+  const reserved = ['--accent', '--accent-2', '--destructive', '--jam-avoid', '--jam-outside'].map((name) => {
+    const probe = document.createElement('div');
+    probe.style.color = 'var(' + name + ')';
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  });
+  const parts = {
+    chip: document.getElementById('requests-toggle'),
+    pill: document.querySelector('#requests-toggle .rq-count'),
+    row: document.querySelector('#requests-panel .rq-row'),
+    flight: document.querySelector('#requests-panel .rq-mark[data-shape="flight"]'),
+    done: document.querySelector('#requests-panel .rq-mark[data-shape="done"]'),
+    ended: document.querySelector('#requests-panel .rq-mark[data-shape="ended"]'),
+    bad: document.querySelector('#requests-panel .rq-mark[data-shape="bad"]'),
+    detail: [...document.querySelectorAll('#requests-panel .rq-detail')].find((el) => !el.hidden) ?? null,
+    recentHead: document.querySelector('#requests-panel .rq-recent-head'),
+  };
+  const properties = ['color', 'backgroundColor', 'borderTopColor', 'borderRightColor', 'borderBottomColor', 'borderLeftColor'];
+  const missing = [];
+  const hidden = [];
+  const offenders = [];
+  for (const [name, el] of Object.entries(parts)) {
+    if (el === null) { missing.push(name); continue; }
+    if (el.getClientRects().length === 0) hidden.push(name);
+    const style = getComputedStyle(el);
+    for (const property of properties) if (reserved.includes(style[property])) offenders.push(name + ' ' + property);
+  }
+  return { reserved, distinct: new Set(reserved).size, missing, hidden, offenders };
+})()`;
+
+/** The Requests panel in every layout at 1024 and 1920 px, with the Timeline open, a waiting change showing its countdown and
+ * three requests in flight: neither the bar nor the document scrolls sideways, opening the panel moves no bar item, and the
+ * panel sits under the bar's right end inside the window. No part of the list (the chip, the pill, a row, each mark shape, an open detail and the
+ * Recent header) takes the accent, the second accent, the destructive red or a Jam colour. When MOONTIDE_PROBE_SHOTS names a
+ * folder outside the repository it also saves the Requests pictures at 1080p and 4K. The music is silent; the page is left with
+ * none of its requests in flight, the panel folded, the viewport cleared and the layout and view it had. */
+async function requestsLayoutCheck({ cdp, client, report }) {
+  const phrases = REQUEST_STATUS_COPY.phrases;
+  const kit = requestsKit(cdp, client);
+  const folder = shotsFolder();
+  const stamp = Date.now();
+  const piece = (tag) => `setcps(0.25)\nrequests_layout: s("bd*4").gain(0)\n// ${stamp} ${tag}`;
+  const finished = { failed: `layout failed ${stamp}`, declined: `layout declined ${stamp}`, answered: `layout answered ${stamp}`, applied: `layout applied ${stamp}` };
+  const flight = [1, 2, 3].map((n) => `layout in flight ${n} ${stamp}`);
+  const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+  const startView = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`);
+  const shots = [];
+  const detail = { rows: [] };
+  const openIds = [];
+  // Each layout with the Timeline open, so the panel is seen over a view in layouts b and c.
+  const setLayout = async (layout) => {
+    await setSplitState(cdp, layout, '2');
+    const shown = await waitFor(cdp, `(() => { const w = document.getElementById('workspace').dataset; return w.layout === ${JSON.stringify(layout)} && w.view === 'timeline' ? true : null; })()`, 3000);
+    if (shown !== true) throw new ProbeCouldNotRun(`layout ${layout} with the Timeline open did not show`);
+  };
+  const setSize = async (width, height) => {
+    await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+    await layoutSettled(cdp, width, height);
+  };
+  const openPanel = async () => {
+    if (await evaluateExpr(cdp, `document.getElementById('requests-panel').hidden`)) await clickElement(cdp, '#requests-toggle');
+    // The pointer leaves the panel, so it holds no row where it is.
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
+  };
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.playSilent(piece('start'), 'probe requests layout start');
+    await kit.waitForClaude();
+    await foldRequestsPanel(cdp);
+
+    // Four finished requests, one per mark shape that is not in flight: failed (bad), declined (ended), answered and applied
+    // (done). They move to Recent while the layouts are checked.
+    await kit.send(finished.failed);
+    const failedId = await kit.handOver(finished.failed);
+    try {
+      await callTool(client, 'set_code', { code: 'requests_layout: s("bd*4"', label: 'probe requests layout broken', answering: failedId });
+    } catch {
+      // The failure is what this row needs.
+    }
+    if ((await kit.waitStarts(finished.failed, phraseLead(phrases.failed))) === null) throw new ProbeCouldNotRun('the failed request of the layout check did not read Failed');
+    await kit.playSilent(piece('after failed'), 'probe requests layout after failed');
+    if ((await waitFor(cdp, `document.getElementById('problem-banner').hidden ? true : null`, 4000)) !== true) await clickElement(cdp, '#problem-dismiss');
+    await kit.send(finished.declined);
+    await callTool(client, 'answer_request', { id: await kit.handOver(finished.declined), outcome: 'declined', text: 'The layout check declines this one.' });
+    await kit.send(finished.answered);
+    await callTool(client, 'answer_request', { id: await kit.handOver(finished.answered), outcome: 'answered', text: 'The layout check answers this one.' });
+    await kit.send(finished.applied);
+    await callTool(client, 'set_code', { code: piece('applied'), label: 'probe requests layout applied', answering: await kit.handOver(finished.applied) });
+    if ((await kit.waitStarts(finished.applied, phraseLead(phrases.applied))) === null) throw new ProbeCouldNotRun('the applied request of the layout check did not read Applied');
+
+    // A waiting change far enough away (64 cycles at 0.25 cycles a second) that it shows its countdown through the whole check,
+    // then three requests in flight with three different phrases: started, received and waiting.
+    await callTool(client, 'set_code', { code: piece('waits'), label: 'probe requests layout waits', at: 'phrase', phraseCycles: 64 });
+    if ((await waitFor(cdp, `!document.getElementById('pending-change').hidden ? true : null`, 6000)) !== true) throw new ProbeCouldNotRun('the waiting change of the layout check never showed its countdown');
+    await kit.send(flight[0]);
+    openIds.push(await kit.handOver(flight[0]));
+    await kit.send(flight[1]);
+    openIds.push(await kit.handOver(flight[1]));
+    await kit.send(flight[2]);
+    detail.phrases = [await kit.state(flight[0]), await kit.state(flight[1]), await kit.state(flight[2])];
+    const differ = new Set(detail.phrases).size === 3;
+
+    // The flight pictures right away, while the three phrases still differ (each turns to No change yet after 30 s).
+    if (folder !== null) {
+      for (const layout of SHOT_LAYOUTS) {
+        await setLayout(layout);
+        for (const [width, height] of [[1920, 1080], [3840, 2160]]) {
+          await setSize(width, height);
+          await openPanel();
+          shots.push(await saveShot(cdp, folder, 'flight', width, height, layout, 'requests'));
+        }
+      }
+    }
+
+    // Every layout at 1024 and 1920 px: folded, then open.
+    for (const [width, height] of [[1024, 768], [1920, 1080]]) {
+      await setSize(width, height);
+      for (const layout of ['a', 'b', 'c']) {
+        await setLayout(layout);
+        await layoutSettled(cdp, width, height);
+        await foldRequestsPanel(cdp);
+        await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
+        const folded = await evaluateExpr(cdp, REQUESTS_PLACES_EXPR);
+        await openPanel();
+        const open = await evaluateExpr(cdp, REQUESTS_PLACES_EXPR);
+        const same =
+          folded.items.length === open.items.length &&
+          folded.items.every(([name, place], index) => {
+            const [otherName, other] = open.items[index];
+            return name === otherName && ['left', 'top', 'width', 'height'].every((key) => Math.abs(place[key] - other[key]) < 0.5);
+          });
+        const rem = open.rem;
+        const placed =
+          open.panelShown &&
+          open.panel.top >= open.bar.bottom - 0.5 &&
+          open.panel.right <= open.width + 0.5 &&
+          open.width - open.panel.right <= rem + 0.5 &&
+          open.panel.width <= open.width - 2 * rem + 0.5;
+        detail.rows.push({
+          width,
+          layout,
+          ok: folded.layout === layout && folded.width === width && folded.pending && open.pill !== null && Number(open.pill) >= 3 && folded.barFits && folded.docFits && open.barFits && open.docFits && same && placed,
+          fit: open.fit,
+          fits: [folded.barFits, folded.docFits, open.barFits, open.docFits],
+          same,
+          placed,
+          pill: open.pill,
+          panel: { top: open.panel.top, right: open.panel.right, width: open.panel.width },
+          barBottom: open.bar.bottom,
+          rem,
+        });
+        await foldRequestsPanel(cdp);
+      }
+    }
+
+    // The colours, with every shape on show: the four finished rows are in Recent (folded), so Recent is opened, then the
+    // failed row's detail.
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await setLayout('a');
+    await openPanel();
+    const recent = await waitFor(
+      cdp,
+      `(() => { const recent = document.querySelector('#requests-panel .rq-recent'); return recent !== null && !recent.hidden && recent.querySelectorAll('.rq-item').length >= 4 ? true : null; })()`,
+      40000,
+    );
+    if (recent !== true) throw new ProbeCouldNotRun('the finished requests of the layout check did not move to Recent within 40 seconds');
+    if ((await evaluateExpr(cdp, `document.querySelector('#requests-panel .rq-recent-head').getAttribute('aria-expanded')`)) !== 'true') {
+      await clickElement(cdp, '#requests-panel .rq-recent-head');
+    }
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
+    if (folder !== null) {
+      for (const [width, height] of [[1920, 1080], [3840, 2160]]) {
+        await setSize(width, height);
+        shots.push(await saveShot(cdp, folder, 'finished', width, height, 'a', 'requests'));
+      }
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    await clickRequestRow(cdp, finished.failed);
+    await cdp('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 2, y: 2 });
+    const colours = await evaluateExpr(cdp, REQUESTS_COLOURS_EXPR);
+    detail.colours = colours;
+    if (folder !== null) {
+      for (const [width, height] of [[1920, 1080], [3840, 2160]]) {
+        await setSize(width, height);
+        shots.push(await saveShot(cdp, folder, 'detail', width, height, 'a', 'requests'));
+      }
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    detail.shots = shots.length;
+    const coloursOk = colours.distinct === 5 && colours.missing.length === 0 && colours.hidden.length === 0 && colours.offenders.length === 0;
+    report(
+      'requests: the panel fits every layout at 1024 and 1920 px and takes no reserved colour',
+      differ && detail.rows.length === 6 && detail.rows.every((row) => row.ok) && coloursOk && (folder === null || shots.length === 10),
+      JSON.stringify(detail),
+    );
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    // The third request in flight was never handed over: get_code hands it over, so it can be closed too.
+    const late = requestIdsOf(await callTool(client, 'get_code', {}).catch(() => '')).get(flight[2]);
+    if (late !== undefined) openIds.push(late);
+    for (const id of openIds) {
+      await callTool(client, 'answer_request', { id, outcome: 'answered', text: 'The layout check is done.' }).catch(() => {});
+    }
+    await stopSpawnedListeners();
+    await foldRequestsPanel(cdp);
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); return true; })()`);
+    if (startView === 'none' && (await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`)) !== 'none') {
+      await pressKey(cdp, 'Escape');
+      await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'none' ? true : null`, 3000);
+    }
+    if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`)) !== startLayout) {
+      await pressKey(cdp, startLayout);
+      await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(startLayout)} ? true : null`, 3000);
+    }
+    // The at-once change also replaces the waiting one.
+    await kit.playSilent(piece('reset'), 'probe requests layout reset');
+  }
+}
+
+/** The Requests panel and chip against the real page. */
+export async function requestsBlocks(context) {
+  await requestsRowFollowsServerCheck(context);
+  await requestsPanelKeysAndDrawerCheck(context);
+  await requestsEveryStateCheck(context);
+  await requestsQuietWaitCheck(context);
+  await requestsLostAndReloadCheck(context);
+  await requestsSecondTabCheck(context);
+  await requestsLayoutCheck(context);
+}
+
+/**
+ * Page-side tempo trace for the gesture runs: text the probe evaluates in its own browser tab, like the ramp driver, never page
+ * code. It records every change of the scheduler's tempo with the performance time it was made at, and the start and the end of
+ * every evaluation the page runs, so what a gesture does to the tempo can be read in time order. A tempo change is
+ * `{ kind: 'cps', perf, cps, old, lastEnd, landPerf }` (`landPerf` is where its new tempo would be heard, worked out like the
+ * driver's); an evaluation is `{ kind: 'eval-start' | 'eval-end', perf, cps, lastEnd }` (`lastEnd` is the cycle a new tempo would start at, the position a ramp is read at); `mark(name)` adds `{ kind: 'mark', name, perf }`
+ * and returns its time. `events()` gives the list, `clear()` empties it and `stop()` puts the scheduler and the evaluate
+ * function back as they were.
+ */
+export const TEMPO_TRACE_SOURCE = `(() => {
+  if (window.__tempoTrace) window.__tempoTrace.stop();
+  const repl = document.getElementById('repl').editor.repl;
+  const scheduler = repl.scheduler;
+  if (!Object.hasOwn(scheduler, 'cps')) throw new Error('tempo trace: the scheduler has no own cps property');
+  let events = [];
+  let value = scheduler.cps;
+  const heardAt = (perf, old) => {
+    try {
+      if (typeof scheduler.lastEnd !== 'number') return null;
+      return perf + ((scheduler.lastEnd - scheduler.now()) / old + scheduler.latency) * 1000 + 34;
+    } catch (err) {
+      return null;
+    }
+  };
+  Object.defineProperty(scheduler, 'cps', {
+    configurable: true,
+    enumerable: true,
+    get: () => value,
+    set: (next) => {
+      if (next !== value) {
+        const perf = performance.now();
+        events.push({ kind: 'cps', perf, cps: next, old: value, lastEnd: scheduler.lastEnd, landPerf: heardAt(perf, value) });
+      }
+      value = next;
+    },
+  });
+  const originalEvaluate = repl.evaluate;
+  const traced = function (...args) {
+    events.push({ kind: 'eval-start', perf: performance.now(), cps: value, lastEnd: scheduler.lastEnd });
+    const end = () => events.push({ kind: 'eval-end', perf: performance.now(), cps: value, lastEnd: scheduler.lastEnd });
+    let result;
+    try {
+      result = originalEvaluate.apply(this, args);
+    } catch (err) {
+      end();
+      throw err;
+    }
+    Promise.resolve(result).then(end, end);
+    return result;
+  };
+  repl.evaluate = traced;
+  window.__tempoTrace = {
+    events: () => events.slice(),
+    clear: () => {
+      events = [];
+    },
+    mark: (name) => {
+      const perf = performance.now();
+      events.push({ kind: 'mark', name, perf });
+      return perf;
+    },
+    stop: () => {
+      Object.defineProperty(scheduler, 'cps', { configurable: true, enumerable: true, writable: true, value });
+      if (repl.evaluate === traced) repl.evaluate = originalEvaluate;
+      delete window.__tempoTrace;
+    },
+  };
+})()`;
+
+// --- The tempo ramp in the real page (group "ramp") ---
+//
+// A ramp is asked for with set_code and glideBars. These checks prove what keeps its course, what cancels it, what is refused and
+// what Stop and a reload do to it. Every piece the checks play is inaudible: the tracks have gain 0, and a keep-alive line at a
+// gain of 0.0006 keeps the page's audio output alive. The tempo is read through the injected tempo trace (every change of the
+// scheduler's tempo and the start and end of every evaluation) and a small recorder that adds the scheduler's cycle position at
+// the start and end of every evaluation. The trace shows the tempo a program sets during its evaluation too (the page takes it
+// back in the same task), so a value is read at the end of an evaluation, never in the middle of one.
+
+const GLIDE_KEEPALIVE = 'keepalive: s("sine").gain(0.0006).slow(2)';
+/** The cps of a tempo in BPM, computed as the code's setcpm(bpm/4) computes it, so the numbers are equal and not just close. */
+const glideCps = (bpm) => bpm / 4 / 60;
+/** A silent piece. A `bpm` of null states no tempo; `tag` makes every text new, so a change is never "the same code". */
+const glidePiece = (bpm, tag) => `${bpm === null ? '' : `setcpm(${bpm}/4)\n`}glide_base: s("bd*4").gain(0)\n${GLIDE_KEEPALIVE}\n// ${tag}`;
+const GLIDE_RESET_PIECE = `setcps(0.45)\nglide_reset: s("bd*4").gain(0)\n${GLIDE_KEEPALIVE}`;
+const GLIDE_SCHEDULER = "document.getElementById('repl').editor.repl.scheduler";
+const roundBpm = (cps) => Math.round(cps * 240 * 10) / 10;
+
+/** Page-side recorder (probe text, never page code): wraps repl.evaluate on top of the tempo trace and records, for every
+ * evaluation, the scheduler's cycle position and tempo when it was called and when it settled. */
+const GLIDE_EVAL_RECORDER_SOURCE = `(() => {
+  if (window.__glideEvals) window.__glideEvals.stop();
+  const repl = document.getElementById('repl').editor.repl;
+  const scheduler = repl.scheduler;
+  const inner = repl.evaluate;
+  let records = [];
+  const outer = function (...args) {
+    const record = { startLastEnd: scheduler.lastEnd, startCps: scheduler.cps, endLastEnd: null, endCps: null };
+    records.push(record);
+    const end = () => {
+      record.endLastEnd = scheduler.lastEnd;
+      record.endCps = scheduler.cps;
+    };
+    let result;
+    try {
+      result = inner.apply(this, args);
+    } catch (err) {
+      end();
+      throw err;
+    }
+    Promise.resolve(result).then(end, end);
+    return result;
+  };
+  repl.evaluate = outer;
+  window.__glideEvals = {
+    records: () => records.slice(),
+    stop: () => {
+      if (repl.evaluate === outer) repl.evaluate = inner;
+      delete window.__glideEvals;
+    },
+  };
+})()`;
+
+/** The first evaluation that began at or after `markPerf` in the trace's events: { start, end } (end is undefined while it runs). */
+function glideEvalWindow(events, markPerf) {
+  const start = events.find((event) => event.kind === 'eval-start' && event.perf >= markPerf);
+  if (start === undefined) return { start: undefined, end: undefined };
+  const end = events.find((event) => event.kind === 'eval-end' && event.perf >= start.perf);
+  return { start, end };
+}
+
+/** The tempo changes of the trace after `perf` that were not made inside an evaluation (inside one, a program's tempo shows
+ * for a moment and is taken back; those are not what plays). */
+function glideStepEventsAfter(events, perf) {
+  const windows = [];
+  const open = [];
+  for (const event of events) {
+    if (event.kind === 'eval-start') open.push(event.perf);
+    else if (event.kind === 'eval-end' && open.length > 0) windows.push([open.shift(), event.perf]);
+  }
+  for (const begun of open) windows.push([begun, Infinity]);
+  return events.filter(
+    (event) => event.kind === 'cps' && event.perf > perf && !windows.some(([from, to]) => event.perf >= from && event.perf <= to),
+  );
+}
+
+/** The tempo of the planned step that plays at `cycle`. */
+const glideCourseAt = (plan, cycle) => glideCpsOf(plan, glideStepAt(plan, cycle));
+const glideStepSize = (plan) => Math.abs(plan.toCps - plan.fromCps) / plan.steps;
+/** True when every event value is one of the plan's step tempos, to the last digit, and the values only move toward the end. */
+function glideEventsFollow(plan, stepEvents) {
+  const values = Array.from({ length: plan.steps + 1 }, (_, k) => glideCpsOf(plan, k));
+  const direction = Math.sign(plan.toCps - plan.fromCps);
+  let previous = null;
+  for (const event of stepEvents) {
+    if (!values.some((value) => Math.abs(value - event.cps) < 1e-12)) return false;
+    if (previous !== null && direction * (event.cps - previous) <= 0) return false;
+    previous = event.cps;
+  }
+  return true;
+}
+
+function glideKit(cdp, client) {
+  const scheduler = (field) => evaluateExpr(cdp, `${GLIDE_SCHEDULER}.${field}`);
+  const kit = {
+    async install() {
+      await evaluateExpr(cdp, TEMPO_TRACE_SOURCE);
+      await evaluateExpr(cdp, GLIDE_EVAL_RECORDER_SOURCE);
+    },
+    async uninstall() {
+      // The recorder wraps the trace's evaluate, so it comes off first.
+      await evaluateExpr(cdp, 'window.__glideEvals && window.__glideEvals.stop()');
+      await evaluateExpr(cdp, 'window.__tempoTrace && window.__tempoTrace.stop()');
+    },
+    events: () => evaluateExpr(cdp, 'window.__tempoTrace.events()'),
+    records: () => evaluateExpr(cdp, 'window.__glideEvals.records()'),
+    mark: (name) => evaluateExpr(cdp, `window.__tempoTrace.mark(${JSON.stringify(name)})`),
+    cps: () => scheduler('cps'),
+    lastEnd: () => scheduler('lastEnd'),
+    async waitCycle(cycle, what, timeoutMs = 60000) {
+      const reached = await waitFor(cdp, `(() => ${GLIDE_SCHEDULER}.lastEnd >= ${cycle} ? true : null)()`, timeoutMs);
+      if (reached !== true) throw new Error(`${what}: the scheduler did not reach cycle ${cycle} within ${timeoutMs / 1000} s`);
+    },
+    async waitCps(cps, what, timeoutMs = 60000) {
+      const reached = await waitFor(cdp, `(() => ${GLIDE_SCHEDULER}.cps === ${cps} ? true : null)()`, timeoutMs);
+      if (reached !== true) throw new Error(`${what}: the tempo did not reach exactly ${cps} cps within ${timeoutMs / 1000} s (it is ${await kit.cps()})`);
+    },
+    /** A steady tempo, set at once without a ramp (it also ends any ramp a check left running). */
+    async steady(bpm, tag) {
+      await callTool(client, 'set_code', { code: glidePiece(bpm, tag), label: `probe ramp ${tag}` });
+      await kit.waitCps(glideCps(bpm), `the steady ${bpm} BPM of ${tag}`, 10000);
+    },
+    /** The record of the nth evaluation since the recorder was installed, waited for until it settled. */
+    async recordAt(index, what) {
+      const record = await waitFor(
+        cdp,
+        `(() => { const r = window.__glideEvals.records()[${index}]; return r !== undefined && r.endCps !== null ? r : null; })()`,
+        10000,
+      );
+      if (record === null || record === undefined) throw new Error(`${what}: the page ran no settled evaluation number ${index}`);
+      return record;
+    },
+    /** A ramp from a steady `fromBpm`; returns its plan, built from the cycle the page started it at. */
+    async startRamp({ fromBpm, toBpm, bars, tag }) {
+      await kit.steady(fromBpm, `${tag} steady`);
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark(`ramp ${tag}`);
+      const reply = await callTool(client, 'set_code', { code: glidePiece(toBpm, tag), label: `probe ramp ${tag}`, glideBars: bars });
+      const record = await kit.recordAt(index, `the ramp ${tag}`);
+      const plan = planGlide({ fromCps: glideCps(fromBpm), toCps: glideCps(toBpm), bars, startCycle: record.endLastEnd });
+      const { end } = glideEvalWindow(await kit.events(), markPerf);
+      return { plan, record, reply, markPerf, endPerf: end === undefined ? Infinity : end.perf };
+    },
+  };
+  return kit;
+}
+
+const lineOf = (reply, startsWith) => reply.split('\n').find((line) => line.startsWith(startsWith)) ?? null;
+
+/** A ramp keeps its course through a change that restates its target, a hand edit, a change that fails and a change that waits for
+ * its bar, and ends exactly on the code's tempo; after that a change that restates it moves nothing. */
+async function glideCourseCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const detail = { legs: [] };
+  try {
+    await kit.install();
+    const { plan, reply, endPerf } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'course' });
+    const target = glideCps(120);
+    const stepSize = glideStepSize(plan);
+    detail.plan = { steps: plan.steps, startCycle: plan.startCycle };
+    detail.startLine = lineOf(reply, 'Tempo ramp');
+    const leg = async (name, fraction, act) => {
+      await kit.waitCycle(plan.startCycle + plan.bars * fraction, `the ${name} leg`);
+      const index = (await kit.records()).length;
+      let outcome = 'ok';
+      try {
+        await act();
+      } catch (err) {
+        outcome = err instanceof Error ? err.message : String(err);
+      }
+      const record = await kit.recordAt(index, `the ${name} leg`);
+      const expected = glideCourseAt(plan, record.endLastEnd);
+      const entry = {
+        name,
+        endBpm: record.endCps * 240,
+        expectedBpm: expected * 240,
+        onCourse: Math.abs(record.endCps - expected) <= stepSize + 1e-9,
+        notTarget: record.endCps !== target,
+        outcome,
+      };
+      detail.legs.push(entry);
+      return { record, entry };
+    };
+    await leg('restating change', 0.25, () => callTool(client, 'set_code', { code: glidePiece(120, 'course restate'), label: 'probe ramp restate' }));
+    await leg('hand edit', 0.5, async () => {
+      await evaluateExpr(
+        cdp,
+        `(() => { const mirror = document.getElementById('repl').editor; mirror.editor.dispatch({ changes: { from: mirror.editor.state.doc.length, insert: '\\n// hand edit' } }); mirror.editor.focus(); return true; })()`,
+      );
+      await pressKey(cdp, 'Enter', { ctrl: true });
+    });
+    const failing = await leg('failed change', 0.6, async () => {
+      try {
+        await callTool(client, 'set_code', {
+          code: `setcpm(90/4)\nglide_base: s("bd*4").gain(0)\n${GLIDE_KEEPALIVE}\nglideProbeMissing()`,
+          label: 'probe ramp failing',
+        });
+      } catch {
+        return;
+      }
+      throw new Error('the failing change did not fail');
+    });
+    detail.failedAsExpected = failing.entry.outcome === 'ok';
+    const waiting = await leg('waiting change', 0.75, async () => {
+      const waitReply = await callTool(client, 'set_code', { code: glidePiece(120, 'course waiting'), label: 'probe ramp waiting', at: 'bar' });
+      const line = Number(/at cycle (\d+)/.exec(waitReply)?.[1]);
+      if (!Number.isFinite(line)) throw new Error(`the waiting change's reply names no line: ${waitReply.slice(0, 200)}`);
+      detail.waitingLine = line;
+    });
+    // Right after its line: the ramp is still on course, and the line applied nothing.
+    await kit.waitCycle(detail.waitingLine + 0.3, 'the line of the waiting change');
+    const afterLine = await evaluateExpr(cdp, `({ cps: ${GLIDE_SCHEDULER}.cps, lastEnd: ${GLIDE_SCHEDULER}.lastEnd })`);
+    detail.afterLine = {
+      bpm: afterLine.cps * 240,
+      expectedBpm: glideCourseAt(plan, afterLine.lastEnd) * 240,
+      onCourse: Math.abs(afterLine.cps - glideCourseAt(plan, afterLine.lastEnd)) <= 2 * stepSize + 1e-9,
+      notTarget: afterLine.cps !== target,
+    };
+    detail.waitingDeferred = waiting.record.endCps !== target;
+    await kit.waitCps(target, 'the end of the ramp', 60000);
+    const events = await kit.events();
+    // Every change of the tempo made outside an evaluation is one of the planned steps, in order, and the last is the end.
+    const outside = glideStepEventsAfter(events, endPerf);
+    detail.stepEvents = outside.length;
+    detail.follows = glideEventsFollow(plan, outside);
+    detail.lastIsTarget = outside.length > 0 && outside.at(-1).cps === target;
+    // After the end, a change that restates the target moves nothing.
+    const markPerf = await kit.mark('after the end');
+    await callTool(client, 'set_code', { code: glidePiece(120, 'course after end'), label: 'probe ramp after end' });
+    await sleep(1500);
+    const later = (await kit.events()).filter((event) => event.kind === 'cps' && event.perf > markPerf);
+    detail.afterEndChanges = later.length;
+    detail.endCps = await kit.cps();
+    const legsOk = detail.legs.every((entry) => entry.onCourse && entry.notTarget);
+    report(
+      "ramp: a ramp keeps its course through a change that restates its target, a hand edit, a change that fails and a change that waits for its bar, and ends exactly on the code's tempo",
+      legsOk &&
+        detail.failedAsExpected === true &&
+        detail.waitingDeferred === true &&
+        detail.afterLine.onCourse &&
+        detail.afterLine.notTarget &&
+        detail.follows &&
+        detail.lastIsTarget &&
+        detail.afterEndChanges === 0 &&
+        detail.endCps === target,
+      JSON.stringify(detail),
+    );
+  } finally {
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp course reset' });
+  }
+}
+
+
+/** The tempo changes the trace saw after the evaluation that began at or after `markPerf` ended (none while it still runs). */
+function glideChangesAfterEval(events, markPerf) {
+  const { end } = glideEvalWindow(events, markPerf);
+  return end === undefined ? null : events.filter((event) => event.kind === 'cps' && event.perf > end.perf);
+}
+
+/** A tempo written in the code wins, a program with no tempo cancels, a new ramp replaces the running one, and a change that waits
+ * for its bar starts a ramp at the line or cancels one there. */
+async function glideCancelCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  try {
+    await kit.install();
+
+    // Another tempo wins at once and ends the ramp.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 4, tag: 'cancel other' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark('other tempo');
+      await callTool(client, 'set_code', { code: glidePiece(90, 'cancel other 90'), label: 'probe ramp other tempo' });
+      const record = await kit.recordAt(index, 'the other-tempo change');
+      await kit.waitCycle(record.endLastEnd + 2, 'two cycles after the other-tempo change');
+      const changes = glideChangesAfterEval(await kit.events(), markPerf);
+      report(
+        'ramp: a program that states another tempo sets it at once and ends the ramp',
+        record.endCps === glideCps(90) && changes !== null && changes.length === 0,
+        JSON.stringify({ endCps: record.endCps, expected: glideCps(90), changesAfter: changes === null ? null : changes.length }),
+      );
+    }
+
+    // No tempo statement ends the ramp and the tempo stays where it was.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 4, tag: 'cancel none' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark('no tempo');
+      await callTool(client, 'set_code', { code: glidePiece(null, 'cancel none code'), label: 'probe ramp no tempo' });
+      const record = await kit.recordAt(index, 'the no-tempo change');
+      await kit.waitCycle(record.endLastEnd + 2, 'two cycles after the no-tempo change');
+      const changes = glideChangesAfterEval(await kit.events(), markPerf);
+      const stayed = Math.abs(record.endCps - record.startCps) <= glideStepSize(plan) + 1e-9;
+      report(
+        'ramp: a program with no tempo statement ends the ramp and the tempo stays where the ramp was',
+        stayed && record.endCps !== glideCps(120) && changes !== null && changes.length === 0,
+        JSON.stringify({ startBpm: record.startCps * 240, endBpm: record.endCps * 240, changesAfter: changes === null ? null : changes.length }),
+      );
+    }
+
+    // A new ramp replaces the running one and starts from the tempo that plays.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 4, tag: 'cancel replace' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark('new ramp');
+      const reply = await callTool(client, 'set_code', { code: glidePiece(110, 'cancel replace 110'), label: 'probe ramp replace', glideBars: 2 });
+      const record = await kit.recordAt(index, 'the replacing ramp');
+      const target = glideCps(110);
+      const next = planGlide({ fromCps: record.endCps, toCps: target, bars: 2, startCycle: record.endLastEnd });
+      await kit.waitCps(target, 'the end of the replacing ramp', 30000);
+      const events = await kit.events();
+      const { end } = glideEvalWindow(events, markPerf);
+      const steps = end === undefined ? [] : glideStepEventsAfter(events, end.perf);
+      const expectedLine = glideLine({ state: 'started', fromBpm: roundBpm(record.endCps), toBpm: 110, bars: 2 });
+      const detail = {
+        startBpm: record.startCps * 240,
+        endBpm: record.endCps * 240,
+        steps: steps.length,
+        plannedSteps: next.steps,
+        lastBpm: steps.length === 0 ? null : steps.at(-1).cps * 240,
+        line: lineOf(reply, 'Tempo ramp'),
+        expectedLine,
+      };
+      report(
+        'ramp: a new ramp replaces the running one from the tempo that plays, with no jump, and ends exactly on its own tempo',
+        Math.abs(record.endCps - record.startCps) <= glideStepSize(plan) + 1e-9 &&
+          steps.length > 0 &&
+          glideEventsFollow(next, steps) &&
+          steps.at(-1).cps === target &&
+          detail.line === expectedLine,
+        JSON.stringify(detail),
+      );
+    }
+
+    // A change that waits for its bar starts its ramp at the line, from the tempo that plays then.
+    {
+      await kit.steady(100, 'cancel line steady');
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark('waiting ramp');
+      const reply = await callTool(client, 'set_code', {
+        code: glidePiece(120, 'cancel line ramp'),
+        label: 'probe ramp at the line',
+        at: 'bar',
+        glideBars: 2,
+      });
+      const line = Number(/at cycle (\d+)/.exec(reply)?.[1]);
+      if (!Number.isFinite(line)) throw new Error(`the waiting ramp's reply names no line: ${reply.slice(0, 200)}`);
+      const record = await kit.recordAt(index, 'the waiting ramp');
+      const target = glideCps(120);
+      const next = planGlide({ fromCps: glideCps(100), toCps: target, bars: 2, startCycle: line });
+      await kit.waitCps(target, 'the end of the ramp that started at the line', 40000);
+      const events = await kit.events();
+      const { end } = glideEvalWindow(events, markPerf);
+      const steps = end === undefined ? [] : glideStepEventsAfter(events, end.perf);
+      const early = steps.filter((event) => event.lastEnd < line - 1e-6);
+      report(
+        'ramp: a change that waits for its bar changes nothing before the line, then ramps from the tempo that plays to the code\'s tempo',
+        record.endCps === glideCps(100) && early.length === 0 && steps.length > 0 && glideEventsFollow(next, steps) && steps.at(-1).cps === target,
+        JSON.stringify({ line, endBpm: record.endCps * 240, steps: steps.length, plannedSteps: next.steps, beforeLine: early.length }),
+      );
+    }
+
+    // A change that waits for its bar and states another tempo: the ramp follows its course until the line, then the tempo applies.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 6, tag: 'cancel line other' });
+      await kit.waitCycle(plan.startCycle + 0.5, 'half a bar into the ramp');
+      const index = (await kit.records()).length;
+      const markPerf = await kit.mark('waiting other tempo');
+      const reply = await callTool(client, 'set_code', { code: glidePiece(90, 'cancel line 90'), label: 'probe ramp waiting other', at: 'bar' });
+      const line = Number(/at cycle (\d+)/.exec(reply)?.[1]);
+      if (!Number.isFinite(line)) throw new Error(`the waiting change's reply names no line: ${reply.slice(0, 200)}`);
+      const record = await kit.recordAt(index, 'the waiting other-tempo change');
+      await kit.waitCycle(line + 2, 'two cycles after the line');
+      const events = await kit.events();
+      const { end } = glideEvalWindow(events, markPerf);
+      const after = end === undefined ? [] : glideStepEventsAfter(events, end.perf);
+      const before = after.filter((event) => event.lastEnd < line - 1e-6);
+      const atLine = after.filter((event) => event.lastEnd >= line - 1e-6);
+      report(
+        'ramp: a change that waits for its bar and states another tempo lets the ramp follow its course until the line, then sets that tempo and no step follows',
+        line < plan.endCycle &&
+          Math.abs(record.endCps - glideCourseAt(plan, record.endLastEnd)) <= glideStepSize(plan) + 1e-9 &&
+          glideEventsFollow(plan, before) &&
+          atLine.length === 1 &&
+          atLine[0].cps === glideCps(90),
+        JSON.stringify({ line, rampEnd: plan.endCycle, stepsBeforeLine: before.length, atLine: atLine.map((event) => event.cps * 240) }),
+      );
+    }
+  } finally {
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp cancel reset' });
+  }
+}
+
+/** A ramp that has nothing to leave or nothing to reach is refused whole: nothing changes and the page shows no banner. */
+async function glideRefusalsCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const steadyCode = glidePiece(100, 'refusals steady');
+  const historyRows = async () => (await callTool(client, 'list_history', {})).split('\n').filter((line) => line.startsWith('#')).length;
+  const snapshot = async () => ({
+    cps: await kit.cps(),
+    code: await callTool(client, 'get_code', {}),
+    editor: await evaluateExpr(cdp, "document.getElementById('repl').editor.code"),
+    rows: await historyRows(),
+    bannerHidden: await evaluateExpr(cdp, "document.getElementById('problem-banner').hidden"),
+  });
+  const refused = async (args) => {
+    try {
+      await callTool(client, 'set_code', args);
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    return null;
+  };
+  try {
+    await callTool(client, 'set_code', { code: steadyCode, label: 'probe ramp refusals steady' });
+    await kit.waitCps(glideCps(100), 'the steady tempo of the refusals', 10000);
+    await kit.install();
+    for (const [name, code, text] of [
+      ['code with no tempo statement', glidePiece(null, 'refusals no tempo'), GLIDE_REFUSALS.noTempo],
+      ['code that sets the tempo that plays', glidePiece(100, 'refusals same tempo'), GLIDE_REFUSALS.sameTempo],
+    ]) {
+      const before = await snapshot();
+      const markPerf = await kit.mark(name);
+      const message = await refused({ code, label: `probe ramp refused ${name}`, glideBars: 4 });
+      const after = await snapshot();
+      const changes = (await kit.events()).filter((event) => event.kind === 'cps' && event.perf > markPerf);
+      report(
+        `ramp: a change with glideBars and ${name} is refused whole, with nothing changed and no banner`,
+        message !== null &&
+          message.includes(text) &&
+          before.editor === steadyCode &&
+          JSON.stringify(after) === JSON.stringify(before) &&
+          after.bannerHidden === true &&
+          after.cps === glideCps(100) &&
+          changes.length === 0,
+        JSON.stringify({ message: message === null ? null : message.slice(0, 160), changes: changes.length, unchanged: JSON.stringify(after) === JSON.stringify(before), rows: after.rows, bannerHidden: after.bannerHidden }),
+      );
+    }
+    await stopMusic(cdp);
+    const before = await snapshot();
+    const message = await refused({ code: glidePiece(120, 'refusals stopped'), label: 'probe ramp refused while stopped', glideBars: 4 });
+    const after = await snapshot();
+    const word = await readStateWord(cdp);
+    report(
+      'ramp: a change with glideBars while the page is stopped is refused whole, the page stays stopped and nothing changes',
+      message !== null &&
+        message.includes(GLIDE_REFUSALS.nothingPlays) &&
+        word !== SOUND_LABELS.playing &&
+        JSON.stringify(after) === JSON.stringify(before) &&
+        after.bannerHidden === true,
+      JSON.stringify({ message: message === null ? null : message.slice(0, 160), word, unchanged: JSON.stringify(after) === JSON.stringify(before), rows: after.rows, bannerHidden: after.bannerHidden }),
+    );
+  } finally {
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp refusals reset' });
+  }
+}
+
+/** Stop ends a ramp and the next Play starts at the code's tempo; a reload loses the ramp and plays the code's tempo. */
+async function glideStopPlayCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const target = glideCps(120);
+  try {
+    await kit.install();
+    const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'stop play' });
+    await kit.waitCycle(plan.startCycle + 4, 'half of the ramp');
+    await stopMusic(cdp);
+    const stopPerf = await kit.mark('stopped');
+    const stoppedAt = await kit.cps();
+    await sleep(1500);
+    const whileStopped = (await kit.events()).filter((event) => event.kind === 'cps' && event.perf > stopPerf);
+    const playPerf = await kit.mark('play');
+    await playMusic(cdp);
+    const afterPlay = await waitFor(cdp, `(() => { const w = window.__tempoTrace.events().find((e) => e.kind === 'eval-end' && e.perf >= ${playPerf}); return w === undefined ? null : w; })()`, 10000);
+    await sleep(4500);
+    const events = await kit.events();
+    const playChanges = afterPlay === null ? [] : events.filter((event) => event.kind === 'cps' && event.perf > afterPlay.perf);
+    report(
+      "ramp: Stop ends the ramp, no step comes while stopped, and the next Play starts at the code's tempo with no step after it",
+      stoppedAt !== target &&
+        whileStopped.length === 0 &&
+        afterPlay !== null &&
+        afterPlay.cps === target &&
+        playChanges.length === 0 &&
+        (await kit.cps()) === target,
+      JSON.stringify({ stoppedBpm: stoppedAt * 240, changesWhileStopped: whileStopped.length, endOfPlayBpm: afterPlay === null ? null : afterPlay.cps * 240, changesAfterPlay: playChanges.length }),
+    );
+
+    // A reload loses the ramp: the replay plays the code's tempo and no step follows.
+    const second = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'reload' });
+    await kit.waitCycle(second.plan.startCycle + 4, 'half of the second ramp');
+    await kit.uninstall();
+    await reloadPage(cdp);
+    const back = await waitFor(cdp, `(() => ${GLIDE_SCHEDULER}.cps === ${target} && ${GLIDE_SCHEDULER}.started === true ? true : null)()`, 15000);
+    await kit.install();
+    await sleep(4500);
+    const reloaded = (await kit.events()).filter((event) => event.kind === 'cps');
+    report(
+      "ramp: a reload loses the ramp, the page plays the code's tempo and no step follows",
+      back === true && reloaded.length === 0 && (await kit.cps()) === target && (await readStateWord(cdp)) === SOUND_LABELS.playing,
+      JSON.stringify({ back, changesAfterReload: reloaded.length, bpm: (await kit.cps()) * 240 }),
+    );
+  } finally {
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp stop play reset' });
+  }
+}
+
+/** The number of times `line` occurs in `text`. */
+const occurrences = (text, line) => text.split(line).length - 1;
+/** The start of every told-once line of a ramp that ended early. */
+const GLIDE_ENDED_LEAD = 'Note: the tempo ramp ended early';
+
+/** Claude is told about a ramp in the replies: a change that restates the target gets "goes on", a change that waits for its bar gets
+ * the line it starts at, and a ramp that another tempo, a lost tempo statement or a reload ended is told once in the next reply and
+ * not again; a ramp that finished and a ramp Stop ended are not told. */
+async function glideToldOnceCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const target = glideCps(120);
+  const drain = () => callTool(client, 'get_code', {});
+  /** A hand edit of the editor text: `insert` goes at the end, or replaces everything when `replace` is set; then Ctrl+Enter. */
+  const handEdit = async (insert, replace = false) => {
+    const index = (await kit.records()).length;
+    await evaluateExpr(
+      cdp,
+      `(() => { const mirror = document.getElementById('repl').editor; const doc = mirror.editor.state.doc; mirror.editor.dispatch({ changes: { from: ${replace ? 0 : 'doc.length'}, to: doc.length, insert: ${JSON.stringify(insert)} } }); mirror.editor.focus(); return true; })()`,
+    );
+    await pressKey(cdp, 'Enter', { ctrl: true });
+    await kit.recordAt(index, 'the hand edit');
+    await sleep(300);
+  };
+  /** Two replies in a row: the first holds `line` once, the second holds no ramp line at all. */
+  const toldOnce = async (line) => {
+    const first = await drain();
+    const second = await drain();
+    return { once: occurrences(first, line) === 1, noMore: !second.includes(GLIDE_ENDED_LEAD), first: first.slice(0, 300), second: second.slice(0, 300) };
+  };
+  try {
+    await kit.install();
+    await drain();
+
+    // A change that restates the target mid-ramp: the reply says the ramp goes on.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'told running' });
+      await kit.waitCycle(plan.startCycle + 2, 'two bars into the ramp');
+      const reply = await callTool(client, 'set_code', { code: glidePiece(120, 'told running restate'), label: 'probe ramp told restate' });
+      const line = lineOf(reply, 'Tempo ramp');
+      const now = Number(/now ([\d.]+) BPM\.$/.exec(line ?? '')?.[1]);
+      const expected = Number.isFinite(now) ? glideLine({ state: 'running', nowBpm: now, toBpm: 120 }) : null;
+      report(
+        'ramp: a change that restates the target of a running ramp is answered with the line that says the ramp goes on, and no tempo line',
+        expected !== null && line === expected && !reply.includes('Tempo:'),
+        JSON.stringify({ line, expected }),
+      );
+      await kit.waitCps(target, 'the end of the ramp', 60000);
+      await drain();
+    }
+
+    // A change that waits for its bar: the reply says the line the ramp starts at.
+    {
+      await kit.steady(100, 'told line steady');
+      const reply = await callTool(client, 'set_code', {
+        code: glidePiece(120, 'told line ramp'),
+        label: 'probe ramp told at the line',
+        at: 'bar',
+        glideBars: 2,
+      });
+      const line = Number(/at cycle (\d+)/.exec(reply)?.[1]);
+      const said = lineOf(reply, 'Tempo ramp');
+      const expected = Number.isFinite(line) ? glideLine({ state: 'at-line', toBpm: 120, bars: 2 }, line) : null;
+      report(
+        'ramp: a change that waits for its bar and asks for a ramp is answered with the line the ramp starts at, and no tempo line',
+        expected !== null && said === expected && !reply.includes('Tempo from cycle'),
+        JSON.stringify({ line, said, expected }),
+      );
+      await kit.waitCps(target, 'the end of the ramp that started at the line', 40000);
+      await drain();
+    }
+
+    // A hand edit that states another tempo ends the ramp: Claude is told once.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'told other' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      await handEdit('\nsetcpm(90/4)');
+      const told = await toldOnce(glideEndedLine('other-tempo', 90));
+      report('ramp: a hand edit that states another tempo ends the ramp and Claude is told once, in the next reply only', told.once && told.noMore, JSON.stringify(told));
+    }
+
+    // A hand edit with no tempo statement ends the ramp: Claude is told once, with the tempo where it stopped.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'told none' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      await handEdit(glidePiece(null, 'told none edit'), true);
+      const first = await drain();
+      const second = await drain();
+      const stopped = Number(/stays at ([\d.]+) BPM/.exec(first)?.[1]);
+      const line = Number.isFinite(stopped) ? glideEndedLine('no-tempo', stopped) : null;
+      report(
+        'ramp: a hand edit with no tempo statement ends the ramp and Claude is told once, in the next reply only',
+        line !== null && occurrences(first, line) === 1 && !second.includes(GLIDE_ENDED_LEAD),
+        JSON.stringify({ line, first: first.slice(0, 300), second: second.slice(0, 300) }),
+      );
+    }
+
+    // A reload in the middle of a ramp: the page line, once.
+    {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'told reload' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      await kit.uninstall();
+      await reloadPage(cdp);
+      await waitFor(cdp, `(() => ${GLIDE_SCHEDULER}.started === true ? true : null)()`, 15000);
+      await sleep(500);
+      const told = await toldOnce(glideEndedLine('page'));
+      report('ramp: a reload in the middle of a ramp is told to Claude once, in the next reply only', told.once && told.noMore, JSON.stringify(told));
+      await kit.install();
+    }
+
+    // A ramp left to finish, and a Stop in the middle of one: no line.
+    {
+      await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 2, tag: 'told finish' });
+      await kit.waitCps(target, 'the end of the short ramp', 40000);
+      await sleep(500);
+      const finished = await drain();
+      const second = await startRampStop(kit);
+      report(
+        'ramp: a ramp left to finish and a ramp that Stop ended give no line to Claude',
+        !finished.includes(GLIDE_ENDED_LEAD) && !second.includes(GLIDE_ENDED_LEAD),
+        JSON.stringify({ finished: finished.slice(0, 200), afterStop: second.slice(0, 200) }),
+      );
+    }
+  } finally {
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp told once reset' });
+    await drainSafely(client);
+  }
+
+  /** A ramp, Stop in the middle of it, Play again; returns the reply of the next get_code. */
+  async function startRampStop(rampKit) {
+    const { plan } = await rampKit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'told stop' });
+    await rampKit.waitCycle(plan.startCycle + 2, 'two bars into the ramp');
+    await stopMusic(cdp);
+    await sleep(300);
+    const reply = await drain();
+    await playMusic(cdp);
+    await sleep(500);
+    return reply + (await drain());
+  }
+}
+
+async function drainSafely(client) {
+  try {
+    await callTool(client, 'get_code', {});
+  } catch {
+    // The reset piece is playing; a failing drain only leaves a note for the next check, which drains first.
+  }
+}
+
+// --- The tempo ramp in the top bar (group "ramp") ---
+//
+// The readout while a ramp runs, the sentences the live region speaks, the bar at 1024 px with a countdown and the Requests chip, and
+// the views while the tempo moves. The page is read through a recorder of its own writes (a MutationObserver, probe text only) that
+// notes every write to the readout and to the live region with the time and the scheduler's cycle; the expected words are always
+// built from tempoText and rampLine of the page's own modules, never retyped.
+
+/** Page-side recorder: one entry for every batch of writes to #tempo-readout (its parts, its accessible name and its title) and to
+ * #change-status. */
+const RAMP_DOM_LOG_SOURCE = `(() => {
+  if (window.__rampDom) window.__rampDom.stop();
+  const scheduler = document.getElementById('repl').editor.repl.scheduler;
+  const readout = document.getElementById('tempo-readout');
+  const status = document.getElementById('change-status');
+  const part = (selector) => readout.querySelector(selector).textContent;
+  const log = [];
+  const readoutObserver = new MutationObserver(() => {
+    log.push({ kind: 'readout', t: performance.now(), num: part('.tempo-num'), arrow: part('.tempo-arrow'), unit: part('.tempo-unit'), name: readout.getAttribute('aria-label'), title: readout.getAttribute('title') });
+  });
+  readoutObserver.observe(readout, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['aria-label', 'title'] });
+  // One entry for every write, also two in the same task: the text of the node a write added, or '' for a write of nothing.
+  const statusObserver = new MutationObserver((records) => {
+    const cycle = scheduler.now();
+    for (const record of records) {
+      if (record.type !== 'childList') continue;
+      const text = record.addedNodes.length > 0 ? record.addedNodes[0].textContent : '';
+      log.push({ kind: 'status', t: performance.now(), text, cycle: Number.isFinite(cycle) ? cycle : null });
+    }
+  });
+  statusObserver.observe(status, { childList: true });
+  window.__rampDom = {
+    log: () => log.slice(),
+    stop() {
+      readoutObserver.disconnect();
+      statusObserver.disconnect();
+      delete window.__rampDom;
+    },
+  };
+})()`;
+
+const RAMP_TITLE_LEAD = /^Tempo moving (up|down) to /;
+const RAMP_STEADY_TITLE = BAR_COPY.tempoTitle;
+const rampBarsLeft = (title) => {
+  const match = /(\d+) bars? left\.$/.exec(title);
+  return match === null ? null : Number(match[1]);
+};
+
+/** The writes the recorder saw after `markPerf`: the readout entries and the non-empty live-region texts. */
+function rampDomSince(log, markPerf) {
+  return {
+    readouts: log.filter((entry) => entry.kind === 'readout' && entry.t >= markPerf),
+    statuses: log.filter((entry) => entry.kind === 'status' && entry.t >= markPerf && entry.text !== ''),
+  };
+}
+
+/** What a run of readout entries must show for a ramp to `toBpm` (`rising` or not): every entry in the ramp form has a whole number
+ * between the tempos, the arrow part and the words of the model for that number, and bars left that only count down. Returns the
+ * problems found, the bars left in order and the number writes. */
+function rampReadoutProblems(readouts, { fromBpm, toBpm }) {
+  const rising = toBpm > fromBpm;
+  const low = Math.min(fromBpm, toBpm);
+  const high = Math.max(fromBpm, toBpm);
+  const problems = [];
+  const bars = [];
+  let previousNum = null;
+  let previousBars = Infinity;
+  for (const entry of readouts) {
+    if (/^\d+$/.test(entry.num) === false) {
+      problems.push(`number ${entry.num}`);
+      continue;
+    }
+    const value = Number(entry.num);
+    if (value < low || value > high) problems.push(`number ${value} outside ${low} to ${high}`);
+    if (previousNum !== null && (rising ? value < previousNum : value > previousNum)) problems.push(`number ${previousNum} to ${value} moves back`);
+    previousNum = value;
+    if (RAMP_TITLE_LEAD.test(entry.title) === false) continue;
+    const left = rampBarsLeft(entry.title);
+    if (left === null) {
+      problems.push(`title ${entry.title}`);
+      continue;
+    }
+    const expected = tempoText({ playing: true, bpm: value, ramp: { targetBpm: toBpm, barsLeft: left, rising } });
+    if (entry.arrow.trim() !== expected.arrow || entry.name !== expected.name || entry.title !== expected.title || entry.unit.trim() !== expected.unit) {
+      problems.push(`entry ${JSON.stringify(entry)} is not ${JSON.stringify(expected)}`);
+    }
+    if (left > previousBars) problems.push(`bars left ${previousBars} to ${left} counts up`);
+    previousBars = left;
+    if (bars.at(-1) !== left) bars.push(left);
+  }
+  return { problems, bars };
+}
+
+/** The gaps in ms between consecutive writes of a different number. */
+function rampNumberGaps(readouts) {
+  const gaps = [];
+  let previous = null;
+  for (const entry of readouts) {
+    if (previous !== null && entry.num !== previous.num) gaps.push(entry.t - previous.t);
+    previous = entry;
+  }
+  return gaps;
+}
+
+const rampSentences = (statuses) => statuses.map((entry) => entry.text).filter((text) => text.startsWith('Tempo ramp'));
+
+/** In the real page the readout steps through whole BPM toward the target with its bars left, the live region speaks the start and the
+ * end once each, a cancel by the code once, and a ramp that starts at a bar line shows the waiting form until its line. */
+async function rampReadoutCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const dom = { log: () => evaluateExpr(cdp, 'window.__rampDom.log()') };
+  const detail = {};
+  const steadyOf = (bpm) => tempoText({ playing: true, bpm });
+  const finalReadout = (readouts) => readouts.at(-1);
+  try {
+    await kit.install();
+    await evaluateExpr(cdp, RAMP_DOM_LOG_SOURCE);
+
+    // Up: 100 to 120 BPM over 4 bars.
+    {
+      const { markPerf, endPerf } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 4, tag: 'readout up' });
+      await kit.waitCps(glideCps(120), 'the end of the rising ramp', 40000);
+      await sleep(900);
+      const { readouts, statuses } = rampDomSince(await dom.log(), markPerf);
+      const lastStep = glideStepEventsAfter(await kit.events(), endPerf).at(-1);
+      const form = rampReadoutProblems(readouts, { fromBpm: 100, toBpm: 120 });
+      const steady = steadyOf(120);
+      const settled = readouts.find((entry) => entry.t > lastStep.perf && entry.title === RAMP_STEADY_TITLE);
+      const last = finalReadout(readouts);
+      detail.up = {
+        entries: readouts.length,
+        problems: form.problems.slice(0, 5),
+        bars: form.bars,
+        gapsMin: Math.min(...rampNumberGaps(readouts)),
+        steadyAfterMs: settled === undefined ? null : Math.round(settled.t - lastStep.perf),
+        last,
+        sentences: rampSentences(statuses),
+      };
+      const expectedSentences = [rampLine({ kind: 'started', fromBpm: 100, toBpm: 120, bars: 4 }), rampLine({ kind: 'finished', toBpm: 120 })];
+      report(
+        'ramp: the readout steps through whole BPM with the arrow, the target and the bars left, the steady form returns within one poll, and the live region speaks the start and the end once each',
+        form.problems.length === 0 &&
+          JSON.stringify(form.bars) === JSON.stringify([4, 3, 2, 1]) &&
+          readouts.some((entry) => RAMP_TITLE_LEAD.test(entry.title) && entry.name.includes('rising to')) &&
+          detail.up.gapsMin >= 200 &&
+          settled !== undefined &&
+          detail.up.steadyAfterMs <= 400 &&
+          last.num === steady.num &&
+          last.arrow === '' &&
+          last.name === steady.name &&
+          last.title === steady.title &&
+          JSON.stringify(detail.up.sentences) === JSON.stringify(expectedSentences),
+        JSON.stringify(detail.up),
+      );
+    }
+
+    // Down: 120 to 100 BPM over 2 bars.
+    {
+      const { markPerf } = await kit.startRamp({ fromBpm: 120, toBpm: 100, bars: 2, tag: 'readout down' });
+      await kit.waitCps(glideCps(100), 'the end of the falling ramp', 40000);
+      await sleep(900);
+      const { readouts } = rampDomSince(await dom.log(), markPerf);
+      const form = rampReadoutProblems(readouts, { fromBpm: 120, toBpm: 100 });
+      detail.down = { entries: readouts.length, problems: form.problems.slice(0, 5), bars: form.bars };
+      report(
+        'ramp: a ramp down reads falling in the accessible name and moving down in the title',
+        form.problems.length === 0 &&
+          form.bars.length > 0 &&
+          readouts.filter((entry) => RAMP_TITLE_LEAD.test(entry.title)).every((entry) => entry.name.includes('falling to') && entry.title.startsWith('Tempo moving down')),
+        JSON.stringify(detail.down),
+      );
+    }
+
+    // Canceled by the code: setcpm(90/4) in the middle of a ramp says it once, and the steady form shows the new tempo.
+    {
+      const { plan, markPerf } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'readout cancel' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+      await callTool(client, 'set_code', { code: glidePiece(90, 'readout canceled'), label: 'probe ramp readout canceled' });
+      await sleep(900);
+      const { readouts, statuses } = rampDomSince(await dom.log(), markPerf);
+      const steady = steadyOf(90);
+      const last = finalReadout(readouts);
+      detail.canceled = { sentences: rampSentences(statuses), last };
+      report(
+        'ramp: a ramp canceled by a change that states another tempo says so once with that tempo, and the readout shows the new tempo at once',
+        JSON.stringify(detail.canceled.sentences.filter((text) => !text.startsWith('Tempo ramp started'))) === JSON.stringify([rampLine({ kind: 'canceled', reason: 'other-tempo', bpm: 90 })]) &&
+          last.num === steady.num &&
+          last.arrow === '' &&
+          last.name === steady.name &&
+          last.title === steady.title,
+        JSON.stringify(detail.canceled),
+      );
+    }
+
+    // At a bar line: the waiting form shows until the line, the start is spoken after it, the end once.
+    {
+      await kit.steady(100, 'readout line steady');
+      const markPerf = await kit.mark('readout line');
+      const reply = await callTool(client, 'set_code', { code: glidePiece(120, 'readout line'), label: 'probe ramp readout line', at: 'bar', glideBars: 2 });
+      const line = Number(/at cycle (\d+)/.exec(reply)?.[1]);
+      await kit.waitCps(glideCps(120), 'the end of the ramp that started at the line', 40000);
+      await sleep(900);
+      const { readouts, statuses } = rampDomSince(await dom.log(), markPerf);
+      const waitingForm = tempoText({ playing: true, bpm: 100, waitingBpm: 120 });
+      const waitingAt = readouts.findIndex((entry) => entry.name === waitingForm.name && entry.arrow.trim() === waitingForm.arrow);
+      const rampAt = readouts.findIndex((entry) => RAMP_TITLE_LEAD.test(entry.title));
+      const started = rampLine({ kind: 'started', fromBpm: 100, toBpm: 120, bars: 2 });
+      const startedEntry = statuses.find((entry) => entry.text === started);
+      detail.atLine = {
+        line,
+        waitingAt,
+        rampAt,
+        texts: statuses.map((entry) => entry.text),
+        startedCycle: startedEntry === undefined ? null : startedEntry.cycle,
+      };
+      report(
+        'ramp: a change that waits for its bar and asks for a ramp shows the waiting form until its line, speaks the start after the line, and speaks the end once',
+        Number.isFinite(line) &&
+          waitingAt >= 0 &&
+          rampAt > waitingAt &&
+          JSON.stringify(detail.atLine.texts) === JSON.stringify([queuedLine('bar'), started, rampLine({ kind: 'finished', toBpm: 120 })]) &&
+          detail.atLine.startedCycle !== null &&
+          detail.atLine.startedCycle >= line - 0.1,
+        JSON.stringify(detail.atLine),
+      );
+    }
+
+    // Pictures of the bar during a ramp for the person to judge (the page has the one dark theme only).
+    const folder = shotsFolder();
+    if (folder !== null) {
+      const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 130, bars: 32, tag: 'readout shots' });
+      await kit.waitCycle(plan.startCycle + 1, 'one bar into the long ramp');
+      const saved = [];
+      try {
+        for (const state of ['ramp', 'ramp-countdown']) {
+          if (state === 'ramp-countdown') {
+            await callTool(client, 'set_code', { code: glidePiece(130, 'readout shots restate'), label: 'probe ramp readout shots restate', at: 'phrase' });
+            await waitFor(cdp, "(() => (document.getElementById('pending-change').hidden ? null : true))()", 5000);
+          }
+          for (const [width, height] of [[1920, 1080], [3840, 2160]]) {
+            await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+            await layoutSettled(cdp, width, height);
+            const shown = await evaluateExpr(cdp, "document.getElementById('tempo-readout').getAttribute('title')");
+            if (!RAMP_TITLE_LEAD.test(shown)) throw new Error(`the readout did not show a ramp for the picture: ${shown}`);
+            saved.push(await saveShot(cdp, folder, state, width, height, 'a', 'ramp'));
+          }
+        }
+      } finally {
+        await cdp('Emulation.clearDeviceMetricsOverride');
+      }
+      report('ramp: the pictures of the bar during a ramp are saved for the person to judge', saved.length === 4, JSON.stringify(saved));
+    }
+  } finally {
+    await evaluateExpr(cdp, 'window.__rampDom && window.__rampDom.stop()');
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp readout reset' });
+    await drainSafely(client);
+  }
+}
+
+/** At 1024 px wide with a ramp running, a waiting change's countdown and the Requests chip showing, neither the bar nor the page
+ * overflows; when the ramp ends the steady form shows within one poll. */
+async function rampFitCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const requests = requestsKit(cdp, client);
+  const stamp = Date.now();
+  const text = `ramp fit ${stamp}`;
+  const detail = {};
+  let requestId = null;
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.install();
+    await requests.playSilent(glidePiece(100, `fit start ${stamp}`), 'probe ramp fit start');
+    await requests.waitForClaude();
+    await foldRequestsPanel(cdp);
+    await requests.send(text);
+    await foldRequestsPanel(cdp);
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1024, height: 768, deviceScaleFactor: 1, mobile: false });
+    await layoutSettled(cdp, 1024, 768);
+    const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'fit' });
+    await kit.waitCycle(plan.startCycle + 1, 'one bar into the ramp');
+    await callTool(client, 'set_code', { code: glidePiece(120, 'fit restate'), label: 'probe ramp fit restate', at: 'phrase' });
+    await waitFor(cdp, "(() => (document.getElementById('pending-change').hidden ? null : true))()", 5000);
+    await layoutSettled(cdp, 1024, 768);
+    const read = () =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const bar = document.getElementById('top-bar');
+          const readout = document.getElementById('tempo-readout');
+          return {
+            barScroll: bar.scrollWidth,
+            barClient: bar.clientWidth,
+            documentScroll: document.documentElement.scrollWidth,
+            documentClient: document.documentElement.clientWidth,
+            fit: bar.dataset.fit,
+            chipShown: !document.getElementById('requests-toggle').hidden,
+            countdownShown: !document.getElementById('pending-change').hidden,
+            readoutTitle: readout.getAttribute('title'),
+            readoutText: readout.textContent,
+          };
+        })()`,
+      );
+    detail.during = await read();
+    // Let the ramp end, then look for the steady form.
+    await kit.waitCps(glideCps(120), 'the end of the ramp', 60000);
+    const endedAt = Date.now();
+    const steady = tempoText({ playing: true, bpm: 120 });
+    const back = await waitFor(
+      cdp,
+      `(() => { const r = document.getElementById('tempo-readout'); return r.getAttribute('aria-label') === ${JSON.stringify(steady.name)} && r.getAttribute('title') === ${JSON.stringify(steady.title)} && r.querySelector('.tempo-arrow').textContent === '' ? true : null; })()`,
+      1000,
+    );
+    detail.backAfterMs = back === true ? Date.now() - endedAt : null;
+    detail.after = await read();
+    const during = detail.during;
+    report(
+      'ramp: at 1024 px with a ramp, a waiting change and the Requests chip showing, neither the bar nor the page overflows, and the steady form returns within one poll of the end',
+      during.chipShown === true &&
+        during.countdownShown === true &&
+        RAMP_TITLE_LEAD.test(during.readoutTitle) &&
+        during.barScroll <= during.barClient &&
+        during.documentScroll <= during.documentClient &&
+        back === true &&
+        detail.backAfterMs <= 600 &&
+        detail.after.barScroll <= detail.after.barClient,
+      JSON.stringify(detail),
+    );
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.uninstall();
+    try {
+      requestId = await requests.handOver(text);
+      await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp fit answer', answering: requestId });
+    } catch {
+      // The request is left for the reset below; a failing hand-over only leaves a note for the next check.
+    }
+    await stopSpawnedListeners();
+    await foldRequestsPanel(cdp);
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp fit reset' });
+    await drainSafely(client);
+  }
+}
+
+/** During a ramp of 8 bars the Mixer, Jam, Parts and Timeline views each run for one cycle with no console error and no uncaught exception. */
+async function rampViewsCheck({ cdp, client, report }) {
+  const kit = glideKit(cdp, client);
+  const heard = { errors: [], thrown: [] };
+  const stopListening = cdp.onEvent((message) => {
+    if (message.method === 'Runtime.consoleAPICalled' && message.params.type === 'error') {
+      heard.errors.push(message.params.args.map((arg) => String(arg.value ?? arg.description ?? '')).join(' '));
+    }
+    if (message.method === 'Runtime.exceptionThrown') heard.thrown.push(String(message.params.exceptionDetails.text));
+  });
+  const detail = { views: [] };
+  const open = (digit) => evaluateExpr(cdp, `document.querySelector('#view-buttons button[data-key="${digit}"]').getAttribute('aria-pressed')`);
+  try {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await kit.install();
+    const { plan } = await kit.startRamp({ fromBpm: 100, toBpm: 120, bars: 8, tag: 'views' });
+    let cycle = plan.startCycle;
+    for (const [digit, name] of [['3', 'mixer'], ['5', 'jam'], ['4', 'parts'], ['2', 'timeline']]) {
+      if ((await open(digit)) !== 'true') await clickElement(cdp, `#view-buttons button[data-key="${digit}"]`);
+      const shown = (await waitFor(cdp, `(() => (document.querySelector('#view-buttons button[data-key="${digit}"]').getAttribute('aria-pressed') === 'true' ? true : null))()`, 3000)) === true;
+      cycle += 1;
+      await kit.waitCycle(cycle, `one cycle of the ${name} view`);
+      detail.views.push({ name, shown, runs: await kit.cps() > 0 });
+    }
+    detail.rampStillRuns = (await evaluateExpr(cdp, "document.getElementById('tempo-readout').getAttribute('title')")).startsWith('Tempo moving');
+    await kit.waitCps(glideCps(120), 'the end of the ramp', 60000);
+    await sleep(500);
+    detail.errors = heard.errors.slice(0, 5);
+    detail.thrown = heard.thrown.slice(0, 5);
+    report(
+      'ramp: the Mixer, Jam, Parts and Timeline views run for a cycle each during a ramp with no console error and no uncaught exception',
+      detail.views.length === 4 && detail.views.every((view) => view.shown && view.runs) && detail.rampStillRuns === true && heard.errors.length === 0 && heard.thrown.length === 0,
+      JSON.stringify(detail),
+    );
+  } finally {
+    stopListening();
+    for (const digit of ['2', '3', '4', '5']) {
+      if ((await open(digit)) === 'true') await clickElement(cdp, `#view-buttons button[data-key="${digit}"]`);
+    }
+    await kit.uninstall();
+    await callTool(client, 'set_code', { code: GLIDE_RESET_PIECE, label: 'probe ramp views reset' });
+    await drainSafely(client);
+  }
+}
+
+/** The tempo ramp against the real page. */
+export async function rampBlocks(context) {
+  await glideCourseCheck(context);
+  await glideCancelCheck(context);
+  await glideRefusalsCheck(context);
+  await glideStopPlayCheck(context);
+  await glideToldOnceCheck(context);
+  await rampReadoutCheck(context);
+  await rampFitCheck(context);
+  await rampViewsCheck(context);
+}
+
+/** The Jam view against the real page: the scale states, the status line, the coming-up list, the piano, the guitar,
+ * the chord tones, the ask contexts and the layouts. Runs alone with `--only jam`. */
+export async function jamBlocks(context) {
+  const { cdp, client, report } = context;
+  const REQUEST_PREFIX = 'Request from the Moontide page: ';
+  // --- Jam ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    // Leaves the page with no view open and no focus in a field, so the next key press is a view key.
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const JAM_DORIAN_PROGRAM = ['bass: note("d2").gain(0)', 'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)'].join('\n');
+    const jamReply = await callTool(client, 'set_code', { code: JAM_DORIAN_PROGRAM, label: 'probe jam dorian' });
+    const jamEvaluated = !/runtime error/i.test(jamReply);
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    const jamReady = await waitFor(
+      cdp,
+      `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
+      6000,
+    );
+    const jamChips = await evaluateExpr(
+      cdp,
+      `[...document.querySelectorAll('#jam-degrees .jam-degree')].map((chip) => ({
+          note: chip.querySelector('.jam-degree-note').textContent,
+          degree: chip.querySelector('.jam-degree-num').textContent,
+          role: chip.dataset.role,
+        }))`,
+    );
+    const jamNotes = jamChips.map((chip) => chip.note);
+    const jamDegrees = jamChips.map((chip) => chip.degree);
+    const jamRoles = jamChips.map((chip) => chip.role);
+    report(
+      'key 5 opens Jam and names the scale of the playing code with its seven degrees',
+      jamEvaluated &&
+        jamReady === true &&
+        JSON.stringify(jamNotes) === JSON.stringify(['D', 'E', 'F', 'G', 'A', 'B', 'C']) &&
+        JSON.stringify(jamDegrees) === JSON.stringify(['1', '2', '♭3', '4', '5', '6', '♭7']) &&
+        JSON.stringify(jamRoles) === JSON.stringify(['root', 'scale', 'scale', 'scale', 'scale', 'scale', 'scale']),
+      JSON.stringify({ jamEvaluated, jamReady, jamNotes, jamDegrees, jamRoles }),
+    );
+
+    // Jam then the Timeline: the same page, read once. A page turn between the two reads repeats the check once.
+    const readBoth = async () => {
+      const jam = await waitFor(
+        cdp,
+        `(() => { const v = document.getElementById('jam-view'); return v.dataset.state === 'ready' && v.dataset.computeMs ? { pageStart: v.dataset.pageStart, computeMs: v.dataset.computeMs } : null; })()`,
+        6000,
+      );
+      await pressKey(cdp, '2');
+      const timeline = await waitFor(
+        cdp,
+        `(() => { const v = document.getElementById('timeline-view'); return v.dataset.state === 'ok' ? { pageStart: v.dataset.pageStart, computeMs: v.dataset.computeMs } : null; })()`,
+        8000,
+      );
+      return { jam, timeline };
+    };
+    let both = await readBoth();
+    const same = (pair) =>
+      pair.jam !== null &&
+      pair.timeline !== null &&
+      pair.jam.pageStart === pair.timeline.pageStart &&
+      pair.jam.computeMs === pair.timeline.computeMs;
+    let attempts = 1;
+    if (!same(both) && both.jam !== null && both.timeline !== null && both.jam.pageStart !== both.timeline.pageStart) {
+      await pressKey(cdp, '5');
+      both = await readBoth();
+      attempts = 2;
+    }
+    report(
+      'the Timeline opened after Jam reuses the same reading',
+      same(both),
+      JSON.stringify({ both, attempts }),
+    );
+
+    // 5 twice from the Timeline: opens Jam, then closes it.
+    await pressKey(cdp, '5');
+    const jamOpenedAgain = await waitFor(cdp, `document.getElementById('jam-view').hidden ? null : true`, 3000);
+    await pressKey(cdp, '5');
+    const jamClosed = await evaluateExpr(
+      cdp,
+      `({ hidden: document.getElementById('jam-view').hidden, view: document.getElementById('workspace').dataset.view })`,
+    );
+    report(
+      'key 5 again closes the Jam view',
+      jamOpenedAgain === true && jamClosed.hidden === true && jamClosed.view === 'none',
+      JSON.stringify({ jamOpenedAgain, jamClosed }),
+    );
+    await clearViews();
+  }
+
+  // --- Jam: scale states ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const scaleFacts = `(() => {
+        const name = document.getElementById('jam-scale-name');
+        return {
+          state: document.getElementById('jam-view').dataset.state,
+          kind: name.dataset.kind,
+          name: name.textContent,
+          sub: document.getElementById('jam-scale-sub').textContent,
+          degreesHidden: document.getElementById('jam-degrees').hidden,
+          reasonHidden: document.getElementById('jam-reason').hidden,
+          reason: document.getElementById('jam-reason').textContent,
+        };
+      })()`;
+
+    // Several scales share the four-pad loop's notes: the view uses one, says why, and draws its degrees.
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    const tieReply = await callTool(client, 'set_code', {
+      code: 'pads: note("<[a3,c4,e4] [f3,a3,c4] [c4,e4,g4] [g3,b3,d4]>").gain(0)',
+      label: 'probe jam tie',
+    });
+    const tieFacts = await waitFor(
+      cdp,
+      `(() => { const f = ${scaleFacts}; return f.kind === 'clear' && f.name === 'C major' ? f : null; })()`,
+      6000,
+    );
+    report(
+      'notes that fit several scales with the same notes show the proposed scale, why, and its degrees',
+      !/runtime error/i.test(tieReply) &&
+        tieFacts !== null &&
+        tieFacts.reasonHidden === false &&
+        tieFacts.reason === 'Proposed: C major, C is the note heard most.' &&
+        tieFacts.degreesHidden === false,
+      JSON.stringify(tieFacts),
+    );
+
+    // Drums only: nothing pitched to read.
+    await callTool(client, 'set_code', { code: 'drums: s("bd*4").gain(0)', label: 'probe jam drums' });
+    const drumsFacts = await waitFor(
+      cdp,
+      `(() => {
+          const message = document.getElementById('jam-message');
+          if (message.hidden || document.getElementById('jam-message-text').textContent !== 'No notes to read: the playing code has no pitched notes.') return null;
+          return {
+            text: document.getElementById('jam-message-text').textContent,
+            sub: document.getElementById('jam-message-sub').textContent,
+            subHidden: document.getElementById('jam-message-sub').hidden,
+            bodyHidden: document.getElementById('jam-body').hidden,
+          };
+        })()`,
+      6000,
+    );
+    report(
+      'a drums-only pattern says there are no notes to read',
+      drumsFacts !== null &&
+        drumsFacts.sub === 'Only notes with a pitch count; drums are ignored.' &&
+        drumsFacts.subHidden === false &&
+        drumsFacts.bodyHidden === true,
+      JSON.stringify(drumsFacts),
+    );
+
+    // Parts: the scale follows the part that plays (4 cycles each at one cycle per second).
+    const JAM_PARTS_PROGRAM = [
+      'setcps(1)',
+      'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+      'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
+      'bass: note("<d2!4 e2!4>").gain(0)',
+      'lead: arrange([4, calm], [4, bright])',
+    ].join('\n');
+    const partsReply = await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam parts' });
+    const seen = { calm: null, bright: null };
+    const partsDeadline = Date.now() + 12000;
+    while ((seen.calm === null || seen.bright === null) && Date.now() < partsDeadline) {
+      const facts = await evaluateExpr(cdp, scaleFacts);
+      if (facts.name === 'D Dorian' && facts.sub === 'Part "calm" · read from this part') seen.calm = facts;
+      if (facts.name === 'E harmonic minor' && facts.sub === 'Part "bright" · read from this part') seen.bright = facts;
+      if (seen.calm === null || seen.bright === null) await sleep(250);
+    }
+    report(
+      'the scale follows the part that is playing',
+      !/runtime error/i.test(partsReply) && seen.calm !== null && seen.bright !== null,
+      JSON.stringify(seen),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: the status line ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const statusFacts = `(() => {
+        const box = document.getElementById('jam-status');
+        const time = document.getElementById('jam-status-time');
+        const avoidChip = document.querySelector('#jam-degrees .jam-degree[data-note="C"]');
+        return {
+          hidden: box.hidden,
+          state: box.dataset.state ?? null,
+          warning: box.getAttribute('data-warning'),
+          tabindex: box.getAttribute('tabindex'),
+          lead: document.getElementById('jam-status-lead').textContent,
+          rest: document.getElementById('jam-status-rest').textContent,
+          time: time.textContent,
+          timeHidden: time.hidden,
+          timeAriaHidden: time.getAttribute('aria-hidden'),
+          timeTitle: time.title,
+          chipRole: avoidChip ? avoidChip.dataset.role : null,
+        };
+      })()`;
+    // Neutral, silent, eight-cycle loop at one cycle per second: a D pedal, a pad (Dm7, with an A7 on
+    // cycles 2 and 3 of each eight) and an eighth-note D Dorian melody.
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const warnReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam warning' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    const warnSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
+    const warnClock = await readSchedulerNow(cdp);
+    const warnFacts = await evaluateExpr(cdp, statusFacts);
+    // The spoken copy: a visually hidden child of the live region, written when a warning starts or
+    // ends and never on a tick. The observers count every write to it and to the drawn time.
+    const spokenFacts = await evaluateExpr(
+      cdp,
+      `(() => {
+          const box = document.getElementById('jam-status');
+          const spoken = document.getElementById('jam-status-spoken');
+          const time = document.getElementById('jam-status-time');
+          const probeText = document.createElement('span');
+          probeText.style.color = 'var(--text)';
+          document.body.appendChild(probeText);
+          const textColor = getComputedStyle(probeText).color;
+          probeText.remove();
+          const rect = spoken ? spoken.getBoundingClientRect() : null;
+          const facts = {
+            exists: spoken !== null,
+            inside: spoken !== null && box.contains(spoken),
+            ariaHidden: spoken ? spoken.getAttribute('aria-hidden') : null,
+            live: box.getAttribute('aria-live'),
+            width: rect ? rect.width : null,
+            height: rect ? rect.height : null,
+            text: spoken ? spoken.textContent : null,
+            timeAriaHidden: time.getAttribute('aria-hidden'),
+            timeColor: getComputedStyle(time).color,
+            textColor,
+          };
+          if (spoken) {
+            window.__spokenWrites = 0;
+            window.__timeWrites = 0;
+            const options = { childList: true, characterData: true, subtree: true };
+            window.__spokenObserver = new MutationObserver((records) => { window.__spokenWrites += records.length; });
+            window.__timeObserver = new MutationObserver((records) => { window.__timeWrites += records.length; });
+            window.__spokenObserver.observe(spoken, options);
+            window.__timeObserver.observe(time, options);
+          }
+          return facts;
+        })()`,
+    );
+    const timeMatch = /^back in key in (\d+)\u00A0s$/.exec(warnFacts.time);
+    const loopPosition = warnClock % 8;
+    const warnOk =
+      !/runtime error/i.test(warnReply) &&
+      warnSeen === true &&
+      warnFacts.state === 'warning' &&
+      warnFacts.lead === 'The harmony leaves the scale:' &&
+      warnFacts.rest === ' A7/D contains C#, avoid C' &&
+      timeMatch !== null &&
+      (timeMatch[1] === '1' || timeMatch[1] === '2') &&
+      loopPosition >= 2 &&
+      loopPosition <= 4.5 &&
+      warnFacts.timeAriaHidden === 'true' &&
+      warnFacts.timeTitle === warnFacts.time &&
+      warnFacts.tabindex === '0' &&
+      warnFacts.chipRole === 'avoid';
+    const safeSeen = await waitFor(cdp, `document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 8000);
+    const safeFacts = await evaluateExpr(cdp, statusFacts);
+    const readCounters = `({
+        spokenWrites: window.__spokenWrites ?? null,
+        timeWrites: window.__timeWrites ?? null,
+        text: document.getElementById('jam-status-spoken') ? document.getElementById('jam-status-spoken').textContent : null,
+      })`;
+    const toSafeCounters = await evaluateExpr(cdp, readCounters);
+    await evaluateExpr(cdp, `(() => { window.__spokenWrites = 0; window.__timeWrites = 0; })()`);
+    await sleep(2500);
+    const tickCounters = await evaluateExpr(cdp, readCounters);
+    await evaluateExpr(
+      cdp,
+      `(() => {
+          if (window.__spokenObserver) window.__spokenObserver.disconnect();
+          if (window.__timeObserver) window.__timeObserver.disconnect();
+          delete window.__spokenObserver;
+          delete window.__timeObserver;
+          delete window.__spokenWrites;
+          delete window.__timeWrites;
+        })()`,
+    );
+    const safeOk =
+      safeSeen === true &&
+      safeFacts.lead === 'All safe' &&
+      safeFacts.rest === ' \u2014 every note of D Dorian works with the harmony right now.' &&
+      safeFacts.time.startsWith('Next warning in ') &&
+      safeFacts.warning === null &&
+      safeFacts.tabindex === null &&
+      safeFacts.chipRole === 'scale';
+    report(
+      'an outside chord makes the status warn in time, then say all safe',
+      warnOk && safeOk,
+      JSON.stringify({ warnClock, loopPosition, warnFacts, safeFacts }),
+    );
+    const spokenOk =
+      spokenFacts.exists === true &&
+      spokenFacts.inside === true &&
+      spokenFacts.ariaHidden === null &&
+      spokenFacts.live === 'polite' &&
+      spokenFacts.width <= 1 &&
+      spokenFacts.height <= 1 &&
+      /^back in key in \d+\u00A0s$/.test(spokenFacts.text ?? '') &&
+      spokenFacts.timeAriaHidden === 'true' &&
+      spokenFacts.timeColor === spokenFacts.textColor &&
+      toSafeCounters.spokenWrites !== null &&
+      toSafeCounters.spokenWrites <= 1 &&
+      /^Next warning in \d+\u00A0s$/.test(toSafeCounters.text ?? '') &&
+      tickCounters.timeWrites !== null &&
+      tickCounters.timeWrites >= 2 &&
+      tickCounters.spokenWrites === 0;
+    report(
+      'the status box speaks its countdown when a warning starts and ends, never on each tick, and the warning time reads in the text color',
+      spokenOk,
+      JSON.stringify({ spokenFacts, toSafeCounters, tickCounters }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam status reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: coming up ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const rowFacts = `[...document.querySelectorAll('#jam-rows .jam-row')].map((row) => ({
+        time: row.querySelector('.jam-row-time').textContent,
+        kind: row.querySelector('.jam-row-kind').textContent,
+        kindData: row.querySelector('.jam-row-kind').dataset.kind,
+        text: row.querySelector('.jam-row-text').textContent,
+        warning: row.getAttribute('data-warning'),
+        part: row.getAttribute('data-part'),
+        tabindex: row.getAttribute('tabindex'),
+      }))`;
+    const secondsOf = (row) => {
+      const match = /^(\d+)\u00A0s$/.exec(row.time);
+      return match === null ? null : Number(match[1]);
+    };
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const warnReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(cdp, `document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
+    const firstRows = await waitFor(cdp, `(() => { const r = ${rowFacts}; return r.some((x) => x.warning !== null) ? r : null; })()`, 6000);
+    const firstWarning = firstRows === null ? null : firstRows.find((row) => row.warning !== null);
+    const firstSeconds = firstWarning ? secondsOf(firstWarning) : null;
+    const firstTimes = firstRows === null ? [] : firstRows.map(secondsOf);
+    await sleep(1500);
+    const laterRows = await evaluateExpr(cdp, rowFacts);
+    const laterWarning = laterRows.find((row) => row.warning !== null);
+    const laterSeconds = laterWarning ? secondsOf(laterWarning) : null;
+    report(
+      'the coming-up list counts down to the next warning',
+      !/runtime error/i.test(warnReply) &&
+        firstRows !== null &&
+        firstRows.length <= 3 &&
+        firstWarning.kind === 'Warning' &&
+        firstWarning.kindData === 'warning' &&
+        firstWarning.text === 'A7/D brings C#, avoid C, lasts 2 cycles' &&
+        firstWarning.tabindex === '0' &&
+        firstTimes.every((value, i) => value !== null && (i === 0 || value > firstTimes[i - 1])) &&
+        firstSeconds !== null &&
+        laterSeconds !== null &&
+        laterSeconds !== firstSeconds,
+      JSON.stringify({ firstRows, laterRows }),
+    );
+
+    // Nothing outside the scale: all safe, no warning ahead, one calm row.
+    const JAM_CALM_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const calmReply = await callTool(client, 'set_code', { code: JAM_CALM_PROGRAM, label: 'probe jam calm' });
+    const calmFacts = await waitFor(
+      cdp,
+      `(() => {
+          const rows = ${rowFacts};
+          if (rows.length !== 1 || rows[0].kindData !== 'calm') return null;
+          return { rows, lead: document.getElementById('jam-status-lead').textContent, time: document.getElementById('jam-status-time').textContent };
+        })()`,
+      8000,
+    );
+    report(
+      'with nothing outside the scale the view says all safe and no warning ahead',
+      !/runtime error/i.test(calmReply) &&
+        calmFacts !== null &&
+        calmFacts.lead === 'All safe' &&
+        calmFacts.time === 'No warning ahead' &&
+        calmFacts.rows[0].time === '\u2013' &&
+        calmFacts.rows[0].text === 'No warning ahead \u2014 nothing leaves D Dorian in the next 32\u00A0s.' &&
+        calmFacts.rows[0].warning === null &&
+        calmFacts.rows[0].tabindex === null,
+      JSON.stringify(calmFacts),
+    );
+
+    // Parts: a part change is listed with what happens to the scale.
+    const JAM_PARTS_PROGRAM = [
+      'setcps(1)',
+      'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+      'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
+      'bass: note("<d2!4 e2!4>").gain(0)',
+      'lead: arrange([4, calm], [4, bright])',
+    ].join('\n');
+    const partsReply = await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam coming parts' });
+    const partRow = await waitFor(
+      cdp,
+      `(() => {
+          const rows = ${rowFacts};
+          return rows.find((row) => row.part !== null && row.kind === 'Part' &&
+            (row.text === '"bright" starts (4 cycles) \u2014 scale changes to E harmonic minor' ||
+             row.text === '"calm" starts (4 cycles) \u2014 scale changes to D Dorian')) ?? null;
+        })()`,
+      12000,
+    );
+    report(
+      'a part change is listed with its scale',
+      !/runtime error/i.test(partsReply) && partRow !== null && partRow.tabindex === '0' && partRow.kindData === 'part',
+      JSON.stringify(partRow),
+    );
+
+    // Stop: the countdowns pause, the reading stays, and everything picks up when the music plays again.
+    await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up again' });
+    await waitFor(
+      cdp,
+      `(() => { const r = ${rowFacts}; return r.some((x) => x.warning !== null) && r.every((x) => /^\\d+\u00A0s$/.test(x.time)) ? true : null; })()`,
+      12000,
+    );
+    await callTool(client, 'stop', {});
+    const pausedFacts = await waitFor(
+      cdp,
+      `(() => {
+          const paused = document.getElementById('jam-paused');
+          if (paused.hidden) return null;
+          const rows = ${rowFacts};
+          return { text: paused.textContent, times: rows.map((row) => row.time), timeHidden: document.getElementById('jam-status-time').hidden, count: rows.length };
+        })()`,
+      6000,
+    );
+    await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up resumed' });
+    const resumedFacts = await waitFor(
+      cdp,
+      `(() => {
+          const rows = ${rowFacts};
+          const paused = document.getElementById('jam-paused');
+          return paused.hidden && rows.length > 0 && rows.every((row) => /^\\d+\u00A0s$/.test(row.time)) ? rows.map((row) => row.time) : null;
+        })()`,
+      12000,
+    );
+    report(
+      'countdowns pause while the music is stopped',
+      pausedFacts !== null &&
+        pausedFacts.text === 'Not playing \u2014 countdowns are paused.' &&
+        pausedFacts.count > 0 &&
+        pausedFacts.times.every((time) => time === '\u2013') &&
+        pausedFacts.timeHidden === true &&
+        resumedFacts !== null,
+      JSON.stringify({ pausedFacts, resumedFacts }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam coming up reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: the piano ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const pianoFacts = `(() => {
+        const piano = document.getElementById('jam-piano');
+        const keys = [...piano.querySelectorAll('.jam-key')];
+        const notesOf = (role) => keys.filter((key) => key.dataset.role === role).map((key) => key.dataset.note);
+        return {
+          count: keys.length,
+          white: keys.filter((key) => key.dataset.black === 'false').length,
+          root: notesOf('root'),
+          scale: notesOf('scale'),
+          off: notesOf('off').length,
+          cLabels: keys.filter((key) => key.dataset.note === 'C').map((key) => key.querySelector('.jam-key-label').textContent),
+          label: piano.getAttribute('aria-label'),
+          role: piano.getAttribute('role'),
+        };
+      })()`;
+    const markFacts = (note) => `(() => {
+        const keys = [...document.querySelectorAll('#jam-piano .jam-key[data-note=${JSON.stringify(note)}]')];
+        return keys.map((key) => ({
+          role: key.dataset.role,
+          border: getComputedStyle(key).borderTopStyle,
+          cross: getComputedStyle(key, '::after').content,
+          label: key.querySelector('.jam-key-label').textContent,
+        }));
+      })()`;
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const pianoReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam piano' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
+    const safePiano = await evaluateExpr(cdp, pianoFacts);
+    const sameList = (a, b) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
+    const safeOk =
+      safePiano.count === 24 &&
+      safePiano.white === 14 &&
+      safePiano.role === 'img' &&
+      sameList(safePiano.root, ['D', 'D']) &&
+      sameList(safePiano.scale, ['E', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B', 'B', 'C', 'C']) &&
+      safePiano.off === 10 &&
+      sameList(safePiano.cLabels, ['C3', 'C4']) &&
+      typeof safePiano.label === 'string' &&
+      safePiano.label.endsWith('Avoid: none.');
+    const warnSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
+    const avoidMarks = await evaluateExpr(cdp, markFacts('C'));
+    const outsideMarks = await evaluateExpr(cdp, markFacts('C#'));
+    const warnLabel = await evaluateExpr(cdp, `document.getElementById('jam-piano').getAttribute('aria-label')`);
+    const warnOk =
+      warnSeen === true &&
+      avoidMarks.length === 2 &&
+      avoidMarks.every((mark) => mark.role === 'avoid' && mark.border === 'solid' && mark.cross !== 'none' && mark.label === 'C') &&
+      outsideMarks.length === 2 &&
+      outsideMarks.every((mark) => mark.role === 'outside' && mark.border === 'dashed' && mark.cross === 'none') &&
+      typeof warnLabel === 'string' &&
+      warnLabel.includes('Avoid: C. Outside: C#.');
+    report(
+      'the piano marks the scale, the root, the note to avoid and the outside note',
+      !/runtime error/i.test(pianoReply) && safeOk && warnOk,
+      JSON.stringify({ safePiano, avoidMarks, outsideMarks, warnLabel }),
+    );
+
+    // The legend's Root swatch: two inset layers, a text-colored ring on top of a page-colored one, so
+    // it reads as a ring (light edge, dark ring, light center) and differs from the Scale swatch.
+    const rootMark = await evaluateExpr(
+      cdp,
+      `(() => {
+          const mark = document.querySelector('#jam-legend .jam-legend-mark[data-role="root"]');
+          if (mark === null) return null;
+          const colorOf = (name) => {
+            const el = document.createElement('span');
+            el.style.color = 'var(' + name + ')';
+            document.body.appendChild(el);
+            const color = getComputedStyle(el).color;
+            el.remove();
+            return color;
+          };
+          const layers = [];
+          let depth = 0;
+          let current = '';
+          for (const ch of getComputedStyle(mark).boxShadow) {
+            if (ch === '(') depth += 1;
+            if (ch === ')') depth -= 1;
+            if (ch === ',' && depth === 0) { layers.push(current.trim()); current = ''; } else current += ch;
+          }
+          layers.push(current.trim());
+          return {
+            layers: layers.map((layer) => ({
+              color: (/rgba?\\([^)]*\\)/.exec(layer) || [null])[0],
+              spread: parseFloat((layer.replace(/rgba?\\([^)]*\\)/, '').match(/-?[\\d.]+px/g) || [])[3]),
+              inset: layer.includes('inset'),
+            })),
+            text: colorOf('--text'),
+            dominant: colorOf('--dominant'),
+          };
+        })()`,
+    );
+    report(
+      "the legend's Root mark draws a ring inside its swatch",
+      rootMark !== null &&
+        rootMark.layers.length === 2 &&
+        rootMark.layers.every((layer) => layer.inset) &&
+        rootMark.layers[0].color === rootMark.text &&
+        rootMark.layers[1].color === rootMark.dominant &&
+        rootMark.layers[0].spread < rootMark.layers[1].spread,
+      JSON.stringify(rootMark),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam piano reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: the guitar and the switch ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const switchFacts = `(() => ({
+        pianoPressed: document.getElementById('jam-instrument-piano').getAttribute('aria-pressed'),
+        guitarPressed: document.getElementById('jam-instrument-guitar').getAttribute('aria-pressed'),
+        pianoHidden: document.getElementById('jam-piano').hidden,
+        guitarHidden: document.getElementById('jam-guitar').hidden,
+        stored: localStorage.getItem('moontide.jamInstrument'),
+      }))()`;
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const guitarReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam guitar' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
+    const before = await evaluateExpr(cdp, switchFacts);
+    await clickElement(cdp, '#jam-instrument-guitar');
+    const guitarFacts = await waitFor(
+      cdp,
+      `(() => {
+          const facts = ${switchFacts};
+          if (facts.guitarHidden) return null;
+          const guitar = document.getElementById('jam-guitar');
+          const rows = [...guitar.querySelectorAll('.jam-string')];
+          const cell = (string, fret) => guitar.querySelector('.jam-string[data-string="' + string + '"] .jam-fret[data-fret="' + fret + '"]');
+          const widthOf = (fret) => cell(0, fret).getBoundingClientRect().width;
+          const aString = cell(4, 5);
+          const bString = cell(1, 4);
+          return {
+            ...facts,
+            role: guitar.getAttribute('role'),
+            label: guitar.getAttribute('aria-label'),
+            rows: rows.length,
+            cells: rows.map((row) => row.querySelectorAll('.jam-fret').length),
+            names: rows.map((row) => row.querySelector('.jam-string-name').textContent).join(''),
+            numbers: [...guitar.querySelectorAll('.jam-fret-number')].map((el) => el.textContent).filter((text) => text !== '').join(' '),
+            aNote: aString.dataset.note,
+            aRole: aString.dataset.role,
+            aDot: aString.querySelector('.jam-dot').textContent,
+            bNote: bString.dataset.note,
+            bRole: bString.dataset.role,
+            ratio: widthOf(12) / widthOf(1),
+          };
+        })()`,
+      4000,
+    );
+    const guitarOk =
+      before.pianoPressed === 'true' &&
+      before.guitarPressed === 'false' &&
+      before.guitarHidden === true &&
+      guitarFacts !== null &&
+      guitarFacts.pianoHidden === true &&
+      guitarFacts.pianoPressed === 'false' &&
+      guitarFacts.guitarPressed === 'true' &&
+      guitarFacts.role === 'img' &&
+      guitarFacts.label === 'Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: none.' &&
+      guitarFacts.rows === 6 &&
+      guitarFacts.cells.every((count) => count === 13) &&
+      guitarFacts.names === 'eBGDAE' &&
+      guitarFacts.numbers === '3 5 7 9 12' &&
+      guitarFacts.aNote === 'D' &&
+      guitarFacts.aRole === 'root' &&
+      guitarFacts.aDot === 'D' &&
+      guitarFacts.bNote === 'Eb' &&
+      guitarFacts.bRole === 'off' &&
+      guitarFacts.ratio >= 0.5 &&
+      guitarFacts.ratio <= 0.56 &&
+      guitarFacts.stored === 'guitar';
+    // The choice survives a reload: leave no view open so pressing 5 opens the Jam view again.
+    await clearViews();
+    await reloadPage(cdp);
+    await pressKey(cdp, '5');
+    const reloaded = await waitFor(
+      cdp,
+      `(() => { const facts = ${switchFacts}; return document.getElementById('workspace').dataset.view === 'jam' && facts.guitarPressed === 'true' ? facts : null; })()`,
+      8000,
+    );
+    const reloadOk = reloaded !== null && reloaded.guitarHidden === false && reloaded.pianoHidden === true && reloaded.stored === 'guitar';
+    // The switch is inside the body, which shows once the reading is ready: wait for it before clicking.
+    await waitFor(cdp, `document.getElementById('jam-body').hidden ? null : true`, 12000);
+    await clickElement(cdp, '#jam-instrument-piano');
+    const backFacts = await waitFor(cdp, `(() => { const facts = ${switchFacts}; return facts.pianoPressed === 'true' ? facts : null; })()`, 4000);
+    const backOk = backFacts !== null && backFacts.guitarHidden === true && backFacts.pianoHidden === false && backFacts.stored === 'piano';
+    report(
+      'the guitar shows the same marks and the Piano / Guitar choice survives a reload',
+      !/runtime error/i.test(guitarReply) && guitarOk && reloadOk && backOk,
+      JSON.stringify({ before, guitarFacts, reloaded, backFacts }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam guitar reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: chord tones ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const chordFacts = `(() => ({
+        checked: document.getElementById('jam-chord-tones').checked,
+        lineHidden: document.getElementById('jam-chord').hidden,
+        line: document.getElementById('jam-chord').textContent,
+        marked: document.querySelectorAll('#jam-view [data-chord="true"]').length,
+        keys: [...document.querySelectorAll('#jam-piano .jam-key[data-chord="true"]')].map((el) => el.dataset.note),
+        chips: [...document.querySelectorAll('#jam-degrees .jam-degree[data-chord="true"]')].map((el) => el.dataset.note),
+        legendHidden: document.getElementById('jam-legend-chord').hidden,
+        legend: document.getElementById('jam-legend-chord').textContent,
+        legendCount: document.querySelectorAll('#jam-legend .jam-legend-entry:not([hidden])').length,
+        stored: localStorage.getItem('moontide.jamChordTones'),
+      }))()`;
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const chordReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam chord tones' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
+    const offFacts = await evaluateExpr(cdp, chordFacts);
+    const offOk =
+      offFacts.checked === false &&
+      offFacts.lineHidden === true &&
+      offFacts.marked === 0 &&
+      offFacts.legendHidden === true &&
+      offFacts.legendCount === 4 &&
+      offFacts.stored === null;
+    await clickElement(cdp, '#jam-chord-tones');
+    const onFacts = await waitFor(
+      cdp,
+      `(() => { const facts = ${chordFacts}; return facts.line === 'Chord now: Dm7 · D F A C' ? facts : null; })()`,
+      12000,
+    );
+    const sameNotes = (list, wanted) => list.length === wanted.length && [...list].sort().join() === [...wanted].sort().join();
+    const onOk =
+      onFacts !== null &&
+      onFacts.checked === true &&
+      onFacts.lineHidden === false &&
+      onFacts.marked >= 8 + 4 &&
+      sameNotes(onFacts.keys, ['D', 'F', 'A', 'C', 'D', 'F', 'A', 'C']) &&
+      sameNotes(onFacts.chips, ['D', 'F', 'A', 'C']) &&
+      onFacts.legendHidden === false &&
+      onFacts.legend === 'Chord tone' &&
+      onFacts.legendCount === 5 &&
+      onFacts.stored === 'on';
+    // Remembered: leave no view open so pressing 5 opens the Jam view again after the reload.
+    await clearViews();
+    await reloadPage(cdp);
+    await pressKey(cdp, '5');
+    const reloaded = await waitFor(
+      cdp,
+      `(() => { const facts = ${chordFacts}; return document.getElementById('workspace').dataset.view === 'jam' && facts.checked ? facts : null; })()`,
+      8000,
+    );
+    const reloadOk = reloaded !== null && reloaded.stored === 'on';
+    await waitFor(cdp, `document.getElementById('jam-body').hidden ? null : true`, 12000);
+    await clickElement(cdp, '#jam-chord-tones');
+    const backFacts = await waitFor(
+      cdp,
+      `(() => { const facts = ${chordFacts}; return facts.checked === false && facts.lineHidden ? facts : null; })()`,
+      4000,
+    );
+    const backOk = backFacts !== null && backFacts.marked === 0 && backFacts.legendHidden === true && backFacts.stored === 'off';
+    report(
+      'Chord tones is off by default, marks the chord sounding now and survives a reload',
+      !/runtime error/i.test(chordReply) && offOk && onOk && reloadOk && backOk,
+      JSON.stringify({ offFacts, onFacts, reloaded, backFacts }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam chord tones reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: warning contexts ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const requestsOf = (reply) =>
+      reply
+        .split('\n')
+        .filter((line) => line.startsWith(REQUEST_PREFIX))
+        .map((line) => {
+          try {
+            return JSON.parse(line.slice(REQUEST_PREFIX.length));
+          } catch {
+            return null;
+          }
+        });
+    // A live listener would take the request before the next tool reply can carry it: stop them all.
+    for (const child of spawnedListeners) {
+      if (child.exitCode === null && child.signalCode === null) {
+        const exited = new Promise((resolve) => child.once('exit', resolve));
+        child.kill();
+        await exited;
+      }
+    }
+    // The rate limit counts a rolling second across pages.
+    await sleep(1200);
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const askReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam warning contexts' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    // The rows of an earlier block may still be in the DOM while the view reads again: wait for the ready state.
+    const rowSeen = await waitFor(
+      cdp,
+      `document.getElementById('jam-view').dataset.state === 'ready' && document.querySelector('#jam-view .jam-row[data-warning]') ? true : null`,
+      12000,
+    );
+    const onRow = rowSeen === true ? await askAt(cdp, '#jam-view .jam-row[data-warning]') : null;
+    const rowChip = onRow === null ? null : /^Warning · A7\/D brings C#, avoid C, in (\d+) s$/.exec(onRow.chip);
+    await closeAsk();
+    const statusSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
+    const onStatus = statusSeen === true ? await askAt(cdp, '#jam-status[data-warning]') : null;
+    await cdp('Input.insertText', { text: 'jam warning check' });
+    await pressKey(cdp, 'Enter');
+    const sentReply = await callTool(client, 'get_code', {});
+    const sent = requestsOf(sentReply).find((entry) => entry !== null && entry.text === 'jam warning check');
+    await closeAsk();
+    report(
+      'a right-click on a warning asks Claude with the warning context',
+      !/runtime error/i.test(askReply) &&
+        onRow !== null &&
+        onRow.prevented === true &&
+        onRow.open === true &&
+        rowChip !== null &&
+        onStatus !== null &&
+        onStatus.prevented === true &&
+        onStatus.open === true &&
+        onStatus.chip === 'Warning · A7/D brings C#, avoid C, now' &&
+        sent !== undefined &&
+        JSON.stringify(sent.context) ===
+          JSON.stringify({ kind: 'warning', chord: 'A7/D', outside: 'C#', avoid: 'C', seconds: 0, scale: 'D Dorian' }) &&
+        sent.chip === 'Warning · A7/D brings C#, avoid C, now',
+      JSON.stringify({ onRow, onStatus, sent }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam warning contexts reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: note contexts ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    // Right-clicks `selector`, closes the box and says whether the page took the event and the chip read `wanted`
+    // (a string, or a function of the chip text).
+    const chipAt = async (selector, wanted) => {
+      const result = await askAt(cdp, selector);
+      await closeAsk();
+      const chipOk = typeof wanted === 'function' ? wanted(result.chip) : result.chip === wanted;
+      return { selector, chip: result.chip, ok: result.prevented === true && result.open === true && chipOk };
+    };
+    // A right-click in the warning state: waits for the status to warn, asks at once, and tries once more
+    // when the warning ended in between.
+    const chipInWarning = async (selector, wanted) => {
+      let last = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
+        last = await chipAt(selector, wanted);
+        if (last.ok) return last;
+      }
+      return last;
+    };
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    const noteReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam note contexts' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(
+      cdp,
+      `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-status').dataset.state === 'safe' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
+      12000,
+    );
+    await clickElement(cdp, '#jam-instrument-piano');
+    const checks04 = [];
+    checks04.push(await chipAt('#jam-piano .jam-key[data-note="D"]', 'Note D · root of D Dorian'));
+    checks04.push(await chipAt('#jam-piano .jam-key[data-note="B"]', 'Note B · in D Dorian'));
+    checks04.push(await chipAt('#jam-piano .jam-key[data-note="Eb"]', 'Note Eb · not in D Dorian'));
+    checks04.push(await chipAt('#jam-degrees .jam-degree[data-note="A"]', 'Note A · in D Dorian'));
+    // The rest of the Jam view is the whole session.
+    checks04.push(await chipAt('#jam-status', 'Whole session'));
+    checks04.push(await chipAt('#jam-scale-name', 'Whole session'));
+    checks04.push(await chipAt('#jam-legend', 'Whole session'));
+    // In the warning state the note to avoid and the outside note say so.
+    checks04.push(await chipInWarning('#jam-piano .jam-key[data-note="C"]', 'Note C · to avoid in D Dorian'));
+    checks04.push(await chipInWarning('#jam-piano .jam-key[data-note="C#"]', 'Note C# · outside D Dorian'));
+    // The fretboard: an empty cell and a root cell.
+    await clickElement(cdp, '#jam-instrument-guitar');
+    await waitFor(cdp, `document.getElementById('jam-guitar').hidden ? null : true`, 2000);
+    checks04.push(await chipAt('#jam-guitar .jam-string[data-string="1"] .jam-fret[data-fret="4"]', 'Note Eb · not in D Dorian'));
+    checks04.push(await chipAt('#jam-guitar .jam-string[data-string="4"] .jam-fret[data-fret="5"]', 'Note D · root of D Dorian'));
+    await clickElement(cdp, '#jam-instrument-piano');
+    await waitFor(cdp, `document.getElementById('jam-piano').hidden ? null : true`, 2000);
+    // Several scales with different notes and nothing declared: no scale is in use, so the bare note.
+    await callTool(client, 'set_code', { code: JAM_DIFFERENT_NOTES, label: 'probe jam note contexts different notes' });
+    await waitFor(cdp, `document.getElementById('jam-scale-name').dataset.kind === 'ambiguous' ? true : null`, 8000);
+    checks04.push(await chipAt('#jam-piano .jam-key[data-note="D"]', 'Note D'));
+    // Several scales with the same notes: the scale in use is the proposed one, and a note's context names it.
+    await callTool(client, 'set_code', { code: JAM_FOUR_PADS, label: 'probe jam note contexts proposed' });
+    await waitFor(cdp, `document.getElementById('jam-scale-name').textContent === 'C major' ? true : null`, 8000);
+    checks04.push(await chipAt('#jam-piano .jam-key[data-note="D"]', 'Note D · in C major'));
+    report(
+      'a right-click on a key, a fretboard cell or a degree chip gives the note, its role and the scale',
+      !/runtime error/i.test(noteReply) && checks04.every((entry) => entry.ok),
+      JSON.stringify(checks04.map((entry) => `${entry.ok ? 'ok' : 'FAIL'} ${entry.chip}`)),
+    );
+
+    // A part row gives its part.
+    const JAM_PARTS_PROGRAM = [
+      'setcps(1)',
+      'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+      'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
+      'bass: note("<d2!4 e2!4>").gain(0)',
+      'lead: arrange([4, calm], [4, bright])',
+    ].join('\n');
+    await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam note contexts parts' });
+    const partRow = await waitFor(
+      cdp,
+      `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-sub').textContent.startsWith('Part "') && document.querySelector('#jam-view .jam-row[data-part]') ? true : null`,
+      12000,
+    );
+    const onPart = partRow === true ? await chipAt('#jam-view .jam-row[data-part]', (chip) => chip.startsWith('Part "')) : null;
+    report(
+      'a part row gives its part and the rest of the Jam view the whole session',
+      onPart !== null && onPart.ok && checks04.slice(4, 7).every((entry) => entry.ok),
+      JSON.stringify({ onPart, whole: checks04.slice(4, 7) }),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam note contexts reset tempo' });
+    await clearViews();
+  }
+
+  // --- Jam: layouts and motion ---
+  {
+    const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+    const closeAsk = async () => {
+      if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+      await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+    };
+    const blurActive = () =>
+      evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    const clearViews = async () => {
+      await closeAsk();
+      await blurActive();
+      if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+      await blurActive();
+    };
+    const JAM_WARNING_PROGRAM = [
+      'setcps(1)',
+      'bass: note("d2").gain(0)',
+      'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+      'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+    ].join('\n');
+    // The Jam view's boxes at this moment, with the view scrolled to the top.
+    const jamGeometry = `(() => {
+        const box = (id) => {
+          const b = document.getElementById(id).getBoundingClientRect();
+          return { left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width };
+        };
+        const view = document.getElementById('jam-view');
+        view.scrollTop = 0;
+        const clipped = (selector) =>
+          [...document.querySelectorAll(selector)]
+            .filter((el) => el.textContent !== '' && el.clientWidth > 0)
+            .filter((el) => el.scrollWidth > el.clientWidth)
+            .map((el) => el.textContent);
+        return {
+          scrollWidth: view.scrollWidth,
+          clientWidth: view.clientWidth,
+          view: box('jam-view'),
+          board: box('jam-board'),
+          instrument: box('jam-instrument'),
+          piano: box('jam-piano'),
+          guitar: box('jam-guitar'),
+          root: parseFloat(getComputedStyle(document.documentElement).fontSize),
+          clippedKeys: clipped('#jam-piano .jam-key-label'),
+          clippedDots: clipped('#jam-guitar .jam-dot'),
+          rowBottoms: [...document.querySelectorAll('#jam-rows .jam-row')].map((row) => row.getBoundingClientRect().bottom),
+          statusState: document.getElementById('jam-status').dataset.state ?? null,
+        };
+      })()`;
+    // One reading of the Coming up rows against the strip's bottom.
+    const rowsFit = [];
+    const noteRowsFit = (at, g) => {
+      const overflow = g.rowBottoms.length === 0 ? null : Math.max(...g.rowBottoms) - g.view.bottom;
+      rowsFit.push({ at, state: g.statusState, rows: g.rowBottoms.length, overflow: overflow === null ? null : fmt(overflow), ok: g.rowBottoms.length === 3 && overflow <= 1 });
+    };
+    const pick = async (instrument) => {
+      await clickElement(cdp, `#jam-instrument-${instrument}`);
+      await waitFor(cdp, `document.getElementById('jam-${instrument}').hidden ? null : true`, 2000);
+      await blurActive();
+    };
+    const layoutReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam layouts' });
+    await clearViews();
+    await pressKey(cdp, 'a');
+    await pressKey(cdp, '5');
+    await waitFor(
+      cdp,
+      `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
+      12000,
+    );
+    const fits = [];
+    const tight = {};
+    const fmt = (value) => Math.round(value * 10) / 10;
+    try {
+      for (const [width, height] of [[1920, 1080], [1366, 768], [3840, 2160]]) {
+        await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+        for (const layoutKey of ['a', 'b', 'c']) {
+          await pressKey(cdp, layoutKey);
+          for (const instrument of ['piano', 'guitar']) {
+            await pick(instrument);
+            const g = await evaluateExpr(cdp, jamGeometry);
+            const inside =
+              g.board.left >= g.view.left - 1 && g.board.right <= g.view.right + 1;
+            const noSideScroll = g.scrollWidth <= g.clientWidth + 1;
+            const labelsOk = g.clippedKeys.length === 0 && g.clippedDots.length === 0;
+            fits.push({ ok: inside && noSideScroll && labelsOk, at: `${layoutKey} ${width}x${height} ${instrument}`, scrollWidth: g.scrollWidth, clientWidth: g.clientWidth, inside, clipped: g.clippedKeys.concat(g.clippedDots) });
+            // Layout a at 1366 x 768: the instrument column is fully visible without scrolling.
+            if (layoutKey === 'a' && width === 1366) {
+              tight[`a-${instrument}`] = { instrumentBottom: fmt(g.instrument.bottom), viewBottom: fmt(g.view.bottom), ok: g.instrument.bottom <= g.view.bottom + 1 };
+              noteRowsFit(instrument, g);
+            }
+          }
+          // Layout a at 1366 x 768: the rows are inside the strip both while the box warns and while it says all safe.
+          if (layoutKey === 'a' && width === 1366) {
+            for (const state of ['warning', 'safe']) {
+              await waitFor(cdp, `document.getElementById('jam-status').dataset.state === '${state}' ? true : null`, 9000);
+              noteRowsFit(`wait ${state}`, await evaluateExpr(cdp, jamGeometry));
+            }
+          }
+        }
+      }
+      // Layout b at 1280 x 720: the piano is at least 28rem wide and the fretboard at least 30rem.
+      await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
+      await pressKey(cdp, 'b');
+      await pick('piano');
+      const pianoB = await evaluateExpr(cdp, jamGeometry);
+      await pick('guitar');
+      const guitarB = await evaluateExpr(cdp, jamGeometry);
+      tight.b = {
+        pianoRem: fmt(pianoB.piano.width / pianoB.root),
+        guitarRem: fmt(guitarB.guitar.width / guitarB.root),
+        ok: pianoB.piano.width >= 28 * pianoB.root - 0.5 && guitarB.guitar.width >= 30 * guitarB.root - 0.5,
+      };
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    // Leave layout a and the piano chosen.
+    await pressKey(cdp, 'a');
+    await pick('piano');
+    // Nothing inside the Jam view has a transition or an animation.
+    const moving = await evaluateExpr(
+      cdp,
+      `[...document.querySelectorAll('#jam-view, #jam-view *')]
+          .map((el) => {
+            const style = getComputedStyle(el);
+            return { el: el.id || el.className || el.tagName, duration: style.transitionDuration, animation: style.animationName };
+          })
+          .filter((entry) => entry.duration.split(',').some((part) => part.trim() !== '0s') || entry.animation !== 'none')`,
+    );
+    report(
+      'the Jam view fits every layout and window, and nothing in it animates',
+      !/runtime error/i.test(layoutReply) &&
+        fits.length === 18 &&
+        fits.every((entry) => entry.ok) &&
+        tight['a-piano'].ok &&
+        tight['a-guitar'].ok &&
+        tight.b.ok &&
+        moving.length === 0,
+      JSON.stringify({ failing: fits.filter((entry) => !entry.ok), tight, moving: moving.slice(0, 5) }),
+    );
+
+    report(
+      'in layout a at 1366x768 every Coming up row is inside the strip, warning or all safe',
+      rowsFit.length === 4 &&
+        rowsFit.every((entry) => entry.ok) &&
+        rowsFit.some((entry) => entry.state === 'warning') &&
+        rowsFit.some((entry) => entry.state === 'safe'),
+      JSON.stringify(rowsFit),
+    );
+
+    // Leave the default tempo behind so nothing after this block depends on a changed one.
+    await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam layouts reset tempo' });
+    await clearViews();
+  }
+
+  await jamProposalCheck(context);
+  await jamCannotChooseCheck(context);
+  await jamPickCheck(context);
+  await jamPianoRolesCheck(context);
+  await jamPianoColourCheck(context);
+}
+
+/** The four-pad loop of A minor, F, C and G triads: the notes fit several scales, one per cycle. */
+const JAM_FOUR_PADS = 'pads: note("<[a3,c4,e4] [f3,a3,c4] [c4,e4,g4] [g3,b3,d4]>").gain(0)';
+/** The clear program of the first Jam block: D Dorian, read from a bass and a lead. */
+const JAM_DORIAN_CODE = ['bass: note("d2").gain(0)', 'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)'].join('\n');
+
+/** Leaves the page with no view open and no focus in a field, so the next key press is a view key. */
+async function jamClearViews(cdp) {
+  const askOpen = await evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+  if (askOpen) await pressKey(cdp, 'Escape');
+  await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+  const blur = () => evaluateExpr(cdp, '(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()');
+  await blur();
+  if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+  await blur();
+}
+
+/** Opens the Jam view in layout a with the piano showing, from a page with no view open. */
+async function jamOpenWithPiano(cdp) {
+  await jamClearViews(cdp);
+  await pressKey(cdp, 'a');
+  await pressKey(cdp, '5');
+  if ((await waitFor(cdp, "document.getElementById('jam-instrument-piano') ? true : null", 3000)) !== true) {
+    throw new Error('the Jam view did not open');
+  }
+  if ((await evaluateExpr(cdp, "document.getElementById('jam-instrument-piano').getAttribute('aria-pressed')")) !== 'true') {
+    await clickElement(cdp, '#jam-instrument-piano');
+  }
+}
+
+/** What the Jam shows of its scale and its 24 piano keys, in key order: the role, the computed fill and the border style. */
+const JAM_PIANO_READ = `(() => {
+  const name = document.getElementById('jam-scale-name');
+  return {
+    state: document.getElementById('jam-view').dataset.state,
+    kind: name.dataset.kind,
+    name: name.textContent,
+    keys: [...document.querySelectorAll('#jam-piano .jam-key')].map((key) => {
+      const style = getComputedStyle(key);
+      return {
+        note: key.dataset.note,
+        black: key.dataset.black,
+        role: key.dataset.role,
+        fill: style.backgroundColor,
+        border: style.borderTopStyle,
+        label: key.querySelector('.jam-key-label').textContent,
+      };
+    }),
+  };
+})()`;
+
+/** Plays `code` silently, waits until the Jam view is ready and the scale name satisfies `until` (a page expression on
+ * `name`, the #jam-scale-name element), and returns JAM_PIANO_READ. */
+async function jamReadPiano(cdp, client, code, label, until) {
+  const reply = await callTool(client, 'set_code', { code, label });
+  if (/runtime error/i.test(reply)) throw new Error(`the Jam probe code did not run: ${reply}`);
+  const ready = await waitFor(
+    cdp,
+    `(() => { const name = document.getElementById('jam-scale-name'); return document.getElementById('jam-view').dataset.state === 'ready' && (${until}) ? true : null; })()`,
+    8000,
+  );
+  if (ready !== true) throw new Error(`the Jam view did not reach the expected reading for ${label}`);
+  return evaluateExpr(cdp, JAM_PIANO_READ);
+}
+
+/** One picture of the page at 1920 by 1080 in layout a, named after the state, when MOONTIDE_PROBE_SHOTS names a folder. */
+async function jamShot(cdp, state, prefix) {
+  const folder = shotsFolder();
+  if (folder === null) return null;
+  try {
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
+    await waitFor(cdp, 'window.innerWidth === 1920 && window.innerHeight === 1080 ? true : null', 3000);
+    return await saveShot(cdp, folder, state, 1920, 1080, 'a', prefix);
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await waitFor(cdp, 'window.innerWidth !== 1920 || window.innerHeight !== 1080 ? true : null', 3000);
+  }
+}
+
+/** The roles of 24 piano keys as one string per key, 'note:role', for a report. */
+const rolesOf = (keys) => keys.map((key) => `${key.note}:${key.role}`);
+
+/** The piano against what the Jam view reads. A reading that cannot choose a scale (different notes, nothing declared) leaves
+ * all 24 keys off; a proposed scale colours them like a heard one (the four-pad loop: C root, the six other notes of C major
+ * on the scale role, the five others off); a clear one colours its scale and its root. The roles and fills of each case go
+ * in one `probe:page JAM-PIANO ` line. Leaves setcps(0.5) playing and no view open. */
+async function jamPianoColourCheck(context) {
+  const { cdp, client, report } = context;
+  await jamOpenWithPiano(cdp);
+  const ambiguous = await jamReadPiano(cdp, client, `setcps(0.5)\n${JAM_DIFFERENT_NOTES}`, 'probe jam piano cannot choose', `name.dataset.kind === 'ambiguous'`);
+  const ambiguousShot = await jamShot(cdp, 'ambiguous', 'jam-diagnosis');
+  const proposed = await jamReadPiano(cdp, client, `setcps(0.5)\n${JAM_FOUR_PADS}`, 'probe jam piano proposed', `name.textContent === 'C major'`);
+  const proposedShot = await jamShot(cdp, 'proposed', 'jam-diagnosis');
+  const clear = await jamReadPiano(cdp, client, `setcps(0.5)\n${JAM_DORIAN_CODE}`, 'probe jam piano clear', `name.textContent === 'D Dorian'`);
+  const clearShot = await jamShot(cdp, 'clear', 'jam-diagnosis');
+  console.log(`probe:page JAM-PIANO ${JSON.stringify({ ambiguous, proposed, clear, pictures: [ambiguousShot, proposedShot, clearShot] })}`);
+  const rolesAre = (read, expected) => read.keys.length === 24 && read.keys.every((key) => key.role === (expected[key.note] ?? 'off'));
+  const expectedProposed = { C: 'root', D: 'scale', E: 'scale', F: 'scale', G: 'scale', A: 'scale', B: 'scale' };
+  const expectedClear = { D: 'root', E: 'scale', F: 'scale', G: 'scale', A: 'scale', B: 'scale', C: 'scale' };
+  // A scale key must look different from an off key and the root from a scale key, or the role is invisible.
+  const fillOf = (read, role, black) => read.keys.find((key) => key.role === role && key.black === black)?.fill;
+  const fillsDiffer = {
+    scaleFromOff: fillOf(clear, 'scale', 'false') !== undefined && fillOf(clear, 'scale', 'false') !== fillOf(ambiguous, 'off', 'false'),
+    rootFromScale: fillOf(clear, 'root', 'false') !== undefined && fillOf(clear, 'root', 'false') !== fillOf(clear, 'scale', 'false'),
+    proposedLikeClear: fillOf(proposed, 'scale', 'false') === fillOf(clear, 'scale', 'false') && fillOf(proposed, 'root', 'false') === fillOf(clear, 'root', 'false'),
+  };
+  report(
+    'jam piano: a proposed scale colours the keys, a reading that cannot choose leaves them off, a clear one colours them',
+    ambiguous.kind === 'ambiguous' &&
+      ambiguous.keys.every((key) => key.role === 'off') &&
+      ambiguous.keys.length === 24 &&
+      proposed.kind === 'clear' &&
+      rolesAre(proposed, expectedProposed) &&
+      clear.kind === 'clear' &&
+      rolesAre(clear, expectedClear) &&
+      fillsDiffer.scaleFromOff &&
+      fillsDiffer.rootFromScale &&
+      fillsDiffer.proposedLikeClear,
+    JSON.stringify({ ambiguous: rolesOf(ambiguous.keys), proposed: rolesOf(proposed.keys), clear: rolesOf(clear.keys), fillsDiffer }),
+  );
+  await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam piano reset tempo' });
+  await jamClearViews(cdp);
+}
+
+/** Notes that fit A minor and A Dorian, which have different notes: a drone and a line that leaves out the F. */
+const JAM_DIFFERENT_NOTES = ['bass: note("a2").gain(0)', 'lead: note("a3 b3 c4 d4 e4 g4").gain(0)'].join('\n');
+
+/** What the Jam view shows of the scale in use and why: the heading, its source, the reason line with the weights of its
+ * two parts, which blocks show, and the role of each of the 24 piano keys. */
+const JAM_PROPOSAL_FACTS = `(() => {
+  const name = document.getElementById('jam-scale-name');
+  const reason = document.getElementById('jam-reason');
+  const shown = (id) => { const el = document.getElementById(id); return !el.hidden && getComputedStyle(el).display !== 'none'; };
+  return {
+    state: document.getElementById('jam-view').dataset.state,
+    kind: name.dataset.kind,
+    name: name.textContent,
+    source: document.getElementById('jam-scale').dataset.source,
+    sub: document.getElementById('jam-scale-sub').textContent,
+    reasonShown: shown('jam-reason'),
+    reasonText: reason.textContent,
+    leadWeight: getComputedStyle(document.getElementById('jam-reason-lead')).fontWeight,
+    restWeight: getComputedStyle(document.getElementById('jam-reason-rest')).fontWeight,
+    degreesShown: shown('jam-degrees'),
+    statusShown: shown('jam-status'),
+    labelShown: shown('jam-scale-label'),
+    keys: [...document.querySelectorAll('#jam-piano .jam-key')].map((key) => ({ note: key.dataset.note, black: key.dataset.black, role: key.dataset.role })),
+  };
+})()`;
+
+/** Plays `code` silently and returns JAM_PROPOSAL_FACTS once the Jam view is ready and `until` (a page expression on the
+ * facts `f`) holds, or null when it never does. */
+async function jamProposalFacts(cdp, client, code, label, until) {
+  const reply = await callTool(client, 'set_code', { code, label });
+  if (/runtime error/i.test(reply)) throw new Error(`the Jam probe code did not run: ${reply}`);
+  return waitFor(cdp, `(() => { const f = ${JAM_PROPOSAL_FACTS}; return f.state === 'ready' && (${until}) ? f : null; })()`, 8000);
+}
+
+/** The Jam view when several scales fit the notes: it uses one and says why, a declared scale among them is the one it uses,
+ * and notes with different notes and nothing declared say why none is used. Leaves setcps(0.5) playing and no view open. */
+async function jamProposalCheck(context) {
+  const { cdp, client, report } = context;
+  await jamOpenWithPiano(cdp);
+
+  // (a) the four pads fit four scales that share their notes: C major is the note heard most.
+  const heard = await jamProposalFacts(cdp, client, `setcps(0.5)\n${JAM_FOUR_PADS}`, 'probe jam proposal heard', `f.name === 'C major' && f.reasonShown`);
+  const whites = heard === null ? [] : heard.keys.filter((key) => key.black === 'false');
+  report(
+    'jam proposal: notes that fit several scales with the same notes use C major and say it is proposed because C is the note heard most',
+    heard !== null &&
+      heard.kind === 'clear' &&
+      heard.source === 'proposed' &&
+      heard.reasonText === 'Proposed: C major, C is the note heard most.' &&
+      heard.leadWeight === '600' &&
+      heard.restWeight === '400' &&
+      heard.degreesShown === true &&
+      heard.statusShown === true &&
+      heard.labelShown === false &&
+      whites.length === 14 &&
+      whites.every((key) => key.role !== 'off') &&
+      heard.keys[0].role === 'root',
+    JSON.stringify(heard),
+  );
+
+  // (b) a declared scale among them wins over the evidence.
+  const byCode = await jamProposalFacts(cdp, client, `setcps(0.5)\nconst harmony = 'A:minor'\n${JAM_FOUR_PADS}`, 'probe jam proposal declared', `f.name === 'A minor' && f.reasonShown`);
+  report(
+    'jam proposal: a declared scale among the candidates is the one proposed, declared by the code',
+    byCode !== null && byCode.kind === 'clear' && byCode.source === 'proposed' && byCode.reasonText === 'Proposed: A minor, declared by the code.' && byCode.labelShown === false,
+    JSON.stringify(byCode),
+  );
+
+  // (c) different notes with the declared scale among them: that scale is used and its warnings are on.
+  const different = await jamProposalFacts(
+    cdp,
+    client,
+    `setcps(0.5)\nconst harmony = 'A:dorian'\n${JAM_DIFFERENT_NOTES}`,
+    'probe jam proposal different notes declared',
+    `f.name === 'A Dorian' && f.reasonShown`,
+  );
+  const fSharp = different === null ? [] : different.keys.filter((key) => key.note === 'F#');
+  report(
+    'jam proposal: scales with different notes use the declared one, with its warnings on and its notes on the piano',
+    different !== null &&
+      different.kind === 'clear' &&
+      different.reasonText === 'Proposed: A Dorian, declared by the code.' &&
+      different.statusShown === true &&
+      fSharp.length === 2 &&
+      fSharp.every((key) => key.role === 'scale'),
+    JSON.stringify(different),
+  );
+
+  // (d) the same notes with nothing declared: no scale is used, and the heading says why.
+  const stuck = await jamProposalFacts(cdp, client, `setcps(0.5)\n${JAM_DIFFERENT_NOTES}`, 'probe jam proposal different notes', `f.kind === 'ambiguous'`);
+  report(
+    'jam proposal: scales with different notes and nothing declared say why, with no reason line, no status and an uncoloured piano',
+    stuck !== null &&
+      stuck.name === 'Several scales fit, with different notes, and nothing is declared.' &&
+      stuck.sub === 'Warnings are off until a scale is declared or the notes settle on one.' &&
+      stuck.reasonShown === false &&
+      stuck.statusShown === false &&
+      stuck.degreesShown === false &&
+      stuck.keys.length === 24 &&
+      stuck.keys.every((key) => key.role === 'off'),
+    JSON.stringify(stuck),
+  );
+
+  await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam proposal reset tempo' });
+  await jamClearViews(cdp);
+}
+
+/** What the Jam view shows of the scales that fit, as page-side source of a function: the heading and its source, the reason
+ * line, the section words of the Declared line, the list of the scales that fit (its mode, caption, items and the count of the
+ * rest, each item's tag, pressed state and whether a key press can reach it), which blocks show, and the role of the piano's
+ * F keys (A minor holds the F, A Dorian does not). */
+const JAM_CANDIDATE_FACTS = `() => {
+  const el = (id) => document.getElementById(id);
+  const shown = (id) => { const node = el(id); return !node.hidden && getComputedStyle(node).display !== 'none'; };
+  const list = el('jam-candidate-list');
+  const items = [...list.children];
+  return {
+    state: el('jam-view').dataset.state,
+    kind: el('jam-scale-name').dataset.kind,
+    name: el('jam-scale-name').textContent,
+    source: el('jam-scale').dataset.source,
+    reason: shown('jam-reason') ? el('jam-reason').textContent : '',
+    section: el('jam-declared-section').hidden ? '' : el('jam-declared-section').textContent,
+    candidatesShown: shown('jam-candidates'),
+    mode: el('jam-candidates').dataset.mode,
+    caption: el('jam-candidates-label').textContent,
+    listRole: list.getAttribute('role'),
+    more: shown('jam-candidates-more') ? el('jam-candidates-more').textContent : null,
+    items: items.map((item) => ({
+      name: item.textContent,
+      tag: item.tagName,
+      pressed: item.getAttribute('aria-pressed'),
+      cursor: getComputedStyle(item).cursor,
+      reachable: item.tabIndex >= 0,
+    })),
+    focusables: el('jam-candidates').querySelectorAll('button, [tabindex]').length,
+    degreesShown: shown('jam-degrees'),
+    statusShown: shown('jam-status'),
+    fKeyRoles: [...document.querySelectorAll('#jam-piano .jam-key')].filter((key) => key.dataset.note === 'F').map((key) => key.dataset.role),
+    roles: [...document.querySelectorAll('#jam-piano .jam-key')].map((key) => key.dataset.role),
+  };
+}`;
+
+/** Plays `code` silently and returns JAM_CANDIDATE_FACTS once the Jam view is ready and `until` (a page expression on the facts
+ * `f`) holds, or null when it never does within `timeoutMs`. */
+async function jamCandidateFacts(cdp, client, code, label, until, timeoutMs = 8000) {
+  const reply = await callTool(client, 'set_code', { code, label });
+  if (/runtime error/i.test(reply)) throw new Error(`the Jam probe code did not run: ${reply}`);
+  return jamWaitCandidateFacts(cdp, until, timeoutMs);
+}
+
+/** JAM_CANDIDATE_FACTS once the Jam view is ready and `until` holds, or null. */
+function jamWaitCandidateFacts(cdp, until, timeoutMs = 8000) {
+  return waitFor(cdp, `(() => { const f = (${JAM_CANDIDATE_FACTS})(); return f.state === 'ready' && (${until}) ? f : null; })()`, timeoutMs);
+}
+
+/** Notes that fit twelve scales (a line of six notes, no drone): more than the eight the list draws. */
+const JAM_MANY_SCALES = 'lead: note("a3 b3 c4 d4 e4 g4").gain(0)';
+
+/** When nothing can be chosen the scales that fit are only named, with no control; when many fit, eight are drawn and the rest
+ * counted, inside the info column. Leaves setcps(0.5) playing and no view open. */
+async function jamCannotChooseCheck(context) {
+  const { cdp, client, report } = context;
+  await jamOpenWithPiano(cdp);
+
+  // (a) different notes, nothing declared: the names are listed as plain text.
+  const stuck = await jamCandidateFacts(cdp, client, `setcps(0.5)\n${JAM_DIFFERENT_NOTES}`, 'probe jam cannot choose', `f.kind === 'ambiguous' && f.candidatesShown`);
+  report(
+    'jam cannot choose: the scales that fit are listed as plain text with no control, and nothing is coloured or warned',
+    stuck !== null &&
+      stuck.mode === 'list' &&
+      stuck.caption === 'Scales that fit:' &&
+      stuck.listRole === 'list' &&
+      stuck.items.length === 2 &&
+      stuck.items[0].name === 'A Dorian' &&
+      stuck.items[1].name === 'A minor' &&
+      stuck.items.every((item) => item.tag === 'SPAN' && item.pressed === null && item.cursor !== 'pointer' && item.reachable === false) &&
+      stuck.focusables === 0 &&
+      stuck.more === null &&
+      stuck.reason === '' &&
+      stuck.degreesShown === false &&
+      stuck.statusShown === false &&
+      stuck.roles.length === 24 &&
+      stuck.roles.every((role) => role === 'off'),
+    JSON.stringify(stuck),
+  );
+
+  // (b) many scales fit: eight items, the count of the rest, nothing wider than the info column at 1024 pixels.
+  const many = await jamCandidateFacts(cdp, client, `setcps(0.5)\n${JAM_MANY_SCALES}`, 'probe jam many scales', `f.candidatesShown && f.more !== null`);
+  await cdp('Emulation.setDeviceMetricsOverride', { width: 1024, height: 768, deviceScaleFactor: 1, mobile: false });
+  let fit = null;
+  try {
+    await waitFor(cdp, 'window.innerWidth === 1024 ? true : null', 3000);
+    fit = await waitFor(
+      cdp,
+      `(() => {
+        const box = document.getElementById('jam-candidates');
+        const info = document.getElementById('jam-info');
+        if (box.hidden || info.clientWidth === 0) return null;
+        return { scrollWidth: box.scrollWidth, clientWidth: box.clientWidth, right: box.getBoundingClientRect().right, infoRight: info.getBoundingClientRect().right };
+      })()`,
+      3000,
+    );
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await waitFor(cdp, 'window.innerWidth !== 1024 ? true : null', 3000);
+  }
+  const manyCount = many === null ? 0 : Number(/^and (\d+) more$/.exec(many.more ?? '')?.[1] ?? 0);
+  report(
+    'jam cannot choose: past eight scales that fit, eight are drawn and the rest counted, without growing wider than the info column',
+    many !== null &&
+      many.items.length === 8 &&
+      manyCount === 4 &&
+      many.items.filter((item) => item.pressed === 'true').length === (many.mode === 'pick' ? 1 : 0) &&
+      fit !== null &&
+      fit.scrollWidth <= fit.clientWidth &&
+      fit.right <= fit.infoRight + 0.5,
+    JSON.stringify({ items: many?.items.map((item) => item.name), mode: many?.mode, more: many?.more, fit }),
+  );
+
+  await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam cannot choose reset tempo' });
+  await jamClearViews(cdp);
+}
+
+/** A piece in two sections of four cycles that declare A minor and A dorian, over a drone and a line that fit both. */
+const JAM_PICK_SONG = [
+  'setcps(1)',
+  "const song = { shift: 0, sections: [['x', 4, 'A:minor'], ['y', 4, 'A:dorian']], plan: { x: { t1: 'd', t2: 'l' }, y: { t1: 'd', t2: 'l' } } };",
+  HELPER_TEXT,
+  'const t1 = { d: note("a2") };',
+  'const t2 = { l: note("a3 b3 c4 d4 e4 g4") };',
+  "t1: play('t1', t1).gain(0)",
+  "t2: play('t2', t2).gain(0)",
+].join('\n');
+
+const JAM_PICK_MINOR = 'Your pick: A minor. It holds while these same scales fit.';
+const JAM_PICK_DORIAN = 'Your pick: A Dorian. It holds while these same scales fit.';
+
+/** The warning program of the Jam blocks: D Dorian with an A7 over the D bass on cycles 2 and 3 of each eight, so a note to avoid
+ * (C) and an outside note (C#) show for two seconds out of eight. Silent. */
+const JAM_ROLES_PROGRAM = [
+  'setcps(1)',
+  'bass: note("d2").gain(0)',
+  'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
+  'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
+].join('\n');
+
+/** The cues of every role on a piano key, a guitar dot and a legend mark, read in one expression while the warning with the
+ * Chord tones overlay is up (null otherwise). Each cue record holds the computed fill, border, ring, text weight and
+ * decoration, and the content and size of the two pseudo-elements. A border of 0.125rem computes to a whole device pixel
+ * (1px at the 15px root of a 1080p window), so a border is asked to be at least 1px, with its style and its hue. */
+const JAM_ROLE_CUES = `(() => {
+  const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  const colorOf = (name) => {
+    const el = document.createElement('span');
+    el.style.color = 'var(' + name + ')';
+    document.body.appendChild(el);
+    const color = getComputedStyle(el).color;
+    el.remove();
+    return color;
+  };
+  const cue = (el, labelEl) => {
+    const style = getComputedStyle(el);
+    const before = getComputedStyle(el, '::before');
+    const after = getComputedStyle(el, '::after');
+    const label = getComputedStyle(labelEl);
+    return {
+      fill: style.backgroundColor,
+      borderStyle: style.borderTopStyle,
+      borderWidth: parseFloat(style.borderTopWidth),
+      borderColor: style.borderTopColor,
+      ring: style.boxShadow,
+      ringInset: style.boxShadow.includes('inset'),
+      weight: label.fontWeight,
+      decoration: label.textDecorationLine,
+      text: labelEl.textContent,
+      beforeContent: before.content,
+      beforeWidth: parseFloat(before.width),
+      afterContent: after.content,
+      afterHeight: parseFloat(after.height),
+    };
+  };
+  const keyOf = (note, role) => [...document.querySelectorAll('#jam-piano .jam-key')].find((key) => key.dataset.note === note && key.dataset.role === role);
+  const dotOf = (role, chord) => {
+    const cell = [...document.querySelectorAll('#jam-guitar .jam-fret')].find((fret) => fret.dataset.role === role && (chord === undefined || (fret.dataset.chord === 'true') === chord));
+    return cell === undefined ? null : cell.querySelector('.jam-dot');
+  };
+  const markOf = (role) => document.querySelector('#jam-legend .jam-legend-mark[data-role="' + role + '"]');
+  const pianoPick = { scale: keyOf('F', 'scale'), root: keyOf('D', 'root'), avoid: keyOf('C', 'avoid'), outside: keyOf('C#', 'outside'), chord: keyOf('C#', 'outside') };
+  const dotPick = { scale: dotOf('scale', false), root: dotOf('root'), avoid: dotOf('avoid'), outside: dotOf('outside'), chord: dotOf('outside', true) };
+  const missing = Object.entries(pianoPick).filter(([, el]) => el === undefined || el === null).map(([role]) => 'piano ' + role)
+    .concat(Object.entries(dotPick).filter(([, el]) => el === null).map(([role]) => 'guitar ' + role))
+    .concat(['scale', 'root', 'avoid', 'outside', 'chord'].filter((role) => markOf(role) === null).map((role) => 'legend ' + role));
+  if (missing.length > 0) return null;
+  const roles = {};
+  for (const role of ['scale', 'root', 'avoid', 'outside', 'chord']) {
+    const mark = markOf(role);
+    roles[role] = {
+      piano: cue(pianoPick[role], pianoPick[role].querySelector('.jam-key-label')),
+      guitar: cue(dotPick[role], dotPick[role]),
+      legend: cue(mark, mark),
+    };
+  }
+  const entries = [...document.querySelectorAll('#jam-legend .jam-legend-entry')].filter((entry) => !entry.hidden && getComputedStyle(entry).display !== 'none');
+  return {
+    root,
+    colors: { text: colorOf('--text'), muted: colorOf('--text-muted'), avoid: colorOf('--jam-avoid'), outside: colorOf('--jam-outside'), surface: colorOf('--surface-2'), dominant: colorOf('--dominant') },
+    roles,
+    legend: entries.map((entry) => entry.textContent),
+    pianoLabel: document.getElementById('jam-piano').getAttribute('aria-label'),
+    guitarLabel: document.getElementById('jam-guitar').getAttribute('aria-label'),
+    titles: {
+      root: pianoPick.root.getAttribute('title'),
+      avoid: pianoPick.avoid.getAttribute('title'),
+      outside: pianoPick.outside.getAttribute('title'),
+      scale: pianoPick.scale.getAttribute('title'),
+    },
+    offTitles: [...document.querySelectorAll('#jam-piano .jam-key')].filter((key) => key.dataset.role === 'off' && key.dataset.chord !== 'true').map((key) => key.hasAttribute('title')),
+  };
+})()`;
+
+/** Sets Chord tones on or off through its checkbox and waits for the page to follow. */
+async function jamSetChordTones(cdp, wanted) {
+  if ((await waitFor(cdp, "document.getElementById('jam-body').hidden ? null : true", 15000)) !== true) throw new Error('the Jam view never showed its body');
+  const now = await evaluateExpr(cdp, "document.getElementById('jam-chord-tones').checked");
+  if (now !== wanted) await clickElement(cdp, '#jam-chord-tones');
+  if ((await waitFor(cdp, `document.getElementById('jam-chord-tones').checked === ${wanted} ? true : null`, 3000)) !== true) {
+    throw new Error('the Chord tones checkbox did not follow the click');
+  }
+}
+
+/** Pictures of the Jam view in layout a at both sizes: sets the viewport, waits for `until` (a page expression), saves, and
+ * checks `until` still held after the capture (the warning only lasts two seconds), trying again a few times. Clears the
+ * viewport override. Returns the file names. */
+async function jamPictures(cdp, folder, state, until) {
+  const files = [];
+  try {
+    for (const [width, height] of [[1920, 1080], [3840, 2160]]) {
+      await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+      await waitFor(cdp, `window.innerWidth === ${width} && window.innerHeight === ${height} ? true : null`, 3000);
+      let file = null;
+      for (let attempt = 0; attempt < 6 && file === null; attempt += 1) {
+        if ((await waitFor(cdp, `(${until}) ? true : null`, 20000)) !== true) throw new Error(`the Jam view never showed the state ${state} for its picture`);
+        const taken = await saveShot(cdp, folder, state, width, height, 'a', 'jam');
+        if ((await evaluateExpr(cdp, `Boolean(${until})`)) === true) file = taken;
+      }
+      if (file === null) throw new Error(`the Jam view did not hold the state ${state} long enough for its picture at ${width}x${height}`);
+      files.push(file);
+    }
+  } finally {
+    await cdp('Emulation.clearDeviceMetricsOverride');
+    await waitFor(cdp, 'window.innerWidth !== 1920 && window.innerWidth !== 3840 ? true : null', 3000);
+  }
+  return files;
+}
+
+/** Every role carries the same cue on the piano key, the guitar dot and the legend mark, none of them colour alone (a fill and
+ * note text for scale, a ring and 600 text for root, a solid border, a slash and struck-through text for avoid, a dashed border
+ * for outside, a corner square for a chord tone); the piano and the guitar names say the source, the outside notes and the chord
+ * tones; every key says its role on hover. Then the pictures of the view in five states at 1920 by 1080 and 3840 by 2160 when
+ * MOONTIDE_PROBE_SHOTS names a folder. Ends with a reload (a pick of this check reaches no later check), setcps(0.5) playing and
+ * no view open. */
+async function jamPianoRolesCheck(context) {
+  const { cdp, client, report } = context;
+  const folder = shotsFolder();
+  await jamOpenWithPiano(cdp);
+
+  // (a) the cues, read while the warning is up with Chord tones on.
+  const reply = await callTool(client, 'set_code', { code: JAM_ROLES_PROGRAM, label: 'probe jam piano roles' });
+  if (/runtime error/i.test(reply)) throw new Error(`the Jam probe code did not run: ${reply}`);
+  await jamSetChordTones(cdp, true);
+  const cues = await waitFor(
+    cdp,
+    `(() => { const f = ${JAM_ROLE_CUES}; return f !== null && document.querySelector('#jam-status[data-warning]') !== null && f.pianoLabel.includes('Outside: C#.') && f.pianoLabel.includes('Chord tones: ') ? f : null; })()`,
+    30000,
+  );
+  if (cues === null) throw new Error('the Jam view never showed the warning with the chord tones for the role cues');
+  const { colors, roles } = cues;
+  const sixth = cues.root * 0.375;
+  const near = (a, b) => Math.abs(a - b) < 0.6;
+  const cueProblems = [];
+  const need = (ok, what) => {
+    if (!ok) cueProblems.push(what);
+  };
+  for (const where of ['piano', 'guitar', 'legend']) {
+    const scale = roles.scale[where];
+    need(scale.fill === colors.muted && scale.fill !== colors.surface && scale.fill !== colors.dominant, `scale fill on the ${where}`);
+    const root = roles.root[where];
+    need(root.fill === colors.text && root.ring !== 'none', `root fill and ring on the ${where}`);
+    const avoid = roles.avoid[where];
+    need(avoid.borderStyle === 'solid' && avoid.borderWidth >= 1 && avoid.borderColor === colors.avoid, `avoid solid border on the ${where}`);
+    need(avoid.afterContent !== 'none' && avoid.afterHeight >= 1.5, `avoid slash on the ${where}`);
+    const outside = roles.outside[where];
+    need(outside.borderStyle === 'dashed' && outside.borderWidth >= 1 && outside.borderColor === colors.outside, `outside dashed border on the ${where}`);
+    need(outside.afterContent === 'none', `outside has no slash on the ${where}`);
+    const chord = roles.chord[where];
+    need(chord.beforeContent !== 'none' && near(chord.beforeWidth, sixth), `chord tone corner square of 0.375rem on the ${where}`);
+  }
+  need(roles.scale.piano.text !== '' && roles.scale.guitar.text !== '', 'scale note text on the key and the dot');
+  need(roles.root.piano.weight === '600' && roles.root.guitar.weight === '600' && roles.root.piano.ringInset === true, 'root 600 text and an inset ring on the key');
+  need(roles.avoid.piano.decoration.includes('line-through') && roles.avoid.guitar.decoration.includes('line-through'), 'avoid struck-through text on the key and the dot');
+  need(roles.scale.piano.weight === '400', 'scale text stays at 400');
+  const wordsAre = JSON.stringify(cues.legend) === JSON.stringify(['Scale', 'Root', 'Avoid', 'Outside', 'Chord tone']);
+  report(
+    'jam piano roles: every role has its cue on the piano key, the guitar dot and the legend mark, and the legend shows five entries',
+    cueProblems.length === 0 && wordsAre,
+    JSON.stringify({ cueProblems, legend: cues.legend, roles }),
+  );
+  report(
+    'jam piano roles: the piano and guitar names hold the avoid, outside and chord tones sentences, and the keys carry their role as a title',
+    cues.pianoLabel.startsWith('Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#. Chord tones: ') &&
+      cues.pianoLabel.endsWith('.') &&
+      cues.guitarLabel.startsWith('Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#. Chord tones: ') &&
+      cues.titles.root === 'D, root, chord tone' &&
+      cues.titles.avoid === 'C, avoid' &&
+      cues.titles.outside === 'C#, outside, chord tone' &&
+      cues.titles.scale === 'F, scale' &&
+      cues.offTitles.length > 0 &&
+      cues.offTitles.every((has) => has === false),
+    JSON.stringify({ pianoLabel: cues.pianoLabel, guitarLabel: cues.guitarLabel, titles: cues.titles, offTitles: cues.offTitles.length }),
+  );
+
+  // (b) a proposed scale, then a pick, then notes that cannot be chosen: the source and the cannot-choose sentence in the names.
+  await jamSetChordTones(cdp, false);
+  const pianoOf = () => evaluateExpr(cdp, "document.getElementById('jam-piano').getAttribute('aria-label')");
+  const legendCount = () => evaluateExpr(cdp, "[...document.querySelectorAll('#jam-legend .jam-legend-entry')].filter((entry) => !entry.hidden && getComputedStyle(entry).display !== 'none').length");
+  const files = [];
+  const heard = await jamProposalFacts(cdp, client, `setcps(0.5)\n${JAM_DORIAN_CODE}`, 'probe jam piano roles heard', `f.name === 'D Dorian' && f.reasonShown === false`);
+  if (heard === null) throw new Error('the Jam view never showed the heard D Dorian');
+  const heardTitle = await evaluateExpr(cdp, `[...document.querySelectorAll('#jam-piano .jam-key')].find((key) => key.dataset.note === 'D' && key.dataset.role === 'root').getAttribute('title')`);
+  if (folder !== null) files.push(...(await jamPictures(cdp, folder, 'heard-clear', `document.getElementById('jam-scale-name').textContent === 'D Dorian' && document.getElementById('jam-reason').hidden`)));
+  const proposed = await jamProposalFacts(cdp, client, `setcps(0.5)\n${JAM_FOUR_PADS}`, 'probe jam piano roles proposed', `f.name === 'C major' && f.reasonShown`);
+  const proposedLabel = await waitFor(cdp, `(() => { const label = document.getElementById('jam-piano').getAttribute('aria-label'); return label.includes('Proposed scale: C major.') ? label : null; })()`, 5000);
+  if (folder !== null) files.push(...(await jamPictures(cdp, folder, 'proposed', `document.getElementById('jam-scale').dataset.source === 'proposed' && document.getElementById('jam-scale-name').textContent === 'C major'`)));
+  await jamWaitCandidateFacts(cdp, `f.items.some((item) => item.name === 'A minor' && item.pressed === 'false')`, 8000);
+  await evaluateExpr(cdp, `[...document.getElementById('jam-candidate-list').children].find((item) => item.textContent === 'A minor').click()`);
+  const chosen = await jamWaitCandidateFacts(cdp, `f.source === 'chosen' && f.name === 'A minor'`, 5000);
+  const chosenLabel = await pianoOf();
+  const chosenGuitar = await evaluateExpr(cdp, "document.getElementById('jam-guitar').getAttribute('aria-label')");
+  if (folder !== null) files.push(...(await jamPictures(cdp, folder, 'picked', `document.getElementById('jam-scale').dataset.source === 'chosen' && document.getElementById('jam-scale-name').textContent === 'A minor'`)));
+  const stuck = await jamProposalFacts(cdp, client, `setcps(0.5)\n${JAM_DIFFERENT_NOTES}`, 'probe jam piano roles cannot choose', `f.kind === 'ambiguous'`);
+  const stuckLabel = await pianoOf();
+  const stuckGuitar = await evaluateExpr(cdp, "document.getElementById('jam-guitar').getAttribute('aria-label')");
+  const stuckLegend = await legendCount();
+  if (folder !== null) files.push(...(await jamPictures(cdp, folder, 'cannot-choose', `document.getElementById('jam-scale-name').dataset.kind === 'ambiguous' && document.getElementById('jam-candidates').dataset.mode === 'list'`)));
+  report(
+    'jam piano roles: a proposed scale, a pick and notes that cannot be chosen are named in the piano and guitar names, and the legend stays',
+    heardTitle === 'D, root' &&
+      proposed !== null &&
+      proposedLabel === 'Piano, two octaves from C3. Proposed scale: C major. Scale notes: C, D, E, F, G, A, B. Root C. Avoid: none.' &&
+      chosen !== null &&
+      chosenLabel === 'Piano, two octaves from C3. Chosen scale: A minor. Scale notes: A, B, C, D, E, F, G. Root A. Avoid: none.' &&
+      chosenGuitar === 'Guitar fretboard, standard tuning, 12 frets. Chosen scale: A minor. Scale notes: A, B, C, D, E, F, G. Root A. Avoid: none.' &&
+      stuck !== null &&
+      stuckLabel === 'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.' &&
+      stuckGuitar === 'Guitar fretboard, standard tuning, 12 frets. Several scales fit with different notes, so none is coloured.' &&
+      stuckLegend === 4,
+    JSON.stringify({ heardTitle, proposedLabel, chosenLabel, chosenGuitar, stuckLabel, stuckGuitar, stuckLegend }),
+  );
+
+  // (c) the warning with the Chord tones overlay on, for its picture.
+  if (folder !== null) {
+    await callTool(client, 'set_code', { code: JAM_ROLES_PROGRAM, label: 'probe jam piano roles warning picture' });
+    await jamSetChordTones(cdp, true);
+    const until = `document.querySelector('#jam-status[data-warning]') !== null && document.getElementById('jam-piano').getAttribute('aria-label').includes('Outside: C#.') && document.querySelector('#jam-piano .jam-key[data-chord="true"]') !== null`;
+    files.push(...(await jamPictures(cdp, folder, 'warning-chord-tones', until)));
+    console.log(`probe:page JAM-PICTURES ${JSON.stringify(files)}`);
+  }
+
+  // The pick of this check must not reach a later check, and Chord tones goes back to its default.
+  await jamSetChordTones(cdp, false);
+  await jamClearViews(cdp);
+  await reloadPage(cdp);
+  await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam piano roles reset tempo' });
+  await jamClearViews(cdp);
+}
+
+/** The user's pick: one click switches the whole view in the same turn, the pick wins over the declared scale, holds across a
+ * section and across another piece with the same scales, moves with Enter and keeps focus, and a reload forgets it. Leaves
+ * setcps(0.5) playing and no view open. */
+async function jamPickCheck(context) {
+  const { cdp, client, report } = context;
+  await jamOpenWithPiano(cdp);
+
+  // (a) each section's declaration moves the proposal.
+  const inX = await jamCandidateFacts(
+    cdp,
+    client,
+    JAM_PICK_SONG,
+    'probe jam pick sections',
+    `f.reason === 'Proposed: A minor, declared by the section.' && f.section === "section 'x'"`,
+    15000,
+  );
+  const inY = await jamWaitCandidateFacts(cdp, `f.reason === 'Proposed: A Dorian, declared by the section.' && f.section === "section 'y'"`, 15000);
+  report(
+    "jam pick: a section's declared scale moves the proposal, and the candidates are listed as buttons with the proposal pressed",
+    inX !== null &&
+      inY !== null &&
+      inX.name === 'A minor' &&
+      inY.name === 'A Dorian' &&
+      inX.mode === 'pick' &&
+      inX.items.map((item) => item.name).join() === inY.items.map((item) => item.name).join() &&
+      inX.items.filter((item) => item.pressed === 'true').map((item) => item.name).join() === 'A minor' &&
+      inY.items.filter((item) => item.pressed === 'true').map((item) => item.name).join() === 'A Dorian' &&
+      inX.fKeyRoles.every((role) => role === 'scale') &&
+      inY.fKeyRoles.every((role) => role !== 'scale'),
+    JSON.stringify({ inX, inY }),
+  );
+
+  // (b) one click on the unpressed A minor button, and the whole view follows in the same turn: read in the same expression.
+  const click = `(() => {
+    const facts = ${JAM_CANDIDATE_FACTS};
+    const before = facts();
+    const button = [...document.getElementById('jam-candidate-list').children].find((item) => item.textContent === 'A minor');
+    if (button === undefined || button.getAttribute('aria-pressed') !== 'false') return { before, after: null };
+    button.click();
+    return { before, after: facts() };
+  })()`;
+  let clicked = null;
+  for (let attempt = 0; attempt < 3 && (clicked === null || clicked.after === null); attempt += 1) {
+    await jamWaitCandidateFacts(cdp, `f.reason === 'Proposed: A Dorian, declared by the section.'`, 15000);
+    clicked = await evaluateExpr(cdp, click);
+  }
+  const after = clicked?.after ?? null;
+  report(
+    'jam pick: one click switches the reason, the pressed button, the heading and the piano in the same turn, over the section\'s declaration',
+    after !== null &&
+      after.reason === JAM_PICK_MINOR &&
+      after.source === 'chosen' &&
+      after.name === 'A minor' &&
+      after.section === "section 'y'" &&
+      after.items.filter((item) => item.pressed === 'true').map((item) => item.name).join() === 'A minor' &&
+      after.items.filter((item) => item.pressed === 'false').length === 1 &&
+      after.items.map((item) => item.name).join() === clicked.before.items.map((item) => item.name).join() &&
+      after.fKeyRoles.every((role) => role === 'scale') &&
+      clicked.before.fKeyRoles.every((role) => role !== 'scale') &&
+      after.degreesShown === true,
+    JSON.stringify(clicked),
+  );
+
+  // (c) the pick holds when the section changes, and again when it changes back, whatever the section declares.
+  const heldInX = await jamWaitCandidateFacts(cdp, `f.section === "section 'x'"`, 15000);
+  const heldInY = await jamWaitCandidateFacts(cdp, `f.section === "section 'y'"`, 15000);
+  report(
+    'jam pick: the pick holds across a change of section, and wins over the declared scale of the section that declares the other one',
+    [heldInX, heldInY].every((held) => held !== null && held.reason === JAM_PICK_MINOR && held.source === 'chosen' && held.name === 'A minor') &&
+      heldInY.items.filter((item) => item.pressed === 'true').map((item) => item.name).join() === 'A minor',
+    JSON.stringify({ heldInX, heldInY }),
+  );
+
+  // (d) another piece with the same scales: the pick still holds.
+  const another = await jamCandidateFacts(
+    cdp,
+    client,
+    `setcps(0.5)\nconst harmony = 'A:dorian'\n${JAM_DIFFERENT_NOTES}`,
+    'probe jam pick another piece',
+    `f.reason === ${JSON.stringify(JAM_PICK_MINOR)} && f.section === ''`,
+    15000,
+  );
+  report(
+    'jam pick: the pick holds in another piece that fits the same scales',
+    another !== null && another.name === 'A minor' && another.source === 'chosen' && another.items.filter((item) => item.pressed === 'true').map((item) => item.name).join() === 'A minor',
+    JSON.stringify(another),
+  );
+
+  // (e) Enter on the focused A Dorian button moves the pick, and the focus stays on that same button.
+  await evaluateExpr(
+    cdp,
+    `(() => {
+      const button = [...document.getElementById('jam-candidate-list').children].find((item) => item.textContent === 'A Dorian');
+      window.__probeCandidate = button;
+      button.focus();
+    })()`,
+  );
+  await pressKey(cdp, 'Enter');
+  const moved = await jamWaitCandidateFacts(cdp, `f.reason === ${JSON.stringify(JAM_PICK_DORIAN)}`, 5000);
+  const focusKept = await evaluateExpr(
+    cdp,
+    `(() => ({
+      same: document.activeElement === window.__probeCandidate,
+      attached: window.__probeCandidate.isConnected,
+      pressed: window.__probeCandidate.getAttribute('aria-pressed'),
+      other: [...document.getElementById('jam-candidate-list').children].filter((item) => item !== window.__probeCandidate).map((item) => item.getAttribute('aria-pressed')),
+    }))()`,
+  );
+  report(
+    'jam pick: Enter on a focused candidate button picks it and the focus stays on that button',
+    moved !== null && moved.name === 'A Dorian' && moved.source === 'chosen' && focusKept.same === true && focusKept.attached === true && focusKept.pressed === 'true' && focusKept.other.every((value) => value === 'false'),
+    JSON.stringify({ moved, focusKept }),
+  );
+
+  // (f) a reload forgets every pick: the same piece is back to the declared scale.
+  await reloadPage(cdp);
+  await jamOpenWithPiano(cdp);
+  const reloaded = await jamWaitCandidateFacts(cdp, `f.reason === 'Proposed: A Dorian, declared by the code.'`, 15000);
+  report(
+    'jam pick: a reload forgets the pick',
+    reloaded !== null && reloaded.source === 'proposed' && reloaded.name === 'A Dorian' && !reloaded.reason.startsWith('Your pick'),
+    JSON.stringify(reloaded),
+  );
+
+  await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam pick reset tempo' });
+  await jamClearViews(cdp);
+}
+
+/** The checks that can run alone and several times with `--check <name> --times <n>`; each takes `{ cdp, client, report, port, pageUrl }`. */
+const PAGE_CHECKS = Object.freeze({
+  'jam-proposal': jamProposalCheck,
+  'jam-cannot-choose': jamCannotChooseCheck,
+  'jam-pick': jamPickCheck,
+  'jam-piano-roles': jamPianoRolesCheck,
+  'jam-piano-colour': jamPianoColourCheck,
+  'ask-box-moves': askBoxMovesCheck,
+  'ask-box-moves-after-resize': askBoxMovesAfterResizeCheck,
+  'mixer-light-timing': mixerLightTimingCheck,
+  'requests-row-follows-server': requestsRowFollowsServerCheck,
+  'requests-panel-keys-and-drawer': requestsPanelKeysAndDrawerCheck,
+  'requests-every-state': requestsEveryStateCheck,
+  'requests-quiet-wait': requestsQuietWaitCheck,
+  'requests-lost-and-reload': requestsLostAndReloadCheck,
+  'requests-second-tab': requestsSecondTabCheck,
+  'tempo-glide-course': glideCourseCheck,
+  'tempo-glide-cancel': glideCancelCheck,
+  'tempo-glide-refusals': glideRefusalsCheck,
+  'tempo-glide-stop-play': glideStopPlayCheck,
+  'tempo-glide-told-once': glideToldOnceCheck,
+  'tempo-ramp-readout': rampReadoutCheck,
+  'tempo-ramp-fit': rampFitCheck,
+  'tempo-ramp-views': rampViewsCheck,
+});
+export const PAGE_CHECK_NAMES = Object.freeze(Object.keys(PAGE_CHECKS));
+
+/** Runs `run` `times` times alone and prints one tally line, `${label} check ${name}: P of N runs passed`. Each report of
+ * a run is named `run i of N: <check name>`; a run passes when every report it made passed. A run that throws did not pass:
+ * it is reported as a failed check named `${name} threw` with the error message, and the loop goes on (the throw is the
+ * result of that run, not a reason to run it again). Returns `{ passed, times }`. */
+export async function repeatCheck({ name, times, run, context, label = 'probe:page' }) {
+  let passed = 0;
+  for (let i = 1; i <= times; i++) {
+    let runPassed = true;
+    const report = (checkName, pass, detail) => {
+      if (!pass) runPassed = false;
+      context.report(`run ${i} of ${times}: ${checkName}`, pass, detail);
+    };
+    try {
+      await run({ ...context, report });
+    } catch (err) {
+      runPassed = false;
+      context.report(`run ${i} of ${times}: ${name} threw`, false, err instanceof Error ? err.message : String(err));
+    }
+    if (runPassed) passed++;
+  }
+  console.log(`${label} check ${name}: ${passed} of ${times} runs passed`);
+  return { passed, times };
 }
 
 async function main() {
@@ -15719,6 +20606,16 @@ async function main() {
       process.exitCode = 0;
     }
 
+    if (args.check !== null) {
+      await repeatCheck({ name: args.check, times: args.times, run: PAGE_CHECKS[args.check], context: { cdp, client, report, port, pageUrl } });
+      summarize();
+      return;
+    }
+    if (args.only === 'jam') {
+      await jamBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
     if (args.only === 'bar') {
       await barBlocks({ cdp, client, report, port, pageUrl });
       summarize();
@@ -15756,6 +20653,16 @@ async function main() {
     }
     if (args.only === 'timeline') {
       await timelineBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
+    if (args.only === 'requests') {
+      await requestsBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
+    if (args.only === 'ramp') {
+      await rampBlocks({ cdp, client, report, port, pageUrl });
       summarize();
       return;
     }
@@ -20502,7 +25409,6 @@ async function main() {
 
     // --- Ask Claude ---
     const REQUEST_PREFIX = 'Request from the Moontide page: ';
-    const statusText = (wanted) => `(() => { const el = document.getElementById('ask-status'); return !el.hidden && el.querySelector('.ask-long').textContent === ${JSON.stringify(wanted)} ? true : null; })()`;
     const askTypeAndSend = async (text) => {
       await cdp('Input.insertText', { text });
       await pressKey(cdp, 'Enter');
@@ -20533,7 +25439,7 @@ async function main() {
           parsed = null;
         }
       }
-      const receivedShown = await waitFor(cdp, statusText('Claude received it'), 2000);
+      const receivedShown = await waitFor(cdp, requestRowReads('make the drums shorter', REQUEST_STATUS_COPY.phrases.received), 2000);
       const boxHiddenAfterSend = await evaluateExpr(cdp, "document.getElementById('ask-box').hidden");
       report(
         'a request typed in the page reaches the listener started from the arming line, as one line',
@@ -20563,7 +25469,7 @@ async function main() {
       }
       const reopened = await askAt(cdp, '#product-name');
       await askTypeAndSend('make the hats quieter');
-      const waitingShown = await waitFor(cdp, statusText('Claude will see it on its next action'), 3000);
+      const waitingShown = await waitFor(cdp, requestRowReads('make the hats quieter', REQUEST_STATUS_COPY.phrases.waiting), 3000);
       const nextReply = await callTool(client, 'get_code', {});
       const replyLines = nextReply.split('\n');
       const requestLines = replyLines.filter((line) => line.startsWith(REQUEST_PREFIX));
@@ -20574,7 +25480,7 @@ async function main() {
         waitingText = null;
       }
       const lastLine = replyLines[replyLines.length - 1] ?? '';
-      const handedOver = await waitFor(cdp, statusText('Claude received it'), 2000);
+      const handedOver = await waitFor(cdp, requestRowReads('make the hats quieter', REQUEST_STATUS_COPY.phrases.received), 2000);
       report(
         'with no listener the request waits and arrives in the next tool reply, and the arming line comes back',
         reopened.open === true &&
@@ -21369,11 +26275,7 @@ async function main() {
 
     // --- Ask Claude: the box and the Parts button ---
     {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
+      const { askBoxOpen, closeAsk, clearField, readField, boxRect, insideWindow } = askBoxHelpers(cdp);
       const layoutAndView = () =>
         evaluateExpr(
           cdp,
@@ -21386,12 +26288,6 @@ async function main() {
         if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
         await blurActive();
       };
-      // Empties the field the way a person would, then closes the box.
-      const clearField = () =>
-        evaluateExpr(
-          cdp,
-          "(() => { const f = document.getElementById('ask-field'); f.value = ''; f.dispatchEvent(new Event('input', { bubbles: true })); })()",
-        );
       const stopListeners = async () => {
         for (const child of spawnedListeners) {
           if (child.exitCode === null && child.signalCode === null) {
@@ -21413,31 +26309,6 @@ async function main() {
               return null;
             }
           });
-      const readField = () =>
-        evaluateExpr(
-          cdp,
-          "(() => { const f = document.getElementById('ask-field'); return { value: f.value, start: f.selectionStart, end: f.selectionEnd, focused: document.activeElement === f }; })()",
-        );
-      const boxRect = () =>
-        evaluateExpr(
-          cdp,
-          `(() => {
-            const r = document.getElementById('ask-box').getBoundingClientRect();
-            return {
-              left: r.left,
-              top: r.top,
-              right: r.right,
-              bottom: r.bottom,
-              width: window.innerWidth,
-              height: window.innerHeight,
-              rootPx: parseFloat(getComputedStyle(document.documentElement).fontSize),
-            };
-          })()`,
-        );
-      const insideWindow = (r) => {
-        const margin = r.rootPx * 0.5 - 0.5;
-        return r.left >= margin && r.top >= margin && r.right <= r.width - margin && r.bottom <= r.height - margin;
-      };
       // The rate limit counts a rolling second across pages: start this block clear of the earlier bursts.
       await sleep(1200);
       await stopListeners();
@@ -21785,65 +26656,26 @@ async function main() {
       }
 
       // Clicking elsewhere closes the box and keeps the draft; a second right-click moves it and keeps the text.
-      {
-        const detail = {};
-        try {
-          await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
-          await askAt(cdp, '#product-name');
-          await cdp('Input.insertText', { text: 'moving check' });
-          const first = await boxRect();
-          const viewsRect = await evaluateExpr(
-            cdp,
-            "(() => { const r = document.getElementById('view-buttons').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()",
-          );
-          await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: viewsRect.x, y: viewsRect.y, button: 'right', buttons: 2, clickCount: 1 });
-          await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: viewsRect.x, y: viewsRect.y, button: 'right', buttons: 0, clickCount: 1 });
-          await sleep(200);
-          const second = await boxRect();
-          detail.moved = second.left !== first.left || second.top !== first.top;
-          detail.open = await askBoxOpen();
-          detail.field = await readField();
-          await clickElement(cdp, '#product-name');
-          detail.closedByClick = (await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000)) === true;
-          await askAt(cdp, '#product-name');
-          detail.draft = await readField();
-        } finally {
-          await cdp('Emulation.clearDeviceMetricsOverride');
-          await clearField();
-          await closeAsk();
-        }
-        report(
-          'clicking elsewhere closes the box and keeps the draft; a second right-click moves it and keeps the text',
-          detail.moved === true &&
-            detail.open === true &&
-            detail.field.value === 'moving check' &&
-            detail.field.focused === true &&
-            detail.closedByClick === true &&
-            detail.draft.value === 'moving check' &&
-            detail.draft.start === 0 &&
-            detail.draft.end === 12,
-          JSON.stringify(detail),
-        );
-      }
+      await askBoxMovesCheck({ cdp, report });
 
-      // The status sequence, with a listener and then without.
+      // The state of each request in the Requests panel, with a listener and then without: Sent comes before Received, and
+      // several waiting requests each keep their own row.
       {
-        await sleep(4500);
         await evaluateExpr(
           cdp,
           `(() => {
-            window.__askStatusLog = [];
-            const el = document.getElementById('ask-status');
+            window.__requestPhraseLog = [];
+            const panel = document.getElementById('requests-panel');
             new MutationObserver(() => {
-              const text = el.querySelector('.ask-long').textContent;
-              if (!el.hidden && text !== '') window.__askStatusLog.push(text);
-            }).observe(el, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['hidden'] });
+              const row = [...panel.querySelectorAll('.rq-item')].find((li) => li.querySelector('.rq-text').getAttribute('title') === 'status check one');
+              if (row) window.__requestPhraseLog.push(row.querySelector('.rq-state').textContent);
+            }).observe(panel, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['hidden'] });
           })()`,
         );
         await askAt(cdp, '#product-name');
         await cdp('Input.insertText', { text: 'status check one' });
         await pressKey(cdp, 'Enter');
-        const log = await waitFor(cdp, "window.__askStatusLog.includes('Claude received it') ? window.__askStatusLog.slice() : null", 3000);
+        const log = await waitFor(cdp, `window.__requestPhraseLog.includes(${JSON.stringify(REQUEST_STATUS_COPY.phrases.received)}) ? window.__requestPhraseLog.slice() : null`, 3000);
         const deduped = (log ?? []).filter((text, index, all) => index === 0 || text !== all[index - 1]);
 
         await stopListeners();
@@ -21855,15 +26687,15 @@ async function main() {
         await askAt(cdp, '#product-name');
         await cdp('Input.insertText', { text: 'wait two' });
         await pressKey(cdp, 'Enter');
-        const waitingForTwo = await waitFor(cdp, statusText('Claude will see 2 requests on its next action'), 3000);
+        const waitingForTwo = await waitFor(cdp, requestRowReads(['wait one', 'wait two'], REQUEST_STATUS_COPY.phrases.waiting), 3000);
         const reply = await callTool(client, 'get_code', {});
         const twoDelivered = requestsOf(reply).filter((entry) => entry !== null && (entry.text === 'wait one' || entry.text === 'wait two')).length;
-        const receivedTwo = await waitFor(cdp, statusText('Claude received 2 requests'), 2000);
+        const receivedTwo = await waitFor(cdp, requestRowReads(['wait one', 'wait two'], REQUEST_STATUS_COPY.phrases.received), 2000);
         report(
-          'the status shows Sent to Claude before Claude received it; waiting requests use the count form',
+          'the Requests panel shows Sent before Received; waiting requests each keep their own row',
           deduped.length === 2 &&
-            deduped[0] === 'Sent to Claude' &&
-            deduped[1] === 'Claude received it' &&
+            deduped[0] === REQUEST_STATUS_COPY.phrases.sent &&
+            deduped[1] === REQUEST_STATUS_COPY.phrases.received &&
             waitingForTwo === true &&
             twoDelivered === 2 &&
             receivedTwo === true,
@@ -21897,7 +26729,7 @@ async function main() {
           `(() => {
             const button = document.getElementById('parts-ask');
             const line = document.getElementById('parts-ask-status');
-            return button.disabled && !line.hidden && line.textContent === 'Claude will see it on its next action' ? true : null;
+            return button.disabled && !line.hidden && line.textContent === ${JSON.stringify(REQUEST_STATUS_COPY.phrases.waiting)} ? true : null;
           })()`,
           3000,
         );
@@ -21958,13 +26790,13 @@ async function main() {
         );
       }
 
-      // At a 1280-pixel window the bar gives up text before it clips; the status and the transport button stay whole.
+      // At a 1280-pixel window the bar gives up text before it clips; the Requests chip and the transport button stay whole.
       {
         await sleep(1200);
         await askAt(cdp, '#product-name');
         await cdp('Input.insertText', { text: 'width check' });
         await pressKey(cdp, 'Enter');
-        const waiting = await waitFor(cdp, statusText('Claude will see it on its next action'), 3000);
+        const waiting = await waitFor(cdp, requestRowReads('width check', REQUEST_STATUS_COPY.phrases.waiting), 3000);
         const detail = {};
         try {
           await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
@@ -21984,7 +26816,7 @@ async function main() {
                 const drawerItem = ${DRAWER_ITEM_JS};
                 const requests = drawerItem('page-requests');
                 return {
-                  statusWhole: whole('ask-status'),
+                  chipWhole: whole('requests-toggle'),
                   stopWhole: whole(${JSON.stringify(TRANSPORT_ID)}),
                   pageRequestsShown: requests.shown,
                   pageRequestsWhole: requests.whole,
@@ -22001,17 +26833,15 @@ async function main() {
         }
         await callTool(client, 'get_code', {});
         report(
-          'at a 1280-pixel window the bar gives up text before it clips; the status and the transport button stay whole',
+          'at a 1280-pixel window the bar gives up text before it clips; the Requests chip and the transport button stay whole',
           waiting === true &&
-            detail.statusWhole === true &&
+            detail.chipWhole === true &&
             detail.stopWhole === true &&
             detail.pageRequestsShown === true &&
             detail.pageRequestsWhole === true &&
             detail.hintTitle === "Shift + right-click keeps the browser's own menu.",
           JSON.stringify({ waiting, detail }),
         );
-        // Nothing may linger for anything that follows.
-        await waitFor(cdp, "document.getElementById('ask-status').hidden ? true : null", 6000);
         await clearViews();
       }
     }
@@ -22654,13 +27484,13 @@ async function main() {
         await stopAllListeners();
       }
 
-      // At 1920x1080 the whole top bar fits on one line, with a waiting request status showing.
+      // At 1920x1080 the whole top bar fits on one line, with a waiting request in the Requests panel.
       {
         await sleep(1200);
         await askAt(cdp, '#product-name');
         await cdp('Input.insertText', { text: 'fit check' });
         await pressKey(cdp, 'Enter');
-        const requestWaiting = await waitFor(cdp, statusText('Claude will see it on its next action'), 3000);
+        const requestWaiting = await waitFor(cdp, requestRowReads('fit check', REQUEST_STATUS_COPY.phrases.waiting), 3000);
         const fit = {};
         try {
           await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
@@ -22702,14 +27532,14 @@ async function main() {
                   })(),
                   pageRequestsShown: requests.shown && requestsInfo.shown,
                   pageRequestsWhole: requests.whole && requests.lines <= 1,
-                  askStatusWhole: whole('ask-status'),
+                  chipWhole: whole('requests-toggle'),
                   infoInside: requestsInfo.whole,
                   stateText: document.getElementById('page-requests-state').textContent,
                   widths: {
                     bar: barBox.width,
                     views: views.getBoundingClientRect().width,
                     pageRequests: requests.width,
-                    askStatus: document.getElementById('ask-status').getBoundingClientRect().width,
+                    chip: document.getElementById('requests-toggle').getBoundingClientRect().width,
                   },
                 };
               })()`,
@@ -22722,13 +27552,13 @@ async function main() {
         }
         await callTool(client, 'get_code', {});
         report(
-          'at 1920x1080 the top bar holds the view and layout buttons whole, the request status and the page-requests status with its (i), on one line',
+          'at 1920x1080 the top bar holds the view and layout buttons whole, the Requests chip and the page-requests status with its (i), on one line',
           requestWaiting === true &&
             fit.barFits === true &&
             fit.hintWhole === true &&
             fit.pageRequestsShown === true &&
             fit.pageRequestsWhole === true &&
-            fit.askStatusWhole === true &&
+            fit.chipWhole === true &&
             fit.infoInside === true &&
             fit.stateText === PAGE_REQUESTS_COPY.waiting,
           JSON.stringify({ requestWaiting, fit }),
@@ -22745,1220 +27575,12 @@ async function main() {
             JSON.stringify(fit.viewTexts) === JSON.stringify(viewButtonParts().map((part) => `${part.digit}${part.name}`)),
           JSON.stringify({ requestWaiting, hintWhole: fit.hintWhole, sixInsideHint: fit.sixInsideHint, sixText: fit.sixText, viewTexts: fit.viewTexts, fitStep: fit.fitStep }),
         );
-        await waitFor(cdp, "document.getElementById('ask-status').hidden ? true : null", 6000);
         await blurActive();
       }
       await stopAllListeners();
     }
 
-    // --- Jam ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      // Leaves the page with no view open and no focus in a field, so the next key press is a view key.
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const JAM_DORIAN_PROGRAM = ['bass: note("d2").gain(0)', 'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)'].join('\n');
-      const jamReply = await callTool(client, 'set_code', { code: JAM_DORIAN_PROGRAM, label: 'probe jam dorian' });
-      const jamEvaluated = !/runtime error/i.test(jamReply);
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      const jamReady = await waitFor(
-        cdp,
-        `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
-        6000,
-      );
-      const jamChips = await evaluateExpr(
-        cdp,
-        `[...document.querySelectorAll('#jam-degrees .jam-degree')].map((chip) => ({
-          note: chip.querySelector('.jam-degree-note').textContent,
-          degree: chip.querySelector('.jam-degree-num').textContent,
-          role: chip.dataset.role,
-        }))`,
-      );
-      const jamNotes = jamChips.map((chip) => chip.note);
-      const jamDegrees = jamChips.map((chip) => chip.degree);
-      const jamRoles = jamChips.map((chip) => chip.role);
-      report(
-        'key 5 opens Jam and names the scale of the playing code with its seven degrees',
-        jamEvaluated &&
-          jamReady === true &&
-          JSON.stringify(jamNotes) === JSON.stringify(['D', 'E', 'F', 'G', 'A', 'B', 'C']) &&
-          JSON.stringify(jamDegrees) === JSON.stringify(['1', '2', '♭3', '4', '5', '6', '♭7']) &&
-          JSON.stringify(jamRoles) === JSON.stringify(['root', 'scale', 'scale', 'scale', 'scale', 'scale', 'scale']),
-        JSON.stringify({ jamEvaluated, jamReady, jamNotes, jamDegrees, jamRoles }),
-      );
-
-      // Jam then the Timeline: the same page, read once. A page turn between the two reads repeats the check once.
-      const readBoth = async () => {
-        const jam = await waitFor(
-          cdp,
-          `(() => { const v = document.getElementById('jam-view'); return v.dataset.state === 'ready' && v.dataset.computeMs ? { pageStart: v.dataset.pageStart, computeMs: v.dataset.computeMs } : null; })()`,
-          6000,
-        );
-        await pressKey(cdp, '2');
-        const timeline = await waitFor(
-          cdp,
-          `(() => { const v = document.getElementById('timeline-view'); return v.dataset.state === 'ok' ? { pageStart: v.dataset.pageStart, computeMs: v.dataset.computeMs } : null; })()`,
-          8000,
-        );
-        return { jam, timeline };
-      };
-      let both = await readBoth();
-      const same = (pair) =>
-        pair.jam !== null &&
-        pair.timeline !== null &&
-        pair.jam.pageStart === pair.timeline.pageStart &&
-        pair.jam.computeMs === pair.timeline.computeMs;
-      let attempts = 1;
-      if (!same(both) && both.jam !== null && both.timeline !== null && both.jam.pageStart !== both.timeline.pageStart) {
-        await pressKey(cdp, '5');
-        both = await readBoth();
-        attempts = 2;
-      }
-      report(
-        'the Timeline opened after Jam reuses the same reading',
-        same(both),
-        JSON.stringify({ both, attempts }),
-      );
-
-      // 5 twice from the Timeline: opens Jam, then closes it.
-      await pressKey(cdp, '5');
-      const jamOpenedAgain = await waitFor(cdp, `document.getElementById('jam-view').hidden ? null : true`, 3000);
-      await pressKey(cdp, '5');
-      const jamClosed = await evaluateExpr(
-        cdp,
-        `({ hidden: document.getElementById('jam-view').hidden, view: document.getElementById('workspace').dataset.view })`,
-      );
-      report(
-        'key 5 again closes the Jam view',
-        jamOpenedAgain === true && jamClosed.hidden === true && jamClosed.view === 'none',
-        JSON.stringify({ jamOpenedAgain, jamClosed }),
-      );
-      await clearViews();
-    }
-
-    // --- Jam: scale states ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const scaleFacts = `(() => {
-        const name = document.getElementById('jam-scale-name');
-        return {
-          state: document.getElementById('jam-view').dataset.state,
-          kind: name.dataset.kind,
-          name: name.textContent,
-          sub: document.getElementById('jam-scale-sub').textContent,
-          degreesHidden: document.getElementById('jam-degrees').hidden,
-        };
-      })()`;
-
-      // A tie: the four-pad loop fits several scales equally, so the view says so and draws no degrees.
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      const tieReply = await callTool(client, 'set_code', {
-        code: 'pads: note("<[a3,c4,e4] [f3,a3,c4] [c4,e4,g4] [g3,b3,d4]>").gain(0)',
-        label: 'probe jam tie',
-      });
-      const tieFacts = await waitFor(
-        cdp,
-        `(() => { const f = ${scaleFacts}; return f.kind === 'ambiguous' ? f : null; })()`,
-        6000,
-      );
-      report(
-        'an ambiguous reading says so plainly and draws no degrees',
-        !/runtime error/i.test(tieReply) &&
-          tieFacts !== null &&
-          tieFacts.name.startsWith('No clear scale: the notes fit ') &&
-          tieFacts.name.includes('C major') &&
-          tieFacts.name.endsWith(' equally.') &&
-          tieFacts.sub === 'Warnings are off until the scale is clear.' &&
-          tieFacts.degreesHidden === true,
-        JSON.stringify(tieFacts),
-      );
-
-      // Drums only: nothing pitched to read.
-      await callTool(client, 'set_code', { code: 'drums: s("bd*4").gain(0)', label: 'probe jam drums' });
-      const drumsFacts = await waitFor(
-        cdp,
-        `(() => {
-          const message = document.getElementById('jam-message');
-          if (message.hidden || document.getElementById('jam-message-text').textContent !== 'No notes to read: the playing code has no pitched notes.') return null;
-          return {
-            text: document.getElementById('jam-message-text').textContent,
-            sub: document.getElementById('jam-message-sub').textContent,
-            subHidden: document.getElementById('jam-message-sub').hidden,
-            bodyHidden: document.getElementById('jam-body').hidden,
-          };
-        })()`,
-        6000,
-      );
-      report(
-        'a drums-only pattern says there are no notes to read',
-        drumsFacts !== null &&
-          drumsFacts.sub === 'Only notes with a pitch count; drums are ignored.' &&
-          drumsFacts.subHidden === false &&
-          drumsFacts.bodyHidden === true,
-        JSON.stringify(drumsFacts),
-      );
-
-      // Parts: the scale follows the part that plays (4 cycles each at one cycle per second).
-      const JAM_PARTS_PROGRAM = [
-        'setcps(1)',
-        'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-        'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
-        'bass: note("<d2!4 e2!4>").gain(0)',
-        'lead: arrange([4, calm], [4, bright])',
-      ].join('\n');
-      const partsReply = await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam parts' });
-      const seen = { calm: null, bright: null };
-      const partsDeadline = Date.now() + 12000;
-      while ((seen.calm === null || seen.bright === null) && Date.now() < partsDeadline) {
-        const facts = await evaluateExpr(cdp, scaleFacts);
-        if (facts.name === 'D Dorian' && facts.sub === 'Part "calm" · read from this part') seen.calm = facts;
-        if (facts.name === 'E harmonic minor' && facts.sub === 'Part "bright" · read from this part') seen.bright = facts;
-        if (seen.calm === null || seen.bright === null) await sleep(250);
-      }
-      report(
-        'the scale follows the part that is playing',
-        !/runtime error/i.test(partsReply) && seen.calm !== null && seen.bright !== null,
-        JSON.stringify(seen),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: the status line ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const statusFacts = `(() => {
-        const box = document.getElementById('jam-status');
-        const time = document.getElementById('jam-status-time');
-        const avoidChip = document.querySelector('#jam-degrees .jam-degree[data-note="C"]');
-        return {
-          hidden: box.hidden,
-          state: box.dataset.state ?? null,
-          warning: box.getAttribute('data-warning'),
-          tabindex: box.getAttribute('tabindex'),
-          lead: document.getElementById('jam-status-lead').textContent,
-          rest: document.getElementById('jam-status-rest').textContent,
-          time: time.textContent,
-          timeHidden: time.hidden,
-          timeAriaHidden: time.getAttribute('aria-hidden'),
-          timeTitle: time.title,
-          chipRole: avoidChip ? avoidChip.dataset.role : null,
-        };
-      })()`;
-      // Neutral, silent, eight-cycle loop at one cycle per second: a D pedal, a pad (Dm7, with an A7 on
-      // cycles 2 and 3 of each eight) and an eighth-note D Dorian melody.
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const warnReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam warning' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      const warnSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
-      const warnClock = await readSchedulerNow(cdp);
-      const warnFacts = await evaluateExpr(cdp, statusFacts);
-      // The spoken copy: a visually hidden child of the live region, written when a warning starts or
-      // ends and never on a tick. The observers count every write to it and to the drawn time.
-      const spokenFacts = await evaluateExpr(
-        cdp,
-        `(() => {
-          const box = document.getElementById('jam-status');
-          const spoken = document.getElementById('jam-status-spoken');
-          const time = document.getElementById('jam-status-time');
-          const probeText = document.createElement('span');
-          probeText.style.color = 'var(--text)';
-          document.body.appendChild(probeText);
-          const textColor = getComputedStyle(probeText).color;
-          probeText.remove();
-          const rect = spoken ? spoken.getBoundingClientRect() : null;
-          const facts = {
-            exists: spoken !== null,
-            inside: spoken !== null && box.contains(spoken),
-            ariaHidden: spoken ? spoken.getAttribute('aria-hidden') : null,
-            live: box.getAttribute('aria-live'),
-            width: rect ? rect.width : null,
-            height: rect ? rect.height : null,
-            text: spoken ? spoken.textContent : null,
-            timeAriaHidden: time.getAttribute('aria-hidden'),
-            timeColor: getComputedStyle(time).color,
-            textColor,
-          };
-          if (spoken) {
-            window.__spokenWrites = 0;
-            window.__timeWrites = 0;
-            const options = { childList: true, characterData: true, subtree: true };
-            window.__spokenObserver = new MutationObserver((records) => { window.__spokenWrites += records.length; });
-            window.__timeObserver = new MutationObserver((records) => { window.__timeWrites += records.length; });
-            window.__spokenObserver.observe(spoken, options);
-            window.__timeObserver.observe(time, options);
-          }
-          return facts;
-        })()`,
-      );
-      const timeMatch = /^back in key in (\d+)\u00A0s$/.exec(warnFacts.time);
-      const loopPosition = warnClock % 8;
-      const warnOk =
-        !/runtime error/i.test(warnReply) &&
-        warnSeen === true &&
-        warnFacts.state === 'warning' &&
-        warnFacts.lead === 'The harmony leaves the scale:' &&
-        warnFacts.rest === ' A7/D contains C#, avoid C' &&
-        timeMatch !== null &&
-        (timeMatch[1] === '1' || timeMatch[1] === '2') &&
-        loopPosition >= 2 &&
-        loopPosition <= 4.5 &&
-        warnFacts.timeAriaHidden === 'true' &&
-        warnFacts.timeTitle === warnFacts.time &&
-        warnFacts.tabindex === '0' &&
-        warnFacts.chipRole === 'avoid';
-      const safeSeen = await waitFor(cdp, `document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 8000);
-      const safeFacts = await evaluateExpr(cdp, statusFacts);
-      const readCounters = `({
-        spokenWrites: window.__spokenWrites ?? null,
-        timeWrites: window.__timeWrites ?? null,
-        text: document.getElementById('jam-status-spoken') ? document.getElementById('jam-status-spoken').textContent : null,
-      })`;
-      const toSafeCounters = await evaluateExpr(cdp, readCounters);
-      await evaluateExpr(cdp, `(() => { window.__spokenWrites = 0; window.__timeWrites = 0; })()`);
-      await sleep(2500);
-      const tickCounters = await evaluateExpr(cdp, readCounters);
-      await evaluateExpr(
-        cdp,
-        `(() => {
-          if (window.__spokenObserver) window.__spokenObserver.disconnect();
-          if (window.__timeObserver) window.__timeObserver.disconnect();
-          delete window.__spokenObserver;
-          delete window.__timeObserver;
-          delete window.__spokenWrites;
-          delete window.__timeWrites;
-        })()`,
-      );
-      const safeOk =
-        safeSeen === true &&
-        safeFacts.lead === 'All safe' &&
-        safeFacts.rest === ' \u2014 every note of D Dorian works with the harmony right now.' &&
-        safeFacts.time.startsWith('Next warning in ') &&
-        safeFacts.warning === null &&
-        safeFacts.tabindex === null &&
-        safeFacts.chipRole === 'scale';
-      report(
-        'an outside chord makes the status warn in time, then say all safe',
-        warnOk && safeOk,
-        JSON.stringify({ warnClock, loopPosition, warnFacts, safeFacts }),
-      );
-      const spokenOk =
-        spokenFacts.exists === true &&
-        spokenFacts.inside === true &&
-        spokenFacts.ariaHidden === null &&
-        spokenFacts.live === 'polite' &&
-        spokenFacts.width <= 1 &&
-        spokenFacts.height <= 1 &&
-        /^back in key in \d+\u00A0s$/.test(spokenFacts.text ?? '') &&
-        spokenFacts.timeAriaHidden === 'true' &&
-        spokenFacts.timeColor === spokenFacts.textColor &&
-        toSafeCounters.spokenWrites !== null &&
-        toSafeCounters.spokenWrites <= 1 &&
-        /^Next warning in \d+\u00A0s$/.test(toSafeCounters.text ?? '') &&
-        tickCounters.timeWrites !== null &&
-        tickCounters.timeWrites >= 2 &&
-        tickCounters.spokenWrites === 0;
-      report(
-        'the status box speaks its countdown when a warning starts and ends, never on each tick, and the warning time reads in the text color',
-        spokenOk,
-        JSON.stringify({ spokenFacts, toSafeCounters, tickCounters }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam status reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: coming up ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const rowFacts = `[...document.querySelectorAll('#jam-rows .jam-row')].map((row) => ({
-        time: row.querySelector('.jam-row-time').textContent,
-        kind: row.querySelector('.jam-row-kind').textContent,
-        kindData: row.querySelector('.jam-row-kind').dataset.kind,
-        text: row.querySelector('.jam-row-text').textContent,
-        warning: row.getAttribute('data-warning'),
-        part: row.getAttribute('data-part'),
-        tabindex: row.getAttribute('tabindex'),
-      }))`;
-      const secondsOf = (row) => {
-        const match = /^(\d+)\u00A0s$/.exec(row.time);
-        return match === null ? null : Number(match[1]);
-      };
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const warnReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(cdp, `document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
-      const firstRows = await waitFor(cdp, `(() => { const r = ${rowFacts}; return r.some((x) => x.warning !== null) ? r : null; })()`, 6000);
-      const firstWarning = firstRows === null ? null : firstRows.find((row) => row.warning !== null);
-      const firstSeconds = firstWarning ? secondsOf(firstWarning) : null;
-      const firstTimes = firstRows === null ? [] : firstRows.map(secondsOf);
-      await sleep(1500);
-      const laterRows = await evaluateExpr(cdp, rowFacts);
-      const laterWarning = laterRows.find((row) => row.warning !== null);
-      const laterSeconds = laterWarning ? secondsOf(laterWarning) : null;
-      report(
-        'the coming-up list counts down to the next warning',
-        !/runtime error/i.test(warnReply) &&
-          firstRows !== null &&
-          firstRows.length <= 3 &&
-          firstWarning.kind === 'Warning' &&
-          firstWarning.kindData === 'warning' &&
-          firstWarning.text === 'A7/D brings C#, avoid C, lasts 2 cycles' &&
-          firstWarning.tabindex === '0' &&
-          firstTimes.every((value, i) => value !== null && (i === 0 || value > firstTimes[i - 1])) &&
-          firstSeconds !== null &&
-          laterSeconds !== null &&
-          laterSeconds !== firstSeconds,
-        JSON.stringify({ firstRows, laterRows }),
-      );
-
-      // Nothing outside the scale: all safe, no warning ahead, one calm row.
-      const JAM_CALM_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const calmReply = await callTool(client, 'set_code', { code: JAM_CALM_PROGRAM, label: 'probe jam calm' });
-      const calmFacts = await waitFor(
-        cdp,
-        `(() => {
-          const rows = ${rowFacts};
-          if (rows.length !== 1 || rows[0].kindData !== 'calm') return null;
-          return { rows, lead: document.getElementById('jam-status-lead').textContent, time: document.getElementById('jam-status-time').textContent };
-        })()`,
-        8000,
-      );
-      report(
-        'with nothing outside the scale the view says all safe and no warning ahead',
-        !/runtime error/i.test(calmReply) &&
-          calmFacts !== null &&
-          calmFacts.lead === 'All safe' &&
-          calmFacts.time === 'No warning ahead' &&
-          calmFacts.rows[0].time === '\u2013' &&
-          calmFacts.rows[0].text === 'No warning ahead \u2014 nothing leaves D Dorian in the next 32\u00A0s.' &&
-          calmFacts.rows[0].warning === null &&
-          calmFacts.rows[0].tabindex === null,
-        JSON.stringify(calmFacts),
-      );
-
-      // Parts: a part change is listed with what happens to the scale.
-      const JAM_PARTS_PROGRAM = [
-        'setcps(1)',
-        'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-        'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
-        'bass: note("<d2!4 e2!4>").gain(0)',
-        'lead: arrange([4, calm], [4, bright])',
-      ].join('\n');
-      const partsReply = await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam coming parts' });
-      const partRow = await waitFor(
-        cdp,
-        `(() => {
-          const rows = ${rowFacts};
-          return rows.find((row) => row.part !== null && row.kind === 'Part' &&
-            (row.text === '"bright" starts (4 cycles) \u2014 scale changes to E harmonic minor' ||
-             row.text === '"calm" starts (4 cycles) \u2014 scale changes to D Dorian')) ?? null;
-        })()`,
-        12000,
-      );
-      report(
-        'a part change is listed with its scale',
-        !/runtime error/i.test(partsReply) && partRow !== null && partRow.tabindex === '0' && partRow.kindData === 'part',
-        JSON.stringify(partRow),
-      );
-
-      // Stop: the countdowns pause, the reading stays, and everything picks up when the music plays again.
-      await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up again' });
-      await waitFor(
-        cdp,
-        `(() => { const r = ${rowFacts}; return r.some((x) => x.warning !== null) && r.every((x) => /^\\d+\u00A0s$/.test(x.time)) ? true : null; })()`,
-        12000,
-      );
-      await callTool(client, 'stop', {});
-      const pausedFacts = await waitFor(
-        cdp,
-        `(() => {
-          const paused = document.getElementById('jam-paused');
-          if (paused.hidden) return null;
-          const rows = ${rowFacts};
-          return { text: paused.textContent, times: rows.map((row) => row.time), timeHidden: document.getElementById('jam-status-time').hidden, count: rows.length };
-        })()`,
-        6000,
-      );
-      await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam coming up resumed' });
-      const resumedFacts = await waitFor(
-        cdp,
-        `(() => {
-          const rows = ${rowFacts};
-          const paused = document.getElementById('jam-paused');
-          return paused.hidden && rows.length > 0 && rows.every((row) => /^\\d+\u00A0s$/.test(row.time)) ? rows.map((row) => row.time) : null;
-        })()`,
-        12000,
-      );
-      report(
-        'countdowns pause while the music is stopped',
-        pausedFacts !== null &&
-          pausedFacts.text === 'Not playing \u2014 countdowns are paused.' &&
-          pausedFacts.count > 0 &&
-          pausedFacts.times.every((time) => time === '\u2013') &&
-          pausedFacts.timeHidden === true &&
-          resumedFacts !== null,
-        JSON.stringify({ pausedFacts, resumedFacts }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam coming up reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: the piano ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const pianoFacts = `(() => {
-        const piano = document.getElementById('jam-piano');
-        const keys = [...piano.querySelectorAll('.jam-key')];
-        const notesOf = (role) => keys.filter((key) => key.dataset.role === role).map((key) => key.dataset.note);
-        return {
-          count: keys.length,
-          white: keys.filter((key) => key.dataset.black === 'false').length,
-          root: notesOf('root'),
-          scale: notesOf('scale'),
-          off: notesOf('off').length,
-          cLabels: keys.filter((key) => key.dataset.note === 'C').map((key) => key.querySelector('.jam-key-label').textContent),
-          label: piano.getAttribute('aria-label'),
-          role: piano.getAttribute('role'),
-        };
-      })()`;
-      const markFacts = (note) => `(() => {
-        const keys = [...document.querySelectorAll('#jam-piano .jam-key[data-note=${JSON.stringify(note)}]')];
-        return keys.map((key) => ({
-          role: key.dataset.role,
-          border: getComputedStyle(key).borderTopStyle,
-          cross: getComputedStyle(key, '::after').content,
-          label: key.querySelector('.jam-key-label').textContent,
-        }));
-      })()`;
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const pianoReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam piano' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
-      const safePiano = await evaluateExpr(cdp, pianoFacts);
-      const sameList = (a, b) => a.length === b.length && [...a].sort().join() === [...b].sort().join();
-      const safeOk =
-        safePiano.count === 24 &&
-        safePiano.white === 14 &&
-        safePiano.role === 'img' &&
-        sameList(safePiano.root, ['D', 'D']) &&
-        sameList(safePiano.scale, ['E', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B', 'B', 'C', 'C']) &&
-        safePiano.off === 10 &&
-        sameList(safePiano.cLabels, ['C3', 'C4']) &&
-        typeof safePiano.label === 'string' &&
-        safePiano.label.endsWith('Avoid: none.');
-      const warnSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
-      const avoidMarks = await evaluateExpr(cdp, markFacts('C'));
-      const outsideMarks = await evaluateExpr(cdp, markFacts('C#'));
-      const warnLabel = await evaluateExpr(cdp, `document.getElementById('jam-piano').getAttribute('aria-label')`);
-      const warnOk =
-        warnSeen === true &&
-        avoidMarks.length === 2 &&
-        avoidMarks.every((mark) => mark.role === 'avoid' && mark.border === 'solid' && mark.cross !== 'none' && mark.label === 'C') &&
-        outsideMarks.length === 2 &&
-        outsideMarks.every((mark) => mark.role === 'outside' && mark.border === 'dashed' && mark.cross === 'none') &&
-        typeof warnLabel === 'string' &&
-        warnLabel.includes('Avoid: C.');
-      report(
-        'the piano marks the scale, the root, the note to avoid and the outside note',
-        !/runtime error/i.test(pianoReply) && safeOk && warnOk,
-        JSON.stringify({ safePiano, avoidMarks, outsideMarks, warnLabel }),
-      );
-
-      // The legend's Root swatch: two inset layers, a text-colored ring on top of a page-colored one, so
-      // it reads as a ring (light edge, dark ring, light center) and differs from the Scale swatch.
-      const rootMark = await evaluateExpr(
-        cdp,
-        `(() => {
-          const mark = document.querySelector('#jam-legend .jam-legend-mark[data-role="root"]');
-          if (mark === null) return null;
-          const colorOf = (name) => {
-            const el = document.createElement('span');
-            el.style.color = 'var(' + name + ')';
-            document.body.appendChild(el);
-            const color = getComputedStyle(el).color;
-            el.remove();
-            return color;
-          };
-          const layers = [];
-          let depth = 0;
-          let current = '';
-          for (const ch of getComputedStyle(mark).boxShadow) {
-            if (ch === '(') depth += 1;
-            if (ch === ')') depth -= 1;
-            if (ch === ',' && depth === 0) { layers.push(current.trim()); current = ''; } else current += ch;
-          }
-          layers.push(current.trim());
-          return {
-            layers: layers.map((layer) => ({
-              color: (/rgba?\\([^)]*\\)/.exec(layer) || [null])[0],
-              spread: parseFloat((layer.replace(/rgba?\\([^)]*\\)/, '').match(/-?[\\d.]+px/g) || [])[3]),
-              inset: layer.includes('inset'),
-            })),
-            text: colorOf('--text'),
-            dominant: colorOf('--dominant'),
-          };
-        })()`,
-      );
-      report(
-        "the legend's Root mark draws a ring inside its swatch",
-        rootMark !== null &&
-          rootMark.layers.length === 2 &&
-          rootMark.layers.every((layer) => layer.inset) &&
-          rootMark.layers[0].color === rootMark.text &&
-          rootMark.layers[1].color === rootMark.dominant &&
-          rootMark.layers[0].spread < rootMark.layers[1].spread,
-        JSON.stringify(rootMark),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam piano reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: the guitar and the switch ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const switchFacts = `(() => ({
-        pianoPressed: document.getElementById('jam-instrument-piano').getAttribute('aria-pressed'),
-        guitarPressed: document.getElementById('jam-instrument-guitar').getAttribute('aria-pressed'),
-        pianoHidden: document.getElementById('jam-piano').hidden,
-        guitarHidden: document.getElementById('jam-guitar').hidden,
-        stored: localStorage.getItem('moontide.jamInstrument'),
-      }))()`;
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const guitarReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam guitar' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
-      const before = await evaluateExpr(cdp, switchFacts);
-      await clickElement(cdp, '#jam-instrument-guitar');
-      const guitarFacts = await waitFor(
-        cdp,
-        `(() => {
-          const facts = ${switchFacts};
-          if (facts.guitarHidden) return null;
-          const guitar = document.getElementById('jam-guitar');
-          const rows = [...guitar.querySelectorAll('.jam-string')];
-          const cell = (string, fret) => guitar.querySelector('.jam-string[data-string="' + string + '"] .jam-fret[data-fret="' + fret + '"]');
-          const widthOf = (fret) => cell(0, fret).getBoundingClientRect().width;
-          const aString = cell(4, 5);
-          const bString = cell(1, 4);
-          return {
-            ...facts,
-            role: guitar.getAttribute('role'),
-            label: guitar.getAttribute('aria-label'),
-            rows: rows.length,
-            cells: rows.map((row) => row.querySelectorAll('.jam-fret').length),
-            names: rows.map((row) => row.querySelector('.jam-string-name').textContent).join(''),
-            numbers: [...guitar.querySelectorAll('.jam-fret-number')].map((el) => el.textContent).filter((text) => text !== '').join(' '),
-            aNote: aString.dataset.note,
-            aRole: aString.dataset.role,
-            aDot: aString.querySelector('.jam-dot').textContent,
-            bNote: bString.dataset.note,
-            bRole: bString.dataset.role,
-            ratio: widthOf(12) / widthOf(1),
-          };
-        })()`,
-        4000,
-      );
-      const guitarOk =
-        before.pianoPressed === 'true' &&
-        before.guitarPressed === 'false' &&
-        before.guitarHidden === true &&
-        guitarFacts !== null &&
-        guitarFacts.pianoHidden === true &&
-        guitarFacts.pianoPressed === 'false' &&
-        guitarFacts.guitarPressed === 'true' &&
-        guitarFacts.role === 'img' &&
-        guitarFacts.label === 'Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: none.' &&
-        guitarFacts.rows === 6 &&
-        guitarFacts.cells.every((count) => count === 13) &&
-        guitarFacts.names === 'eBGDAE' &&
-        guitarFacts.numbers === '3 5 7 9 12' &&
-        guitarFacts.aNote === 'D' &&
-        guitarFacts.aRole === 'root' &&
-        guitarFacts.aDot === 'D' &&
-        guitarFacts.bNote === 'Eb' &&
-        guitarFacts.bRole === 'off' &&
-        guitarFacts.ratio >= 0.5 &&
-        guitarFacts.ratio <= 0.56 &&
-        guitarFacts.stored === 'guitar';
-      // The choice survives a reload: leave no view open so pressing 5 opens the Jam view again.
-      await clearViews();
-      await reloadPage(cdp);
-      await pressKey(cdp, '5');
-      const reloaded = await waitFor(
-        cdp,
-        `(() => { const facts = ${switchFacts}; return document.getElementById('workspace').dataset.view === 'jam' && facts.guitarPressed === 'true' ? facts : null; })()`,
-        8000,
-      );
-      const reloadOk = reloaded !== null && reloaded.guitarHidden === false && reloaded.pianoHidden === true && reloaded.stored === 'guitar';
-      // The switch is inside the body, which shows once the reading is ready: wait for it before clicking.
-      await waitFor(cdp, `document.getElementById('jam-body').hidden ? null : true`, 12000);
-      await clickElement(cdp, '#jam-instrument-piano');
-      const backFacts = await waitFor(cdp, `(() => { const facts = ${switchFacts}; return facts.pianoPressed === 'true' ? facts : null; })()`, 4000);
-      const backOk = backFacts !== null && backFacts.guitarHidden === true && backFacts.pianoHidden === false && backFacts.stored === 'piano';
-      report(
-        'the guitar shows the same marks and the Piano / Guitar choice survives a reload',
-        !/runtime error/i.test(guitarReply) && guitarOk && reloadOk && backOk,
-        JSON.stringify({ before, guitarFacts, reloaded, backFacts }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam guitar reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: chord tones ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const chordFacts = `(() => ({
-        checked: document.getElementById('jam-chord-tones').checked,
-        lineHidden: document.getElementById('jam-chord').hidden,
-        line: document.getElementById('jam-chord').textContent,
-        marked: document.querySelectorAll('#jam-view [data-chord="true"]').length,
-        keys: [...document.querySelectorAll('#jam-piano .jam-key[data-chord="true"]')].map((el) => el.dataset.note),
-        chips: [...document.querySelectorAll('#jam-degrees .jam-degree[data-chord="true"]')].map((el) => el.dataset.note),
-        legendHidden: document.getElementById('jam-legend-chord').hidden,
-        legend: document.getElementById('jam-legend-chord').textContent,
-        legendCount: document.querySelectorAll('#jam-legend .jam-legend-entry:not([hidden])').length,
-        stored: localStorage.getItem('moontide.jamChordTones'),
-      }))()`;
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const chordReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam chord tones' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(cdp, `!document.getElementById('jam-body').hidden && document.getElementById('jam-status').dataset.state === 'safe' ? true : null`, 12000);
-      const offFacts = await evaluateExpr(cdp, chordFacts);
-      const offOk =
-        offFacts.checked === false &&
-        offFacts.lineHidden === true &&
-        offFacts.marked === 0 &&
-        offFacts.legendHidden === true &&
-        offFacts.legendCount === 4 &&
-        offFacts.stored === null;
-      await clickElement(cdp, '#jam-chord-tones');
-      const onFacts = await waitFor(
-        cdp,
-        `(() => { const facts = ${chordFacts}; return facts.line === 'Chord now: Dm7 · D F A C' ? facts : null; })()`,
-        12000,
-      );
-      const sameNotes = (list, wanted) => list.length === wanted.length && [...list].sort().join() === [...wanted].sort().join();
-      const onOk =
-        onFacts !== null &&
-        onFacts.checked === true &&
-        onFacts.lineHidden === false &&
-        onFacts.marked >= 8 + 4 &&
-        sameNotes(onFacts.keys, ['D', 'F', 'A', 'C', 'D', 'F', 'A', 'C']) &&
-        sameNotes(onFacts.chips, ['D', 'F', 'A', 'C']) &&
-        onFacts.legendHidden === false &&
-        onFacts.legend === 'Chord tone' &&
-        onFacts.legendCount === 5 &&
-        onFacts.stored === 'on';
-      // Remembered: leave no view open so pressing 5 opens the Jam view again after the reload.
-      await clearViews();
-      await reloadPage(cdp);
-      await pressKey(cdp, '5');
-      const reloaded = await waitFor(
-        cdp,
-        `(() => { const facts = ${chordFacts}; return document.getElementById('workspace').dataset.view === 'jam' && facts.checked ? facts : null; })()`,
-        8000,
-      );
-      const reloadOk = reloaded !== null && reloaded.stored === 'on';
-      await waitFor(cdp, `document.getElementById('jam-body').hidden ? null : true`, 12000);
-      await clickElement(cdp, '#jam-chord-tones');
-      const backFacts = await waitFor(
-        cdp,
-        `(() => { const facts = ${chordFacts}; return facts.checked === false && facts.lineHidden ? facts : null; })()`,
-        4000,
-      );
-      const backOk = backFacts !== null && backFacts.marked === 0 && backFacts.legendHidden === true && backFacts.stored === 'off';
-      report(
-        'Chord tones is off by default, marks the chord sounding now and survives a reload',
-        !/runtime error/i.test(chordReply) && offOk && onOk && reloadOk && backOk,
-        JSON.stringify({ offFacts, onFacts, reloaded, backFacts }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam chord tones reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: warning contexts ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const requestsOf = (reply) =>
-        reply
-          .split('\n')
-          .filter((line) => line.startsWith(REQUEST_PREFIX))
-          .map((line) => {
-            try {
-              return JSON.parse(line.slice(REQUEST_PREFIX.length));
-            } catch {
-              return null;
-            }
-          });
-      // A live listener would take the request before the next tool reply can carry it: stop them all.
-      for (const child of spawnedListeners) {
-        if (child.exitCode === null && child.signalCode === null) {
-          const exited = new Promise((resolve) => child.once('exit', resolve));
-          child.kill();
-          await exited;
-        }
-      }
-      // The rate limit counts a rolling second across pages.
-      await sleep(1200);
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const askReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam warning contexts' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      // The rows of an earlier block may still be in the DOM while the view reads again: wait for the ready state.
-      const rowSeen = await waitFor(
-        cdp,
-        `document.getElementById('jam-view').dataset.state === 'ready' && document.querySelector('#jam-view .jam-row[data-warning]') ? true : null`,
-        12000,
-      );
-      const onRow = rowSeen === true ? await askAt(cdp, '#jam-view .jam-row[data-warning]') : null;
-      const rowChip = onRow === null ? null : /^Warning · A7\/D brings C#, avoid C, in (\d+) s$/.exec(onRow.chip);
-      await closeAsk();
-      const statusSeen = await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
-      const onStatus = statusSeen === true ? await askAt(cdp, '#jam-status[data-warning]') : null;
-      await cdp('Input.insertText', { text: 'jam warning check' });
-      await pressKey(cdp, 'Enter');
-      const sentReply = await callTool(client, 'get_code', {});
-      const sent = requestsOf(sentReply).find((entry) => entry !== null && entry.text === 'jam warning check');
-      await closeAsk();
-      report(
-        'a right-click on a warning asks Claude with the warning context',
-        !/runtime error/i.test(askReply) &&
-          onRow !== null &&
-          onRow.prevented === true &&
-          onRow.open === true &&
-          rowChip !== null &&
-          onStatus !== null &&
-          onStatus.prevented === true &&
-          onStatus.open === true &&
-          onStatus.chip === 'Warning · A7/D brings C#, avoid C, now' &&
-          sent !== undefined &&
-          JSON.stringify(sent.context) ===
-            JSON.stringify({ kind: 'warning', chord: 'A7/D', outside: 'C#', avoid: 'C', seconds: 0, scale: 'D Dorian' }) &&
-          sent.chip === 'Warning · A7/D brings C#, avoid C, now',
-        JSON.stringify({ onRow, onStatus, sent }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam warning contexts reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: note contexts ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      // Right-clicks `selector`, closes the box and says whether the page took the event and the chip read `wanted`
-      // (a string, or a function of the chip text).
-      const chipAt = async (selector, wanted) => {
-        const result = await askAt(cdp, selector);
-        await closeAsk();
-        const chipOk = typeof wanted === 'function' ? wanted(result.chip) : result.chip === wanted;
-        return { selector, chip: result.chip, ok: result.prevented === true && result.open === true && chipOk };
-      };
-      // A right-click in the warning state: waits for the status to warn, asks at once, and tries once more
-      // when the warning ended in between.
-      const chipInWarning = async (selector, wanted) => {
-        let last = null;
-        for (let attempt = 0; attempt < 2; attempt++) {
-          await waitFor(cdp, `document.querySelector('#jam-status[data-warning]') ? true : null`, 12000);
-          last = await chipAt(selector, wanted);
-          if (last.ok) return last;
-        }
-        return last;
-      };
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      const noteReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam note contexts' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(
-        cdp,
-        `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-status').dataset.state === 'safe' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
-        12000,
-      );
-      await clickElement(cdp, '#jam-instrument-piano');
-      const checks04 = [];
-      checks04.push(await chipAt('#jam-piano .jam-key[data-note="D"]', 'Note D · root of D Dorian'));
-      checks04.push(await chipAt('#jam-piano .jam-key[data-note="B"]', 'Note B · in D Dorian'));
-      checks04.push(await chipAt('#jam-piano .jam-key[data-note="Eb"]', 'Note Eb · not in D Dorian'));
-      checks04.push(await chipAt('#jam-degrees .jam-degree[data-note="A"]', 'Note A · in D Dorian'));
-      // The rest of the Jam view is the whole session.
-      checks04.push(await chipAt('#jam-status', 'Whole session'));
-      checks04.push(await chipAt('#jam-scale-name', 'Whole session'));
-      checks04.push(await chipAt('#jam-legend', 'Whole session'));
-      // In the warning state the note to avoid and the outside note say so.
-      checks04.push(await chipInWarning('#jam-piano .jam-key[data-note="C"]', 'Note C · to avoid in D Dorian'));
-      checks04.push(await chipInWarning('#jam-piano .jam-key[data-note="C#"]', 'Note C# · outside D Dorian'));
-      // The fretboard: an empty cell and a root cell.
-      await clickElement(cdp, '#jam-instrument-guitar');
-      await waitFor(cdp, `document.getElementById('jam-guitar').hidden ? null : true`, 2000);
-      checks04.push(await chipAt('#jam-guitar .jam-string[data-string="1"] .jam-fret[data-fret="4"]', 'Note Eb · not in D Dorian'));
-      checks04.push(await chipAt('#jam-guitar .jam-string[data-string="4"] .jam-fret[data-fret="5"]', 'Note D · root of D Dorian'));
-      await clickElement(cdp, '#jam-instrument-piano');
-      await waitFor(cdp, `document.getElementById('jam-piano').hidden ? null : true`, 2000);
-      // The scale is not clear: the bare note.
-      await callTool(client, 'set_code', {
-        code: 'pads: note("<[a3,c4,e4] [f3,a3,c4] [c4,e4,g4] [g3,b3,d4]>").gain(0)',
-        label: 'probe jam note contexts tie',
-      });
-      await waitFor(cdp, `document.getElementById('jam-scale-name').dataset.kind === 'ambiguous' ? true : null`, 8000);
-      checks04.push(await chipAt('#jam-piano .jam-key[data-note="D"]', 'Note D'));
-      report(
-        'a right-click on a key, a fretboard cell or a degree chip gives the note, its role and the scale',
-        !/runtime error/i.test(noteReply) && checks04.every((entry) => entry.ok),
-        JSON.stringify(checks04.map((entry) => `${entry.ok ? 'ok' : 'FAIL'} ${entry.chip}`)),
-      );
-
-      // A part row gives its part.
-      const JAM_PARTS_PROGRAM = [
-        'setcps(1)',
-        'const calm = n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-        'const bright = n("0 1 2 3 4 5 6 7").scale("E:harmonic:minor").gain(0)',
-        'bass: note("<d2!4 e2!4>").gain(0)',
-        'lead: arrange([4, calm], [4, bright])',
-      ].join('\n');
-      await callTool(client, 'set_code', { code: JAM_PARTS_PROGRAM, label: 'probe jam note contexts parts' });
-      const partRow = await waitFor(
-        cdp,
-        `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-sub').textContent.startsWith('Part "') && document.querySelector('#jam-view .jam-row[data-part]') ? true : null`,
-        12000,
-      );
-      const onPart = partRow === true ? await chipAt('#jam-view .jam-row[data-part]', (chip) => chip.startsWith('Part "')) : null;
-      report(
-        'a part row gives its part and the rest of the Jam view the whole session',
-        onPart !== null && onPart.ok && checks04.slice(4, 7).every((entry) => entry.ok),
-        JSON.stringify({ onPart, whole: checks04.slice(4, 7) }),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam note contexts reset tempo' });
-      await clearViews();
-    }
-
-    // --- Jam: layouts and motion ---
-    {
-      const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
-      const closeAsk = async () => {
-        if (await askBoxOpen()) await pressKey(cdp, 'Escape');
-        await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
-      };
-      const blurActive = () =>
-        evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
-      const clearViews = async () => {
-        await closeAsk();
-        await blurActive();
-        if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
-        await blurActive();
-      };
-      const JAM_WARNING_PROGRAM = [
-        'setcps(1)',
-        'bass: note("d2").gain(0)',
-        'pad: note("<[d3,f3,a3,c4]!2 [a2,c#3,e3,g3]!2 [d3,f3,a3,c4]!4>").gain(0)',
-        'lead: n("0 1 2 3 4 5 6 7").scale("D:dorian").gain(0)',
-      ].join('\n');
-      // The Jam view's boxes at this moment, with the view scrolled to the top.
-      const jamGeometry = `(() => {
-        const box = (id) => {
-          const b = document.getElementById(id).getBoundingClientRect();
-          return { left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width };
-        };
-        const view = document.getElementById('jam-view');
-        view.scrollTop = 0;
-        const clipped = (selector) =>
-          [...document.querySelectorAll(selector)]
-            .filter((el) => el.textContent !== '' && el.clientWidth > 0)
-            .filter((el) => el.scrollWidth > el.clientWidth)
-            .map((el) => el.textContent);
-        return {
-          scrollWidth: view.scrollWidth,
-          clientWidth: view.clientWidth,
-          view: box('jam-view'),
-          board: box('jam-board'),
-          instrument: box('jam-instrument'),
-          piano: box('jam-piano'),
-          guitar: box('jam-guitar'),
-          root: parseFloat(getComputedStyle(document.documentElement).fontSize),
-          clippedKeys: clipped('#jam-piano .jam-key-label'),
-          clippedDots: clipped('#jam-guitar .jam-dot'),
-          rowBottoms: [...document.querySelectorAll('#jam-rows .jam-row')].map((row) => row.getBoundingClientRect().bottom),
-          statusState: document.getElementById('jam-status').dataset.state ?? null,
-        };
-      })()`;
-      // One reading of the Coming up rows against the strip's bottom.
-      const rowsFit = [];
-      const noteRowsFit = (at, g) => {
-        const overflow = g.rowBottoms.length === 0 ? null : Math.max(...g.rowBottoms) - g.view.bottom;
-        rowsFit.push({ at, state: g.statusState, rows: g.rowBottoms.length, overflow: overflow === null ? null : fmt(overflow), ok: g.rowBottoms.length === 3 && overflow <= 1 });
-      };
-      const pick = async (instrument) => {
-        await clickElement(cdp, `#jam-instrument-${instrument}`);
-        await waitFor(cdp, `document.getElementById('jam-${instrument}').hidden ? null : true`, 2000);
-        await blurActive();
-      };
-      const layoutReply = await callTool(client, 'set_code', { code: JAM_WARNING_PROGRAM, label: 'probe jam layouts' });
-      await clearViews();
-      await pressKey(cdp, 'a');
-      await pressKey(cdp, '5');
-      await waitFor(
-        cdp,
-        `document.getElementById('jam-view').dataset.state === 'ready' && document.getElementById('jam-scale-name').textContent === 'D Dorian' ? true : null`,
-        12000,
-      );
-      const fits = [];
-      const tight = {};
-      const fmt = (value) => Math.round(value * 10) / 10;
-      try {
-        for (const [width, height] of [[1920, 1080], [1366, 768], [3840, 2160]]) {
-          await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
-          for (const layoutKey of ['a', 'b', 'c']) {
-            await pressKey(cdp, layoutKey);
-            for (const instrument of ['piano', 'guitar']) {
-              await pick(instrument);
-              const g = await evaluateExpr(cdp, jamGeometry);
-              const inside =
-                g.board.left >= g.view.left - 1 && g.board.right <= g.view.right + 1;
-              const noSideScroll = g.scrollWidth <= g.clientWidth + 1;
-              const labelsOk = g.clippedKeys.length === 0 && g.clippedDots.length === 0;
-              fits.push({ ok: inside && noSideScroll && labelsOk, at: `${layoutKey} ${width}x${height} ${instrument}`, scrollWidth: g.scrollWidth, clientWidth: g.clientWidth, inside, clipped: g.clippedKeys.concat(g.clippedDots) });
-              // Layout a at 1366 x 768: the instrument column is fully visible without scrolling.
-              if (layoutKey === 'a' && width === 1366) {
-                tight[`a-${instrument}`] = { instrumentBottom: fmt(g.instrument.bottom), viewBottom: fmt(g.view.bottom), ok: g.instrument.bottom <= g.view.bottom + 1 };
-                noteRowsFit(instrument, g);
-              }
-            }
-            // Layout a at 1366 x 768: the rows are inside the strip both while the box warns and while it says all safe.
-            if (layoutKey === 'a' && width === 1366) {
-              for (const state of ['warning', 'safe']) {
-                await waitFor(cdp, `document.getElementById('jam-status').dataset.state === '${state}' ? true : null`, 9000);
-                noteRowsFit(`wait ${state}`, await evaluateExpr(cdp, jamGeometry));
-              }
-            }
-          }
-        }
-        // Layout b at 1280 x 720: the piano is at least 28rem wide and the fretboard at least 30rem.
-        await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 720, deviceScaleFactor: 1, mobile: false });
-        await pressKey(cdp, 'b');
-        await pick('piano');
-        const pianoB = await evaluateExpr(cdp, jamGeometry);
-        await pick('guitar');
-        const guitarB = await evaluateExpr(cdp, jamGeometry);
-        tight.b = {
-          pianoRem: fmt(pianoB.piano.width / pianoB.root),
-          guitarRem: fmt(guitarB.guitar.width / guitarB.root),
-          ok: pianoB.piano.width >= 28 * pianoB.root - 0.5 && guitarB.guitar.width >= 30 * guitarB.root - 0.5,
-        };
-      } finally {
-        await cdp('Emulation.clearDeviceMetricsOverride');
-      }
-      // Leave layout a and the piano chosen.
-      await pressKey(cdp, 'a');
-      await pick('piano');
-      // Nothing inside the Jam view has a transition or an animation.
-      const moving = await evaluateExpr(
-        cdp,
-        `[...document.querySelectorAll('#jam-view, #jam-view *')]
-          .map((el) => {
-            const style = getComputedStyle(el);
-            return { el: el.id || el.className || el.tagName, duration: style.transitionDuration, animation: style.animationName };
-          })
-          .filter((entry) => entry.duration.split(',').some((part) => part.trim() !== '0s') || entry.animation !== 'none')`,
-      );
-      report(
-        'the Jam view fits every layout and window, and nothing in it animates',
-        !/runtime error/i.test(layoutReply) &&
-          fits.length === 18 &&
-          fits.every((entry) => entry.ok) &&
-          tight['a-piano'].ok &&
-          tight['a-guitar'].ok &&
-          tight.b.ok &&
-          moving.length === 0,
-        JSON.stringify({ failing: fits.filter((entry) => !entry.ok), tight, moving: moving.slice(0, 5) }),
-      );
-
-      report(
-        'in layout a at 1366x768 every Coming up row is inside the strip, warning or all safe',
-        rowsFit.length === 4 &&
-          rowsFit.every((entry) => entry.ok) &&
-          rowsFit.some((entry) => entry.state === 'warning') &&
-          rowsFit.some((entry) => entry.state === 'safe'),
-        JSON.stringify(rowsFit),
-      );
-
-      // Leave the default tempo behind so nothing after this block depends on a changed one.
-      await callTool(client, 'set_code', { code: 'setcps(0.5)', label: 'probe jam layouts reset tempo' });
-      await clearViews();
-    }
+    await jamBlocks({ cdp, client, report, port, pageUrl });
 
     // --- String forms ---
     // Proves, in the real page, which JavaScript string forms the pinned transpiler turns into
@@ -25469,7 +29091,9 @@ async function main() {
         await sleep(2000);
         const plainReply = await callTool(client, 'set_code', { code: timedCode(2, ''), label: 'probe hand cross plain' });
         const plainCode = await callTool(client, 'get_code', {});
-        const plainPass = cycleOf(plainReply) === null && !plainReply.includes('takes over at') && plainCode.includes('v: 2');
+        // The sentence of a waiting change names its cycle; the standing page-requests text a reply carries while no listener is
+        // connected also says a change takes over at the next bar, so only the cycle sentence counts.
+        const plainPass = cycleOf(plainReply) === null && !plainReply.includes('takes over at cycle') && plainCode.includes('v: 2');
         await storeTiming('now');
         await resetLog();
         await callTool(client, 'set_code', { code: timedCode(1, 'setcps(1);\n'), label: 'probe hand cross old again' });
@@ -25506,6 +29130,8 @@ async function main() {
             told === 1;
           detail = JSON.stringify({
             plainPass,
+            plainReply: plainReply.slice(0, 240),
+            plainHasNew: plainCode.includes('v: 2'),
             handTookOverAtOnce: codeNow.includes('probehandcross'),
             phraseEvents: log.filter((e) => e.v === 3).length,
             handEvents: log.filter((e) => e.v === 4).length,
@@ -26360,6 +29986,8 @@ async function main() {
     await gridBlocks({ cdp, client, report, port, pageUrl });
     await mixerGroupBlocks({ cdp, client, report, port, pageUrl });
     await timelineBlocks({ cdp, client, report, port, pageUrl });
+    await requestsBlocks({ cdp, client, report, port, pageUrl });
+    await rampBlocks({ cdp, client, report, port, pageUrl });
     summarize();
   } catch (err) {
     if (err instanceof ProbeCouldNotRun) {

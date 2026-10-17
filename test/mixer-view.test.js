@@ -739,3 +739,42 @@ test('the stylesheet rules for groups, folds, lights and the name row never anim
   }
   assert.doesNotMatch(css, /@keyframes/);
 });
+
+// --- what a render built ---
+
+const MIDI_RIG = {
+  setup: 'valid',
+  instruments: [{
+    id: 'mt32',
+    model: 'mt32',
+    modelName: 'Model mt32',
+    port: 'Port A',
+    channels: [{ channel: 3, role: 'melodic' }],
+    bankSelect: 'none',
+    defaultVolume: 100,
+    controls: [{ id: 'volume', name: 'Volume', cc: 7, min: 0, max: 127, default: 100 }],
+    reset: null,
+    sounds: { melodic: [], rhythm: [] },
+    catalogSounds: 0,
+  }],
+};
+
+test('render tells how many strips and frames it built: all of them the first time, none for the same model, one for a track that switches between MIDI and the browser', () => {
+  const { view } = setup();
+  const browser = `pad: note("c3").gain(0)\nhats: s("hh").gain(0)`;
+  const midi = `pad: note("c3").midi('Port A', { midichannel: 3 })\nhats: s("hh").gain(0)`;
+  const build = (code) => buildMixerModel({ code, parse, colorOf, rig: MIDI_RIG });
+  assert.deepEqual(view.render(build(browser)), { created: 2 });
+  assert.deepEqual(view.render(build(browser)), { created: 0 });
+  assert.deepEqual(view.render(build(midi)), { created: 1 });
+  assert.deepEqual(view.render(build(midi)), { created: 0 });
+  assert.deepEqual(view.render(build(browser)), { created: 1 });
+});
+
+test('render counts the group frames it builds with the strips, and gives none for a model that is not ready', () => {
+  const { view } = setup();
+  assert.deepEqual(view.render(modelOf(piece())), { created: 4 + 3 });
+  assert.deepEqual(view.render(modelOf(piece())), { created: 0 });
+  assert.deepEqual(view.render({ status: 'empty', strips: [] }), { created: 0 });
+  assert.deepEqual(view.render({ status: 'unreadable', strips: [] }), { created: 0 });
+});

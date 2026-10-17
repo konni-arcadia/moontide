@@ -41,8 +41,11 @@ change.
 - Around the code, the page shows the music in several views: the named tracks on a timeline
   where you can edit notes, the Song grid with the sections of a piece, the history as a list
   or a tree, a mixer with groups and lights whose moves rewrite the code, and a jam view with
-  the scale on a piano or a guitar.
-- A right-click on anything in the page sends Claude a request with that context.
+  the scale on a piano or a guitar. When the notes fit several scales, the jam view proposes
+  one and says why.
+- Claude can move the tempo up or down over a number of bars, instead of jumping.
+- A right-click on anything in the page sends Claude a request with that context. The Requests
+  list in the top bar shows what became of each request.
 - The same code can play real MIDI instruments from the page, through Web MIDI.
 
 Moontide does not start from scratch. The music engine is
@@ -69,6 +72,20 @@ Strudel contributors. Moontide is the bridge between Claude and a Strudel page.
    MIDI track, its instrument and channel. The Session drawer (the Session button in the top
    bar) says whether page requests are live (they reach Claude right away) or wait for Claude
    (they reach it with its next action). Its (i) explains how to switch.
+
+   The **Requests** button in the top bar counts the requests still in flight and opens a list:
+   one row per request, with what happened to it and how long ago. A request reads Sent, then
+   Waiting for Claude's next action or Received, then Claude has started on it, which means
+   Claude made a call after the request arrived. A change made for it reads Waiting for its
+   line while it waits for the next bar or phrase, then Applied as v12 (the version in the
+   History view); a change that failed reads Failed with the error, and one that a newer change
+   replaced or Stop canceled says so. A request Claude answers in words reads Answered or
+   Declined, with Claude's sentence. A request shows as applied only when Claude names it with
+   its change, never from timing alone. After 30 seconds without news a row reads No change yet
+   and keeps counting: that is not a failure. If the page loses its connection, open rows read
+   Connection lost. Click a row to see the whole request and what its
+   state means. Finished rows move to a short Recent list after 30 seconds. Nothing is kept
+   after the Moontide server stops.
 
 ## Install
 
@@ -274,6 +291,15 @@ The code can say which harmony it means with one top-level line, for example
 `const harmony = 'C:minor'`, placed above the patterns. It plays nothing and is never a
 track. The Jam view then shows two lines, "Declared:" and "Heard:", side by side.
 
+When the notes fit several scales, the Jam view proposes one and says why in a sentence, for
+example "Proposed: C major, C is the note heard most." It takes the declared scale of the playing
+section when that scale is among the ones that fit, and otherwise the scale the notes support
+most. Warnings stay on. "Scales that fit, click to switch:" lists them, and one click or Enter
+switches the whole view. Your pick holds while the same scales fit, and is forgotten on reload.
+When the scales differ in their notes and the code declares none of them, warnings are off: the
+view says why and lists the scales without a switch. The piano is coloured like the guitar, with
+the same legend, and every role also has a shape or text cue, so it reads without colour.
+
 ## Song structure
 
 Every new piece Claude writes starts with one `const song` at the top. It names the sections
@@ -308,6 +334,30 @@ and it goes to Claude only when you press Enter. Drag across one lane, or hold S
 Left or Right, to select a range of whole cycles, and use "Ask Claude" to send it.
 
 A right-click on a section, a track, a cell or a group asks Claude about that thing.
+
+## Tempo ramp
+
+Ask Claude to speed up or slow down over a number of bars, for example "bring it up to 140 over
+eight bars". Claude sends the new code with the tempo to reach and `glideBars`, a whole number
+of bars from 1 to 64, on `set_code` or `edit_code`. The tempo then moves from the tempo that
+plays to the one in the code in equal small steps, and ends exactly on it. It starts at once, or
+at the line when the change waits for the next bar or phrase.
+
+While it runs, the tempo in the top bar shows the live tempo, an arrow and the tempo to reach.
+Hover it to see how many bars are left.
+
+Your Mixer moves, Song grid cells, Timeline edits and hand edits keep the ramp going. Code with
+another tempo cancels it, and that tempo plays at once. Code with no tempo cancels it, and the
+tempo stays where it was. A new `glideBars` replaces it. Stop cancels it too, and the next Play
+starts at the code's tempo. A reload, or another tab taking over, ends it. There is no cancel
+button of its own.
+
+A ramp is refused, and nothing changes, when nothing plays, when the code sets no tempo, or when
+it sets the tempo that already plays. A ramp is never a version: it writes nothing into the code
+or the history.
+
+The MIDI clock follows every step of a ramp. How hardware that follows the clock, such as an
+arpeggiator or a step sequencer, reacts to a ramp has not been verified.
 
 ## History
 
@@ -368,6 +418,8 @@ Known limits:
 - Windows and Linux are untested by hand. Edge, Safari and Firefox are untested.
 - Internet access is needed.
 - MIDI needs Chrome or Edge.
+- How hardware that follows Moontide's MIDI clock, such as an arpeggiator or a step sequencer,
+  reacts to a tempo ramp has not been verified.
 - Run one Moontide at a time with the same history file.
 - The first start through npx downloads the package and can be slow.
 

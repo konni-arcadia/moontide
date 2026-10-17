@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import nodePath from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ProbeCouldNotRun, shotsFolder } from '../scripts/probe-page.mjs';
+import { ProbeCouldNotRun, leavesFolder, shotsFolder, shotsSavedOutside } from '../scripts/probe-page.mjs';
 import { SPLIT_DEFAULTS } from '../page/split-model.js';
 import { ACCENT_EXEMPT_TODAY, BAR_INVENTORY, BAR_WIDTHS, INVARIANTS, SHOT_LAYOUTS, SHOT_SIZES, SHOT_SKIPPED, SHOT_STATES, SIZED_CONTROLS, SIZED_FAMILIES, WORST_CASE, shotFileNames } from './bar-inventory.js';
 
@@ -335,6 +335,41 @@ test('shotsFolder: unset gives null, a folder inside the repository is refused, 
   }
 });
 
+// One rule decides whether a picture folder is outside the repository. The Windows cases run on every OS through the
+// Windows flavor of the path module.
+test('leavesFolder: another Windows drive and other folders leave the repository, the repository and names like ..shots stay inside', () => {
+  const win = nodePath.win32;
+  assert.equal(leavesFolder('C:\\repo', 'D:\\shots', win), true, 'another drive');
+  assert.equal(leavesFolder('C:\\repo', 'C:\\other\\shots', win), true);
+  assert.equal(leavesFolder('C:\\repo', 'C:\\shots', win), true);
+  assert.equal(leavesFolder('C:\\repo', 'C:\\repo', win), false, 'the repository itself');
+  assert.equal(leavesFolder('C:\\repo', 'C:\\repo\\shots', win), false);
+  assert.equal(leavesFolder('C:\\repo', 'C:\\repo\\..shots', win), false, 'a folder named like ..shots is inside');
+  assert.equal(leavesFolder('C:\\repo', 'c:\\REPO\\shots', win), false, 'drive letters and names are not case sensitive');
+});
+
+test('leavesFolder: POSIX paths', () => {
+  const posix = nodePath.posix;
+  assert.equal(leavesFolder('/repo', '/other', posix), true);
+  assert.equal(leavesFolder('/repo', '/repo', posix), false);
+  assert.equal(leavesFolder('/repo', '/repo/..shots', posix), false);
+  assert.equal(leavesFolder('/repo', '/repo/a/../b', posix), false);
+  assert.equal(leavesFolder('/repo', '/repository', posix), true, 'a sibling that starts with the same letters is outside');
+});
+
+test('shotsSavedOutside: a temporary folder is outside, a folder inside the repository is not', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+  const base = mkdtempSync(nodePath.join(tmpdir(), 'moontide-shots-test-'));
+  try {
+    assert.equal(shotsSavedOutside(base), true);
+    assert.equal(shotsSavedOutside(nodePath.join(base, 'not-created-yet')), true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+  assert.equal(shotsSavedOutside(nodePath.join(repo, 'scripts')), false);
+  assert.equal(shotsSavedOutside(repo), false);
+});
+
 test('probe:page with MOONTIDE_PROBE_SHOTS inside the repository stops with exit code 2 before any browser work and writes nothing', () => {
   const repo = fileURLToPath(new URL('..', import.meta.url));
   const inside = nodePath.join(repo, 'shots-must-not-exist');
@@ -345,6 +380,19 @@ test('probe:page with MOONTIDE_PROBE_SHOTS inside the repository stops with exit
   });
   assert.equal(run.status, 2);
   assert.match(run.stderr, /COULD NOT RUN: MOONTIDE_PROBE_SHOTS must name a folder outside the repository/);
+  assert.equal(existsSync(inside), false);
+});
+
+test('probe:midi with MOONTIDE_PROBE_SHOTS inside the repository stops with exit code 2 before any browser work and writes nothing', () => {
+  const repo = fileURLToPath(new URL('..', import.meta.url));
+  const inside = nodePath.join(repo, 'shots-must-not-exist');
+  const run = spawnSync(process.execPath, [nodePath.join(repo, 'scripts', 'probe-midi.mjs'), '--only', 'mixer'], {
+    env: { ...process.env, MOONTIDE_PROBE_SHOTS: inside },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  assert.equal(run.status, 2);
+  assert.match(run.stderr, /probe:midi COULD NOT RUN: MOONTIDE_PROBE_SHOTS must name a folder outside the repository/);
   assert.equal(existsSync(inside), false);
 });
 

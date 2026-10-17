@@ -456,34 +456,6 @@ body {
   font-size: 0.8125rem;
 }
 
-/* The status of the latest request to Claude. No display rule: #top-bar > span styles it and the browser's [hidden]
-   works unaided, so nothing to say takes no width. It sits before the Session button in the markup, so it is right of
-   the Layout group. It holds the long sentence and a short form: the short one is for fit step 3 and is aria-hidden. */
-#ask-status {
-  flex: none;
-}
-
-#ask-status .ask-short {
-  display: none;
-}
-
-/* Fit step 3 and 4: the short form shows, and the long sentence is visually hidden but kept in the accessibility tree
-   (never display: none), the recipe of #change-status. */
-#top-bar[data-fit="3"] #ask-status .ask-short,
-#top-bar[data-fit="4"] #ask-status .ask-short {
-  display: inline;
-}
-
-#top-bar[data-fit="3"] #ask-status .ask-long,
-#top-bar[data-fit="4"] #ask-status .ask-long {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
 /* The cycle and beat beside the tempo, quiet decoration (Label size, mono, muted). The hidden attribute
    hides it while nothing plays, so it has no display rule. Fit step 1 drops it with the wordmark (.bar-deco). */
 #top-bar #cycle-beat {
@@ -494,9 +466,7 @@ body {
 }
 
 /* Whether page requests reach Claude live. No display rule: #top-bar > span
-   styles it and the browser's [hidden] works unaided. After #ask-status in the markup, same order,
-   so it sits right of the request status and left of the motion switch, and the request status
-   appearing never moves it. */
+   styles it and the browser's [hidden] works unaided. */
 #page-requests {
   flex-shrink: 0;
 }
@@ -1013,6 +983,300 @@ body {
   padding: 0 0.5rem;
   font-family: var(--font-mono);
   font-weight: 400;
+}
+
+/* The Requests chip, before the Session button: the same box as every control of the bar (1.75rem high, 0.75rem at the
+   sides), so it lines up with its neighbour. It is hidden while no request was sent, and the count in its pill is the
+   requests still in flight. Neutral colors only: the accent means live now and red belongs to the failed-change banner.
+   No transition and no animation: everything changes in one frame. */
+#requests-toggle {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  box-sizing: border-box;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 0.5rem;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.9375rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+#requests-toggle[hidden] {
+  display: none;
+}
+
+#requests-toggle[data-inflight="true"] {
+  color: var(--text);
+}
+
+/* The word is the text color on hover, never muted on the fill. */
+#requests-toggle:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+#requests-toggle[aria-expanded="true"] {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+#requests-toggle:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+.rq-count {
+  background: var(--surface-2);
+  color: var(--text);
+  border-radius: 1rem;
+  padding: 0 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+#requests-toggle[data-inflight="true"] .rq-count {
+  font-weight: 600;
+}
+
+.rq-count[hidden] {
+  display: none;
+}
+
+#top-bar[data-fit="4"] #requests-toggle {
+  padding: 0 0.5rem;
+}
+
+/* The panel under the bar's right end: an overlay that pushes nothing, under the Ask box and the popovers (1000) and
+   the return banner (900), level with the Session drawer (800), which it never shares the screen with. One row per
+   request, newest first; it scrolls inside itself. */
+#requests-panel {
+  position: absolute;
+  top: 100%;
+  right: 1rem;
+  margin-top: 0.5rem;
+  z-index: 800;
+  box-sizing: border-box;
+  width: 26rem;
+  max-width: calc(100vw - 2rem);
+  max-height: 20rem;
+  overflow-y: auto;
+  padding: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  background: var(--secondary);
+  border: 1px solid var(--text-muted);
+  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.45);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#requests-panel[hidden] {
+  display: none;
+}
+
+#requests-panel:focus {
+  outline: none;
+}
+
+#requests-panel:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.rq-list,
+.rq-recent-body {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.rq-recent-body[hidden] {
+  display: none;
+}
+
+.rq-recent[hidden] {
+  display: none;
+}
+
+/* A row is two lines: the start of the request and its time, then a shape and the words of the state. The hover and
+   the open state change the border, never the fill, so muted text is never placed on the lighter surface. */
+.rq-row {
+  display: grid;
+  grid-template-columns: 0.5rem 1fr auto;
+  column-gap: 0.5rem;
+  align-items: center;
+  width: 100%;
+  min-width: 1.75rem;
+  min-height: 3rem;
+  box-sizing: border-box;
+  padding: 0.5rem 1rem;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rq-row:hover {
+  border-color: var(--border);
+}
+
+.rq-row[aria-expanded="true"] {
+  border-color: var(--border);
+}
+
+.rq-row:focus-visible,
+.rq-recent-head:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: -1px;
+}
+
+.rq-text {
+  grid-column: 1 / 3;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rq-time {
+  grid-column: 3;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* The shape backs the words up and nothing more: a ring while it goes on, a disc when it is done, a dashed ring when
+   it ended without a change, a square when it did not work. Text colors only. */
+.rq-mark {
+  grid-column: 1;
+  grid-row: 2;
+  width: 0.5rem;
+  height: 0.5rem;
+  box-sizing: border-box;
+  border-radius: 50%;
+  border: 1px solid var(--text-muted);
+}
+
+.rq-mark[data-shape="done"] {
+  background: var(--text);
+  border-color: var(--text);
+}
+
+.rq-mark[data-shape="ended"] {
+  border-style: dashed;
+}
+
+.rq-mark[data-shape="bad"] {
+  background: var(--text);
+  border-color: var(--text);
+  border-radius: 0;
+}
+
+.rq-state {
+  grid-column: 2 / 4;
+  grid-row: 2;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rq-item[data-finished="true"] .rq-text {
+  color: var(--text-muted);
+}
+
+.rq-detail {
+  box-sizing: border-box;
+  margin: 0.25rem 0 0;
+  padding: 0.5rem;
+  max-height: 8rem;
+  overflow-y: auto;
+  background: var(--dominant);
+  border: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+
+.rq-detail[hidden] {
+  display: none;
+}
+
+.rq-detail p {
+  margin: 0 0 0.5rem;
+}
+
+.rq-detail p:last-child {
+  margin-bottom: 0;
+}
+
+.rq-detail .rq-about,
+.rq-detail .rq-basis {
+  color: var(--text-muted);
+}
+
+.rq-detail .rq-reason {
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+}
+
+.rq-recent-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  min-width: 2rem;
+  min-height: 2rem;
+  box-sizing: border-box;
+  padding: 0 1rem;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rq-recent-head:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.rq-recent .rq-item .rq-state {
+  color: var(--text-muted);
+}
+
+/* The spoken line of the Requests list: visually hidden, kept in the accessibility tree, always present and never
+   [hidden] (the recipe of #change-status). */
+#requests-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  font-size: 0.8125rem;
+  line-height: 1.5;
 }
 
 /* The strip: one muted line under the bar, only while the drawer is closed and a condition holds. */
@@ -4531,6 +4795,100 @@ button.mx-name:focus-visible {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* The line that says why a scale is in use when several fit: a bold lead word and one plain sentence under the scale
+   name. It is no warning, so it wears the text colour only, and it is hidden for a scale that was simply heard. */
+#jam-reason {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+#jam-reason[hidden] {
+  display: none;
+}
+
+#jam-reason-lead {
+  font-weight: 600;
+}
+
+/* The scales that fit, under the reason line: a quiet caption, then one item per scale. While one can be chosen each item is a
+   button and the one in use is pressed (a lighter fill and an underline, no weight change, so nothing shifts); when none can
+   be chosen the items are plain text with no hover and no pointer. Never cut: an item keeps its whole name and the row wraps
+   between items. Text colours only, no Jam hue: a list of scales is no warning. */
+#jam-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+#jam-candidates[hidden] {
+  display: none;
+}
+
+#jam-candidates-label,
+#jam-candidates-more {
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+#jam-candidates-more[hidden] {
+  display: none;
+}
+
+#jam-candidate-list {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.jam-candidate {
+  box-sizing: border-box;
+  min-height: 1.75rem;
+  padding: 0 0.5rem;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+button.jam-candidate {
+  cursor: pointer;
+}
+
+button.jam-candidate:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+}
+
+button.jam-candidate[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+  border-color: var(--text-muted);
+  box-shadow: inset 0 -0.125rem 0 var(--text);
+}
+
+button.jam-candidate:focus-visible {
+  outline: 0.125rem solid var(--text);
+  outline-offset: 0.25rem;
+}
+
+span.jam-candidate {
+  color: var(--text);
 }
 
 /* The declared harmony: a quiet line above the scale block and the label before the scale name.

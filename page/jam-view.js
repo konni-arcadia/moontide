@@ -1,21 +1,25 @@
-// The Jam view's DOM: the message, the scale block, the seven degree chips, the
+// The Jam view's DOM: the message, the scale block with the line that says why a scale is proposed and the list of the scales that
+// fit (buttons that switch while one can be chosen, plain text when none can), the seven degree chips, the
 // status box, the coming-up rows and the piano, built with DOM methods only. Every text reaches
 // the page through textContent, title or setAttribute, never as markup: a part name comes from
 // the code and is not trusted. The view attaches no right-click listener: page/main.js owns the
 // only one. No DOM access at import time: main.js calls createJamView() with its document, so
 // this module can be loaded anywhere. The words and the model come from page/jam-model.js.
 
-import { JAM_COPY, statusAnnounceKey, noteDescriptor, pianoKeys, keyLabel, fretCells, fretUnits, legendEntries, STRING_NAMES, FRET_NUMBERS } from './jam-model.js';
+import { JAM_COPY, statusAnnounceKey, noteDescriptor, pianoKeys, keyLabel, keyTitle, fretCells, fretUnits, legendEntries, STRING_NAMES, FRET_NUMBERS } from './jam-model.js';
 
 const DEGREE_COUNT = 7;
 
 /**
  * Builds the Jam view's DOM once and returns `{ showMessage, render, setPreferences }`.
  * `onInstrumentChange(name)` is called with 'piano' or 'guitar' when the user picks the other
- * segment, `onChordTonesChange(checked)` when the user flips the Chord tones checkbox; the view
- * never touches browser storage, main.js owns the preferences.
+ * segment, `onChordTonesChange(checked)` when the user flips the Chord tones checkbox,
+ * `onScaleChoice({ setKey, key })` when the user picks a scale that is not the one in use (a click, or Enter or Space on
+ * the focused button); a handler that throws is caught and said once per set of candidates. The view never touches
+ * browser storage and never chooses: main.js owns the preferences and the choice.
  */
-export function createJamView({ document, onInstrumentChange, onChordTonesChange }) {
+export function createJamView({ document, onInstrumentChange, onChordTonesChange, onScaleChoice }) {
+  if (typeof onScaleChoice !== 'function') throw new Error('Moontide: createJamView needs onScaleChoice, a function that takes { setKey, key }.');
   const jamView = document.getElementById('jam-view');
   const jamMessage = document.getElementById('jam-message');
   const jamMessageText = document.getElementById('jam-message-text');
@@ -25,9 +29,17 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
   const jamDeclaredLabel = document.getElementById('jam-declared-label');
   const jamDeclaredValue = document.getElementById('jam-declared-value');
   const jamDeclaredSection = document.getElementById('jam-declared-section');
+  const jamScale = document.getElementById('jam-scale');
   const jamScaleLabel = document.getElementById('jam-scale-label');
   const jamScaleName = document.getElementById('jam-scale-name');
   const jamScaleSub = document.getElementById('jam-scale-sub');
+  const jamReason = document.getElementById('jam-reason');
+  const jamReasonLead = document.getElementById('jam-reason-lead');
+  const jamReasonRest = document.getElementById('jam-reason-rest');
+  const jamCandidates = document.getElementById('jam-candidates');
+  const jamCandidatesLabel = document.getElementById('jam-candidates-label');
+  const jamCandidateList = document.getElementById('jam-candidate-list');
+  const jamCandidatesMore = document.getElementById('jam-candidates-more');
   const jamDegrees = document.getElementById('jam-degrees');
   const jamStatus = document.getElementById('jam-status');
   const jamStatusLead = document.getElementById('jam-status-lead');
@@ -105,7 +117,7 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
     labelEl.className = 'jam-key-label';
     el.append(labelEl);
     jamPiano.append(el);
-    return { key, el, labelEl, shown: { note: null, role: null, root: null, chord: null, label: null } };
+    return { key, el, labelEl, shown: { note: null, role: null, root: null, chord: null, label: null, title: '' } };
   });
   let shownPianoLabel = null;
 
@@ -163,6 +175,11 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
   }
 
   let shownDeclaredOn = false;
+  let shownLabelOn = null;
+  let shownSource = null;
+  let shownReasonOn = null;
+  let shownReasonLead = null;
+  let shownReasonRest = null;
   let shownDeclaredKind = null;
   let shownDeclaredText = null;
   let shownDeclaredTitle = null;
@@ -199,14 +216,13 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
     lastModel = null;
   }
 
-  // The Declared line and the Heard label: both shown with a declaration, both hidden without one. The
-  // text comes from the code, so it goes in as text only, and only when it changed.
+  // The Declared line: shown with a declaration, hidden without one. The text comes from the code, so it goes
+  // in as text only, and only when it changed.
   function renderDeclared(declared) {
     if (declared === undefined) throw new Error('Moontide: a ready Jam model needs its declared field (null without a declaration).');
     const on = declared !== null;
     if (on !== shownDeclaredOn) {
       jamDeclared.hidden = !on;
-      jamScaleLabel.hidden = !on;
       shownDeclaredOn = on;
     }
     if (!on) return;
@@ -222,6 +238,136 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
       jamDeclaredValue.title = declared.title;
       shownDeclaredTitle = declared.title;
     }
+  }
+
+  // Where the scale in use came from. The Heard label shows only with a declaration and only for a scale that was heard: it
+  // would be false for a proposed one. The source rides on #jam-scale for tests and the probe.
+  function renderSource(declared, scaleSource) {
+    if (scaleSource !== 'heard' && scaleSource !== 'proposed' && scaleSource !== 'chosen') {
+      throw new Error(`Moontide: a ready Jam model needs a scale source of heard, proposed or chosen, got '${String(scaleSource)}'.`);
+    }
+    const labelOn = declared !== null && scaleSource === 'heard';
+    if (labelOn !== shownLabelOn) {
+      jamScaleLabel.hidden = !labelOn;
+      shownLabelOn = labelOn;
+    }
+    if (scaleSource !== shownSource) {
+      jamScale.dataset.source = scaleSource;
+      shownSource = scaleSource;
+    }
+  }
+
+  // The line that says why the scale is proposed: a lead word and one sentence, written only when they changed so the
+  // polite live region reads a proposal once and never per tick. Hiding it clears both texts, so a proposal that comes back
+  // later is read again.
+  function renderReason(reason) {
+    if (reason === undefined) throw new Error('Moontide: a ready Jam model needs its reason field (null for a scale that was heard).');
+    const on = reason !== null;
+    const lead = on ? reason.lead : '';
+    const rest = on ? reason.rest : '';
+    if (lead !== shownReasonLead) {
+      jamReasonLead.textContent = lead;
+      shownReasonLead = lead;
+    }
+    if (rest !== shownReasonRest) {
+      jamReasonRest.textContent = rest;
+      shownReasonRest = rest;
+    }
+    if (on !== shownReasonOn) {
+      jamReason.hidden = !on;
+      shownReasonOn = on;
+    }
+  }
+
+  // The scales that fit. Pick mode draws one button per scale and exactly one is pressed; list mode draws plain items in a
+  // list. The items are rebuilt only when the mode, the set of candidates or the names drawn changed; a switch of the
+  // pressed scale rewrites aria-pressed in place, so the button just clicked keeps focus (and a rebuild gives focus back to
+  // the button of the same scale). Each button reads its own key
+  // from its closure, never from the markup, and a click on the pressed one does nothing. A choice the page refuses is said
+  // once per set of candidates, not once per click.
+  let shownCandidatesOn = null;
+  let shownCandidatesMode = null;
+  let shownCandidatesCaption = null;
+  let shownCandidatesMore = null;
+  let shownCandidatesKey = null;
+  let candidateRefs = [];
+  const choiceReportedFor = new Set();
+
+  function chooseCandidate(setKey, ref) {
+    if (ref.pressed) return;
+    try {
+      onScaleChoice({ setKey, key: ref.key });
+    } catch (err) {
+      if (!choiceReportedFor.has(setKey)) {
+        choiceReportedFor.add(setKey);
+        console.error('Moontide: the Jam view could not switch the scale:', err);
+      }
+    }
+  }
+
+  function buildCandidates(candidates) {
+    // The buttons are replaced, so a focused one would be lost: note its key now and give focus to the new button of the
+    // same scale (a pick can change which scale sits in the last place drawn when more than eight fit).
+    const focused = candidateRefs.find((ref) => ref.el === document.activeElement);
+    candidateRefs = candidates.items.map((item) => {
+      const pick = candidates.mode === 'pick';
+      const el = document.createElement(pick ? 'button' : 'span');
+      el.className = 'jam-candidate';
+      el.textContent = item.name;
+      const ref = { el, key: item.key, pressed: pick && item.pressed };
+      if (pick) {
+        el.type = 'button';
+        el.setAttribute('aria-pressed', String(item.pressed));
+        el.addEventListener('click', () => chooseCandidate(candidates.setKey, ref));
+      } else {
+        el.setAttribute('role', 'listitem');
+      }
+      return ref;
+    });
+    if (candidates.mode === 'list') jamCandidateList.setAttribute('role', 'list');
+    else jamCandidateList.removeAttribute('role');
+    jamCandidateList.replaceChildren(...candidateRefs.map((ref) => ref.el));
+    if (focused !== undefined) candidateRefs.find((ref) => ref.key === focused.key)?.el.focus();
+  }
+
+  function renderCandidates(candidates) {
+    if (candidates === undefined) throw new Error('Moontide: a ready Jam model needs its candidates field (null for a scale that was heard).');
+    const on = candidates !== null;
+    if (on !== shownCandidatesOn) {
+      jamCandidates.hidden = !on;
+      shownCandidatesOn = on;
+    }
+    if (!on) return;
+    if (candidates.mode !== 'pick' && candidates.mode !== 'list') {
+      throw new Error(`Moontide: the Jam view cannot draw scales that fit in the mode '${String(candidates.mode)}'.`);
+    }
+    if (candidates.mode !== shownCandidatesMode) {
+      jamCandidates.dataset.mode = candidates.mode;
+      shownCandidatesMode = candidates.mode;
+    }
+    if (candidates.caption !== shownCandidatesCaption) {
+      jamCandidatesLabel.textContent = candidates.caption;
+      shownCandidatesCaption = candidates.caption;
+    }
+    if (candidates.more !== shownCandidatesMore) {
+      jamCandidatesMore.textContent = candidates.more ?? '';
+      jamCandidatesMore.hidden = candidates.more === null;
+      shownCandidatesMore = candidates.more;
+    }
+    const listKey = [candidates.mode, candidates.setKey, ...candidates.items.map((item) => item.key)].join('\n');
+    if (listKey !== shownCandidatesKey) {
+      buildCandidates(candidates);
+      shownCandidatesKey = listKey;
+      return;
+    }
+    if (candidates.mode !== 'pick') return;
+    candidates.items.forEach((item, i) => {
+      const ref = candidateRefs[i];
+      if (ref.pressed !== item.pressed) {
+        ref.el.setAttribute('aria-pressed', String(item.pressed));
+        ref.pressed = item.pressed;
+      }
+    });
   }
 
   // The section the Declared line speaks for: its words after the value, hidden for a piece without sections.
@@ -376,7 +522,7 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
     });
   }
 
-  // The piano: each key's note, role, avoided-root ring and label, written only when changed.
+  // The piano: each key's note, role, avoided-root ring, label and hover title, written only when changed.
   function renderInstrument(instrument) {
     const { roles, names, rootPc, chordPcs } = instrument;
     for (const ref of keys) {
@@ -407,6 +553,12 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
       if (ref.shown.label !== label) {
         ref.labelEl.textContent = label;
         ref.shown.label = label;
+      }
+      const title = keyTitle(ref.key, roles, names, chordPcs, rootPc);
+      if (ref.shown.title !== title) {
+        if (title === '') ref.el.removeAttribute('title');
+        else ref.el.setAttribute('title', title);
+        ref.shown.title = title;
       }
     }
     if (instrument.pianoLabel !== shownPianoLabel) {
@@ -494,6 +646,9 @@ export function createJamView({ document, onInstrumentChange, onChordTonesChange
     lastModel = model;
     renderDeclared(model.declared);
     renderDeclaredSection(model.section);
+    renderSource(model.declared, model.scaleSource);
+    renderReason(model.reason);
+    renderCandidates(model.candidates);
     renderScale(model.scale, model.degrees);
     renderStatus(model.status);
     if (model.paused !== shownPaused) {

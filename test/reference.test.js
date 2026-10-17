@@ -900,6 +900,8 @@ const CLAIMS_BUNDLE_PARTS = {
   // The operator that wraps a bare number as { value } and the merge that refuses a lone value with a warning.
   addNumberControl:
     'function _composeOp(o,e,l){return _nonArrayObject(o)||_nonArrayObject(e)?(_nonArrayObject(o)||(o={value:o}),_nonArrayObject(e)||(e={value:e}),unionWithObj(o,e,l)):l(o,e)}function unionWithObj(o,e,l){if(e?.value!==void 0&&Object.keys(e).length===1)return logger$2("[warn]: Can\'t do arithmetic on control pattern."),o;const d=Object.keys(o).filter(p=>Object.keys(e).includes(p));return Object.assign({},o,e,Object.fromEntries(d.map(p=>[p,l(o[p],e[p])])))}',
+  // The cpm method, registered so that it reads the scheduler's cps when it is called (when the program runs).
+  cpm: 'const cs=register("cpm",function(os,xs){return xs._fast(os/60/wn.cps)});',
   // The duckorbit control with its alias and the sound engine's read of it.
   duckorbit:
     '{duck}=registerControl("duckorbit","duck"),{duckdepth}=registerControl("duckdepth");let{s:se=getDefaultValue("s"),postgain:sn=getDefaultValue("postgain"),duckorbit:rn,duckonset:ln,duckattack:dn,duckdepth:pn,djf:bn,release:vn=getDefaultValue("release")}=o;',
@@ -987,6 +989,14 @@ const ARRANGE_SENTENCE =
 const structureText = (sentences = STRUCTURE_SENTENCES, helperText = HELPER_TEXT) =>
   `# Song structure\n\n\`\`\`js\n${helperText}\n\`\`\`\n\n${Object.values(sentences).join('\n\n')}\n`;
 
+const TEMPO_RAMP_SECTION = [
+  '## Tempo ramp',
+  '',
+  '`set_code` and `edit_code` take `glideBars`, a whole number of bars from 1 to 64, to move the tempo smoothly instead of jumping.',
+  '',
+  "A pattern's `.cpm()` is worked out once, when the program runs, against the tempo at that moment, and its length in cycles stays fixed after that. The MIDI clock follows every step of a ramp. How a hardware instrument that follows the MIDI clock reacts to a ramp has not been verified.",
+].join('\n');
+
 const CLAIMS_TEXTS_TRUE = {
   'theory.md': [
     'the octave is 3 when none is written',
@@ -1001,10 +1011,9 @@ const CLAIMS_TEXTS_TRUE = {
   ].join('. '),
   'functions.md':
     ARRANGE_SENTENCE + ' arrange repeats every total cycles. No function of this Strudel reads `t` or `f` as a boolean: in mini-notation `t`, `f`, `true` and `false` are plain strings (`f` is also a note name), so `struct`, `mask` and `when` treat each of them as true. The false values are `0` and `~` (a rest) for `struct` and `mask`. `when` needs `1`/`0`. A label longer than one character that starts with a capital `S` plays alone: while one exists, every other label is silent; a label that also starts or ends with `_` is silenced instead.',
-  'transitions.md': [
-    'one cycle lasts 2 seconds at the default 0.5 cycles per second',
-    'arrange repeats every total cycles',
-  ].join('. '),
+  'transitions.md':
+    ['one cycle lasts 2 seconds at the default 0.5 cycles per second', 'arrange repeats every total cycles'].join('. ') +
+    `\n\n${TEMPO_RAMP_SECTION}\n`,
   'src/mcp.ts':
     "  'A label longer than one character that starts with a capital S plays alone, unless it also ends with an underscore, which silences it instead: while a label that plays alone exists, every other label is silent.',",
   'tidal-differences.md': [
@@ -1020,7 +1029,7 @@ const CLAIMS_TEXTS_TRUE = {
   'structure.md': structureText(),
 };
 
-test('check-reference: PROSE_CLAIMS has exactly thirty-eight entries with the expected ids', () => {
+test('check-reference: PROSE_CLAIMS has exactly thirty-nine entries with the expected ids', () => {
   assert.deepEqual(
     PROSE_CLAIMS.map((c) => c.id),
     [
@@ -1062,6 +1071,7 @@ test('check-reference: PROSE_CLAIMS has exactly thirty-eight entries with the ex
       'scale-patterned',
       'add-number-control',
       'duckorbit-exists',
+      'tempo-glide',
     ],
   );
 });
@@ -1754,6 +1764,54 @@ test('check-reference: proseClaimFailures flags a bundle without the Cyclist cps
     .join(';');
   const failures = proseClaimFailures(withoutCyclist, CLAIMS_TEXTS_TRUE);
   assert.ok(failures.some((f) => f.startsWith('default-tempo: cannot find')));
+});
+
+test('check-reference: the tempo-glide claim passes on the true fixtures', () => {
+  assert.deepEqual(proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, CLAIMS_TEXTS_TRUE), []);
+});
+
+test('check-reference: a bundle without the cpm registration shape fails only tempo-glide, with "cannot find"', () => {
+  const without = Object.entries(CLAIMS_BUNDLE_PARTS)
+    .filter(([key]) => key !== 'cpm')
+    .map(([, value]) => value)
+    .join(';');
+  const failures = proseClaimFailures(without, CLAIMS_TEXTS_TRUE);
+  assert.equal(failures.length, 1, failures.join(' | '));
+  assert.ok(failures[0].startsWith('tempo-glide: cannot find'), failures[0]);
+});
+
+test('check-reference: transitions.md stating other bounds than the page uses fails only tempo-glide, naming both', () => {
+  const texts = { ...CLAIMS_TEXTS_TRUE, 'transitions.md': CLAIMS_TEXTS_TRUE['transitions.md'].replace('from 1 to 64', 'from 1 to 32') };
+  assert.deepEqual(proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, texts), ['transitions.md: says glideBars from 1 to 32, the page uses glideBars from 1 to 64']);
+});
+
+test('check-reference: a ramp section that lost the bounds, the .cpm() sentence, the not-verified sentence or itself no longer states the claim', () => {
+  const base = CLAIMS_TEXTS_TRUE['transitions.md'];
+  const cases = {
+    bounds: base.replace('a whole number of bars from 1 to 64', 'a number of bars'),
+    cpm: base.replace("A pattern's `.cpm()` is worked out once, when the program runs, against the tempo at that moment, and its length in cycles stays fixed after that. ", ''),
+    notVerified: base.replace(' How a hardware instrument that follows the MIDI clock reacts to a ramp has not been verified.', ''),
+    section: base.replace('## Tempo ramp', '## Something else'),
+  };
+  for (const [what, text] of Object.entries(cases)) {
+    assert.notEqual(text, base, `${what}: the fixture changed`);
+    const failures = proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, { ...CLAIMS_TEXTS_TRUE, 'transitions.md': text });
+    assert.ok(failures.length >= 1, what);
+    assert.ok(failures.every((f) => f.startsWith('transitions.md: no longer states tempo-glide')), `${what}: ${failures.join(' | ')}`);
+  }
+});
+
+test('check-reference: any digit other than the bounds in the ramp section fails only tempo-glide', () => {
+  const base = CLAIMS_TEXTS_TRUE['transitions.md'];
+  for (const example of ['for example 120 BPM', 'over 8 bars']) {
+    const texts = { ...CLAIMS_TEXTS_TRUE, 'transitions.md': base.replace('instead of jumping.', `instead of jumping, ${example}.`) };
+    const failures = proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, texts);
+    assert.equal(failures.length, 1, failures.join(' | '));
+    assert.ok(failures[0].startsWith('transitions.md: the tempo-glide section holds a digit other than the bounds'), failures[0]);
+  }
+  // A digit in another section of the file is not the ramp section's business.
+  const elsewhere = { ...CLAIMS_TEXTS_TRUE, 'transitions.md': base.replace('arrange repeats every total cycles', 'arrange repeats every 8 total cycles') };
+  assert.ok(!proseClaimFailures(CLAIMS_BUNDLE_FIXTURE, elsewhere).some((f) => f.includes('tempo-glide')));
 });
 
 test(

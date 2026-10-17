@@ -467,3 +467,104 @@ test('installQueryCheck with a takeover replaces a waiting change when the value
   assert.equal(takeover.calls.filter(([name]) => name === 'replaceForImmediate').length, 1);
   assert.equal(scheduler.taken.length, 1);
 });
+
+test('a scheduler query (cyclist control) calls onSchedulerQuery once, before the query; a page query does not', () => {
+  const calls = [];
+  const logs = [];
+  const scope = createSchedulerQueryScope({
+    getTypes: () => constructors,
+    onError: () => {},
+    onSchedulerQuery: () => calls.push('hook'),
+  });
+  const pattern = strudelLikePattern(logs);
+  pattern.failing = false;
+  const original = pattern.query;
+  pattern.query = function (state) {
+    calls.push('query');
+    return original.call(this, state);
+  };
+  scope.wrap(pattern);
+  pattern.queryArc(0, 1, { _cps: 0.5, cyclist: 'cyclist' });
+  assert.deepEqual(calls, ['hook', 'query']);
+  calls.length = 0;
+  pattern.queryArc(0, 1);
+  pattern.queryArc(0, 1, {});
+  pattern.queryArc(0, 1, { _cps: 1 });
+  assert.deepEqual(calls.filter((entry) => entry === 'hook'), [], 'a page query is not the scheduler');
+});
+
+test('a throwing onSchedulerQuery leaves the events of the query intact and logs one line', () => {
+  const lines = [];
+  const original = console.error;
+  console.error = (...args) => lines.push(args.join(' '));
+  try {
+    const scope = createSchedulerQueryScope({
+      getTypes: () => constructors,
+      onError: () => {},
+      onSchedulerQuery: () => {
+        throw new Error('hook failed');
+      },
+    });
+    const pattern = strudelLikePattern([]);
+    pattern.failing = false;
+    scope.wrap(pattern);
+    const events = pattern.queryArc(0, 1, { _cps: 0.5, cyclist: 'cyclist' });
+    assert.equal(events.length, 1, 'the scheduler still gets the events of its query');
+  } finally {
+    console.error = original;
+  }
+  assert.equal(lines.length, 1);
+  assert.ok(lines[0].startsWith('Moontide:'));
+});
+
+test('installQueryCheck: a refuse that returns a text throws it before the pattern is checked, before plan and before anything is armed or installed', () => {
+  const scheduler = fakeScheduler();
+  const takeover = fakeTakeover({ boundary: 12 });
+  const queryErrors = countingErrors();
+  const schedulerQueries = wrapSpy();
+  installQueryCheck(scheduler, {
+    getTypes: () => constructors,
+    queryErrors,
+    schedulerQueries,
+    takeover,
+    refuse: () => 'a refusal text',
+  });
+  const pattern = recordingPattern();
+  assert.throws(() => scheduler.setPattern(pattern, true), (err) => err instanceof Error && err.message === 'a refusal text');
+  assert.equal(pattern.states.length, 0, 'the pattern was not even queried');
+  assert.deepEqual(takeover.calls, [], 'no plan, no settle, no arm and no replace');
+  assert.deepEqual(schedulerQueries.wrapped, []);
+  assert.equal(scheduler.taken.length, 0);
+  assert.equal(queryErrors.resets, 0);
+  // A value that is not a pattern is refused too.
+  assert.throws(() => scheduler.setPattern(undefined, true), /a refusal text/);
+  assert.equal(scheduler.taken.length, 0);
+});
+
+test('installQueryCheck: a refuse that returns null changes nothing, and so does leaving the option out', () => {
+  for (const refuse of [() => null, undefined]) {
+    const scheduler = fakeScheduler();
+    const queryErrors = countingErrors();
+    installQueryCheck(scheduler, { getTypes: () => constructors, queryErrors, schedulerQueries: newScope().scope, refuse });
+    scheduler.setPattern(patternReturning([]), true);
+    assert.equal(scheduler.taken.length, 1);
+    assert.equal(queryErrors.resets, 1);
+  }
+});
+
+test('installQueryCheck: refuse is asked for every value handed over, in order, once each', () => {
+  const scheduler = fakeScheduler();
+  let asked = 0;
+  installQueryCheck(scheduler, {
+    getTypes: () => constructors,
+    queryErrors: countingErrors(),
+    schedulerQueries: newScope().scope,
+    refuse: () => {
+      asked += 1;
+      return null;
+    },
+  });
+  scheduler.setPattern(patternReturning([]), true);
+  scheduler.setPattern(undefined, true);
+  assert.equal(asked, 2);
+});

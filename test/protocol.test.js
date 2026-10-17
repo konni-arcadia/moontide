@@ -7,6 +7,7 @@ import {
   ASK_CONTEXT_KINDS,
   GESTURE_KINDS,
   MAX_DATA_FOLDER_LENGTH,
+  MAX_GLIDE_BARS,
   MAX_MIDI_EVENTS,
   MAX_MIDI_FAILURE_LENGTH,
   MAX_MIDI_NAME_LENGTH,
@@ -15,9 +16,11 @@ import {
   MAX_REPORTED_BPM,
   MAX_STRUCTURE_NOTE_LINE,
   MAX_STRUCTURE_NOTE_LINES,
+  MIN_GLIDE_BARS,
   MIN_PHRASE_CYCLES,
   parsePageMessage,
 } from '../dist/protocol.js';
+import { MAX_GLIDE_BARS as PAGE_MAX_GLIDE_BARS, MIN_GLIDE_BARS as PAGE_MIN_GLIDE_BARS } from '../page/tempo-glide.js';
 import {
   MAX_PENDING_SECONDS as PAGE_MAX_PENDING_SECONDS,
   MAX_PHRASE_CYCLES as PAGE_MAX_PHRASE_CYCLES,
@@ -293,6 +296,11 @@ test('parsePageMessage accepts a history-request frame and returns it unchanged'
   assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'history-request' })), { type: 'history-request' });
 });
 
+test('ask-board-request: parsePageMessage accepts it and drops any extra key', () => {
+  assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'ask-board-request' })), { type: 'ask-board-request' });
+  assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'ask-board-request', id: 'x', text: 'y' })), { type: 'ask-board-request' });
+});
+
 test('data folder request: parsePageMessage accepts a data-folder-request frame, drops an extra path key and MAX_DATA_FOLDER_LENGTH is 1024', () => {
   assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'data-folder-request' })), { type: 'data-folder-request' });
   assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'data-folder-request', path: 'x' })), { type: 'data-folder-request' });
@@ -472,7 +480,7 @@ test('a gesture comes only with a lane context and a moment', () => {
 });
 
 /** A range of cycles as the page sends it: the context and its gesture, which holds the notes of the lane that start in them. */
-const RANGE_CONTEXT = { kind: 'range', track: 't1', from: 2, to: 5, section: 'x', sectionTo: 'y' };
+const RANGE_CONTEXT = { kind: 'range', track: 't1', from: 2, to: 5, sections: ['z', 'x', 'y'] };
 const RANGE_NOTES = [
   { track: 't1', note: 'c3', velocity: 0.8, start: 2, end: 2.25 },
   { track: 't1', note: 'e3', sound: 'sawtooth', velocity: 0.8, start: 3.25, end: 3.5 },
@@ -485,9 +493,11 @@ test('a range context with its range gesture parses unchanged, with or without s
   for (const [context, gesture] of [
     [RANGE_CONTEXT, RANGE_GESTURE],
     [{ kind: 'range', track: 't1', from: 2, to: 5 }, RANGE_GESTURE],
-    [{ kind: 'range', track: 't1', from: 0, to: 0, section: 'x' }, { kind: 'range', version: null, notes: [], more: 0 }],
+    [{ kind: 'range', track: 't1', from: 0, to: 0, sections: ['x'] }, { kind: 'range', version: null, notes: [], more: 0 }],
     [{ kind: 'range', track: 't1', from: 40, to: 71 }, { kind: 'range', version: 7, notes: RANGE_NOTES, more: 12 }],
-    [{ kind: 'range', track: 'n'.repeat(200), from: 1, to: 2, section: 's'.repeat(200), sectionTo: 'e'.repeat(200) }, RANGE_GESTURE],
+    [{ kind: 'range', track: 'n'.repeat(200), from: 1, to: 2, sections: ['s'.repeat(200), 'e'.repeat(200)], moreSections: 31 }, RANGE_GESTURE],
+    [{ kind: 'range', track: 't1', from: 0, to: 31, sections: Array.from({ length: 32 }, (_, at) => `s${at}`) }, RANGE_GESTURE],
+    [{ kind: 'range', track: 't1', from: 0, to: 31, sections: ['x'], moreSections: 1 }, RANGE_GESTURE],
   ]) {
     const frame = askFrame(context, { gesture });
     assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame, JSON.stringify(context));
@@ -509,15 +519,25 @@ test('a range context out of its bounds, or a range gesture out of its bounds, i
     { kind: 'range', track: '', from: 1, to: 3 },
     { kind: 'range', from: 1, to: 3 },
     { kind: 'range', track: 't'.repeat(201), from: 1, to: 3 },
-    { kind: 'range', track: 't1', from: 1, to: 3, section: 's'.repeat(201) },
-    { kind: 'range', track: 't1', from: 1, to: 3, section: 'x', sectionTo: 'y'.repeat(201) },
-    { kind: 'range', track: 't1', from: 1, to: 3, section: '' },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: ['s'.repeat(201)] },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: ['x', 'y'.repeat(201)] },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: [''] },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: [] },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: 'x' },
+    { kind: 'range', track: 't1', from: 0, to: 31, sections: Array.from({ length: 33 }, (_, at) => `s${at}`) },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: ['x'], moreSections: 0 },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: ['x'], moreSections: 32 },
+    { kind: 'range', track: 't1', from: 1, to: 3, sections: ['x'], moreSections: 1.5 },
+    { kind: 'range', track: 't1', from: 1, to: 3, moreSections: 2 },
     { kind: 'range', track: 't1', to: 3 },
     { kind: 'range', track: 't1', from: 1 },
   ];
   for (const context of refusedContexts) {
     assert.throws(() => parsePageMessage(JSON.stringify(askFrame(context, { gesture: RANGE_GESTURE }))), startsWith('Invalid page message shape:'), JSON.stringify(context));
   }
+  // The old two-ends keys are not carried: the schema drops a key it does not name.
+  const oldKeys = askFrame({ kind: 'range', track: 't1', from: 2, to: 5, section: 'x', sectionTo: 'y' }, { gesture: RANGE_GESTURE });
+  assert.deepEqual(parsePageMessage(JSON.stringify(oldKeys)).context, { kind: 'range', track: 't1', from: 2, to: 5 });
   // The longest range, 32 cycles, is accepted.
   const widest = askFrame({ kind: 'range', track: 't1', from: 10, to: 41 }, { gesture: RANGE_GESTURE });
   assert.deepEqual(parsePageMessage(JSON.stringify(widest)), widest);
@@ -869,6 +889,17 @@ test('parsePageMessage accepts a takeover frame with a bounded id and nothing el
   assert.throws(() => parsePageMessage(JSON.stringify({ type: 'takeover' })), startsWith('Invalid page message shape:'));
 });
 
+test('parsePageMessage accepts glideRuns true on a takeover frame and nothing else in its place', () => {
+  assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'takeover', id: 'a', glideRuns: true })), {
+    type: 'takeover',
+    id: 'a',
+    glideRuns: true,
+  });
+  for (const glideRuns of [false, 'true', 1, null]) {
+    assert.throws(() => parsePageMessage(JSON.stringify({ type: 'takeover', id: 'a', glideRuns })), startsWith('Invalid page message shape:'));
+  }
+});
+
 test('parsePageMessage accepts a bpm on an evaluated ok frame and refuses one that is not a tempo', () => {
   const ok = { type: 'evaluated', id: 'a', ok: true, code: 's("bd")', audio: 'playing' };
   const pending = { cycle: 12, seconds: 6.2 };
@@ -1019,4 +1050,95 @@ test('parsePageMessage rejects a structure-note frame with four lines, a line of
   ]) {
     assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame).slice(0, 80));
   }
+});
+
+test('the ramp length limits equal the ones page/tempo-glide.js mirrors', () => {
+  assert.equal(MIN_GLIDE_BARS, PAGE_MIN_GLIDE_BARS);
+  assert.equal(MAX_GLIDE_BARS, PAGE_MAX_GLIDE_BARS);
+  assert.equal(MIN_GLIDE_BARS, 1);
+  assert.equal(MAX_GLIDE_BARS, 64);
+});
+
+test('parsePageMessage accepts a glide report on an evaluated ok frame and refuses one that is not a ramp', () => {
+  const ok = { type: 'evaluated', id: 'a', ok: true, code: 's("bd")', audio: 'playing' };
+  const glide = { state: 'started', fromBpm: 100, toBpm: 120, bars: 8 };
+  assert.deepEqual(parsePageMessage(JSON.stringify({ ...ok, bpm: 100, glide })).glide, glide);
+  assert.equal(parsePageMessage(JSON.stringify(ok)).glide, undefined);
+  for (const bars of [MIN_GLIDE_BARS, MAX_GLIDE_BARS]) {
+    assert.equal(parsePageMessage(JSON.stringify({ ...ok, glide: { ...glide, bars } })).glide.bars, bars);
+  }
+  assert.equal(parsePageMessage(JSON.stringify({ ...ok, glide: { ...glide, toBpm: MAX_REPORTED_BPM } })).glide.toBpm, MAX_REPORTED_BPM);
+  for (const bad of [
+    { ...glide, bars: 0 },
+    { ...glide, bars: MAX_GLIDE_BARS + 1 },
+    { ...glide, bars: 2.5 },
+    { ...glide, fromBpm: 0 },
+    { ...glide, toBpm: -5 },
+    { ...glide, toBpm: MAX_REPORTED_BPM + 1 },
+    { ...glide, fromBpm: null },
+    { ...glide, state: 'later' },
+    { fromBpm: 100, toBpm: 120, bars: 8 },
+  ]) {
+    assert.throws(() => parsePageMessage(JSON.stringify({ ...ok, glide: bad })), startsWith('Invalid page message shape:'), JSON.stringify(bad));
+  }
+});
+
+test('parsePageMessage accepts the at-line and running glide reports and refuses them out of bounds or with an unknown state', () => {
+  const ok = { type: 'evaluated', id: 'a', ok: true, code: 's("bd")', audio: 'playing' };
+  const atLine = { state: 'at-line', toBpm: 120, bars: 4 };
+  const running = { state: 'running', nowBpm: 110, toBpm: 120 };
+  assert.deepEqual(parsePageMessage(JSON.stringify({ ...ok, glide: atLine })).glide, atLine);
+  assert.deepEqual(parsePageMessage(JSON.stringify({ ...ok, glide: running })).glide, running);
+  for (const bars of [MIN_GLIDE_BARS, MAX_GLIDE_BARS]) {
+    assert.equal(parsePageMessage(JSON.stringify({ ...ok, glide: { ...atLine, bars } })).glide.bars, bars);
+  }
+  assert.equal(parsePageMessage(JSON.stringify({ ...ok, glide: { ...running, nowBpm: MAX_REPORTED_BPM } })).glide.nowBpm, MAX_REPORTED_BPM);
+  for (const bad of [
+    { ...atLine, bars: 0 },
+    { ...atLine, bars: MAX_GLIDE_BARS + 1 },
+    { ...atLine, toBpm: 0 },
+    { ...atLine, toBpm: MAX_REPORTED_BPM + 1 },
+    { state: 'at-line', bars: 4 },
+    { ...running, nowBpm: 0 },
+    { ...running, toBpm: MAX_REPORTED_BPM + 1 },
+    { ...running, nowBpm: MAX_REPORTED_BPM + 1 },
+    { state: 'running', toBpm: 120 },
+    { ...running, state: 'later' },
+  ]) {
+    assert.throws(() => parsePageMessage(JSON.stringify({ ...ok, glide: bad })), startsWith('Invalid page message shape:'), JSON.stringify(bad));
+  }
+});
+
+test('glideRefused parses only as true on a refused evaluated frame', () => {
+  const failed = { type: 'evaluated', id: 'a', ok: false, code: 's("bd")', error: 'no' };
+  assert.equal(parsePageMessage(JSON.stringify({ ...failed, glideRefused: true })).glideRefused, true);
+  assert.equal(parsePageMessage(JSON.stringify(failed)).glideRefused, undefined);
+  for (const bad of [false, 'true', 1, null]) {
+    assert.throws(() => parsePageMessage(JSON.stringify({ ...failed, glideRefused: bad })), startsWith('Invalid page message shape:'), String(bad));
+  }
+});
+
+test('parsePageMessage accepts glide-ended for each reason with a bounded tempo and refuses an unknown reason', () => {
+  for (const reason of ['finished', 'other-tempo', 'no-tempo', 'error']) {
+    assert.deepEqual(parsePageMessage(JSON.stringify({ type: 'glide-ended', reason })), { type: 'glide-ended', reason });
+    assert.equal(parsePageMessage(JSON.stringify({ type: 'glide-ended', reason, bpm: 90.5 })).bpm, 90.5);
+  }
+  assert.equal(parsePageMessage(JSON.stringify({ type: 'glide-ended', reason: 'error', bpm: MAX_REPORTED_BPM })).bpm, MAX_REPORTED_BPM);
+  for (const bad of [
+    { type: 'glide-ended', reason: 'stop' },
+    { type: 'glide-ended', reason: 'page' },
+    { type: 'glide-ended' },
+    { type: 'glide-ended', reason: 'error', bpm: 0 },
+    { type: 'glide-ended', reason: 'error', bpm: MAX_REPORTED_BPM + 1 },
+    { type: 'glide-ended', reason: 'error', bpm: 'fast' },
+  ]) {
+    assert.throws(() => parsePageMessage(JSON.stringify(bad)), startsWith('Invalid page message shape:'), JSON.stringify(bad));
+  }
+});
+
+test('the server refusal text of a ramp with nothing playing equals the page text', async () => {
+  const { GLIDE_NOTHING_PLAYS_MESSAGE } = await import('../dist/mcp.js');
+  const { GLIDE_REFUSALS } = await import('../page/tempo-glide.js');
+  assert.equal(GLIDE_NOTHING_PLAYS_MESSAGE, GLIDE_REFUSALS.nothingPlays);
+  assert.ok(GLIDE_NOTHING_PLAYS_MESSAGE.includes('without glideBars'));
 });

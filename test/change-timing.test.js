@@ -23,6 +23,7 @@ import {
   parseTiming,
   pinnedTiming,
   queuedLine,
+  rampLine,
   settingLine,
   timingOptions,
 } from '../page/change-timing.js';
@@ -247,7 +248,7 @@ test('CHANGE_TIMINGS stays the closed set of the stored setting: a pinned sectio
 
 test('fillChange: a placeholder without a value throws, and every template fills with its documented values', () => {
   assert.throws(() => fillChange(CHANGE_COPY.countdownBars, {}), /^Error: Moontide: .*\{n\}/);
-  const values = { bpm: 120, n: 3 };
+  const values = { bpm: 120, n: 3, from: 100, to: 120 };
   for (const [key, template] of Object.entries(CHANGE_COPY)) {
     assert.doesNotMatch(fillChange(template, values), /[{}]/, key);
   }
@@ -267,4 +268,33 @@ test('clampPendingSeconds keeps a wait inside what the server accepts and turns 
   assert.equal(clampPendingSeconds(Number.POSITIVE_INFINITY), MAX_PENDING_SECONDS);
   assert.equal(clampPendingSeconds(MAX_PENDING_SECONDS + 1), MAX_PENDING_SECONDS);
   assert.equal(MAX_REPORTED_BPM, 100000);
+});
+
+test('rampLine: the four sentences of a tempo ramp, filled from the copy', () => {
+  assert.equal(rampLine({ kind: 'started', fromBpm: 100, toBpm: 120, bars: 4 }), 'Tempo ramp started: 100 to 120 BPM over 4 bars.');
+  assert.equal(rampLine({ kind: 'started', fromBpm: 120.5, toBpm: 90, bars: 1 }), 'Tempo ramp started: 120.5 to 90 BPM over 1 bar.');
+  assert.equal(rampLine({ kind: 'finished', toBpm: 120 }), 'Tempo ramp finished at 120 BPM.');
+  assert.equal(rampLine({ kind: 'canceled', reason: 'other-tempo', bpm: 90 }), 'Tempo ramp canceled. The code sets 90 BPM.');
+  assert.equal(rampLine({ kind: 'canceled', reason: 'no-tempo', bpm: 111.6 }), 'Tempo ramp canceled. Tempo stays at 111.6 BPM.');
+});
+
+test('rampLine: the tempos go through bpmText, and anything else throws', () => {
+  assert.equal(rampLine({ kind: 'started', fromBpm: 100.04, toBpm: 120.0, bars: 2 }), 'Tempo ramp started: 100 to 120 BPM over 2 bars.');
+  assert.throws(() => rampLine({ kind: 'started', fromBpm: 100, toBpm: 120, bars: 0 }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'started', fromBpm: 100, toBpm: 120, bars: 2.5 }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'started', fromBpm: 100, toBpm: 120 }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'started', fromBpm: 0, toBpm: 120, bars: 2 }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'finished', toBpm: Number.NaN }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'finished' }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'canceled', reason: 'stop', bpm: 90 }), /^Error: Moontide: .*stop/);
+  assert.throws(() => rampLine({ kind: 'canceled', reason: 'replaced', bpm: 90 }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'canceled', reason: 'no-tempo' }), /^Error: Moontide: /);
+  assert.throws(() => rampLine({ kind: 'step', bpm: 90 }), /^Error: Moontide: .*step/);
+  assert.throws(() => rampLine(null), /^Error: Moontide: /);
+});
+
+test('rampLine: every ramp template needs its values, a missing placeholder throws', () => {
+  for (const key of ['rampStarted', 'rampStartedOneBar', 'rampFinished', 'rampCanceledOtherTempo', 'rampCanceledNoTempo']) {
+    assert.throws(() => fillChange(CHANGE_COPY[key], {}), /^Error: Moontide: the change copy needs a value/, key);
+  }
 });

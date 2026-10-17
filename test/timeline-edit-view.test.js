@@ -96,7 +96,7 @@ function setup({ handlers: overrides = {}, rangeInfo = {}, track = 't1', editabl
     // What the page tells the panel of a range: the lane, the sections of its ends, and how many notes start in it.
     describeRange(selection) {
       calls.describeRange.push(selection);
-      return { track: selection.laneIndex === 0 ? track : 'drums', section: null, sectionTo: null, count: selection.to - selection.from + 1, ...rangeInfo };
+      return { track: selection.laneIndex === 0 ? track : 'drums', count: selection.to - selection.from + 1, ...rangeInfo };
     },
     ...overrides,
   };
@@ -2427,7 +2427,7 @@ test('the panel names a range, shows only Ask Claude and the range hint, and kee
   assert.deepEqual(t.calls.prepare, []);
 });
 
-test('the panel of a range reads one cycle, no notes, one note and the section or the two sections', () => {
+test('the panel of a range reads one cycle, no notes, one note, one section and a list of three sections', () => {
   const read = (rangeInfo, from, to) => {
     const t = setup({ rangeInfo });
     t.view.onRedraw(t.drawn);
@@ -2436,10 +2436,10 @@ test('the panel of a range reads one cycle, no notes, one note and the section o
   };
   assert.equal(read({ count: 0 }, 12, 12), 'Range · t1 · cycle 12 · no notes');
   assert.equal(read({ count: 1 }, 12, 12), 'Range · t1 · cycle 12 · 1 note');
-  assert.equal(read({ count: 14, section: 'y' }, 12, 15), "Range · t1 · cycles 12 to 15 · section 'y' · 14 notes");
-  assert.equal(read({ count: 14, section: 'x', sectionTo: 'z' }, 12, 15), "Range · t1 · cycles 12 to 15 · sections 'x' to 'z' · 14 notes");
+  assert.equal(read({ count: 14, sections: ['y'] }, 12, 15), "Range · t1 · cycles 12 to 15 · section 'y' · 14 notes");
+  assert.equal(read({ count: 14, sections: ['z', 'x', 'y'] }, 12, 15), "Range · t1 · cycles 12 to 15 · sections 'z', 'x', 'y' · 14 notes");
   // A name from the code stays text.
-  assert.equal(read({ count: 2, section: '<b>x</b>' }, 12, 15), "Range · t1 · cycles 12 to 15 · section '<b>x</b>' · 2 notes");
+  assert.equal(read({ count: 2, sections: ['<b>x</b>'] }, 12, 15), "Range · t1 · cycles 12 to 15 · section '<b>x</b>' · 2 notes");
   // The second lane's range names the second lane.
   const t = setup();
   t.view.onRedraw(t.drawn);

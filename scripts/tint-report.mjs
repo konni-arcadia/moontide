@@ -286,6 +286,20 @@ export function structureMetrics(code) {
   };
 }
 
+/**
+ * The structure metrics of one history version. When the structure reader throws, the error names the version (its
+ * id), so a broken reader is traced to the code that broke it; the original error stays as the cause. The message holds
+ * the version id and the reader's message, never the code.
+ */
+export function versionStructure(version, read = structureMetrics) {
+  try {
+    return read(version.code);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`tint:report: the structure reader failed on version #${version.id}: ${message}`, { cause: err });
+  }
+}
+
 /** The `  structure:` line of one version in the report. */
 export function structureLine(metrics) {
   if (metrics.state === 'none') return '  structure: none';
@@ -453,7 +467,7 @@ async function main(argv) {
     tempo: tempoUsed(v.code),
     flute: hasFlute(v.code, v.label),
     reused: reusedDemoLines(v.code, demo),
-    structure: structureMetrics(v.code),
+    structure: versionStructure(v),
   }));
 
   const report = formatReport({

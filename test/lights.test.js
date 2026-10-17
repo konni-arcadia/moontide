@@ -373,6 +373,75 @@ test('reset forgets every waiting note and every lit light', () => {
   assert.deepEqual(lights.frame(700, OFF), []);
 });
 
+test('when the strip that owns a shared key changes while its light is lit, the old strip goes dark and the new one shows the value in that frame', () => {
+  const lights = createLights();
+  const shared = (soundingId) => ({
+    tracks: [
+      { key: 'label:hats', id: 'label:hats', sounding: soundingId === 'label:hats' },
+      { key: 'label:hats', id: 'label:hats_', sounding: soundingId === 'label:hats_' },
+    ],
+    ancestors: new Map(),
+  });
+  lights.setLayout(shared('label:hats'));
+  lights.noteSeen('label:hats', { at: 0 });
+  assert.deepEqual(lights.frame(0, ON), [{ kind: 'track', id: 'label:hats', value: 1 }]);
+  lights.setLayout(shared('label:hats_'));
+  lights.noteSeen('label:hats', { at: 40 });
+  const changes = lights.frame(40, ON);
+  assert.deepEqual(changes, [
+    { kind: 'track', id: 'label:hats', value: 0 },
+    { kind: 'track', id: 'label:hats_', value: 1 },
+  ]);
+  // Nothing is left lit on the old strip afterwards.
+  assert.deepEqual(lights.frame(60, ON).filter((change) => change.id === 'label:hats'), []);
+});
+
+test('forgetShown makes the next frame give every lit value again, groups included, and a frame with nothing lit gives no change', () => {
+  const lights = lightsOf(['t1'], { g: ['t1'] });
+  assert.deepEqual(lights.frame(0, ON), []);
+  lights.forgetShown();
+  assert.deepEqual(lights.frame(1, ON), []);
+  lights.noteSeen('label:t1', { at: 10 });
+  const first = lights.frame(10, ON);
+  assert.deepEqual([...byId(first)], [['track:label:t1', 1], ['group:g', 1]]);
+  assert.deepEqual(lights.frame(10, ON), []);
+  lights.forgetShown();
+  assert.deepEqual([...byId(lights.frame(10, ON))], [['track:label:t1', 1], ['group:g', 1]]);
+  // The note state stays: the light still falls on schedule.
+  assert.deepEqual(lights.frame(190, ON), [{ kind: 'track', id: 'label:t1', value: 0 }, { kind: 'group', id: 'g', value: 0 }]);
+});
+
+test('forgetShown in the middle of a fade still darkens the strip and its group once the fade ends', () => {
+  const lights = lightsOf(['t1'], { g: ['t1'] });
+  lights.noteSeen('label:t1', { at: 0 });
+  assert.deepEqual([...byId(lights.frame(0, ON))], [['track:label:t1', 1], ['group:g', 1]]);
+  const mid = lights.frame(100, ON);
+  assert.ok(mid.length > 0 && mid.every((change) => change.value > 0 && change.value < 1));
+  // The view rebuilt some other strip here, while this light is still partly lit.
+  lights.forgetShown();
+  // The fade ends in the next frame: the light must go dark, not stay at its last written value.
+  assert.deepEqual([...byId(lights.frame(400, ON))], [['track:label:t1', 0], ['group:g', 0]]);
+  assert.deepEqual(lights.frame(500, ON), []);
+});
+
+test('playsMidi tells whether the strip that owns a key plays MIDI, and is false for a browser track and for an unknown key', () => {
+  const lights = createLights();
+  assert.equal(lights.playsMidi('label:a'), false);
+  lights.setLayout({
+    tracks: [
+      { key: 'label:a', id: 'label:a', sounding: true, midi: true },
+      { key: 'label:b', id: 'label:b', sounding: true, midi: false },
+      { key: 'label:c', id: 'label:c', sounding: true },
+    ],
+    ancestors: new Map(),
+  });
+  assert.equal(lights.playsMidi('label:a'), true);
+  assert.equal(lights.playsMidi('label:b'), false);
+  assert.equal(lights.playsMidi('label:c'), false);
+  assert.equal(lights.playsMidi('label:none'), false);
+  assert.equal(lights.playsMidi(undefined), false);
+});
+
 // --- lightLayout ---
 
 const strip = (identity, extra = {}) => ({ identity, lightKey: identity, sounding: true, midi: null, playsMidi: false, ...extra });
@@ -381,10 +450,15 @@ test('lightLayout has one entry for every strip with a light key, and none for a
   const model = { status: 'ready', strips: [strip('label:t1'), strip('unnamed:1', { lightKey: null }), strip('label:t3', { sounding: false })], layout: null };
   const { tracks, ancestors } = lightLayout(model, { webMidi: true });
   assert.deepEqual(tracks, [
-    { key: 'label:t1', id: 'label:t1', sounding: true },
-    { key: 'label:t3', id: 'label:t3', sounding: false },
+    { key: 'label:t1', id: 'label:t1', sounding: true, midi: false },
+    { key: 'label:t3', id: 'label:t3', sounding: false, midi: false },
   ]);
   assert.equal(ancestors.size, 0);
+});
+
+test('lightLayout says which strips play MIDI', () => {
+  const model = { status: 'ready', strips: [strip('label:a', { midi: { port: 'x' } }), strip('label:b', { playsMidi: true }), strip('label:c')], layout: null };
+  assert.deepEqual(lightLayout(model, { webMidi: true }).tracks.map((track) => track.midi), [true, true, false]);
 });
 
 test('lightLayout counts a MIDI strip as not sounding when the browser has no Web MIDI', () => {

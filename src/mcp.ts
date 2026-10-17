@@ -20,7 +20,17 @@ import {
   type Starter,
 } from './start.js';
 import { MAX_EDITS, changedExcerpt } from './edit-code.js';
-import { MAX_PHRASE_CYCLES, MIN_PHRASE_CYCLES, type AudioState, type ChangeTiming } from './protocol.js';
+import {
+  MAX_ANSWER_TEXT_LENGTH,
+  MAX_ASK_ID_LENGTH,
+  MAX_GLIDE_BARS,
+  MAX_PHRASE_CYCLES,
+  MIN_GLIDE_BARS,
+  MIN_PHRASE_CYCLES,
+  type AudioState,
+  type ChangeTiming,
+  type GlideReport,
+} from './protocol.js';
 import { MAX_LABEL_LENGTH, MAX_FAVORITE_NAME_LENGTH } from './history.js';
 import {
   PAGE_REQUESTS_ALREADY_OFF,
@@ -131,10 +141,12 @@ export const NO_STRUCTURE_NOTE =
   'Note: this new piece declares no song structure; every new piece declares one once at the top (see the structure topic of get_strudel_reference). It plays as written.';
 
 // A text match only, like GETTIME_CALL_RE: the code is never parsed, evaluated or changed on the server, and a match
-// inside a comment or a string counts too, by design. Anchored at a line start with [ \t]* (never \s*, so a run of blank
-// lines cannot make the scan quadratic) and ended on a word boundary, so `const songs`, `const song2`, `let song` and a
-// commented-out line are not a structure. The m flag only: no global flag, so test() keeps no lastIndex.
-const SONG_CONST_RE = /^[ \t]*const[ \t]+song\b/m;
+// inside a comment or a string counts too, by design. A song declared with let or var gets its own line from the page,
+// which reads only const, so the server says nothing more for it and the two lines never disagree. Anchored at a line
+// start with [ \t]* (never \s*, so a run of blank lines cannot make the scan quadratic) and ended on a word boundary, so
+// `const songs`, `const song2` and a commented-out line are not a song. The m flag only: no global flag, so test() keeps
+// no lastIndex.
+const SONG_DECLARATION_RE = /^[ \t]*(?:const|let|var)[ \t]+song\b/m;
 
 /** The shortest line, in characters after trimming, that counts when telling a new piece from a changed one. */
 const NEW_PIECE_MIN_LINE = 8;
@@ -160,7 +172,7 @@ function isNewPiece(previous: string, code: string): boolean {
 
 /** The note when `code` replaces `previousCode` as a new piece and declares no song structure, empty otherwise. */
 export function newPieceWithoutStructureLines(previousCode: string, code: string): string[] {
-  if (SONG_CONST_RE.test(code)) return [];
+  if (SONG_DECLARATION_RE.test(code)) return [];
   return isNewPiece(previousCode, code) ? [NO_STRUCTURE_NOTE] : [];
 }
 
@@ -222,6 +234,25 @@ export function tempoLine(bpm: number, pendingCycle?: number): string {
 }
 
 /**
+ * The one-line tempo ramp of a reply, said in place of the tempo line. Three states: a ramp that started with this change,
+ * a ramp that starts at the line of a waiting change (`pendingCycle` is the line), and a ramp that goes on because this
+ * change restated its target. The numbers come from the page, bounded by the protocol schema; only numbers are
+ * formatted here, so no page text enters the reply.
+ */
+export function glideLine(glide: GlideReport, pendingCycle?: number): string {
+  const shown = (bpm: number): string => (Number.isInteger(bpm) ? String(bpm) : bpm.toFixed(1));
+  if (glide.state === 'running') {
+    return `Tempo ramp goes on: to ${shown(glide.toBpm)} BPM, now ${shown(glide.nowBpm)} BPM.`;
+  }
+  const length = glide.bars === 1 ? 'over 1 bar' : `over ${glide.bars} bars`;
+  if (glide.state === 'at-line') {
+    const line = pendingCycle === undefined ? 'at its line' : `from cycle ${pendingCycle}`;
+    return `Tempo ramp ${line}: from the tempo playing then to ${shown(glide.toBpm)} BPM ${length}.`;
+  }
+  return `Tempo ramp: from ${shown(glide.fromBpm)} to ${shown(glide.toBpm)} BPM ${length}.`;
+}
+
+/**
  * The first note of get_code while a change waits to take over: the code the reply shows is the code
  * that plays until the line.
  */
@@ -264,8 +295,13 @@ function changeStatus(
  * the at-once note when a requested line was skipped because nothing played.
  */
 function changeNoteLines(outcome: EvalOutcome, at: ChangeTiming | undefined): string[] {
+  // A change that started a ramp says the ramp in place of the tempo line: the tempo that plays has not changed yet.
   const tempo =
-    outcome.tempoChanged && outcome.bpm !== null ? [tempoLine(outcome.bpm, outcome.pending?.cycle)] : [];
+    outcome.glide !== undefined
+      ? [glideLine(outcome.glide, outcome.pending?.cycle)]
+      : outcome.tempoChanged && outcome.bpm !== null
+        ? [tempoLine(outcome.bpm, outcome.pending?.cycle)]
+        : [];
   const atOnce =
     (at === 'bar' || at === 'phrase') && outcome.pending === undefined && outcome.audio !== 'stopped'
       ? [AT_ONCE_NOTE]
@@ -275,10 +311,46 @@ function changeNoteLines(outcome: EvalOutcome, at: ChangeTiming | undefined): st
 
 const LABEL_FIELD_DESCRIPTION =
   'A few words saying what this change is, for example "added a bass"; shown by list_history';
+// One description for the three tools that change the music, so Claude meets the same fact wherever it reads it.
+export const ANSWERING_FIELD_DESCRIPTION =
+  'The id of the page request this change answers, from its request line; the page shows that request as applied only when the change names it here';
+// Said in a reply when `answering` names no open page request. No user text, no id: the note is the same every time.
+// The music change itself is never refused or held back for it.
+export const UNKNOWN_ANSWERING_NOTE =
+  'Note: answering names no open page request (it is unknown or already closed), so it changed no request status; the music change is not affected by it.';
+
+/** The note when `answering` was given and names no open request, empty otherwise. */
+export function unknownAnsweringLines(answering: string | undefined, open: boolean): string[] {
+  return answering !== undefined && !open ? [UNKNOWN_ANSWERING_NOTE] : [];
+}
+
+export const ANSWER_REQUEST_TOOL = 'answer_request';
+export const ANSWER_REQUEST_DESCRIPTION =
+  'Closes a request typed in the Moontide page without changing the music. Use outcome answered when the request was answered in words, declined when it will not or cannot be done. ' +
+  `Give one sentence of at most ${MAX_ANSWER_TEXT_LENGTH} characters; the page shows it under the request. ` +
+  'A change that answers a request names it with answering on set_code, edit_code or restore_version instead. ' +
+  'An id that is not an open request is refused and nothing changes.';
+export const ANSWER_REQUEST_ID_DESCRIPTION = 'The id of the page request to close, from its request line';
+export const ANSWER_REQUEST_OUTCOME_DESCRIPTION =
+  'answered when the request was answered in words, declined when it will not or cannot be done';
+export const ANSWER_REQUEST_TEXT_DESCRIPTION = `One sentence for the user, at most ${MAX_ANSWER_TEXT_LENGTH} characters; the page shows it under the request`;
+/** The reply when a request was closed, one fixed line per outcome. */
+export function answerRequestReply(outcome: 'answered' | 'declined'): string {
+  return outcome === 'answered' ? 'The page request was closed as answered.' : 'The page request was closed as declined.';
+}
+
 const AT_FIELD_DESCRIPTION =
   "When the change takes over: 'now' (the default) within a fraction of a second, 'bar' on the next bar line, 'phrase' on the next phrase line (4 cycles, counted from Play). " +
   'The code is checked at once; the reply says the cycle and about how many seconds away it is.';
 const PHRASE_CYCLES_FIELD_DESCRIPTION = "How many cycles one phrase lasts, for at: 'phrase' (2 to 64, default 4)";
+// Facts only: the bounds are the only digits. It is one description for both tools that change the music's code.
+export const GLIDE_BARS_FIELD_DESCRIPTION =
+  'Whole bars, 1 to 64, to move the tempo smoothly from the tempo that plays to the one this code sets with setcps or setcpm; with at, it starts at the line. Refused when nothing plays, no tempo is set or it already plays. Stop, or code with another tempo or none, cancels it';
+
+// Said when set_code or edit_code asks for a ramp while nothing plays. The page holds the same text for the case the server
+// cannot know about (a page that has not played yet); a test checks both. Nothing was started, opened or sent.
+export const GLIDE_NOTHING_PLAYS_MESSAGE =
+  'Nothing plays, so there is no tempo to ramp from. Nothing was changed. Send the change again without glideBars.';
 
 /**
  * The tool description of edit_code. The when-to-use rule comes first; Claude Code keeps at most 2048
@@ -442,6 +514,8 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       'Call it before every change.',
     annotations: { readOnlyHint: true },
   }, async () => {
+    // Marks the page requests Claude already holds as started; first, so a request this reply hands over is not.
+    session.noteToolCall();
     // Before the start there is no page and no code: say how to start and start nothing. No drain, so queued
     // notices wait for the next reply.
     const server = starter.current();
@@ -473,6 +547,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       topic: z.enum(REFERENCE_TOPIC_IDS).optional().describe('One topic to return; omit it to get the index of topics'),
     },
   }, async ({ topic }) => {
+    session.noteToolCall();
     try {
       const text = topic ? readReferenceTopic(topic) : referenceIndexText();
       return { content: [{ type: 'text' as const, text }] };
@@ -526,19 +601,34 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         .max(MAX_PHRASE_CYCLES)
         .optional()
         .describe(PHRASE_CYCLES_FIELD_DESCRIPTION),
+      glideBars: z.number().int().min(MIN_GLIDE_BARS).max(MAX_GLIDE_BARS).optional().describe(GLIDE_BARS_FIELD_DESCRIPTION),
+      answering: z.string().min(1).max(MAX_ASK_ID_LENGTH).optional().describe(ANSWERING_FIELD_DESCRIPTION),
     },
-  }, async ({ code, label, at, phraseCycles }) => {
+  }, async ({ code, label, at, phraseCycles, glideBars, answering }) => {
+    session.noteToolCall();
+    // An id that is not open never reaches the change: it is told once and the music change goes ahead.
+    const answeringOpen = answering === undefined ? true : session.requestIsOpen(answering);
     try {
       // A phrase length means nothing for another timing; refused before anything reaches the page.
       if (phraseCycles !== undefined && at !== 'phrase') {
         throw new Error("phraseCycles applies only with at: 'phrase'.");
+      }
+      // A ramp needs music to leave: refused before Moontide starts, a tab opens or anything reaches the page.
+      if (glideBars !== undefined && (!session.hasActivePage() || session.isStopped())) {
+        throw new Error(GLIDE_NOTHING_PLAYS_MESSAGE);
       }
       // The first change of the music starts Moontide and waits for the page of the tab it opens.
       await starter.ensureStarted();
       await starter.waitForPage();
       // What played before this call, read before the page changes it: the new-piece note compares the two.
       const previousCode = session.getCode();
-      const outcome = await session.evaluate(code, { label, at, phraseCycles });
+      const outcome = await session.evaluate(code, {
+        label,
+        at,
+        phraseCycles,
+        glideBars,
+        answering: answeringOpen ? answering : undefined,
+      });
       const { lines, hadRuntimeErrors } = session.drainNotices();
       // Claude must never be told "ok, playing" when something went wrong —
       // including when the user pressed Stop while this code was still starting.
@@ -558,6 +648,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         ...lines,
         ...whenFlagLines(outcome.code),
         ...newPieceWithoutStructureLines(previousCode, outcome.code),
+        ...unknownAnsweringLines(answering, answeringOpen),
         ...getTimeAnchorLines(outcome.code),
       ]);
       return { content: [{ type: 'text' as const, text }] };
@@ -567,7 +658,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       // A failed set_code doesn't clear a pending hand edit, so keep surfacing it.
       const notices = session.wasEditedByHand() ? [HAND_EDIT_NOTE] : [];
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(withNoticeLines(message, [...notices, ...lines]));
+      throw new Error(withNoticeLines(message, [...notices, ...lines, ...unknownAnsweringLines(answering, answeringOpen)]));
     }
   });
 
@@ -608,12 +699,20 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         .max(MAX_PHRASE_CYCLES)
         .optional()
         .describe(PHRASE_CYCLES_FIELD_DESCRIPTION),
+      glideBars: z.number().int().min(MIN_GLIDE_BARS).max(MAX_GLIDE_BARS).optional().describe(GLIDE_BARS_FIELD_DESCRIPTION),
+      answering: z.string().min(1).max(MAX_ASK_ID_LENGTH).optional().describe(ANSWERING_FIELD_DESCRIPTION),
     },
-  }, async ({ edits, base, label, at, phraseCycles }) => {
+  }, async ({ edits, base, label, at, phraseCycles, glideBars, answering }) => {
+    session.noteToolCall();
+    const answeringOpen = answering === undefined ? true : session.requestIsOpen(answering);
     try {
       // The same rule and text as set_code, before anything reaches the page.
       if (phraseCycles !== undefined && at !== 'phrase') {
         throw new Error("phraseCycles applies only with at: 'phrase'.");
+      }
+      // The same rule and text as set_code.
+      if (glideBars !== undefined && (!session.hasActivePage() || session.isStopped())) {
+        throw new Error(GLIDE_NOTHING_PLAYS_MESSAGE);
       }
       // Nothing plays before a start, so there is nothing to edit: refuse before a tab opens for a request that cannot work.
       if (starter.current() === null) {
@@ -621,7 +720,14 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       }
       await starter.ensureStarted();
       await starter.waitForPage();
-      const edit = await session.editCode(edits, { base, label, at, phraseCycles });
+      const edit = await session.editCode(edits, {
+        base,
+        label,
+        at,
+        phraseCycles,
+        glideBars,
+        answering: answeringOpen ? answering : undefined,
+      });
       const { outcome } = edit;
       const { lines, hadRuntimeErrors } = session.drainNotices();
       const status = changeStatus(outcome, at, hadRuntimeErrors, session.getPageUrl());
@@ -643,6 +749,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
           ...otherText,
           ...lines,
           ...whenFlagLines(outcome.code),
+          ...unknownAnsweringLines(answering, answeringOpen),
           ...getTimeAnchorLines(outcome.code),
         ],
       );
@@ -651,7 +758,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       const { lines } = session.drainNotices();
       const notices = session.wasEditedByHand() ? [HAND_EDIT_NOTE] : [];
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(withNoticeLines(message, [...notices, ...lines]));
+      throw new Error(withNoticeLines(message, [...notices, ...lines, ...unknownAnsweringLines(answering, answeringOpen)]));
     }
   });
 
@@ -668,6 +775,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       favorites: z.boolean().optional().describe('true to list only favorites'),
     },
   }, async ({ limit, filter, favorites }) => {
+    session.noteToolCall();
     try {
       const text = session.listHistory({ limit, filter, favoritesOnly: favorites });
       const { lines } = session.drainNotices();
@@ -691,6 +799,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         .describe("Name to keep it under, in the user's words"),
     },
   }, async ({ id, name }) => {
+    session.noteToolCall();
     try {
       const text = session.favoriteVersion(id, name);
       const { lines } = session.drainNotices();
@@ -707,14 +816,17 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       'Plays a past version again, by its id from list_history, in one call: it takes over within a fraction of a second without stopping the music, with the same checks as set_code. The restore is added to the history as a new version ("restored from #id"); nothing is rewritten. Returns the code as confirmed by the page. A restore always takes over at once and replaces a change that waits for a bar or phrase line. The old version replaces the music at once; when the user asked for gradual changes this session, bring it in with set_code and a transition instead. Like set_code, it starts Moontide first when it is not started yet, but only for an id that exists in the history.',
     inputSchema: {
       id: z.number().int().positive().describe('Version id from list_history, for example 41 for #41'),
+      answering: z.string().min(1).max(MAX_ASK_ID_LENGTH).optional().describe(ANSWERING_FIELD_DESCRIPTION),
     },
-  }, async ({ id }) => {
+  }, async ({ id, answering }) => {
+    session.noteToolCall();
+    const answeringOpen = answering === undefined ? true : session.requestIsOpen(answering);
     try {
       // The history needs no page: an id that cannot be restored fails before Moontide starts or a tab opens.
       session.assertVersionExists(id);
       await starter.ensureStarted();
       await starter.waitForPage();
-      const outcome = await session.restoreVersion(id);
+      const outcome = await session.restoreVersion(id, { answering: answeringOpen ? answering : undefined });
       const { lines, hadRuntimeErrors } = session.drainNotices();
       // versionId is null only on a history-write failure — the write-failure
       // note (queued by the same recordConfirmed path set_code uses) explains why below.
@@ -725,7 +837,13 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         outcome.audio === 'playing' && !hadRuntimeErrors
           ? `${head} — now playing.`
           : `${head}. ${playStatus(outcome.audio, hadRuntimeErrors, session.getPageUrl())}`;
-      const tempo = outcome.tempoChanged && outcome.bpm !== null ? [tempoLine(outcome.bpm)] : [];
+      // A restored version that restates the target of a running ramp lets it go on, and says so in place of the tempo line.
+      const tempo =
+        outcome.glide !== undefined
+          ? [glideLine(outcome.glide)]
+          : outcome.tempoChanged && outcome.bpm !== null
+            ? [tempoLine(outcome.bpm)]
+            : [];
       const notices = outcome.replacedHandEdit ? [HAND_EDIT_REPLACED_NOTE] : [];
       // The same t/f flag note and getTime() warn note as set_code, the getTime() note last.
       const text = withNoticeLines(`${status}\n\n${outcome.code}`, [
@@ -733,6 +851,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         ...notices,
         ...lines,
         ...whenFlagLines(outcome.code),
+        ...unknownAnsweringLines(answering, answeringOpen),
         ...getTimeAnchorLines(outcome.code),
       ]);
       return { content: [{ type: 'text' as const, text }] };
@@ -743,7 +862,29 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       const { lines } = session.drainNotices();
       const notices = session.wasEditedByHand() ? [HAND_EDIT_NOTE] : [];
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(withNoticeLines(message, [...notices, ...lines]));
+      throw new Error(withNoticeLines(message, [...notices, ...lines, ...unknownAnsweringLines(answering, answeringOpen)]));
+    }
+  });
+
+  // Needs no started Moontide: a request id is only open while a server runs. It changes no music.
+  server.registerTool(ANSWER_REQUEST_TOOL, {
+    description: ANSWER_REQUEST_DESCRIPTION,
+    annotations: { destructiveHint: false },
+    inputSchema: {
+      id: z.string().min(1).max(MAX_ASK_ID_LENGTH).describe(ANSWER_REQUEST_ID_DESCRIPTION),
+      outcome: z.enum(['answered', 'declined']).describe(ANSWER_REQUEST_OUTCOME_DESCRIPTION),
+      text: z.string().max(MAX_ANSWER_TEXT_LENGTH).describe(ANSWER_REQUEST_TEXT_DESCRIPTION),
+    },
+  }, async ({ id, outcome, text }) => {
+    session.noteToolCall();
+    try {
+      session.answerRequest(id, outcome, text);
+      const { lines } = session.drainNotices();
+      return { content: [{ type: 'text' as const, text: withNoticeLines(answerRequestReply(outcome), lines) }] };
+    } catch (err) {
+      const { lines } = session.drainNotices();
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(withNoticeLines(message, lines));
     }
   });
 
@@ -752,6 +893,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       'Stops all sound in the Moontide page right away, even when the current code is broken. The code stays in the editor; get_code still returns it, and the next set_code starts playing again. Before Moontide is started it says so and starts nothing.',
     annotations: { destructiveHint: false, idempotentHint: true },
   }, async () => {
+    session.noteToolCall();
     if (starter.current() === null) {
       throw new Error(NOT_STARTED_MESSAGE);
     }
@@ -780,6 +922,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       instrument: z.string().min(1).max(32).optional().describe('An instrument id from instruments.json, to list its sounds'),
     },
   }, async ({ instrument }) => {
+    session.noteToolCall();
     try {
       const text = session.instrumentsReply(instrument);
       const { lines } = session.drainNotices();
@@ -801,6 +944,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       category: z.string().max(60).optional().describe('Only sounds of this category; case and spaces do not matter'),
     },
   }, async ({ instrument, query, category }) => {
+    session.noteToolCall();
     try {
       const text = session.searchMidiSounds({ instrument, query, category });
       const { lines } = session.drainNotices();
@@ -821,6 +965,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       overwrite: z.boolean().optional().describe('true to replace an existing user model with the same id'),
     },
   }, async ({ model, confirmed, overwrite }) => {
+    session.noteToolCall();
     try {
       const text = session.saveMidiModel({ model, confirmed, overwrite });
       const { lines } = session.drainNotices();
@@ -874,6 +1019,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
         .describe('The sounds of this part, grouped by bank and category; at most 500 sounds in the call'),
     },
   }, async ({ model, confirmed, append, more, source, programNumbering, overwrite, banks }) => {
+    session.noteToolCall();
     try {
       const text = session.saveMidiCatalog({ model, confirmed, append, more, source, programNumbering, overwrite, banks });
       const { lines } = session.drainNotices();
@@ -927,6 +1073,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
       state: z.enum(['on', 'off']).describe(PAGE_REQUESTS_STATE_DESCRIPTION),
     },
   }, async ({ state }) => {
+    session.noteToolCall();
     const result = switchPageRequests({ session, state });
     if ('noPage' in result) {
       throw new Error(starter.current() === null ? notStartedForRequestsToolText() : noPageForRequestsToolText(session.getPageUrl()));
@@ -954,6 +1101,7 @@ export function createMcpServer(options: { session: Session; starter: Starter })
     description: START_TOOL_DESCRIPTION,
     annotations: { destructiveHint: false, idempotentHint: true },
   }, async () => {
+    session.noteToolCall();
     const text = await startMoontide(starter);
     return { content: [{ type: 'text' as const, text }] };
   });

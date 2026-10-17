@@ -48,6 +48,16 @@ export const STORAGE_KEYS = {
   splitB: 'moontide.split.b',
 };
 
+const SONG_LAUNCH_LIST = `${SONG_LAUNCHES.slice(0, -1).join(', ')} or ${SONG_LAUNCHES[SONG_LAUNCHES.length - 1]}`;
+
+/**
+ * The console line for a stored song launch choice that is not in the list. It is built from the storage key and
+ * the allowed values only, never from the stored text, so nothing a stranger wrote into storage is echoed.
+ */
+export const VIEW_PREFS_COPY = Object.freeze({
+  badSongLaunch: `Moontide: the stored song launch choice under '${STORAGE_KEYS.songLaunch}' is not ${SONG_LAUNCH_LIST}; sections start at the end of the section that plays.`,
+});
+
 /** Plain-word motion switch labels. */
 export const MOTION_LABELS = { on: 'Motion: on', off: 'Motion: off' };
 
@@ -103,11 +113,12 @@ export function applyKey(state, { key, focusInEditor, focusInTextEntry, ctrlKey,
  * JAM_INSTRUMENTS; jamChordTones in JAM_CHORD_TONES; changeTiming in CHANGE_TIMINGS; songLaunch in SONG_LAUNCHES; splitA and splitB a plain number from 15 to 85 (page/split-model.js) — and
  * becomes undefined when missing or invalid, so a stray/legacy value is never interpolated into selectors, HTML or code.
  * `rejected` lists the storage keys of the sizes that were stored but refused (a missing key is not
- * listed), so the page can say so once, loudly. Returns `available: false`, with every value undefined, when storage is
+ * listed), so the page can say so once, loudly. `songLaunchRejected` is true when a launch choice was stored but is
+ * not in SONG_LAUNCHES (a missing key is not), so the page can say that once too; it is false when storage is unavailable. Returns `available: false`, with every value undefined, when storage is
  * null or any read throws (private window, blocked storage).
  */
 export function readViewPrefs(storage) {
-  const UNAVAILABLE_PREFS = { layout: undefined, view: undefined, motion: undefined, historyMode: undefined, jamInstrument: undefined, jamChordTones: undefined, changeTiming: undefined, songLaunch: undefined, splitA: undefined, splitB: undefined, rejected: [], available: false };
+  const UNAVAILABLE_PREFS = { layout: undefined, view: undefined, motion: undefined, historyMode: undefined, jamInstrument: undefined, jamChordTones: undefined, changeTiming: undefined, songLaunch: undefined, splitA: undefined, splitB: undefined, rejected: [], songLaunchRejected: false, available: false };
   if (!storage) {
     return { ...UNAVAILABLE_PREFS };
   }
@@ -127,6 +138,7 @@ export function readViewPrefs(storage) {
     const rejected = [];
     if (rawSplitA !== null && rawSplitA !== undefined && splitA === undefined) rejected.push(STORAGE_KEYS.splitA);
     if (rawSplitB !== null && rawSplitB !== undefined && splitB === undefined) rejected.push(STORAGE_KEYS.splitB);
+    const songLaunchRejected = rawSongLaunch !== null && rawSongLaunch !== undefined && !SONG_LAUNCHES.includes(rawSongLaunch);
     return {
       layout: LAYOUTS.includes(rawLayout) ? rawLayout : undefined,
       view: rawView === 'none' || BUILT_VIEWS.includes(rawView) ? rawView : undefined,
@@ -139,6 +151,7 @@ export function readViewPrefs(storage) {
       splitA,
       splitB,
       rejected,
+      songLaunchRejected,
       available: true,
     };
   } catch {

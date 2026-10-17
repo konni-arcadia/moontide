@@ -28,6 +28,7 @@ const {
   readingAt,
   MERGE_GAP,
   LOOK_AHEAD,
+  TONIC_BONUS,
   warningsFor,
 } = jam;
 
@@ -964,4 +965,86 @@ test('buildReading: an arrangement owned by an excluded track is not chosen', ()
   const window = { windowStart: 0, windowLength: 8, arrangements: [drumsOwned, padOwned] };
   assert.equal(buildReading({ events, ...window }).arrangement, drumsOwned);
   assert.equal(buildReading({ events, ...window, excludeTracks: new Set([1]) }).arrangement, padOwned);
+});
+
+// --- the evidence of each candidate and the proposals of an ambiguous span ---
+
+const modeOf = (id) => MODES.find((mode) => mode.id === id);
+
+test('candidateKey is the root pitch class, a colon and the mode id', () => {
+  assert.equal(jam.candidateKey(9, modeOf('aeolian')), '9:aeolian');
+  assert.equal(jam.candidateKey(0, modeOf('harmonic-minor')), '0:harmonic-minor');
+});
+
+test('detectScale: each ambiguous candidate carries its key, score, lean and heard; lean plus heard is the tonic emphasis of its root', () => {
+  const scale = read(PADS);
+  assert.equal(scale.status, 'ambiguous');
+  for (const candidate of scale.candidates) {
+    assert.equal(candidate.key, `${candidate.root}:${candidate.mode.id}`);
+    assert.equal(typeof candidate.score, 'number');
+    assert.ok(candidate.lean >= 0 && candidate.heard >= 0);
+    close(candidate.lean + candidate.heard, (candidate.score - candidate.coverage) / TONIC_BONUS, 'lean plus heard is the tonic emphasis');
+    assert.equal(candidateNames(scale).includes(candidate.name), true);
+  }
+  assert.deepEqual(scale.candidates.map((c) => c.key), ['0:ionian', '7:mixolydian', '9:aeolian', '5:lydian']);
+});
+
+test('detectScale: the four pads have equal bass and chord evidence for every candidate, so only the note weights tell them apart', () => {
+  const scale = read(PADS);
+  const [first, ...others] = scale.candidates;
+  for (const other of others) close(other.lean, first.lean, 'the bass and chord evidence is the same for the four roots');
+  assert.ok(others.every((other) => first.heard > other.heard + 1e-9), 'C is the note heard most');
+});
+
+test('detectScale: an A drone under a line that fits A minor and A Dorian leans on A for both', () => {
+  const drone = loop(4, (c) => ev(1, c, c + 1, 'a2'));
+  const melody = loop(4, (c) => run(0, c, 1 / 6, ['a3', 'b3', 'c4', 'd4', 'e4', 'g4']));
+  const scale = read([...drone, ...melody]);
+  assert.equal(scale.status, 'ambiguous');
+  assert.deepEqual(scale.candidates.map((c) => c.key).sort(), ['9:aeolian', '9:dorian']);
+  close(scale.candidates[0].heard, scale.candidates[1].heard);
+});
+
+test('clearScale gives the clear shape detectScale returns for the same scale', () => {
+  const pedal = loop(4, (c) => ev(1, c, c + 1, 'a2'));
+  const detected = read([...PADS, ...pedal]);
+  assert.equal(detected.status, 'clear');
+  assert.deepEqual(jam.clearScale(detected.root, detected.mode, detected.coverage), detected);
+});
+
+// A line whose F and F# alternate: C major and G major cover the same weight with different notes.
+const FSHARP_NOTES = ['c4', 'd4', 'e4', 'g4', 'a4', 'b4'];
+const fsharpLine = (cycles) =>
+  loop(cycles, (i) => [...run(0, i * 2, 0.25, FSHARP_NOTES), ev(0, i * 2 + 1.5, i * 2 + 1.75, i % 2 === 0 ? 'f4' : 'f#4')]);
+
+test('buildReading: an ambiguous span carries one proposal per candidate with its scale and its own warnings', () => {
+  const events = fsharpLine(8);
+  const reading = buildReading({ events, windowStart: 0, windowLength: 16 });
+  const span = reading.spans[0];
+  assert.equal(span.scale.status, 'ambiguous');
+  assert.equal(span.proposals.length, span.scale.candidates.length);
+  const pitched = pitchedEvents(events);
+  const brief = segments(markSolid(pitched.map((e) => ({ ...e })), BRIEF), span.begin, span.end);
+  let withWarnings = 0;
+  span.scale.candidates.forEach((candidate, i) => {
+    const proposal = span.proposals[i];
+    assert.equal(proposal.key, candidate.key);
+    assert.deepEqual(proposal.scale, jam.clearScale(candidate.root, candidate.mode, candidate.coverage));
+    const expected = warningsFor(brief, proposal.scale).map((w) => ({ ...w, spanIndex: 0, scaleName: proposal.scale.name }));
+    assert.deepEqual(proposal.warnings, expected);
+    for (const warning of proposal.warnings) assert.equal('index' in warning, false);
+    if (proposal.warnings.length > 0) withWarnings++;
+  });
+  assert.ok(withWarnings > 0, 'some candidate has outside notes to warn about');
+  // The base reading still has no warning: its scale is not clear.
+  assert.deepEqual(reading.warnings, []);
+  assert.deepEqual(span.warnings, []);
+});
+
+test('buildReading: a clear span carries no proposals', () => {
+  const reading = buildReading({ events: dorianLoop(8), windowStart: 0, windowLength: 8 });
+  assert.equal(reading.spans[0].scale.status, 'clear');
+  assert.deepEqual(reading.spans[0].proposals, []);
+  const none = buildReading({ events: [{ begin: 0, end: 1, value: { s: 'bd' }, track: 0 }], windowStart: 0, windowLength: 8 });
+  assert.deepEqual(none.spans[0].proposals, []);
 });

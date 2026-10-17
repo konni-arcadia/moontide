@@ -930,7 +930,7 @@ test('armingLine keeps its command variant byte for byte, and its two reason var
   const token = newToken();
   const head =
     'Page requests: no listener is connected. A request typed in the Moontide page waits on the server and arrives in the reply of your next other Moontide tool. ' +
-    `${REQUEST_LINE_FRAMING} ${askModule.REQUEST_LINE_MOMENT_FACT}`;
+    `${REQUEST_LINE_FRAMING} ${askModule.REQUEST_LINE_MOMENT_FACT} ${askModule.REQUEST_LINE_STATUS_FACT}`;
   assert.equal(askModule.MONITOR_LIMIT_FACT, 'a monitor ends after at most 30 minutes');
   const command = listenerCommand(SCRIPT_PATH, PORT, token);
   const withCommand = armingLine({ scriptPath: SCRIPT_PATH, port: PORT, token });
@@ -952,10 +952,11 @@ test('pageRequestsOnText gives the command with Monitor, timeout_ms 1800000, the
   const text = askModule.pageRequestsOnText({ scriptPath: SCRIPT_PATH, port: PORT, token });
   const command = listenerCommand(SCRIPT_PATH, PORT, token);
   const lines = text.split('\n');
-  assert.equal(lines.length, 5);
+  assert.equal(lines.length, 6);
   assert.equal(lines[1], command);
   assert.equal(lines[3], REQUEST_LINE_FRAMING);
   assert.equal(lines[4], askModule.REQUEST_LINE_MOMENT_FACT);
+  assert.equal(lines[5], askModule.REQUEST_LINE_STATUS_FACT);
   for (const piece of ['Monitor', `timeout_ms ${MONITOR_TIMEOUT_MS}`, askModule.MONITOR_DESCRIPTION, askModule.MONITOR_LIMIT_FACT]) {
     assert.ok(text.includes(piece), piece);
   }
@@ -1019,8 +1020,9 @@ test('the arming switch: a fresh channel is not paused; paused, drainLines hands
 
   const whilePaused = drain(channel);
   assert.deepEqual(requestLines(whilePaused).map(textOf), ['make the drums shorter']);
-  assert.equal(whilePaused.length, 2, 'no arming line while paused: the moment fact, then the request line');
+  assert.equal(whilePaused.length, 3, 'no arming line while paused: the moment fact, the status fact, then the request line');
   assert.equal(whilePaused[0], askModule.REQUEST_LINE_MOMENT_FACT);
+  assert.equal(whilePaused[1], askModule.REQUEST_LINE_STATUS_FACT);
   assert.ok(!whilePaused.some((line) => line.startsWith('Page requests: no listener is connected.')));
   assert.deepEqual(page.sent.at(-1), { type: 'ask-received', ids: ['s1'] });
   assert.deepEqual(drain(channel), []);
@@ -1036,6 +1038,50 @@ test('the arming switch: a fresh channel is not paused; paused, drainLines hands
     assert.ok(line.startsWith('[moontide] '), line);
     assert.doesNotMatch(line, /listen/i);
   }
+});
+
+// What the page shows for a request is a fact Claude needs wherever it reads a request line: the id it passes as
+// answering is what makes the page show applied, and answer_request is what makes it show answered or declined.
+test('the status fact says what the page shows and when, and reaches Claude with every request line, once', () => {
+  const fact = askModule.REQUEST_LINE_STATUS_FACT;
+  for (const piece of [
+    'About the id field of a page request',
+    'answering',
+    'set_code',
+    'edit_code',
+    'restore_version',
+    'answer_request',
+    'applied',
+    'waiting for its line',
+    'answered',
+    'declined',
+    'no change yet',
+  ]) {
+    assert.ok(fact.includes(piece), piece);
+  }
+  assert.doesNotMatch(fact, /could not|couldn't/i);
+  assert.doesNotMatch(fact, /listen/i);
+  assert.ok(!fact.includes(REQUEST_LINE_PREFIX), 'the fact is not itself a request line');
+  const once = (text) => text.split(fact).length - 1;
+  const token = newToken();
+  assert.equal(once(armingLine({ scriptPath: SCRIPT_PATH, port: PORT, token })), 1);
+  assert.equal(once(armingLine({ scriptPath: SCRIPT_PATH, port: null, token })), 1);
+  assert.equal(once(askModule.pageRequestsOnText({ scriptPath: SCRIPT_PATH, port: PORT, token })), 1);
+  assert.ok(armingLine({ scriptPath: SCRIPT_PATH, port: PORT, token }).includes(`${askModule.REQUEST_LINE_MOMENT_FACT} ${fact}`), 'right after the moment fact');
+
+  // Paused (no arming line): both facts come in front of the request lines; with nothing to hand over, nothing.
+  const { channel, page } = trustedChannel();
+  channel.setArmingPaused(true);
+  assert.deepEqual(drain(channel), []);
+  channel.handleAsk(page, askMsg('st1', 'make the drums shorter'));
+  const handed = drain(channel);
+  assert.equal(handed.filter((line) => line === fact).length, 1);
+  assert.equal(handed.indexOf(fact), handed.indexOf(askModule.REQUEST_LINE_MOMENT_FACT) + 1);
+  assert.ok(handed.indexOf(fact) < handed.findIndex((line) => line.startsWith(REQUEST_LINE_PREFIX)));
+  // With the arming line the fact rides it and is not added a second time.
+  channel.setArmingPaused(false);
+  channel.handleAsk(page, askMsg('st2', 'make the hats quieter'));
+  assert.equal(once(drain(channel).join('\n')), 1);
 });
 
 // --- mirrors ---
@@ -1183,7 +1229,9 @@ test('the facts for Claude name the gesture field and each of its kinds, as fact
     'About a request whose context has kind range',
     'track is the lane, from and to are the first and last cycle, both included',
     `a range covers at most ${MAX_RANGE_CYCLES} cycles`,
-    'section is the section of cycle from and sectionTo the section of cycle to when it differs',
+    'in a piece with a song sections lists the sections those cycles cross in playing order',
+    'a section played twice in a row once and a section that comes back after another one again',
+    'moreSections, when present, counts the sections left out so that the list fits',
     'Such a request has no moment; its gesture has kind range',
     'lists the notes of that lane that start in those cycles, in order of start and then pitch (the lower first)',
     `at most ${MAX_MOMENT_NOTES}, each shaped like a moment note without state`,

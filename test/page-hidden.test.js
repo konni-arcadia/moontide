@@ -18,6 +18,7 @@ const MIDI_VIEW_PATH = fileURLToPath(new URL('../page/midi-view.js', import.meta
 const TOP_BAR_VIEW_PATH = fileURLToPath(new URL('../page/top-bar-view.js', import.meta.url));
 const PROBLEM_VIEW_PATH = fileURLToPath(new URL('../page/problem-view.js', import.meta.url));
 const SESSION_VIEW_PATH = fileURLToPath(new URL('../page/session-view.js', import.meta.url));
+const REQUEST_STATUS_VIEW_PATH = fileURLToPath(new URL('../page/request-status-view.js', import.meta.url));
 const LOAD_FAILURE_VIEW_PATH = fileURLToPath(new URL('../page/load-failure-view.js', import.meta.url));
 const STRUCTURE_VIEW_PATH = fileURLToPath(new URL('../page/structure-view.js', import.meta.url));
 const SONG_GRID_VIEW_PATH = fileURLToPath(new URL('../page/song-grid-view.js', import.meta.url));
@@ -36,6 +37,7 @@ const sources = [
   { path: 'page/midi-view.js', text: readFileSync(MIDI_VIEW_PATH, 'utf8') },
   { path: 'page/top-bar-view.js', text: readFileSync(TOP_BAR_VIEW_PATH, 'utf8') },
   { path: 'page/session-view.js', text: readFileSync(SESSION_VIEW_PATH, 'utf8') },
+  { path: 'page/request-status-view.js', text: readFileSync(REQUEST_STATUS_VIEW_PATH, 'utf8') },
   { path: 'page/problem-view.js', text: readFileSync(PROBLEM_VIEW_PATH, 'utf8') },
   { path: 'page/instruments-view.js', text: readFileSync(INSTRUMENTS_VIEW_PATH, 'utf8') },
   { path: 'page/split-view.js', text: readFileSync(SPLIT_VIEW_PATH, 'utf8') },
@@ -91,7 +93,7 @@ test('every element toggled with .hidden and given a display rule has an #id[hid
 // Elements the views create by class and show with toggleAttribute('hidden', ...): the same trap as
 // the ids above, a class display rule beats the browser's [hidden] rule. Later Mixer plans extend
 // this list with their own classes.
-const HIDDEN_CLASSES = ['.mx-note', '.mx-add-list', '.mx-more', '.mx-insp-gone', '.mx-written', '.mx-insp-footer', '.mx-warning', '.mx-midi-note', '.mx-sweep', '.mx-tag', '.mx-shared', '.mx-insp-shared', '.mx-root-note', '.instrument-edit', '.tl-note-controls'];
+const HIDDEN_CLASSES = ['.mx-note', '.mx-add-list', '.mx-more', '.mx-insp-gone', '.mx-written', '.mx-insp-footer', '.mx-warning', '.mx-midi-note', '.mx-sweep', '.mx-tag', '.mx-shared', '.mx-insp-shared', '.mx-root-note', '.instrument-edit', '.tl-note-controls', '.rq-count', '.rq-detail', '.rq-recent-body'];
 
 test('every class shown with the hidden attribute and given a display rule has a [hidden] rule', () => {
   for (const selector of HIDDEN_CLASSES) {
@@ -250,23 +252,6 @@ test('the fit loop restarts at the first step, measures scrollWidth against clie
   assert.match(view, /observer\.observe\(topBar\)/);
 });
 
-// The request status keeps its long sentence for the ear and swaps in a short form for the eye at fit step 3 (and 4).
-// The long text is visually hidden, never display: none, and the short form is aria-hidden.
-test('the ask status holds a long sentence and an aria-hidden short form, and fit steps 3 and 4 swap them visually only', () => {
-  assert.match(html, /<span id="ask-status" role="status" aria-live="polite" hidden><span class="ask-long"><\/span><span class="ask-short" aria-hidden="true"><\/span><\/span>/);
-  assert.match(ruleBody('#ask-status .ask-short'), /display\s*:\s*none/, 'the short form is hidden until step 3');
-  for (const step of ['3', '4']) {
-    assert.match(ruleBody(`#top-bar[data-fit="${step}"] #ask-status .ask-short`), /display\s*:\s*inline/, `the short form shows at step ${step}`);
-    const long = ruleBody(`#top-bar[data-fit="${step}"] #ask-status .ask-long`);
-    assert.ok(long, `the long sentence has a rule at step ${step}`);
-    assert.doesNotMatch(long, /display\s*:\s*none/, 'the long sentence stays in the accessibility tree');
-    assert.match(long, /position\s*:\s*absolute/);
-    assert.match(long, /clip-path\s*:\s*inset\(50%\)/);
-  }
-  assert.equal(ruleBody('#top-bar[data-fit="2"] #ask-status .ask-short'), null, 'the short form does not show before step 3');
-  assert.doesNotMatch(ruleBody('#ask-status') ?? '', /\bdisplay\s*:/, '#ask-status has no display rule, so [hidden] takes it out of the bar');
-});
-
 // The cycle and beat is quiet decoration beside the tempo: aria-hidden, dropped by step 1, hidden by the
 // attribute (so no display rule), drawn in mono and muted.
 test('the cycle and beat is aria-hidden decoration that fit step 1 drops and that has no display rule', () => {
@@ -301,7 +286,7 @@ test('the header holds the bar items in the order of the contract, and the banne
     'class="layout-word"',
     'id="layout-buttons"',
     'class="bar-sep"',
-    'id="ask-status"',
+    'id="requests-toggle"',
     'id="session-button"',
   ];
   let from = 0;

@@ -144,6 +144,13 @@ export const CHANGE_COPY = Object.freeze({
   settingNow: 'Your edits now take over: now.',
   settingBar: 'Your edits now take over: on the next bar.',
   settingPhrase: 'Your edits now take over: on the next phrase.',
+  // The four sentences a tempo ramp speaks in the live region: at its start, at its end and when the code cancels it.
+  // {from}, {to} and {bpm} go through bpmText and {n} is a whole number of bars. Nothing is spoken per step.
+  rampStarted: 'Tempo ramp started: {from} to {to} BPM over {n} bars.',
+  rampStartedOneBar: 'Tempo ramp started: {from} to {to} BPM over 1 bar.',
+  rampFinished: 'Tempo ramp finished at {to} BPM.',
+  rampCanceledOtherTempo: 'Tempo ramp canceled. The code sets {bpm} BPM.',
+  rampCanceledNoTempo: 'Tempo ramp canceled. Tempo stays at {bpm} BPM.',
 });
 
 // The fit steps of the top bar, in the order text is given up: 0 nothing, 1 the decoration
@@ -222,4 +229,32 @@ export function settingLine(value) {
   if (value === 'bar') return CHANGE_COPY.settingBar;
   if (value === 'phrase') return CHANGE_COPY.settingPhrase;
   throw new Error(`Moontide: unknown change timing '${String(value)}' (expected one of ${CHANGE_TIMINGS.join(', ')}).`);
+}
+
+/**
+ * The spoken line of a tempo ramp, for the three events that are told: `{ kind: 'started', fromBpm, toBpm, bars }`,
+ * `{ kind: 'finished', toBpm }` and `{ kind: 'canceled', reason, bpm }` with the reason 'other-tempo' (the code states
+ * another tempo, which plays now) or 'no-tempo' (the code states none, the tempo stays). The tempos go through bpmText and
+ * `bars` is a whole number from 1; anything else throws a `Moontide:` Error. Stop, a reload and a replaced ramp are not told.
+ */
+export function rampLine(event) {
+  if (event === null || typeof event !== 'object') {
+    throw new Error(`Moontide: a ramp line needs an event, got ${String(event)}.`);
+  }
+  if (event.kind === 'started') {
+    if (!Number.isInteger(event.bars) || event.bars < 1) {
+      throw new Error(`Moontide: a ramp line needs a whole number of bars from 1, got ${String(event.bars)}.`);
+    }
+    const template = event.bars === 1 ? CHANGE_COPY.rampStartedOneBar : CHANGE_COPY.rampStarted;
+    return fillChange(template, { from: bpmText(event.fromBpm), to: bpmText(event.toBpm), n: event.bars });
+  }
+  if (event.kind === 'finished') {
+    return fillChange(CHANGE_COPY.rampFinished, { to: bpmText(event.toBpm) });
+  }
+  if (event.kind === 'canceled') {
+    if (event.reason === 'other-tempo') return fillChange(CHANGE_COPY.rampCanceledOtherTempo, { bpm: bpmText(event.bpm) });
+    if (event.reason === 'no-tempo') return fillChange(CHANGE_COPY.rampCanceledNoTempo, { bpm: bpmText(event.bpm) });
+    throw new Error(`Moontide: a canceled ramp is told for 'other-tempo' or 'no-tempo', not '${String(event.reason)}'.`);
+  }
+  throw new Error(`Moontide: a ramp line is told for 'started', 'finished' or 'canceled', not '${String(event.kind)}'.`);
 }

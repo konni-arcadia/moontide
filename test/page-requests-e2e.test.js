@@ -275,6 +275,8 @@ test('page requests e2e: page-requests-off stops tool replies from carrying the 
   // With no arming line, the reply still says what the moment of the request holds, in front of the line.
   assert.ok(handedOver.indexOf(askModule.REQUEST_LINE_MOMENT_FACT) >= 0, handedOver);
   assert.ok(handedOver.indexOf(askModule.REQUEST_LINE_MOMENT_FACT) < handedOver.indexOf(askModule.REQUEST_LINE_PREFIX), handedOver);
+  assert.ok(handedOver.indexOf(askModule.REQUEST_LINE_STATUS_FACT) > handedOver.indexOf(askModule.REQUEST_LINE_MOMENT_FACT), handedOver);
+  assert.ok(handedOver.indexOf(askModule.REQUEST_LINE_STATUS_FACT) < handedOver.indexOf(askModule.REQUEST_LINE_PREFIX), handedOver);
 
   // On clears the switch and gives the command; the next tool reply ends with the arming line again.
   const onText = await promptText(scenario, 'page-requests-on');

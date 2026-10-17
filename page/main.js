@@ -65,6 +65,7 @@ import {
   motionAfterOsChange,
   setChangeTiming,
   setSongLaunch,
+  VIEW_PREFS_COPY,
   BUILT_VIEWS,
   VIEW_KEYS,
   VIEW_TITLES,
@@ -90,17 +91,20 @@ import {
   sectionSpans,
 } from './parts.js';
 import { baseTitle, readSessionLabel, renderSessionIdentity } from './session-identity.js';
-import { ASK_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, lineAtY, timelineEditPrefill } from './ask.js';
+import { ASK_COPY, PAGE_TOKEN_PLACEHOLDER, cycleAt, describeContext, errorAskPrefill, fitSectionNames, lineAtY, timelineEditPrefill } from './ask.js';
 import { createAskView } from './ask-view.js';
+import { createRequestTracker } from './request-status.js';
+import { createRequestStatusView } from './request-status-view.js';
 import { buildReading, readingAt, flattenLanes } from './jam-analysis.js';
+import { resolveReading, createScaleMemory } from './jam-resolve.js';
 import { readHarmony } from './harmony.js';
 import { SONG_COPY, differsLine, quoted, readStructure, songMessageText, songNoteLines } from './structure.js';
 import { checkSections, evaluateDeclared, expectedSource, sectionStarts } from './structure-check.js';
 import { collectFit, evaluateFit, fitLookup, fitPairs, fitSource, pairKey } from './song-fit.js';
 import { createSongView } from './structure-view.js';
-import { buildSongGrid, cellRecordLabel, playingSection, sectionDeclared, songLine } from './song-grid-model.js';
+import { buildSongGrid, cellRecordLabel, playingSection, sectionDeclared, sectionsCrossed, songLine } from './song-grid-model.js';
 import { SongEditRefusal, cellEdit, checkCell, checkSection, launchLine, launchShift, playResetEdit, sameShift, shiftEdit, textAfterCanceledLaunch } from './song-edit.js';
-import { createSongGridView } from './song-grid-view.js';
+import { createSongGridView, isAskKey } from './song-grid-view.js';
 import { SONG_FOLDS_COPY, isRememberable, readSongFolds, writeSongFolds } from './song-prefs.js';
 import { JAM_COPY, buildJamModel, jamStuckFor, jamIsStuck } from './jam-model.js';
 import { createJamView } from './jam-view.js';
@@ -124,6 +128,7 @@ import { checkFailureText, drumMapFor, parseRigMessage, rigFromReadFailure, with
 import { drumLane } from './drum-lane.js';
 import { captureQueryTypes, createSchedulerQueryScope, installQueryCheck } from './query-check.js';
 import { createTempoGuard } from './tempo-guard.js';
+import { GLIDE_REFUSALS, createTempoGlide, lineTempoAction, parseGlideBars } from './tempo-glide.js';
 import {
   BEATS_PER_CYCLE,
   CHANGE_COPY,
@@ -137,6 +142,7 @@ import {
   parseTiming,
   pinnedTiming,
   queuedLine,
+  rampLine,
   settingLine,
 } from './change-timing.js';
 import { createTopBarView } from './top-bar-view.js';
@@ -220,6 +226,11 @@ const midiOut = createMidiOut({
   getScheduler: () => editor.repl.scheduler,
   getAudioContext: () => (typeof globalThis.getAudioContext === 'function' ? globalThis.getAudioContext() : null),
   perfNow: () => performance.now(),
+  // A line far ahead during a tempo ramp is stamped through the ramp's own steps (tempoGlide is created below, long before a line is asked for).
+  rampSeconds: (fromCycle, toCycle) => {
+    const seconds = tempoGlide.secondsBetween(fromCycle, toCycle);
+    return seconds === null ? null : { seconds, lagSeconds: tempoGlide.lagSecondsBetween(fromCycle, toCycle) };
+  },
   // A clock state change (a Start waiting, a Start reached, a Stop) re-renders the indicator and its popover rows.
   onClockState: () => renderMidiIndicator(),
   now: () => Date.now(),
@@ -257,6 +268,71 @@ let evalQueue = Promise.resolve();
 // launch all pass here too, so a hand evaluation follows the same rule. Checking after evaluate returns
 // would be too late: the failing pattern would already be the scheduler's pattern.
 const scheduler = editor.repl.scheduler;
+// The tempo ramp (page/tempo-glide.js): it moves the tempo in steps toward the tempo a change set, and every step goes
+// through the tempo guard's apply. The closure reads tempoGuard only when a step fires, long after the page has loaded.
+const tempoGlide = createTempoGlide({
+  scheduler,
+  apply: (cps) => tempoGuard.apply(cps),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  onEvent(event) {
+    // The server is told when a ramp ends on its own, synchronously, so the message goes out before the evaluated reply
+    // of the change that caused it and that reply carries the cancel line. Stop, a lost role, a page reload and a ramp that
+    // a new ramp replaced send nothing: the server learns the first three itself and the new ramp comes in its own reply.
+    // Mirrors src/protocol.ts's glide-ended by hand.
+    if (event.kind === 'finished') {
+      sendIfOpen(JSON.stringify({ type: 'glide-ended', reason: 'finished' }));
+    } else if (event.kind === 'canceled' && (event.reason === 'other-tempo' || event.reason === 'no-tempo' || event.reason === 'error')) {
+      const bpm = bpmForReply(event.cps);
+      sendIfOpen(JSON.stringify({ type: 'glide-ended', reason: event.reason, ...(bpm !== undefined ? { bpm } : {}) }));
+    }
+    if (event.kind === 'canceled' && event.reason === 'error') {
+      console.error(`Moontide: the tempo ramp was canceled because a step failed; the tempo stays where it was (${String(event.cps)} cps).`);
+    }
+    // The live region speaks a ramp when it starts, when it finishes and when the code cancels it, and says nothing for a step.
+    // Stop, a lost role, a reload, a failed step and a replaced ramp are not spoken (a replaced ramp's new start is).
+    const { plan } = event;
+    if (event.kind === 'started') {
+      const stillRuns = () => {
+        const running = tempoGlide.current();
+        return running !== null && running.startCycle === plan.startCycle && running.toCps === plan.toCps;
+      };
+      sayRamp(() => ({ kind: 'started', fromBpm: bpmOf(plan.fromCps), toBpm: bpmOf(plan.toCps), bars: plan.bars }), stillRuns);
+    } else if (event.kind === 'finished') {
+      sayRamp(() => ({ kind: 'finished', toBpm: bpmOf(plan.toCps) }));
+    } else if (event.kind === 'canceled' && (event.reason === 'other-tempo' || event.reason === 'no-tempo')) {
+      sayRamp(() => ({ kind: 'canceled', reason: event.reason, bpm: bpmOf(event.cps) }));
+    }
+  },
+  onError: (text, err) => console.error(text, err),
+});
+
+// The waiting change whose line onReached is handling now, or null. A ramp that starts or ends at a line is spoken only once
+// that change has finished, after the silent clear of its countdown line, so the sentence is the one that stays in the live region.
+let reachedRecord = null;
+const rampSayLogged = new Set();
+
+/**
+ * Says the sentence of a ramp event through the top bar's live region. `makeEvent` builds the event for rampLine and runs now;
+ * the sentence is spoken now, or after the finish of the waiting change whose line is being handled, and (with `stillCurrent`)
+ * only if it is still true then. A failure is logged once for each text and never reaches the ramp.
+ */
+function sayRamp(makeEvent, stillCurrent = () => true) {
+  try {
+    const line = rampLine(makeEvent());
+    const speak = () => {
+      if (stillCurrent()) topBarUi.say(line);
+    };
+    if (reachedRecord !== null) takeover.whenFinished(reachedRecord, speak);
+    else speak();
+  } catch (err) {
+    const text = err instanceof Error ? err.message : String(err);
+    if (!rampSayLogged.has(text)) {
+      rampSayLogged.add(text);
+      console.error('Moontide: the tempo ramp could not be spoken:', err);
+    }
+  }
+}
 // State and TimeSpan are kept from the first evaluation on (captureQueryTypes, called before the user code
 // of each evaluation runs), so a hand edit that assigns to those globals cannot change the check.
 let queryTypes = { State: undefined, TimeSpan: undefined };
@@ -274,6 +350,7 @@ const queryErrors = createOncePerChange();
 // 1 s debounce lets a page query hide the scheduler's report. The log listener drops every [query] text.
 const schedulerQueries = createSchedulerQueryScope({
   getTypes: () => queryTypes,
+  onSchedulerQuery: () => tempoGlide.onSchedulerQuery(),
   onError(logText) {
     const text = runtimeErrorFromLog(logText);
     if (text !== null && queryErrors.first(text)) sendRuntimeError(text);
@@ -281,7 +358,11 @@ const schedulerQueries = createSchedulerQueryScope({
 });
 
 // The timing of one evaluation run, bound at the editor.repl.evaluate call (see the wrapper below):
-// { timing, deferred }. `deferred` is the waiting change the run created (set by the takeover's onArmed), or null.
+// { timing, deferred, bpm, midiDeferred, glideBars, glide, glidePlan, glideRefusal }. `deferred` is the waiting change the run
+// created (set by the takeover's onArmed), or null. `glideBars` is the length of the tempo ramp the change asked for, or null;
+// `glide` is what the reply says about the ramp the run started or let go on, or undefined; `glidePlan` is the plan of the ramp
+// the run started, or null; `glideRefusal` is the text of the refusal of a ramp that cannot be made (set at the setPattern seam),
+// or null.
 const NOW_TIMING = parseTiming('now');
 let armedRun = null; // set right before a programmatic evaluation and consumed by the wrapper, synchronously
 let activeRun = null; // the run whose evaluation is executing now (evaluations are serialized)
@@ -321,16 +402,33 @@ function playingPattern() {
   return editor.repl.state.pattern;
 }
 
-/** Arms the timing of the next editor.repl.evaluate call; the wrapper takes it synchronously. */
-function armRun(timing) {
-  const run = { timing, deferred: null, bpm: undefined, midiDeferred: false };
+/** Arms the timing (and the tempo ramp) of the next editor.repl.evaluate call; the wrapper takes it synchronously. */
+function armRun(timing, glideBars = null) {
+  const run = { timing, deferred: null, bpm: undefined, midiDeferred: false, glideBars, glide: undefined, glidePlan: null, glideRefusal: null };
   armedRun = run;
   return run;
 }
 
-/** The AudioContext time of a cycle line, from the scheduler's current tempo segment (as a hap's targetTime). */
+/**
+ * The AudioContext time of a cycle line, from the scheduler's current tempo segment (as a hap's targetTime). While a tempo ramp
+ * runs, the seconds from the start of that segment to a line later than it go through the ramp's own tempo: the tempo changes
+ * between now and the line, so one segment at the tempo of the moment would put the line early on a slowing ramp and late on
+ * a rising one.
+ */
 function audioTimeOfCycle(cycle) {
-  return (cycle - scheduler.num_cycles_at_cps_change) / scheduler.cps + scheduler.seconds_at_cps_change + scheduler.latency;
+  const anchor = scheduler.num_cycles_at_cps_change;
+  const throughRamp = cycle > anchor ? tempoGlide.secondsBetween(anchor, cycle) : null;
+  const seconds = throughRamp !== null ? throughRamp : (cycle - anchor) / scheduler.cps;
+  return seconds + scheduler.seconds_at_cps_change + scheduler.latency;
+}
+
+/**
+ * The tempo that sizes the lead of a change. The minimum lead of a line and the lead hook of a waiting change are fixed in
+ * cycles when the change is armed, so during a tempo ramp they are sized at the fastest tempo the ramp reaches and are never
+ * shorter in seconds than intended.
+ */
+function takeoverCps() {
+  return Math.max(tempoGuard.playing(), tempoGlide.fastestCps() ?? 0);
 }
 
 /** Milliseconds until a cycle line is audible (0 when it already is). */
@@ -349,13 +447,17 @@ const takeover = createTakeover({
   getTypes: () => queryTypes,
   getTiming: () => (activeRun !== null ? activeRun.timing : NOW_TIMING),
   // The old music covers the way to the line at the tempo that plays, not at the tempo the waiting code just set.
-  getCps: () => tempoGuard.playing(),
+  getCps: () => takeoverCps(),
   isPlaying: () => scheduler.started === true && !pageStopped && hasEvaluatedSuccessfully && !!scheduler.pattern,
   msUntil: msUntilCycle,
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (timer) => clearTimeout(timer),
   onArmed(record) {
     if (activeRun !== null) activeRun.deferred = record;
+    // Whether the waiting change also asks for a ramp: it starts at the line (onReached), never before.
+    record.glideBars = activeRun !== null ? activeRun.glideBars : null;
+    // The plan of the ramp it started at its line, or null: the takeover message says whether that ramp still runs.
+    record.glidePlan = null;
     // The first finisher of the record: the Mixer and Parts stop saying "waiting" and read the new code at the
     // takeover, before the finishers that report it.
     takeover.whenFinished(record, () => {
@@ -400,14 +502,42 @@ const takeover = createTakeover({
   },
   onReached(record) {
     // A microtask after the gate's first query past the line: the downbeat is already timestamped on the line
-    // and the old bar is untouched. A canceled record never gets here (the takeover skips it).
-    if (takeover.pending() !== record || record.newCps === null) return;
+    // and the old bar is untouched. A canceled record never gets here (the takeover skips it), so a waiting change that
+    // asks for a ramp and is replaced or canceled before its line never starts one.
+    if (takeover.pending() !== record) return;
+    reachedRecord = record;
     try {
-      // Kept for a cancel after this point (Stop before the line is audible): the tempo that played goes back with it.
-      record.cpsBefore = tempoGuard.playing();
-      tempoGuard.apply(record.newCps);
+      // The line decides what the change does to the tempo and to a ramp that runs (page/tempo-glide.js lineTempoAction).
+      const action = lineTempoAction({
+        running: tempoGlide.running(),
+        targetCps: tempoGlide.targetCps(),
+        newCps: record.newCps,
+        startsGlide: typeof record.glideBars === 'number',
+      });
+      if (action === 'start-glide') {
+        // The ramp starts at the line from the tempo that plays then; nothing is applied here.
+        const fromCps = tempoGuard.playing();
+        if (fromCps !== record.newCps) {
+          record.glidePlan = tempoGlide.start({ fromCps, toCps: record.newCps, bars: record.glideBars, startCycle: record.boundary });
+        } else {
+          // Nothing to ramp between: the tempo that plays is the target already. An older ramp that passes through it must
+          // not go on toward its own target, so it ends here as replaced (no message): the takeover message says no ramp
+          // runs, and the server clears its record then.
+          tempoGlide.cancel('replaced');
+        }
+      } else if (action === 'cancel-no-tempo') {
+        tempoGlide.cancel('no-tempo');
+      } else if (action === 'cancel-and-apply' || action === 'apply') {
+        // Kept for a cancel after this point (Stop before the line is audible): the tempo that played goes back with it.
+        record.cpsBefore = tempoGuard.playing();
+        tempoGuard.apply(record.newCps);
+        if (action === 'cancel-and-apply') tempoGlide.cancel('other-tempo');
+      }
+      // 'keep' and 'nothing' apply nothing: the step that plays stays.
     } catch (err) {
       console.error('Moontide: the tempo of the waiting change could not be applied:', err);
+    } finally {
+      reachedRecord = null;
     }
   },
   onCancel(record, reason) {
@@ -481,6 +611,7 @@ installQueryCheck(scheduler, {
   schedulerQueries,
   takeover,
   getPlayingCode: () => (hasEvaluatedSuccessfully ? playingCode() : ''),
+  refuse: glideRefusal,
 });
 
 // The top bar's tempo readout and countdown. The view only writes what changed.
@@ -499,7 +630,9 @@ let badWaitingTempoLogged;
  * the scheduler's cps, which keeps the old value until a waiting change's line, and the countdown is the distance
  * to the waiting change's line in beats of the music. The tempo readout is always shown: while this tab does not
  * play (before the first evaluation, after Stop, with sound off, in a superseded tab) it shows the dash, and a
- * waiting change that carries a new tempo adds it after an arrow ('118 → 124 BPM'). The countdown is hidden while
+ * waiting change that carries a new tempo adds it after an arrow ('118 → 124 BPM'). While a tempo ramp runs the number is the
+ * live tempo to a whole BPM and the arrow shows the ramp's target ('112 → 120 BPM'), with the bars left in the hover text; the
+ * ramp wins over a waiting change's tempo, and the same 250 ms poll draws it. The countdown is hidden while
  * nothing plays. The view redraws only when a text changed.
  */
 function drawTopBar() {
@@ -515,6 +648,9 @@ function drawTopBar() {
   }
   const record = takeover.pending();
   const cps = scheduler.cps;
+  // The cycle is read before the tempo: the bars left of a ramp count from it.
+  const raw = scheduler.now();
+  const now = Number.isFinite(raw) && raw > 0 ? raw : 0;
   try {
     const bpm = bpmOf(cps);
     // The tempo a waiting change brings, when it carries one; a bad number is logged once and the arrow is left out.
@@ -532,7 +668,14 @@ function drawTopBar() {
         }
       }
     }
-    topBarUi.showTempo(tempoText({ playing: true, bpm, waitingBpm }));
+    // A running ramp shows its target and the bars left (the ramp wins over a waiting change's tempo); the live tempo is the
+    // scheduler's own cps, the step that plays. A bad number falls into the catch below like a bad steady tempo.
+    const glide = tempoGlide.current();
+    topBarUi.showTempo(
+      glide === null
+        ? tempoText({ playing: true, bpm, waitingBpm })
+        : tempoText({ playing: true, bpm, waitingBpm, ramp: { targetBpm: bpmOf(glide.toCps), barsLeft: tempoGlide.barsLeft(now), rising: glide.toCps > glide.fromCps } }),
+    );
   } catch (err) {
     topBarUi.showTempo(idleTempo);
     if (!Object.is(badTempoLogged, cps)) {
@@ -540,8 +683,6 @@ function drawTopBar() {
       console.error(`Moontide: the top bar cannot show the tempo, the scheduler reports cps ${String(cps)}:`, err);
     }
   }
-  const raw = scheduler.now();
-  const now = Number.isFinite(raw) && raw > 0 ? raw : 0;
   topBarUi.showCycleBeat(cycleBeat(now));
   if (record === null || record.at === undefined || record.boundary - now <= 0) {
     topBarUi.showCountdown(null);
@@ -602,7 +743,38 @@ setInterval(() => {
 // The program has already run when the check refuses it (or when evaluate fails later), so a
 // top-level setcps/setcpm of the refused code has already reached the scheduler while the previous music
 // keeps playing. The guard puts the previous tempo back when an evaluation fails.
-const tempoGuard = createTempoGuard(scheduler);
+const tempoGuard = createTempoGuard(scheduler, { glide: tempoGlide });
+
+/** True while a tempo ramp has a tempo to leave: the top bar's plays condition, and some version makes sound (playsNow). */
+function glideCanStart() {
+  return currentSoundState === 'playing' && !pageSuperseded && hasEvaluatedSuccessfully && playsNow();
+}
+
+/**
+ * The refusal of a change that asks for a ramp it cannot make, asked at the setPattern seam (installQueryCheck's refuse
+ * option): the program's tempo is known only once the program ran, and a throw here fails the evaluation before the new
+ * pattern or a waiting record exists, so nothing has changed. Returns the text, or null when the change may ramp. The
+ * text is also kept on the run, so the page can tell this refusal from any other failure and show no banner for it.
+ */
+function glideRefusal() {
+  const run = activeRun;
+  if (run === null || run.glideBars === null) return null;
+  const requested = tempoGuard.requestedSoFar();
+  let text = null;
+  if (requested === undefined) {
+    text = GLIDE_REFUSALS.noTempo;
+  } else {
+    try {
+      // The reply states a tempo to one decimal of a BPM, so two tempos that read alike have nothing to ramp between.
+      if (bpmOf(requested) === bpmOf(tempoGuard.playing())) text = GLIDE_REFUSALS.sameTempo;
+    } catch (err) {
+      console.error('Moontide: the tempo of the code is not usable for a ramp:', err);
+      text = GLIDE_REFUSALS.noTempo;
+    }
+  }
+  if (text !== null) run.glideRefusal = text;
+  return text;
+}
 
 /** The tempo in BPM for a reply, or undefined (with one console line) when the cps is not a usable number. */
 function bpmForReply(cps) {
@@ -709,9 +881,18 @@ async function evaluateWithSetup(code, rest) {
   }
   const failed = !!editor.repl.state.evalError;
   const waitingRecord = activeRun !== null ? activeRun.deferred : null;
-  // A waiting change must not touch the music that still plays, so its tempo is taken back now and
-  // applied at the line (onReached); the reply states it as the tempo from that cycle.
-  const { requested } = tempoGuard.end(failed, { hold: !failed && waitingRecord !== null });
+  // A change that asks for a ramp and takes over at once keeps the tempo that plays: the program's tempo is taken back in
+  // this task and a ramp moves toward it (startGlide). A waiting change must not touch the music that still plays either, so
+  // its tempo is taken back now and applied at the line (onReached); the reply states it as the tempo from that cycle.
+  const startsGlide = !failed && run !== null && run.glideBars !== null && waitingRecord === null;
+  const { requested, glide: glideResult } = tempoGuard.end(failed, { hold: !failed && waitingRecord !== null, startsGlide });
+  if (startsGlide) startGlide(run, requested);
+  // A change that asked for no ramp but restated the target of the one that runs lets it go on: the reply says so.
+  if (!failed && run !== null && run.glideBars === null && waitingRecord === null && glideResult === 'kept') {
+    const nowBpm = bpmForReply(scheduler.cps);
+    const toBpm = bpmForReply(tempoGlide.targetCps());
+    if (nowBpm !== undefined && toBpm !== undefined) run.glide = { state: 'running', nowBpm, toBpm };
+  }
   if (!failed && activeRun !== null) {
     if (waitingRecord !== null) {
       waitingRecord.newCps = typeof requested === 'number' ? requested : null;
@@ -729,6 +910,47 @@ async function evaluateWithSetup(code, rest) {
     await sendLateSetup(code);
   }
   return result;
+}
+
+/**
+ * Starts the tempo ramp a change asked for, right after its evaluation (the tempo guard took the program's tempo back in the
+ * same task). A ramp that cannot be made was refused before this point (glideRefusal), so a change that gets here has a tempo
+ * to ramp to. When the page stopped or lost its role during the evaluation nothing starts and nothing is applied: Stop ends
+ * every ramp, and the next Play takes the code's tempo. Never throws.
+ */
+function startGlide(run, requested) {
+  try {
+    if (typeof requested !== 'number') {
+      console.error('Moontide: glideBars was asked for, but the evaluation stated no tempo, so no ramp started.');
+      return;
+    }
+    if (!glideCanStart()) return;
+    const fromCps = scheduler.cps;
+    try {
+      run.glidePlan = tempoGlide.start({ fromCps, toCps: requested, bars: run.glideBars, startCycle: scheduler.lastEnd });
+    } catch (err) {
+      // The program's tempo was taken back for the ramp, so the change keeps its own tempo instead.
+      console.error('Moontide: the tempo ramp could not start, so the tempo applied at once:', err);
+      tempoGuard.apply(requested);
+      return;
+    }
+    const fromBpm = bpmForReply(fromCps);
+    const toBpm = bpmForReply(requested);
+    if (fromBpm !== undefined && toBpm !== undefined) run.glide = { state: 'started', fromBpm, toBpm, bars: run.glideBars };
+  } catch (err) {
+    console.error('Moontide: the tempo ramp of the change could not be set up:', err);
+  }
+}
+
+/**
+ * The glide report of a waiting change that asked for a ramp: it starts at the line, from the tempo that plays then, so the
+ * reply names only the tempo it ends on and the bars. An empty object when the change asked for none or the tempo is not
+ * one a reply can state. Mirrors src/protocol.ts's at-line report by hand.
+ */
+function atLineGlide(record) {
+  if (typeof record.glideBars !== 'number' || typeof record.newCps !== 'number') return {};
+  const toBpm = bpmForReply(record.newCps);
+  return toBpm === undefined ? {} : { glide: { state: 'at-line', toBpm, bars: record.glideBars } };
 }
 
 /** The MIDI setup of a change that took over at once although it was checked as a waiting one. Never throws. */
@@ -755,7 +977,7 @@ editor.repl.evaluate = (code, ...rest) => {
   const evalRun =
     armedRun !== null
       ? armedRun
-      : { timing: parseTiming(viewState.changeTiming), deferred: null, bpm: undefined, midiDeferred: false };
+      : { timing: parseTiming(viewState.changeTiming), deferred: null, bpm: undefined, midiDeferred: false, glideBars: null, glide: undefined, glidePlan: null, glideRefusal: null };
   armedRun = null;
   const run = evalQueue.then(async () => {
     activeRun = evalRun;
@@ -915,6 +1137,7 @@ const jamUi = createJamView({
     // Draw the overlay at once; the 250 ms tick would make the checkbox feel slow.
     renderJam();
   },
+  onScaleChoice: (choice) => chooseJamScale(choice),
 });
 
 // The Instruments view's DOM. Created here, before any code path that can call into it (its redraw
@@ -1023,11 +1246,40 @@ const sessionLabel = readSessionLabel(document, (text) => console.error(text));
 const pageBaseTitle = baseTitle(sessionLabel);
 renderSessionIdentity(document, sessionLabel, (text) => console.error(text));
 
+// What became of each request this page sent: the tracker holds a row per request and the view draws the chip in
+// the top bar and the panel under it. The Session drawer and the panel never show together; each is looked up at
+// call time because the drawer is created further down.
+const requestTracker = createRequestTracker({
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  onChange: () => {
+    requestsUi.render(requestTracker.model());
+    askUi.refreshPartsLine();
+  },
+  onNotConfirmed: (id) => askUi.notConfirmed(id),
+});
+const requestsUi = createRequestStatusView({
+  document,
+  now: () => Date.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  // The panel opening closes the Session drawer, without moving focus.
+  onOpen: () => sessionUi.close(),
+  // A row under the pointer, with focus or with its detail open stays where it is, even when it has finished.
+  onHold: (id, held) => requestTracker.setHeld(id, held),
+  takeLive: () => requestTracker.takeLive(),
+  getModel: () => requestTracker.model(),
+});
+
 // The Ask Claude box. Created before any code path that can call into it.
 const askUi = createAskView({
   document,
+  requests: requestTracker,
   send: (message) => {
     sendIfOpen(JSON.stringify(message));
+    // The panel opens by itself when the user sends, and focus stays where the Ask box gave it back.
+    if (message.type === 'ask') requestsUi.noteSend();
     // A sent request about a range of the Timeline is done with it: the wash goes.
     if (message.type === 'ask' && message.context.kind === 'range') timelineEditUi.clearRange();
   },
@@ -1036,8 +1288,6 @@ const askUi = createAskView({
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (timer) => clearTimeout(timer),
   now: () => Date.now(),
-  // The status text changes the bar's width: the fit step runs again.
-  fit: () => topBarUi.fit(),
 });
 
 // The segment a superseded tab shows, with its "Play in this tab" button. takeBackTimer is the
@@ -1085,6 +1335,7 @@ const sessionUi = createSessionView({
   onOpen() {
     midiUi.closeHelp();
     askUi.closeHelp();
+    requestsUi.close();
   },
   setTimer: (fn, ms) => setTimeout(fn, ms),
   // One of the three Edits timing buttons. The setting is stored by applyViewState (through the closed-set
@@ -1394,8 +1645,8 @@ let mixerLitMemo = { code: null, identity: null, range: null };
  * or a pushed change for a hand evaluation. (runMixerEvaluate below is the single place that
  * calls the repl directly.)
  */
-async function runProgrammaticEvaluate(timing = NOW_TIMING) {
-  const run = armRun(timing);
+async function runProgrammaticEvaluate(timing = NOW_TIMING, { glideBars = null } = {}) {
+  const run = armRun(timing, glideBars);
   programmaticEvalInFlight = true;
   try {
     const evaluation = editor.evaluate();
@@ -1788,6 +2039,8 @@ async function stopSoundLocally({ panicFirst = false } = {}) {
   // A change that waits for its line is canceled first: its finish must never run after Stop, and the
   // next Play starts from cycle 0 without the canceled gate.
   takeover.cancel('stop');
+  // A tempo ramp ends with Stop, and no ramp state survives it: the next Play starts at the tempo the code declares.
+  tempoGlide.cancel('stop');
   // Retire the webmidi Outputs first (synchronous), so no callback frozen from the stopped
   // code can send between scheduler.stop() and the suspend, or after the next Play.
   midiOut.retireOutputs({ timedRelease: !panicFirst });
@@ -1873,6 +2126,9 @@ async function reportHandEval(state, code = editor.repl.state.activeCode) {
   sendIfOpen(JSON.stringify({ type: 'hand-eval', ok: true, code }));
 }
 
+// Whether the sentence for a Play that could not reset the shift (no code parser) was already logged in this page session.
+let playShiftNoParserSaid = false;
+
 /**
  * Play after Stop on a piece that declares a song: the scheduler's cycle count restarts at 0 at every Play, so a shift a
  * launch (or a person) left in the code would start the music inside the structure. The shift literal of the editor text is
@@ -1882,7 +2138,13 @@ async function reportHandEval(state, code = editor.repl.state.activeCode) {
  * reported on the console and Play goes on. Ctrl+Enter in the editor is an evaluation, not a Play, and does not come here.
  */
 function resetSongShiftForPlay() {
-  if (!window.acorn || typeof window.acorn.parse !== 'function') return;
+  if (!window.acorn || typeof window.acorn.parse !== 'function') {
+    if (!playShiftNoParserSaid) {
+      playShiftNoParserSaid = true;
+      console.error('Moontide: Play could not reset the shift of the song because the code parser is not loaded; the code plays as written.');
+    }
+    return;
+  }
   const text = editor.code;
   try {
     const reading = readSongOf(text);
@@ -2024,12 +2286,34 @@ try {
   console.error(err);
 }
 
+// A MIDI note with neither a port timestamp nor the audio clock is timed as a browser sound, which is later than a MIDI
+// message is heard. That is said once per page load, never on every note, and nothing is thrown into the scheduler.
+let midiNoteNoClockSaid = false;
+function sayMidiNoteWithoutClock() {
+  if (midiNoteNoClockSaid) return;
+  midiNoteNoClockSaid = true;
+  console.error('Moontide: a MIDI note reached the lights with no port timestamp and the audio clock is not available, so the lights time it as a browser sound; this is said once.');
+}
+
 // Every note of a labeled track goes to the lights while they are active. Otherwise it is dropped at once, so notes played
 // while the Mixer is closed, the tab is hidden or the music is stopped never wait to be drawn later. A MIDI note carries the
 // time its port got; a browser sound carries the audio time it is due, which the lights map to when it is heard.
 subscribeNotes((event) => {
   if (!lightsActive) return;
-  lights.noteSeen(event.key, event.stamp !== null ? { at: event.stamp + MIDI_LIGHT_OFFSET_MS } : { target: event.target });
+  if (event.stamp !== null) {
+    lights.noteSeen(event.key, { at: event.stamp + MIDI_LIGHT_OFFSET_MS });
+    return;
+  }
+  // A MIDI note that reached the lights without a port timestamp is sent at its due time on the page clock, with no audio output
+  // latency (a MIDI message never has any), so it is timed there and not as a browser sound.
+  if (lights.playsMidi(event.key)) {
+    if (typeof globalThis.getAudioContext === 'function') {
+      lights.noteSeen(event.key, { at: performance.now() + (event.target - globalThis.getAudioContext().currentTime) * 1000 + MIDI_LIGHT_OFFSET_MS });
+      return;
+    }
+    sayMidiNoteWithoutClock();
+  }
+  lights.noteSeen(event.key, { target: event.target });
 });
 
 // Start enabling Web MIDI at page start only when the browser already says the permission is
@@ -2118,6 +2402,8 @@ ws.addEventListener('open', () => {
   historyUi.setConnected('connected');
   mixerUi.setConnected('connected');
   askUi.setConnected('connected');
+  // The requests of a page that went away (a reload) come back from the server; an empty answer changes nothing.
+  sendIfOpen(JSON.stringify({ type: 'ask-board-request' }));
   // Always ask, whether or not the view is open, so live additions accumulate.
   sendIfOpen(JSON.stringify({ type: 'history-request' }));
   // The data folder is asked once per connection, after page-auth (the server answers only a page that
@@ -2138,6 +2424,7 @@ ws.addEventListener('close', () => {
   renderConnectionState('disconnected');
   historyUi.setConnected('disconnected');
   mixerUi.setConnected('disconnected');
+  requestTracker.connectionLost();
   askUi.setConnected('disconnected');
 });
 ws.addEventListener('error', () => {
@@ -2152,6 +2439,7 @@ ws.addEventListener('error', () => {
   renderConnectionState('disconnected');
   historyUi.setConnected('disconnected');
   mixerUi.setConnected('disconnected');
+  requestTracker.connectionLost();
   askUi.setConnected('disconnected');
 });
 
@@ -2305,6 +2593,9 @@ ws.addEventListener('message', (event) => {
   }
 
   if (msg.type === 'hello') {
+    // The server treats every attach as the end of a ramp, so the page agrees at once, before the replay is queued: a
+    // reload, a reconnect or a tab taking the role back never carries a ramp into its replay.
+    tempoGlide.cancel('page');
     // The hello is the first moment the page can know there is no instruments.json, so the
     // Instruments view says "Connecting..." until now. Set synchronously, before anything is queued.
     pageHelloSeen = true;
@@ -2479,6 +2770,13 @@ ws.addEventListener('message', (event) => {
     return;
   }
 
+  if (msg.type === 'ask-status' || msg.type === 'ask-board') {
+    // Mirrors src/protocol.ts by hand: what became of a request after Claude received it, and the requests a
+    // reloaded page gets back. Outside the serial `chain`; the tracker moves each row only forward.
+    requestTracker.serverMessage(msg);
+    return;
+  }
+
   if (msg.type === 'instrument-result') {
     // Mirrors src/protocol.ts by hand: the answer to one instrument-switch of this page. Outside the serial
     // `chain` like the other plain updates; the rig push it follows has already been applied.
@@ -2515,23 +2813,33 @@ function buildEvalErrorReport(evalError) {
  * that is audible), or to nothing before any code has played, and shows the failed-change banner. Returns the
  * report, so a caller that tells the server about the failure sends the same text and line. Every failed
  * evaluation of code the page wrote or received ends here: Claude's change, the reconnect replay and the page's own
- * rewrites.
+ * rewrites. `banner` false takes the code back without the banner (a refused tempo ramp, which is not a failure of the code).
  */
-function revertAndReport(evalError) {
+function revertAndReport(evalError, { banner = true } = {}) {
   editor.setCode(hasEvaluatedSuccessfully ? committedCode() : '');
   const report = buildEvalErrorReport(evalError);
-  showEvalError(report.errorText);
+  if (banner) showEvalError(report.errorText);
   return report;
 }
 
 async function handleEvaluate(msg) {
   // An unknown timing is refused before anything changes (the page mirrors src/protocol.ts by hand).
   let timing;
+  let glideBars;
   try {
     timing = parseTiming(msg.at, msg.phraseCycles);
+    glideBars = parseGlideBars(msg.glideBars);
   } catch (err) {
     sendIfOpen(
       JSON.stringify({ type: 'evaluated', id: msg.id, ok: false, code: msg.code, error: err instanceof Error ? err.message : String(err) }),
+    );
+    return;
+  }
+  // A ramp needs music to leave: with nothing playing the change is refused whole, before anything changes and with no
+  // banner (the server tells Claude to send it again without glideBars).
+  if (glideBars !== null && !glideCanStart()) {
+    sendIfOpen(
+      JSON.stringify({ type: 'evaluated', id: msg.id, ok: false, code: msg.code, error: GLIDE_REFUSALS.nothingPlays, glideRefused: true }),
     );
     return;
   }
@@ -2553,7 +2861,7 @@ async function handleEvaluate(msg) {
   evaluateTag.begin(msg.id);
   let run;
   try {
-    run = await runProgrammaticEvaluate(timing);
+    run = await runProgrammaticEvaluate(timing, { glideBars });
   } finally {
     evaluateTag.end();
   }
@@ -2566,15 +2874,19 @@ async function handleEvaluate(msg) {
     // still audible. Never call editor.evaluate() here: the previous pattern is still
     // playing, re-running it is unnecessary and risks re-triggering audio. A failed
     // evaluate leaves pageStopped and the silence unchanged.
-    const { errorText, line } = revertAndReport(evalError);
+    // A ramp the code cannot make was refused at the setPattern seam (glideRefusal): the editor goes back all the same, but no
+    // banner shows, because nothing the person wrote failed.
+    const refusal = typeof run.glideRefusal === 'string' ? run.glideRefusal : null;
+    const { errorText, line } = revertAndReport(evalError, { banner: refusal === null });
     const payload = {
       type: 'evaluated',
       id: msg.id,
       ok: false,
       code: msg.code,
-      error: errorText,
+      error: refusal ?? errorText,
+      ...(refusal !== null ? { glideRefused: true } : {}),
     };
-    if (line !== undefined) {
+    if (refusal === null && line !== undefined) {
       payload.line = line;
     }
     sendIfOpen(JSON.stringify(payload));
@@ -2612,7 +2924,9 @@ async function handleEvaluate(msg) {
     if (!replacedBeforeReply) {
       takeover.whenFinished(waiting, () => {
         evaluateTag.fromTakeover(msg.id);
-        sendIfOpen(JSON.stringify({ type: 'takeover', id: msg.id }));
+        // The server records the ramp this change started at its line only if it still runs now (mirrors src/protocol.ts).
+        const glideRuns = tempoGlide.runs(waiting.glidePlan);
+        sendIfOpen(JSON.stringify({ type: 'takeover', id: msg.id, ...(glideRuns ? { glideRuns: true } : {}) }));
       });
     }
     sendIfOpen(
@@ -2624,6 +2938,7 @@ async function handleEvaluate(msg) {
         audio,
         pending: { cycle: waiting.boundary, seconds: pendingSecondsForReply(waiting.boundary) },
         ...(typeof run.bpm === 'number' ? { bpm: run.bpm } : {}),
+        ...(!replacedBeforeReply ? atLineGlide(waiting) : {}),
       }),
     );
     waiting.replied = true;
@@ -2646,6 +2961,16 @@ async function handleEvaluate(msg) {
   // A change that already took over (a newer change settled it at its line before this reply) is reported with its
   // own code; the editor may already hold the newer change's text.
   const finishedBeforeReply = waiting !== null && waiting.finished === true && typeof waiting.code === 'string';
+  // The ramp this change started is reported only while it still runs: a Stop during the watch above, or a program that
+  // ended it meanwhile, already ended it, and the server must never record a ramp that no longer runs. A waiting change
+  // that already took over has no takeover message (this reply records it), so the reply carries the ramp it started at
+  // its line, by the same rule.
+  let glide;
+  if (run.glide !== undefined) {
+    glide = run.glide.state !== 'started' || tempoGlide.runs(run.glidePlan) ? run.glide : undefined;
+  } else if (finishedBeforeReply && tempoGlide.runs(waiting.glidePlan)) {
+    glide = atLineGlide(waiting).glide;
+  }
   sendIfOpen(
     JSON.stringify({
       type: 'evaluated',
@@ -2654,8 +2979,15 @@ async function handleEvaluate(msg) {
       code: finishedBeforeReply ? waiting.code : editor.repl.state.activeCode,
       audio,
       ...(typeof run.bpm === 'number' ? { bpm: run.bpm } : {}),
+      ...(glide !== undefined ? { glide } : {}),
     }),
   );
+  // A waiting change that asked for a ramp and already took over ended any older ramp at its line, even when it started
+  // none (nothing to ramp between). It has no takeover message to say so, so when no ramp runs now the server hears a
+  // silent end and clears its record. While a newer ramp runs, its own report sets the record, so nothing is sent.
+  if (finishedBeforeReply && typeof waiting.glideBars === 'number' && !tempoGlide.running()) {
+    sendIfOpen(JSON.stringify({ type: 'glide-ended', reason: 'finished' }));
+  }
 }
 
 // --- the Mixer's writes ---
@@ -3070,9 +3402,11 @@ function renderMixer() {
     for (const { identity, effect } of model.staleRecords) mixerBypassRecords = forgetBypass(mixerBypassRecords, identity, effect);
     if (!writeBypassRecords(storage, mixerBypassRecords)) reportStorageUnavailableOnce();
   }
-  mixerUi.render(model);
+  const { created } = mixerUi.render(model);
   // The lights learn which tracks the Mixer shows, which of them sound, and which groups hold them.
   lights.setLayout(lightLayout(model, { webMidi: typeof navigator.requestMIDIAccess === 'function' }));
+  // A strip this render built starts dark, so the lights write every lit value again from the next frame.
+  if (created > 0) lights.forgetShown();
   // Every render moves the one light onto the selected strip's block (or clears it): the strip may have left the model.
   syncMixerLit();
 }
@@ -3124,6 +3458,9 @@ const splitSizes = { a: initialPrefs.splitA ?? SPLIT_DEFAULTS.a, b: initialPrefs
 for (const key of initialPrefs.rejected) {
   console.error(SPLIT_COPY.badStored(key, key === STORAGE_KEYS.splitA ? SPLIT_DEFAULTS.a : SPLIT_DEFAULTS.b));
 }
+// A stored song launch choice outside the list was refused by readViewPrefs: say so once per page load (top-level code),
+// and use the default launch.
+if (initialPrefs.songLaunchRejected) console.error(VIEW_PREFS_COPY.badSongLaunch);
 const splitStorageKeys = { a: STORAGE_KEYS.splitA, b: STORAGE_KEYS.splitB };
 
 // The border between the editor and the view. The view only draws and listens; this is the one place that applies a size
@@ -3307,6 +3644,11 @@ let timelineRafId = null;
 // cannot change a handled failure until the version or the page changes, so the 250 ms tick does not
 // retry it four times a second; only a too-slow query is retried, once, after a pause.
 let jamReading = null;
+// What the user picked among the scales that fit, and the proposal in view, per set of candidates: page memory only, gone
+// on reload (no browser storage), capped at a few dozen sets (page/jam-resolve.js createScaleMemory).
+const jamScaleMemory = createScaleMemory();
+// The scale the view shows now (the playing span's, as resolved), so a choice is checked against what is on screen.
+let jamShownScale = null;
 let jamTimer = null;
 let jamRefreshRunning = false;
 let jamRefreshAgain = false;
@@ -3562,17 +3904,13 @@ function askAboutTimelineLane(laneIndex, cycle, point) {
 }
 
 /**
- * The section of the first and of the last cycle of a range as `{ section, sectionTo }`, for a piece with a song: `section` is
- * the section of the first cycle and `sectionTo` the section of the last only when it is another one. A piece without a song (or
- * with only arrange()) gives `{}`.
+ * The sections a range crosses as `{ sections }`, in playing order (a section played twice in a row once), for a piece with a
+ * song. A piece without a song (or with only arrange()) gives `{}`.
  */
-function timelineRangeSections(from, to) {
+function timelineRangeSectionList(from, to) {
   const reading = timelineSongReading();
   if (reading.state !== 'read') return {};
-  const sectionAt = (cycle) => String(reading.sections[playingSection(reading, cycle).index].name);
-  const first = sectionAt(from);
-  const last = sectionAt(to);
-  return last === first ? { section: first } : { section: first, sectionTo: last };
+  return { sections: sectionsCrossed(reading, from, to) };
 }
 
 /** The lane of a range of the lanes drawn, or a loud error when the range names none. */
@@ -3584,20 +3922,27 @@ function timelineRangeLane(selection) {
 }
 
 /**
- * What the note panel says of a range: `{ track, section, sectionTo, count }` (the sections only for a piece with a song, the
- * count of the notes that start in the cycles). Reads the lanes and the code only.
+ * What the note panel says of a range: `{ track, sections, moreSections, count }` (the sections the range crosses in playing
+ * order, cut like the request's, only for a piece with a song, and `moreSections` only when names were left out; the count of the
+ * notes that start in the cycles). Reads the lanes and the code only.
  */
 function describeTimelineRange(selection) {
   const lane = timelineRangeLane(selection);
   const { notes, more } = rangeNotes(lane, selection.from, selection.to);
-  const { section = null, sectionTo = null } = timelineRangeSections(selection.from, selection.to);
-  return { track: lane.track, section, sectionTo, count: notes.length + more };
+  const info = { track: lane.track, count: notes.length + more };
+  const { sections } = timelineRangeSectionList(selection.from, selection.to);
+  if (sections !== undefined) {
+    const fitted = fitSectionNames(sections);
+    info.sections = fitted.names;
+    if (fitted.more > 0) info.moreSections = fitted.more;
+  }
+  return info;
 }
 
 /**
- * The descriptor of a range of cycles on one lane of the lanes drawn: the lane's shown name, the first and last cycle, the section
- * of each end when the playing code is a song (the second only when it differs), the notes of the lane that start in those cycles
- * with the version drawn, and the cut when the pointer left the page. Reads the lanes and the code only.
+ * The descriptor of a range of cycles on one lane of the lanes drawn: the lane's shown name, the first and last cycle, the sections
+ * the range crosses in playing order when the playing code is a song, the notes of the lane that start in those cycles with the
+ * version drawn, and the cut when the pointer left the page. Reads the lanes and the code only.
  */
 function timelineRangeDescriptor(selection) {
   const lane = timelineRangeLane(selection);
@@ -3607,7 +3952,7 @@ function timelineRangeDescriptor(selection) {
     track: lane.track,
     from: selection.from,
     to: selection.to,
-    ...timelineRangeSections(selection.from, selection.to),
+    ...timelineRangeSectionList(selection.from, selection.to),
     gesture: { kind: 'range', version: timelineDrawn.version, notes, more },
   };
   if (selection.cut !== null) descriptor.cut = selection.cut;
@@ -3631,11 +3976,35 @@ songGridHandlers.ask = (descriptor, point) => {
   openAskFor(() => descriptor, point);
 };
 
+// The Menu key and Shift+F10 are answered by the control that has focus (the grid and the Timeline open the box on the key
+// itself), and the browser raises a contextmenu for the same press. That contextmenu must neither open the box a second time nor
+// let the browser's own menu show over it. `keyAsk` remembers an ask-key press from its key down until one task after its key up,
+// with whether the box was open when the key went down.
+let keyAsk = null;
+document.addEventListener('keydown', (event) => {
+  // A held key repeats its keydown; the repeats find the box open and must not change what the first press recorded.
+  if (isAskKey(event) && !event.repeat) keyAsk = { key: event.key, openBefore: askUi.isOpen() };
+}, true);
+document.addEventListener('keyup', (event) => {
+  if (keyAsk === null || event.key !== keyAsk.key) return;
+  // One task later, so a contextmenu the browser raises right after the key up is still recognised. On a busy page that task
+  // can run after the next press went down, so it forgets only the press it was set for.
+  const released = keyAsk;
+  setTimeout(() => {
+    if (keyAsk === released) keyAsk = null;
+  }, 0);
+}, true);
+
 // The one contextmenu listener of the page; no view module has its own. Shift + right-click keeps
 // the browser's own menu, and so does a right-click inside the box (the user can paste) or while the
 // audio-unlock overlay shows (it is a gate to start sound, not part of the page's work). The right-click
 // never evaluates, records or changes the editor's text, selection or scroll.
 document.addEventListener('contextmenu', (event) => {
+  // The key press already opened the box: only keep the browser's menu away.
+  if (keyAsk !== null && !keyAsk.openBefore && askUi.isOpen()) {
+    event.preventDefault();
+    return;
+  }
   if (event.shiftKey || !overlay.hidden || askUi.contains(event.target)) return;
   event.preventDefault();
   // A right-click on the failed-change banner (or on its own popover) offers the banner's actions.
@@ -3936,7 +4305,8 @@ function songNoteEntries(reading) {
 /** The line a finished check gives, or null when what plays agrees with the declaration. */
 function songCheckEntry(answer) {
   if (answer.state === 'differs') return differsLine({ ...answer.first, more: answer.more });
-  if (answer.state === 'failed' || answer.state === 'too-slow') return { text: SONG_COPY.checkFailed, kind: 'check-failed' };
+  if (answer.state === 'failed') return { text: SONG_COPY.checkFailed, kind: 'check-failed' };
+  if (answer.state === 'too-slow') return { text: SONG_COPY.checkTooSlow, kind: 'check-failed' };
   return null;
 }
 
@@ -3970,7 +4340,7 @@ async function runSongCheck(generation, code, reading, evaluateId) {
   if (answer.state === 'too-slow') console.error(`Moontide: the check of the song declaration ran over its ${TIMELINE_BUDGET_MS} ms budget (${Math.round(answer.ms)} ms).`);
   const entry = songCheckEntry(answer);
   songCheck = { generation, entry };
-  songNotesEl.dataset.check = answer.state === 'agrees' || answer.state === 'differs' ? answer.state : 'failed';
+  songNotesEl.dataset.check = answer.state === 'agrees' || answer.state === 'differs' || answer.state === 'too-slow' ? answer.state : 'failed';
   songNotesEl.dataset.checkMs = String(Math.round(answer.ms));
   songUi.showNotes(songNoteEntries(reading));
   if (entry !== null) {
@@ -4857,20 +5227,50 @@ function renderJam() {
       options.declaredOverride = sectionDeclared(song.sections[index], jamReading.reading.declared ?? { state: 'none' });
       options.section = quoted(song.sections[index].name);
     }
+    // When several scales fit the notes, the one in use is resolved here, from the harmony the playing section declares;
+    // every path below (the status, the rows, the degrees, the piano and the guitar, what a right-click asks about) then
+    // reads that one scale. The warnings of every candidate came with the reading, so this only looks them up.
+    const declared = options.declaredOverride ?? jamReading.reading.declared ?? { state: 'none' };
+    const resolved = resolveReading(jamReading.reading, { declared, memory: jamScaleMemory });
+    const position = readingAt(resolved, { cycle, cps, playing });
     jamUi.render(
       buildJamModel({
-        position: readingAt(jamReading.reading, { cycle, cps, playing }),
+        position,
         chordTones: viewState.jamChordTones === 'on',
         ...options,
       }),
     );
+    // After the draw: remember what is shown. A proposal that came from the evidence is kept for its set of candidates, so
+    // a later reading that orders the same candidates otherwise does not move it; a declared scale is not kept, because the
+    // declaration moves the proposal on its own and the next section may declare another.
+    jamShownScale = position.scale;
+    if (position.scale.source === 'proposed' && position.scale.reason !== 'declared') {
+      jamScaleMemory.keep(position.scale.setKey, position.scale.key);
+    }
   } catch (err) {
+    jamShownScale = null;
     if (jamDrawErrorLoggedFor !== jamReading) {
       jamDrawErrorLoggedFor = jamReading;
       console.error('Moontide: the Jam view could not draw the reading:', err);
     }
     jamUi.showMessage(JAM_COPY.failed);
   }
+}
+
+/** Takes the user's choice among the scales that fit: `{ setKey, key }` from a candidate button. It is accepted only while the
+ * scale on screen is a proposed or a chosen one, for the set of candidates on screen, and `key` is one of them; anything
+ * else is a caller bug and throws. The pick is remembered for that set (page memory) and the view is drawn again at once from
+ * the reading it already holds: no new reading, the warnings of every candidate came with it. */
+function chooseJamScale({ setKey, key }) {
+  const shown = jamShownScale;
+  const usable =
+    shown !== null &&
+    (shown.source === 'proposed' || shown.source === 'chosen') &&
+    shown.setKey === setKey &&
+    shown.candidates.some((candidate) => candidate.key === key);
+  if (!usable) throw new Error(`Moontide: the Jam view cannot use the scale '${String(key)}': it is not one of the scales that fit now.`);
+  jamScaleMemory.pick(setKey, key);
+  renderJam();
 }
 
 /** The Jam view's 250 ms tick: asks for a rebuild when the reading is missing, belongs to an older
@@ -5672,7 +6072,7 @@ async function launchSectionNow(seen) {
   for (;;) {
     attempt += 1;
     // Read the frontier, compute the line and the shift, write and evaluate: no await until the call has started.
-    const { line, at } = launchLine({ kind: seen.kind, frontier: scheduler.lastEnd, cps: tempoGuard.playing(), reading, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
+    const { line, at } = launchLine({ kind: seen.kind, frontier: scheduler.lastEnd, cps: takeoverCps(), reading, minLeadSeconds: MIN_TAKEOVER_LEAD_SECONDS });
     const shift = launchShift(reading, seen.index, line);
     if (sameShift(shift, reading.shift, reading.total)) {
       // The section already starts on that line: nothing is written. A launch of ours that waits (or the first try of

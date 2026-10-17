@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { parse } from 'acorn';
 import { extractTracks } from '../page/tracks.js';
 import { HELPER_TEXT, SONG_COPY, SONG_REFUSALS, readStructure } from '../page/structure.js';
-import { SONG_GRID_DEEP_FROM, buildSongGrid, cellList, cellRecordLabel, controlsDisabled, gridMove, groupKey, headerLive, launchOptions, listPlacement, nowText, playingSection, sectionDeclared, songLine } from '../page/song-grid-model.js';
+import { SONG_GRID_DEEP_FROM, buildSongGrid, cellList, cellRecordLabel, controlsDisabled, gridMove, groupKey, headerLive, launchOptions, listPlacement, nowText, playingSection, sectionDeclared, sectionsCrossed, songLine } from '../page/song-grid-model.js';
 
 const SOURCE = readFileSync(fileURLToPath(new URL('../page/song-grid-model.js', import.meta.url)), 'utf8');
 const read = (code) => readStructure(code, { parse, tracks: extractTracks(code, { parse }) });
@@ -228,6 +228,21 @@ test('the playing section at a line is the one that starts there', () => {
   assert.deepEqual(playingSection(reading, 14.5).index, 2);
   assert.deepEqual(playingSection(reading, 15), { index: 0, cycleIn: 1, progress: 0 }, 'the structure repeats');
   assert.deepEqual(playingSection(reading, 18), { index: 1, cycleIn: 1, progress: 0 });
+});
+
+test('the sections a range crosses are listed in playing order, a section twice in a row once, one that comes back again', () => {
+  const reading = read(piece());
+  assert.deepEqual(sectionsCrossed(reading, 0, 2), ['x']);
+  assert.deepEqual(sectionsCrossed(reading, 2, 3), ['x', 'y']);
+  assert.deepEqual(sectionsCrossed(reading, 13, 18), ['z', 'x', 'y'], 'a range across the end of the song goes on from its start');
+  assert.deepEqual(sectionsCrossed(reading, 14, 30), ['z', 'x', 'y', 'z', 'x'], 'a section that comes back after another is named again');
+  assert.deepEqual(sectionsCrossed(reading, 5, 5), ['y']);
+  // The same section twice in a row (two entries of the list) counts once.
+  const twice = read(piece({ sections: "[['x', 3], ['x', 2], ['y', 5]]", plan: "{ x: { t1: 'va', t2: 'va', t3: 'va' }, y: { t1: 'vb', t2: 'va', t3: '-' } }" }));
+  assert.deepEqual(sectionsCrossed(twice, 0, 9), ['x', 'y']);
+  // A shift lists by the playing position, the same rule as the playing section.
+  const shifted = read(piece({ shift: '4' }));
+  assert.deepEqual(sectionsCrossed(shifted, 3, 7), ['z', 'x', 'y']);
 });
 
 test('a shift moves the sections: negative and fractional shifts keep the section lines where the clock puts them', () => {

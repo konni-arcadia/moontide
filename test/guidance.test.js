@@ -22,6 +22,7 @@ import * as midnamModule from '../dist/midnam.js';
 import * as importMidnamModule from '../dist/import-midnam.js';
 import * as editCodeModule from '../dist/edit-code.js';
 import * as startModule from '../dist/start.js';
+import * as requestStatusModule from '../dist/request-status.js';
 import { soundLoadFailureText } from '../page/ui-state.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -445,6 +446,17 @@ test('guidance: no Claude-facing text carries a tint word, a steering word, or a
   });
   texts.push({ where: 'REQUEST_LINE_FRAMING', text: askModule.REQUEST_LINE_FRAMING });
   texts.push({ where: 'REQUEST_LINE_MOMENT_FACT', text: askModule.REQUEST_LINE_MOMENT_FACT });
+  // What the page shows for a linked change and a closed request, and the texts of the tool that closes one.
+  texts.push({ where: 'REQUEST_LINE_STATUS_FACT', text: askModule.REQUEST_LINE_STATUS_FACT });
+  texts.push({ where: 'ANSWER_REQUEST_DESCRIPTION', text: mcpModule.ANSWER_REQUEST_DESCRIPTION });
+  texts.push({ where: 'ANSWER_REQUEST_ID_DESCRIPTION', text: mcpModule.ANSWER_REQUEST_ID_DESCRIPTION });
+  texts.push({ where: 'ANSWER_REQUEST_OUTCOME_DESCRIPTION', text: mcpModule.ANSWER_REQUEST_OUTCOME_DESCRIPTION });
+  texts.push({ where: 'ANSWER_REQUEST_TEXT_DESCRIPTION', text: mcpModule.ANSWER_REQUEST_TEXT_DESCRIPTION });
+  texts.push({ where: 'answerRequestReply (answered)', text: mcpModule.answerRequestReply('answered') });
+  texts.push({ where: 'answerRequestReply (declined)', text: mcpModule.answerRequestReply('declined') });
+  texts.push({ where: 'ANSWERING_FIELD_DESCRIPTION', text: mcpModule.ANSWERING_FIELD_DESCRIPTION });
+  texts.push({ where: 'UNKNOWN_ANSWERING_NOTE', text: mcpModule.UNKNOWN_ANSWERING_NOTE });
+  texts.push({ where: 'NOT_OPEN_REQUEST_MESSAGE', text: requestStatusModule.NOT_OPEN_REQUEST_MESSAGE });
   texts.push({ where: 'listenerUsageLine', text: askModule.listenerUsageLine() });
   texts.push({ where: 'listenerRefusedLine', text: askModule.listenerRefusedLine(401) });
   texts.push({ where: 'listenerConnectFailedLine', text: askModule.listenerConnectFailedLine(5757, 'connect ECONNREFUSED') });
@@ -621,18 +633,48 @@ test('guidance: edit_code and set_code say when to use which, within the 2048 ch
   const schema = byName.edit_code.inputSchema;
   assert.deepEqual(
     Object.keys(schema.properties).sort(),
-    ['at', 'base', 'edits', 'label', 'phraseCycles'],
+    ['answering', 'at', 'base', 'edits', 'glideBars', 'label', 'phraseCycles'],
   );
   const item = schema.properties.edits.items;
   assert.deepEqual(Object.keys(item.properties).sort(), ['new_string', 'old_string', 'replace_all']);
   assert.equal(item.additionalProperties, false);
-  for (const field of ['label', 'at', 'phraseCycles']) {
+  for (const field of ['label', 'at', 'phraseCycles', 'glideBars', 'answering']) {
     assert.equal(
       schema.properties[field].description,
       byName.set_code.inputSchema.properties[field].description,
       `edit_code.${field} description must equal set_code's`,
     );
   }
+  // The three tools that change the music take the id of the page request they answer, with one shared description.
+  const answeringDescription = byName.set_code.inputSchema.properties.answering.description;
+  assert.equal(answeringDescription, mcpModule.ANSWERING_FIELD_DESCRIPTION);
+  assert.equal(byName.restore_version.inputSchema.properties.answering.description, answeringDescription);
+  assert.ok(answeringDescription.length <= 200, `the answering description is ${answeringDescription.length} characters`);
+  assert.ok(answeringDescription.includes('request line'));
+  assert.equal(mcpModule.EDIT_CODE_DESCRIPTION.length, 1673, 'the edit_code description is not edited');
+  // The ramp length is asked for with one shared description of facts: the bounds are its only digits.
+  const glideDescription = byName.set_code.inputSchema.properties.glideBars.description;
+  assert.equal(glideDescription, mcpModule.GLIDE_BARS_FIELD_DESCRIPTION);
+  assert.ok(glideDescription.length <= 300, `the glideBars description is ${glideDescription.length} characters`);
+  assert.ok(glideDescription.includes('1 to 64'), 'the glideBars description gives the bounds');
+  assert.deepEqual(glideDescription.replace('1 to 64', '').match(/\d/g), null, 'no digit outside the bounds');
+  // What Claude needs to ask for a ramp: how the tempo is stated, where it starts, what refuses it and what cancels it.
+  for (const fact of ['setcps', 'setcpm', 'at', 'Refused', 'Stop']) {
+    assert.ok(glideDescription.includes(fact), `the glideBars description says ${fact}`);
+  }
+
+  // The tool that closes a request in words: what it does, the two outcomes, the sentence limit and the other way
+  // to answer a request, as facts where Claude chooses a tool.
+  const answerRequest = byName.answer_request;
+  assert.ok(answerRequest, 'answer_request is listed');
+  assert.equal(answerRequest.description, mcpModule.ANSWER_REQUEST_DESCRIPTION);
+  for (const phrase of ['without changing the music', 'answered', 'declined', '200 characters', 'answering']) {
+    assert.ok(answerRequest.description.includes(phrase), `answer_request description must contain "${phrase}"`);
+  }
+  assert.ok(answerRequest.description.length <= mcpModule.CLIENT_INSTRUCTIONS_LIMIT);
+  assert.deepEqual(Object.keys(answerRequest.inputSchema.properties).sort(), ['id', 'outcome', 'text']);
+  assert.deepEqual(answerRequest.inputSchema.properties.outcome.enum, ['answered', 'declined']);
+  assert.equal(answerRequest.inputSchema.properties.text.maxLength, 200);
 
   assert.ok(!(client.getInstructions() ?? '').toLowerCase().includes('edit_code'), 'the instructions must not mention edit_code');
   // The instructions were 1953 characters before the structure rule: it made room by moving the vague-request
@@ -680,7 +722,7 @@ test('guidance: exactly three MCP prompts, none about music', async (t) => {
 
 // No memory tool exists — the tool list and the resource list are exactly what has shipped,
 // nothing added to record the user's own words across sessions. start is how Moontide starts.
-test('guidance: exactly fourteen tools are listed, and resources cover only the reference', async (t) => {
+test('guidance: exactly fifteen tools are listed, and resources cover only the reference', async (t) => {
   const { client } = await startMcpClient();
   t.after(async () => {
     await client.close();
@@ -690,6 +732,7 @@ test('guidance: exactly fourteen tools are listed, and resources cover only the 
   assert.deepEqual(
     tools.map((tool) => tool.name).sort(),
     [
+      'answer_request',
       'edit_code',
       'favorite_version',
       'get_code',

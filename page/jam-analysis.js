@@ -376,15 +376,38 @@ export function warningsFor(solidSegments, scale) {
 
 // --- scale detection ---
 
+/** The key of a candidate scale: its root pitch class and its mode id, '9:aeolian' for A minor. */
+export const candidateKey = (root, mode) => `${root}:${mode.id}`;
+
+/**
+ * The clear shape of one scale: `{ status: 'clear', root, mode, name, spell, notes, coverage }`, notes being the
+ * seven `{ pc, name, degree }` in scale order from the root. detectScale returns it for a scale that stands alone,
+ * and every proposal of an ambiguous reading has it, so a scale in use reads the same wherever it came from.
+ */
+export function clearScale(root, mode, coverage) {
+  const spell = spellTable(root, mode);
+  return {
+    status: 'clear',
+    root,
+    mode,
+    name: scaleName(root, mode),
+    spell,
+    notes: scalePcs(root, mode).map((pc, i) => ({ pc, name: spell[pc], degree: mode.degrees[i] })),
+    coverage,
+  };
+}
+
 /**
  * Reads the scale of a set of pitched events (brief ones too). `harmonicSegments` (segments of
  * the half-cycle segmentation) add tonic evidence: bass notes of segments with at least two
  * notes and chord roots, weighted 2, 2 and 1 with all notes, renormalized over the components
  * that have evidence. Returns
- * - `{ status: 'clear', root, mode, name, spell, notes, coverage }`, notes being the seven
- *   `{ pc, name, degree }` in scale order from the root;
- * - `{ status: 'ambiguous', kind: 'tie' | 'near', candidates }`, candidates `{ root, mode, name, coverage }`
- *   in score order (a tie means the candidates cover the same weight, near that they do not);
+ * - `clearScale(root, mode, coverage)` for a scale that stands alone;
+ * - `{ status: 'ambiguous', kind: 'tie' | 'near', candidates }`, candidates `{ root, mode, name, coverage, key,
+ *   score, lean, heard }` in score order, the best evidence first (a tie means the candidates cover the same weight,
+ *   near that they do not). `score` is the coverage plus TONIC_BONUS times the tonic emphasis of the root, and
+ *   that emphasis is `lean` (the part from bass notes and chord roots) plus `heard` (the part from the weight of the
+ *   notes), so a reader can say which evidence put a candidate first;
  * - `{ status: 'no-fit' }` when no scale covers MIN_COVERAGE of the weight;
  * - `{ status: 'none' }` when no event has any duration.
  */
@@ -410,8 +433,14 @@ export function detectScale(events, harmonicSegments = []) {
     .filter((component) => component[2] > 0);
   const kSum = components.reduce((x, component) => x + component[1], 0);
   const tonic = new Array(12).fill(0);
+  const lean = new Array(12).fill(0);
+  const heard = new Array(12).fill(0);
   for (const [values, k, sum] of components) {
-    for (let pc = 0; pc < 12; pc++) tonic[pc] += (k / kSum) * (values[pc] / sum);
+    for (let pc = 0; pc < 12; pc++) {
+      const part = (k / kSum) * (values[pc] / sum);
+      tonic[pc] += part;
+      (values === weight ? heard : lean)[pc] += part;
+    }
   }
   const candidates = [];
   for (const mode of MODES) {
@@ -419,30 +448,28 @@ export function detectScale(events, harmonicSegments = []) {
       let inside = 0;
       for (const pc of scalePcs(root, mode)) inside += weight[pc];
       const coverage = inside / total;
-      candidates.push({ root, mode, coverage, score: coverage + TONIC_BONUS * tonic[root] });
+      candidates.push({ root, mode, coverage, score: coverage + TONIC_BONUS * tonic[root], lean: lean[root], heard: heard[root] });
     }
   }
   if (Math.max(...candidates.map((c) => c.coverage)) < MIN_COVERAGE) return { status: 'no-fit' };
   candidates.sort((a, b) => b.score - a.score || b.coverage - a.coverage || a.mode.parent - b.mode.parent);
   const top = candidates[0];
   const unresolved = candidates.filter((c) => top.score - c.score < CLEAR_GAP);
-  if (unresolved.length === 1) {
-    const spell = spellTable(top.root, top.mode);
-    return {
-      status: 'clear',
-      root: top.root,
-      mode: top.mode,
-      name: scaleName(top.root, top.mode),
-      spell,
-      notes: scalePcs(top.root, top.mode).map((pc, i) => ({ pc, name: spell[pc], degree: top.mode.degrees[i] })),
-      coverage: top.coverage,
-    };
-  }
+  if (unresolved.length === 1) return clearScale(top.root, top.mode, top.coverage);
   const tie = unresolved.every((c) => Math.abs(c.coverage - top.coverage) < 1e-9);
   return {
     status: 'ambiguous',
     kind: tie ? 'tie' : 'near',
-    candidates: unresolved.map((c) => ({ root: c.root, mode: c.mode, name: scaleName(c.root, c.mode), coverage: c.coverage })),
+    candidates: unresolved.map((c) => ({
+      root: c.root,
+      mode: c.mode,
+      name: scaleName(c.root, c.mode),
+      coverage: c.coverage,
+      key: candidateKey(c.root, c.mode),
+      score: c.score,
+      lean: c.lean,
+      heard: c.heard,
+    })),
   };
 }
 
@@ -482,7 +509,11 @@ function scaleOfPool(pool) {
  * Warnings are computed per span, from the solid segmentation of the events that begin in the
  * span, with the span's own scale and spelling (none when that scale is not clear). `warnings`
  * lists every span's warnings in begin order, each also carrying its `index` in that list, its
- * `spanIndex` and its `scaleName`. Each span also carries `harmonic`, the half-cycle segmentation of
+ * `spanIndex` and its `scaleName`. A span whose scale is ambiguous also carries `proposals`, one
+ * `{ key, scale, warnings }` for each candidate in candidate order: the candidate as a clear scale and
+ * the warnings that scale would have, computed once from the same segmentation, so choosing among the
+ * candidates later (page/jam-resolve.js) is a lookup and never a new reading; the base `warnings` stay empty
+ * for such a span. Every other span has `proposals: []`. Each span also carries `harmonic`, the half-cycle segmentation of
  * its own events, from which the chord sounding now is read. With two or more arrangements `partOwner` names the chosen
  * one the way the Parts view does (the owner track's name among `tracks`, else `arrange() N`).
  * `partial` (default false) says the window is shorter than the look-ahead because the page after
@@ -541,9 +572,23 @@ export function buildReading({ events, windowStart, windowLength, arrangements =
   const warnings = [];
   spans.forEach((span, spanIndex) => {
     span.harmonic = segments(markSolid(spanEvents[spanIndex].map((e) => ({ ...e })), HARMONIC_MIN), span.begin, span.end);
-    span.warnings =
-      span.scale.status === 'clear'
-        ? warningsFor(segments(markSolid(spanEvents[spanIndex].map((e) => ({ ...e })), BRIEF), span.begin, span.end), span.scale)
+    // One brief segmentation per span serves the span's own scale and, when it is ambiguous, every candidate.
+    const brief =
+      span.scale.status === 'clear' || span.scale.status === 'ambiguous'
+        ? segments(markSolid(spanEvents[spanIndex].map((e) => ({ ...e })), BRIEF), span.begin, span.end)
+        : null;
+    span.warnings = span.scale.status === 'clear' ? warningsFor(brief, span.scale) : [];
+    span.proposals =
+      span.scale.status === 'ambiguous'
+        ? span.scale.candidates.map((candidate) => {
+            const scale = clearScale(candidate.root, candidate.mode, candidate.coverage);
+            const proposed = warningsFor(brief, scale);
+            for (const warning of proposed) {
+              warning.spanIndex = spanIndex;
+              warning.scaleName = scale.name;
+            }
+            return { key: candidate.key, scale, warnings: proposed };
+          })
         : [];
     for (const warning of span.warnings) {
       warning.spanIndex = spanIndex;

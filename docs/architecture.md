@@ -36,7 +36,9 @@ one reference for the pointer.
 The page also shows a Jam view for a person playing along. It reads the same query and cache
 as the Timeline through a shared reading, and finds the scale and the chords from the notes
 played in pure modules (`page/jam-analysis.js` for the reading, `page/jam-model.js` for the
-copy and the geometry). A DOM module (`page/jam-view.js`) draws them: a piano, a fretboard, a
+copy and the geometry). `page/jam-resolve.js` is the pure module that turns an ambiguous reading
+into the scale in use (a pick, the declared scale, the proposal kept, or the strongest evidence), or
+says why none can be chosen; every part of the view reads that one answer. A DOM module (`page/jam-view.js`) draws them: a piano, a fretboard, a
 status line and a coming-up list. `page/harmony.js` reads the optional harmony declaration (one
 top-level `const harmony`) from the code text without evaluating it. `page/structure.js` reads the
 song structure a piece declares (one top-level `const song` and the helper next to it) in the same way,
@@ -218,7 +220,9 @@ back right after the evaluation (`page/tempo-guard.js` holds it) and applied in 
 gate's first query past the line, so the downbeat is exact and the old bars keep their tempo. The MIDI
 setup of the waiting code (bank select, program change, controls, the clock Start of a new clock
 instrument) is checked at the request, prepared again at the lead and sent stamped on the line
-(`prepareSetup` with `atCycle`, `stampOfCycle` on the page clock); a cancel before it went out drops it,
+(`prepareSetup` with `atCycle`, `stampOfCycle` on the page clock; while a tempo ramp runs the line is worked out
+through the ramp's steps and the setup is stamped at the earliest the line can be heard, the ramp's lag taken off, so a
+program change never lands after the first note of the new code); a cancel before it went out drops it,
 and a cancel after it went out (stamped bytes cannot be recalled) sends the playing code's sounds and
 controls back stamped just after them; a rig that changed meanwhile skips it and reports through the MIDI
 facts. While a change waits, the Timeline and
@@ -230,6 +234,20 @@ in the editor's scroll container (`syncMixerLit` in `page/main.js`), positioned 
 and shown only while that text equals the playing code. A hand evaluation (Ctrl+Enter) takes its timing from a stored page
 setting (`moontide.changeTiming`: now, bar or phrase, default now); the timing of every other caller is
 bound at the `editor.repl.evaluate` wrapper, so Claude's timing and the hand setting never cross.
+
+A tempo ramp is the page's own series of tempo steps, because `setcps` and `setcpm` read their value once.
+`page/tempo-glide.js` plans it in cycles (never in seconds) and hooks the scheduler's own queries: about 25 ms
+after the query that found a step, the step is set, and only through the tempo guard. The ramp ends exactly on
+the code's tempo, and a scheduler that stalls stalls the ramp with it. The tempo guard decides, in one table, what
+every evaluation does to a ramp that runs: a failed evaluation leaves it going, a program that states the same
+tempo keeps it and the step is put back in the same task, another tempo cancels it and wins at once, a program
+with no tempo cancels it, a new ramp replaces it, and a change that waits for a line leaves it alone until the
+line, where the decision is made. A ramp that cannot be made is refused whole before anything changes. The server
+keeps a small record of the ramp: the reply of the change says it, a cancel or a lost page is told once in the next
+reply, and Stop, a finished ramp and a replaced ramp are not told. The page reports a ramp for that record only while
+it runs (in the reply of a change that takes over at once, in the takeover message of a change that waited for its
+line), so every end of the ramp reaches the server after the report, and the record never holds a ramp that does
+not run; a reply whose audio is stopped records none.
 
 The top bar shows it. The bar holds the wordmark, the Play or Stop button with the state word (`Playing` or
 `Stopped`), the tempo, the cycle and beat, the countdown and status of a waiting change, the Views and Layout
@@ -266,7 +284,7 @@ CodeMirror reflows by itself.
 
 When the bar overflows (its `scrollWidth` above its `clientWidth`) the fit step gives text up in a fixed
 order: 1 the wordmark and the cycle and beat, 2 the names of the unselected view buttons, 3 long texts to
-their short forms (the request status, the countdown's first word, the tempo's unit, the word "Layout"), 4
+their short forms (the countdown's first word, the tempo's unit, the word "Layout"), 4
 tighter spacing. It restarts from step 0 on every run, so the result is a function of the widths, and a
 `ResizeObserver` watches the bar and every direct child; the stylesheet has no at-rule, so the steps are
 attribute selectors on `#top-bar[data-fit]`. The views and the layout are real buttons (the keys `a b c` and
@@ -335,6 +353,22 @@ Two MCP prompts, `page-requests-on` and `page-requests-off`, and one tool, `set_
 (for clients that offer no MCP prompts, such as the Code tab of the Claude desktop app), give
 Claude the command or tell it to stop, and switch whether tool replies carry that command; the
 prompts and the tool share one function in `src/mcp.ts`.
+
+What became of each request lives on the request status board, `src/request-status.ts`: one row per request,
+in memory only, at most 50 requests, with the start of the text (200 characters) and the chip so a reloaded page
+can show what it asked. Nothing of it is written to disk or reaches the History view. The server sends
+`ask-status` (an id and a state, with the version, the timing, the reason or the closing sentence when the state
+needs one) only to the page that sent the request. A reloaded page sends `ask-board-request` after `page-auth` and
+gets `ask-board`: the requests whose page has gone, which the new page takes over; a second live page gets an
+empty board. Every tool call starts by marking the requests Claude has received as started, because Claude made a
+call after they arrived. A change is linked to a request only through the `answering` field of `set_code`,
+`edit_code` and `restore_version`: it says line while the change waits for its bar or phrase, then applied with
+the version, or failed, replaced or canceled. An `answering` id that is not open never fails the change; the reply
+says so once. The `answer_request` tool closes a request in words as answered or declined, with one sentence of
+at most 200 characters, and refuses an id that is not open. On the page, `page/request-status.js` is the tracker
+and its copy (pure, with injected clocks: it moves each row only forward, words each state, and says No change yet
+after 30 s without news), and `page/request-status-view.js` draws the Requests chip in the top bar, the panel
+under it with its rows, details and Recent group, and the one polite live region.
 
 MIDI facts travel the same way as runtime errors: the page sends facts, the server words them.
 The page sends `midi-state` (access, connected outputs, the ports the code names, hidden or

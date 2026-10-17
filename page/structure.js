@@ -120,7 +120,8 @@ export const SONG_COPY = {
   differs: 'What plays differs from the declaration at the start of section {section}, track {track}.',
   differsMore: 'What plays differs from the declaration at the start of section {section}, track {track} (and {count} more places).',
   differsMoreOne: 'What plays differs from the declaration at the start of section {section}, track {track} (and 1 more place).',
-  checkFailed: 'The page could not check what plays against the declaration.',
+  checkFailed: 'The page could not check what plays against the declaration: the check broke off.',
+  checkTooSlow: 'The page could not check what plays against the declaration: the check took too long.',
   // Under a fixed variation: whether its notes are in the scale of the section's harmony (words only, nothing is changed).
   fitFits: 'fits',
   fitNot: 'does not fit ({notes})',

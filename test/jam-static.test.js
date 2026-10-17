@@ -1,4 +1,4 @@
-// Static contracts of the Jam view's declared harmony: five
+// Static contracts of the Jam view's declared harmony and of the line that says why a scale is proposed: five
 // new ids in the markup (the Declared line with the section it speaks for, and the Heard label, both hidden at the start, none a control), the CSS
 // that draws them (rem sizes, the two palette greys only, a [hidden] rule for each, no motion, no at-rule) and the
 // view's text-only rule (the declared text comes from the code and is not trusted). These tests read the sources;
@@ -158,4 +158,189 @@ test('page/jam-view.js looks the five ids up and writes them only through textCo
   assert.match(viewCode, /renderDeclared\(model\.declared\)/);
   assert.match(viewCode, /function renderDeclaredSection\(/);
   assert.match(viewCode, /renderDeclaredSection\(model\.section\)/);
+});
+
+// --- the line that says why a scale is proposed ---
+
+const REASON_IDS = ['jam-reason', 'jam-reason-lead', 'jam-reason-rest'];
+
+test('the markup holds the reason line and its two parts exactly once', () => {
+  for (const id of REASON_IDS) {
+    assert.equal(html.match(new RegExp(`\\bid="${id}"`, 'g'))?.length, 1, `#${id} must appear exactly once`);
+  }
+});
+
+test('the reason line is a polite live region, hidden at the start, right after the scale block and before the degrees', () => {
+  const reason = tagOf('jam-reason');
+  assert.equal(reason.name, 'p');
+  assert.match(reason.attributes, /\baria-live="polite"/);
+  assert.match(reason.attributes, /\bhidden\b/);
+  assert.equal(tagOf('jam-reason-lead').name, 'strong');
+  assert.equal(tagOf('jam-reason-rest').name, 'span');
+  assert.ok(
+    html.includes(
+      '<p id="jam-scale-sub"></p></div><p id="jam-reason" aria-live="polite" hidden><strong id="jam-reason-lead"></strong><span id="jam-reason-rest"></span></p><div id="jam-candidates"',
+    ),
+    'the reason line sits between #jam-scale and the list of the scales that fit',
+  );
+  for (const id of ['jam-reason-lead', 'jam-reason-rest']) {
+    for (const forbidden of ['tabindex', 'aria-live', 'role', 'contenteditable']) {
+      assert.doesNotMatch(tagOf(id).attributes, new RegExp(`\\b${forbidden}\\b`), `#${id} must not carry ${forbidden}`);
+    }
+  }
+});
+
+function reasonRules() {
+  const rules = [];
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = match[1].trim();
+    if (/#jam-reason/.test(selector)) rules.push({ selector, body: match[2] });
+  }
+  return rules;
+}
+
+test('the stylesheet hides the reason line with its own [hidden] rule', () => {
+  assert.match(css, /#jam-reason\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
+});
+
+test('the reason rules use only the text colour, 1rem, weights 400 and 600, no px and no motion', () => {
+  const rules = reasonRules();
+  assert.ok(rules.length >= 3, 'the reason rules are missing');
+  for (const { selector, body } of rules) {
+    const where = `rule '${selector}'`;
+    assert.doesNotMatch(body, /\dpx\b/, `${where} must not use px`);
+    assert.doesNotMatch(body, /\b(transition|animation|transform)\b/, `${where} must not move`);
+    assert.doesNotMatch(body, /--accent|--destructive|--jam-avoid|--jam-outside|--text-muted/, `${where} must not use a reserved or muted color`);
+    assert.doesNotMatch(body, /#[0-9a-fA-F]{3,8}\b|rgba?\(/, `${where} must use palette variables only`);
+    assert.doesNotMatch(selector, /data-motion/, `${where} depends on the motion mode`);
+    for (const color of body.matchAll(/(?<![-\w])color:\s*([^;]+);/g)) assert.equal(color[1].trim(), 'var(--text)', `${where}: color ${color[1]}`);
+    for (const size of body.matchAll(/font-size:\s*([^;]+);/g)) assert.equal(size[1].trim(), '1rem', `${where}: font-size ${size[1]}`);
+    for (const weight of body.matchAll(/font-weight:\s*([^;]+);/g)) assert.match(weight[1].trim(), /^(400|600)$/, `${where}: font-weight ${weight[1]}`);
+  }
+  const lead = rules.find((rule) => rule.selector === '#jam-reason-lead');
+  assert.match(lead.body, /font-weight:\s*600/);
+  const line = rules.find((rule) => rule.selector === '#jam-reason');
+  assert.match(line.body, /font-weight:\s*400/);
+  assert.match(line.body, /font-size:\s*1rem/);
+});
+
+test('page/jam-view.js looks the reason ids up and writes them only through textContent and hidden', () => {
+  const variables = { 'jam-reason': 'jamReason', 'jam-reason-lead': 'jamReasonLead', 'jam-reason-rest': 'jamReasonRest' };
+  for (const [id, variable] of Object.entries(variables)) {
+    assert.ok(viewCode.includes(`const ${variable} = document.getElementById('${id}');`), `the view must look up #${id}`);
+    for (const use of viewCode.matchAll(new RegExp(`\\b${variable}\\.(\\w+)`, 'g'))) {
+      assert.ok(['textContent', 'hidden'].includes(use[1]), `${variable}.${use[1]} is not a text-only write`);
+    }
+  }
+  assert.match(viewCode, /function renderReason\(/);
+  assert.match(viewCode, /renderReason\(model\.reason\)/);
+});
+
+// --- the scales that fit, listed under the scale ---
+
+const CANDIDATE_IDS = ['jam-candidates', 'jam-candidates-label', 'jam-candidate-list', 'jam-candidates-more'];
+
+test('the markup holds the four ids of the scales that fit exactly once, and one new class', () => {
+  for (const id of CANDIDATE_IDS) {
+    assert.equal(html.match(new RegExp(`\\bid="${id}"`, 'g'))?.length, 1, `#${id} must appear exactly once`);
+  }
+  assert.equal(html.match(/\bid="jam-cand[a-z-]*"/g).length, 4);
+  // the class lives in the view's code, never in the markup, and nothing else of the page uses it
+  assert.doesNotMatch(html, /class="jam-candidate"/);
+  assert.match(viewCode, /className = 'jam-candidate'/);
+});
+
+test('the list of the scales that fit sits right after the reason line and before the degrees, hidden, named by its caption', () => {
+  assert.ok(
+    html.includes(
+      '</p><div id="jam-candidates" role="group" aria-labelledby="jam-candidates-label" hidden><span id="jam-candidates-label"></span><div id="jam-candidate-list"></div><span id="jam-candidates-more" hidden></span></div><div id="jam-degrees"',
+    ),
+    'the block must sit between #jam-reason and #jam-degrees with its caption, its list and its count of the rest',
+  );
+  assert.ok(html.indexOf('id="jam-reason"') < html.indexOf('id="jam-candidates"') && html.indexOf('id="jam-candidates"') < html.indexOf('id="jam-degrees"'));
+  assert.match(tagOf('jam-candidates').attributes, /\bhidden\b/);
+  assert.match(tagOf('jam-candidates-more').attributes, /\bhidden\b/);
+  for (const id of ['jam-candidates-label', 'jam-candidates-more', 'jam-candidate-list']) {
+    for (const forbidden of ['tabindex', 'aria-live', 'contenteditable']) {
+      assert.doesNotMatch(tagOf(id).attributes, new RegExp(`\\b${forbidden}\\b`), `#${id} must not carry ${forbidden}`);
+    }
+  }
+});
+
+function candidateRules() {
+  const rules = [];
+  for (const match of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selector = match[1].trim();
+    if (/#jam-candidate|\.jam-candidate/.test(selector)) rules.push({ selector, body: match[2] });
+  }
+  return rules;
+}
+
+test('the stylesheet hides the list and its count of the rest with their own [hidden] rules', () => {
+  assert.match(css, /#jam-candidates\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
+  assert.match(css, /#jam-candidates-more\[hidden\]\s*\{\s*display:\s*none;\s*\}/);
+});
+
+test('the rules of the scales that fit use only text colours, the surface fill and hairlines, rem sizes, no motion', () => {
+  const rules = candidateRules();
+  assert.ok(rules.length >= 8, 'the rules of the scales that fit are missing');
+  for (const { selector, body } of rules) {
+    const where = `rule '${selector}'`;
+    assert.doesNotMatch(body, /--accent|--destructive|--jam-/, `${where} must not use a reserved or Jam colour`);
+    assert.doesNotMatch(body, /#[0-9a-fA-F]{3,8}\b|rgba?\(/, `${where} must use palette variables only`);
+    assert.doesNotMatch(body, /\b(transition|animation|transform)\b/, `${where} must not move`);
+    assert.doesNotMatch(selector, /data-motion/, `${where} depends on the motion mode`);
+    assert.doesNotMatch(body, /^\s*--[\w-]+\s*:/m, `${where} declares a custom property`);
+    // the only px is a one pixel hairline
+    for (const px of body.matchAll(/(\d+(?:\.\d+)?)px\b/g)) assert.equal(px[1], '1', `${where}: ${px[0]}`);
+    for (const variable of body.matchAll(/var\((--[\w-]+)\)/g)) {
+      assert.ok(['--text', '--text-muted', '--border', '--surface-2'].includes(variable[1]), `${where}: ${variable[0]}`);
+    }
+    for (const size of body.matchAll(/font-size:\s*([^;]+);/g)) assert.equal(size[1].trim(), '0.8125rem', `${where}: font-size ${size[1]}`);
+    for (const weight of body.matchAll(/font-weight:\s*([^;]+);/g)) assert.equal(weight[1].trim(), '400', `${where}: font-weight ${weight[1]}`);
+  }
+});
+
+test('a candidate is a pointer target of at least 1.75rem with its name never cut, and the pressed one has a fill and an underline', () => {
+  const rules = candidateRules();
+  const base = rules.find((rule) => rule.selector === '.jam-candidate');
+  assert.match(base.body, /min-height:\s*1\.75rem/);
+  assert.match(base.body, /white-space:\s*nowrap/);
+  assert.match(base.body, /border:\s*1px solid var\(--border\)/);
+  const pressed = rules.find((rule) => rule.selector === 'button.jam-candidate[aria-pressed="true"]');
+  assert.match(pressed.body, /background:\s*var\(--surface-2\)/);
+  assert.match(pressed.body, /box-shadow:\s*inset 0 -0\.125rem 0 var\(--text\)/);
+  const list = rules.find((rule) => rule.selector === '#jam-candidate-list');
+  assert.match(list.body, /flex-wrap:\s*wrap/);
+  // plain items are no control: no pointer cursor on the span, a pointer only on the button
+  assert.doesNotMatch(rules.find((rule) => rule.selector === 'span.jam-candidate').body, /cursor/);
+  assert.match(rules.find((rule) => rule.selector === 'button.jam-candidate').body, /cursor:\s*pointer/);
+});
+
+test('page/jam-view.js looks the four ids up and writes them only through textContent, dataset, hidden, attributes and children', () => {
+  const variables = { 'jam-candidates': 'jamCandidates', 'jam-candidates-label': 'jamCandidatesLabel', 'jam-candidate-list': 'jamCandidateList', 'jam-candidates-more': 'jamCandidatesMore' };
+  for (const [id, variable] of Object.entries(variables)) {
+    assert.ok(viewCode.includes(`const ${variable} = document.getElementById('${id}');`), `the view must look up #${id}`);
+    for (const use of viewCode.matchAll(new RegExp(`\\b${variable}\\.(\\w+)`, 'g'))) {
+      assert.ok(['textContent', 'dataset', 'hidden', 'setAttribute', 'removeAttribute', 'replaceChildren'].includes(use[1]), `${variable}.${use[1]} is not a text-only write`);
+    }
+  }
+  assert.match(viewCode, /function renderCandidates\(/);
+  assert.match(viewCode, /renderCandidates\(model\.candidates\)/);
+  assert.match(viewCode, /el\.textContent = item\.name/);
+});
+
+test('page/jam-view.js and the memory touch no browser storage, and main.js hands the choice to chooseJamScale', () => {
+  const resolveCode = codeOf(read('../page/jam-resolve.js'));
+  for (const [what, pattern] of MARKUP_WRITERS) {
+    assert.doesNotMatch(resolveCode, pattern, `page/jam-resolve.js must not contain ${what}`);
+  }
+  assert.doesNotMatch(resolveCode, /\bdocument\b|\bwindow\b/);
+  const mainCode = codeOf(read('../page/main.js'));
+  assert.match(mainCode, /onScaleChoice: \(choice\) => chooseJamScale\(choice\)/);
+  assert.equal(mainCode.match(/function chooseJamScale\(/g)?.length, 1);
+  assert.equal(mainCode.match(/memory: jamScaleMemory/g)?.length, 1);
+  assert.equal(mainCode.match(/jamScaleMemory\.keep\(/g)?.length, 1);
+  const chooser = mainCode.slice(mainCode.indexOf('function chooseJamScale('), mainCode.indexOf('function chooseJamScale(') + 800);
+  assert.doesNotMatch(chooser, /localStorage|sessionStorage|refreshJam|computePage/);
 });

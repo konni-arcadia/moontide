@@ -148,6 +148,9 @@ function defaultOnError(text, err) {
  * - onState(port, state): called when a port's state changes.
  * - onError(text, err).
  * - alignment: { ms }, default the page-wide one.
+ * - rampSeconds(fromCycle, toCycle): while a tempo ramp runs, `{ seconds, lagSeconds }`: the seconds of music between two cycles
+ *   through the ramp's steps and how far that can be off when the tempo trails the plan by a step; null when no ramp runs
+ *   (default: always null). Only stampOfCycle uses it: a line far enough ahead to lie behind several tempo steps.
  * Returns { want, stop, stateOf, holdsNotes, stamp, stampOfCycle, stats }.
  */
 export function createPageClock({
@@ -162,6 +165,7 @@ export function createPageClock({
   onState = () => {},
   onError = defaultOnError,
   alignment = pageAlignment,
+  rampSeconds = () => null,
 }) {
   // port -> { entry: { port, id }, nextTick, startAt, startCycle, stopOwedFrom, holdSince, holdExpired }
   const wanted = new Map();
@@ -200,6 +204,20 @@ export function createPageClock({
     let seg = segments[0];
     for (const candidate of segments) if (candidate.c <= c) seg = candidate;
     return (c - seg.c) / seg.cps + seg.s + s.latency;
+  }
+
+  /**
+   * AudioContext time of the cycle line `c` a change waits for. Like audioTimeOf, except that while a tempo ramp runs the
+   * seconds from the start of the latest tempo segment to the line go through the ramp's own steps: one segment at the
+   * tempo of the moment puts a line early on a slowing ramp and late on a rising one. With `early` the time is the
+   * earliest the line can be heard, the ramp's lag taken off, for a setup that must land before the line.
+   */
+  function lineAudioTimeOf(s, c, early) {
+    let seg = segments[0];
+    for (const candidate of segments) if (candidate.c <= c) seg = candidate;
+    const through = c > seg.c ? rampSeconds(seg.c, c) : null;
+    const seconds = through === null ? (c - seg.c) / seg.cps : through.seconds - (early ? through.lagSeconds : 0);
+    return seconds + seg.s + s.latency;
   }
 
   /**
@@ -275,16 +293,17 @@ export function createPageClock({
    * a tick and a stamped note of that position use), or null when none can be given: the cycle is not a finite
    * number, the scheduler cannot be read or does not run, its numbers cannot be used, no tempo segment is known yet,
    * or stamp() has none. Reads the scheduler and notes its segment as a pass does, so it also serves while no
-   * instrument wants the clock. Never throws.
+   * instrument wants the clock. While a tempo ramp runs the line is worked out through the ramp, and with `early` it is the
+   * earliest time the line can be heard (see lineAudioTimeOf). Never throws.
    */
-  function stampOfCycle(cycle) {
+  function stampOfCycle(cycle, { early = false } = {}) {
     if (typeof cycle !== 'number' || !Number.isFinite(cycle)) return null;
     try {
       const s = readCyclist(getScheduler());
       if (!s.started || unusableReason(s) !== null) return null;
       if (s.num_ticks_since_cps_change !== 0) noteSegment(s);
       if (segments.length === 0) return null;
-      return stamp(audioTimeOf(s, cycle));
+      return stamp(lineAudioTimeOf(s, cycle, early));
     } catch {
       return null;
     }

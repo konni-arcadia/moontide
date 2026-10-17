@@ -11,6 +11,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import type { PageConnection } from './session.js';
+import type { RequestStatusBoard } from './request-status.js';
 import {
   MAX_ASK_ID_LENGTH,
   MAX_ASK_TEXT_LENGTH,
@@ -75,11 +76,26 @@ export const REQUEST_LINE_MOMENT_FACT =
   'turn the note into a rest. Kind velocity has direction, softer or louder, for the note\'s velocity. ' +
   'About a request whose context has kind range: the user selected whole cycles of one lane. track is the lane, from and to ' +
   `are the first and last cycle, both included (a range covers at most ${MAX_RANGE_CYCLES} cycles), and in a piece with a song ` +
-  'section is the section of cycle from and sectionTo the section of cycle to when it differs. Such a request has no moment; ' +
+  'sections lists the sections those cycles cross in playing order, a section played twice in a row once and a section that ' +
+  'comes back after another one again, and moreSections, when present, counts the sections left out so that the list fits. ' +
+  'Such a request has no moment; ' +
   'its gesture has kind range. The gesture\'s notes lists the notes of that lane that start in those cycles, in order of ' +
   `start and then pitch (the lower first), at most ${MAX_MOMENT_NOTES}, each shaped like a moment note without state; more ` +
   'counts the notes left out, and version is the version that was playing (null when it was not known). A note that began ' +
   'before from and still sounds is not listed. A range with no notes in it is a valid request.';
+
+/**
+ * What the page shows for a request, as facts. Like the moment fact it goes where Claude reads page requests
+ * and nothing limits the length: the arming line, the page-requests-on text and the line in front of request
+ * lines that a tool reply hands over without an arming line. It says what the page shows and when, never what
+ * to do about it.
+ */
+export const REQUEST_LINE_STATUS_FACT =
+  'About the id field of a page request: the page shows the user what became of each request it sent. ' +
+  'It shows a request as applied, or as waiting for its line when the change takes over at the next bar or phrase, ' +
+  'only when the set_code, edit_code or restore_version call that answers it passes that id as answering. ' +
+  'It shows a request as answered or declined, with one sentence, only after answer_request closes it with that id. ' +
+  'A request with neither shows as no change yet. An id that is not an open request changes nothing.';
 
 /**
  * A log function that writes at most one line per window for each kind, to stderr. The next line
@@ -179,7 +195,7 @@ export function listenerCommandOrReason(options: {
 export function armingLine(options: { scriptPath: string; port: number | null; token: string }): string {
   const head =
     'Page requests: no listener is connected. A request typed in the Moontide page waits on the server and arrives in the reply of your next other Moontide tool. ' +
-    `${REQUEST_LINE_FRAMING} ${REQUEST_LINE_MOMENT_FACT}`;
+    `${REQUEST_LINE_FRAMING} ${REQUEST_LINE_MOMENT_FACT} ${REQUEST_LINE_STATUS_FACT}`;
   const result = listenerCommandOrReason(options);
   if ('reason' in result) {
     return `${head} ${result.reason}`;
@@ -240,6 +256,7 @@ export function pageRequestsOnText(options: { scriptPath: string; port: number |
       `Note: ${MONITOR_LIMIT_FACT}; when a Moontide tool reply gives this command again, run it again the same way.`,
     REQUEST_LINE_FRAMING,
     REQUEST_LINE_MOMENT_FACT,
+    REQUEST_LINE_STATUS_FACT,
   ].join('\n');
 }
 
@@ -389,6 +406,8 @@ export class AskChannel {
   readonly listenerToken = newToken();
 
   private readonly send: AskSend;
+  // Told when a request is accepted, handed to Claude, sent back to the queue or loses its page.
+  private readonly board: RequestStatusBoard | undefined;
   private readonly ackTimeoutMs: number;
   private readonly now: () => number;
   private readonly trusted = new Set<PageConnection>();
@@ -405,8 +424,9 @@ export class AskChannel {
   // Refusals are logged through a throttle, so a page or a local process looping on bad input cannot flood stderr.
   private readonly logRefusal: (kind: string, message: string) => void;
 
-  constructor(options: { send: AskSend; ackTimeoutMs?: number; now?: () => number }) {
+  constructor(options: { send: AskSend; board?: RequestStatusBoard; ackTimeoutMs?: number; now?: () => number }) {
     this.send = options.send;
+    this.board = options.board;
     this.ackTimeoutMs = options.ackTimeoutMs ?? LISTENER_ACK_TIMEOUT_MS;
     this.now = options.now ?? Date.now;
     this.logRefusal = makeThrottledLog(ASK_RATE_WINDOW_MS, this.now);
@@ -537,8 +557,13 @@ export class AskChannel {
       this.refuse(conn, msg.id, 'line-too-long');
       return;
     }
-    // The id is chosen by the page. A repeat would overwrite the in-flight slot and orphan its timer.
-    if (this.inFlight.has(msg.id) || this.queue.some((waiting) => waiting.id === msg.id)) {
+    // The id is chosen by the page. A repeat would overwrite the in-flight slot and orphan its timer, or
+    // take over the board row of a request Claude already holds, which may be another page's.
+    if (
+      this.inFlight.has(msg.id) ||
+      this.queue.some((waiting) => waiting.id === msg.id) ||
+      this.board?.has(msg.id) === true
+    ) {
       this.logRefusal('duplicate', '[moontide] Refused a page request: its id is already in use');
       this.refuse(conn, msg.id, 'invalid', 'duplicate request id');
       return;
@@ -546,6 +571,7 @@ export class AskChannel {
     this.recent.push(now);
     const entry: QueueEntry = { id: msg.id, line, origin: conn, answered: 'none' };
     if (this.listener !== null) {
+      this.board?.opened(msg.id, conn, { queued: false, text: msg.text, chip: msg.chip });
       this.dispatch(entry);
       return;
     }
@@ -555,6 +581,7 @@ export class AskChannel {
       return;
     }
     entry.answered = 'waiting';
+    this.board?.opened(msg.id, conn, { queued: true, text: msg.text, chip: msg.chip });
     this.queue.push(entry);
     this.send(conn, { type: 'ask-result', id: msg.id, status: 'waiting', waiting: this.queue.length }, 'the ask answer');
   }
@@ -609,6 +636,7 @@ export class AskChannel {
     this.pushPageRequestsState();
     const requeued = this.requeueInFlight();
     for (const entry of requeued) {
+      this.board?.waiting(entry.id);
       if (entry.answered === 'none') {
         entry.answered = 'waiting';
         if (entry.origin !== null) {
@@ -646,6 +674,7 @@ export class AskChannel {
     }
     this.inFlight.delete(ack);
     const { entry } = slot;
+    this.board?.delivered([entry.id]);
     if (entry.origin === null) {
       return;
     }
@@ -659,6 +688,7 @@ export class AskChannel {
   /** A page connection closed: its trust goes, and nobody is answered for its requests any more. */
   detachPage(conn: PageConnection): void {
     this.trusted.delete(conn);
+    this.board?.pageGone(conn);
     for (const entry of this.queue) {
       if (entry.origin === conn) {
         entry.origin = null;
@@ -677,16 +707,31 @@ export class AskChannel {
   }
 
   /**
+   * A reloaded page took over these requests from the board: the ones still waiting or in flight whose
+   * page has gone now answer to it, so it is told when they are handed over or go back to waiting.
+   */
+  adoptOrigin(conn: PageConnection, ids: readonly string[]): void {
+    const adopted = new Set(ids);
+    const entries = [...this.queue, ...[...this.inFlight.values()].map((slot) => slot.entry)];
+    for (const entry of entries) {
+      if (entry.origin === null && adopted.has(entry.id)) {
+        entry.origin = conn;
+      }
+    }
+  }
+
+  /**
    * Called by the tool replies: takes the WHOLE waiting queue at once and returns its request lines
    * (oldest first), telling each page its requests were handed over. Then, while no listener is
    * connected, a page has authenticated and page-requests-off has not paused it, the arming line. When
-   * there is request text but no arming line, the moment fact goes in front of the request lines.
+   * there is request text but no arming line, the moment fact and the status fact go in front of the request lines.
    */
   drainLines(options: { scriptPath: string; port: number | null }): string[] {
     const lines: string[] = [];
     const entries = this.queue;
     this.queue = [];
     const handedOver = new Map<PageConnection, string[]>();
+    this.board?.delivered(entries.map((entry) => entry.id));
     for (const entry of entries) {
       lines.push(entry.line);
       if (entry.origin !== null) {
@@ -699,12 +744,12 @@ export class AskChannel {
       this.send(origin, { type: 'ask-received', ids }, 'the ask hand-over');
     }
     if (!this.hasListener() && this.hasTrustedPage() && !this.armingPaused) {
-      // The arming line carries the moment fact itself.
+      // The arming line carries both facts itself.
       lines.push(armingLine({ scriptPath: options.scriptPath, port: options.port, token: this.listenerToken }));
     } else if (lines.length > 0) {
       // No arming line (page requests are paused, or a listener is connected): the reply still says what the
-      // moment of the request lines it carries holds.
-      lines.unshift(REQUEST_LINE_MOMENT_FACT);
+      // moment of the request lines it carries holds and what the page shows for a request.
+      lines.unshift(REQUEST_LINE_MOMENT_FACT, REQUEST_LINE_STATUS_FACT);
     }
     return lines;
   }

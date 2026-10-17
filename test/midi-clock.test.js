@@ -37,7 +37,7 @@ const B = { port: 'Port B', id: 'drums' };
 const NEAR_CYCLE_0 = -0.0001;
 
 /** A clock driven by fakes: a fake time, AudioContext and scheduler, one FakeNative per port. */
-function makeRig({ cps = 100 / 4 / 60, latency = 0.1, ports = ['Port A'], alignment = { ms: null } } = {}) {
+function makeRig({ cps = 100 / 4 / 60, latency = 0.1, ports = ['Port A'], alignment = { ms: null }, rampSeconds = undefined } = {}) {
   const time = makeFakeTime();
   const ctx = makeFakeAudioContext(time);
   const cyclist = makeFakeCyclist(time, { cps, latency });
@@ -63,6 +63,7 @@ function makeRig({ cps = 100 / 4 / 60, latency = 0.1, ports = ['Port A'], alignm
       env.causes.push(err instanceof Error ? err.message : '');
     },
     alignment,
+    ...(rampSeconds === undefined ? {} : { rampSeconds }),
   });
   return { time, ctx, cyclist, natives, env, clock, native: natives.get(ports[0]), alignment };
 }
@@ -980,6 +981,56 @@ test('stampOfCycle gives the same timestamp as the tick sent for that cycle posi
   assert.equal(rig.env.errors.length, 0);
 });
 
+test('stampOfCycle works a line behind a tempo ramp out through the ramp, and with early takes the ramp lag off', () => {
+  const asked = [];
+  const rig = makeRig({
+    cps: 2,
+    rampSeconds: (from, to) => {
+      asked.push([from, to]);
+      return { seconds: (to - from) / 2.5, lagSeconds: 0.004 };
+    },
+  });
+  rig.cyclist.nowOverride = NEAR_CYCLE_0;
+  rig.cyclist.start();
+  for (let step = 0; step < 8; step++) {
+    rig.time.advance(10);
+    rig.clock.stamp(rig.ctx.currentTime + 0.2);
+  }
+  rig.time.advance(400);
+  const cycle = 7;
+  // The one-segment line is at 2 cycles per second; the ramp says 2.5 cycles per second for the same span.
+  const oneSegment = rig.clock.stamp(rig.cyclist.soundTime(cycle));
+  const through = rig.clock.stampOfCycle(cycle);
+  const early = rig.clock.stampOfCycle(cycle, { early: true });
+  assert.ok(asked.length >= 1 && asked.every(([from, to]) => from < to && to === cycle), JSON.stringify(asked));
+  const segmentStart = asked[0][0];
+  assert.ok(Math.abs(oneSegment - through - (((cycle - segmentStart) / 2 - (cycle - segmentStart) / 2.5) * 1000)) < 0.05, `${oneSegment} against ${through}`);
+  assert.ok(Math.abs(through - early - 4) < 0.01, `early is the lag (4 ms) before the line: ${through} against ${early}`);
+  assert.equal(rig.env.errors.length, 0);
+});
+
+test('stampOfCycle ignores a ramp that says it does not run, and does not ask it about a line at or before the latest segment', () => {
+  let asked = 0;
+  const rig = makeRig({ cps: 2, rampSeconds: () => (asked++, null) });
+  const plain = makeRig({ cps: 2 });
+  for (const r of [rig, plain]) {
+    r.cyclist.nowOverride = NEAR_CYCLE_0;
+    r.cyclist.start();
+    for (let step = 0; step < 8; step++) {
+      r.time.advance(10);
+      r.clock.stamp(r.ctx.currentTime + 0.2);
+    }
+    r.time.advance(400);
+  }
+  for (const cycle of [3, 7.25]) {
+    assert.equal(rig.clock.stampOfCycle(cycle, { early: true }), plain.clock.stampOfCycle(cycle));
+  }
+  assert.ok(asked >= 1);
+  const before = asked;
+  rig.clock.stampOfCycle(-5);
+  assert.equal(asked, before, 'a line before the first segment starts is worked out by the segment alone');
+});
+
 test('stampOfCycle is null before the clock is warm, for a cycle that is not a finite number, when the scheduler does not run and when the context does not run; it never throws', () => {
   const rig = makeRig({ cps: 2 });
   assert.equal(rig.clock.stampOfCycle(4), null, 'the scheduler has not started');
@@ -1008,4 +1059,71 @@ test('stampOfCycle is null before the clock is warm, for a cycle that is not a f
     alignment: { ms: 7 },
   });
   assert.equal(broken.stampOfCycle(4), null, 'a scheduler that cannot be read gives none');
+});
+
+// --- The clock under about 20 small tempo steps ---
+
+/**
+ * Plays 20 one-BPM steps from 100 to 120 BPM, `spacingMs` apart, on a fake scheduler, and returns what the clock sent. The
+ * scheduler's real anchors are recorded as they are taken, so the expected time of any cycle position is worked out from the
+ * whole history (the clock itself only keeps its latest tempo segments).
+ */
+function tempoStepRun(spacingMs) {
+  const rig = makeRig({ cps: 100 / 4 / 60 });
+  const anchors = [];
+  rig.time.onStep(() => {
+    const scheduler = rig.cyclist;
+    if (scheduler.num_ticks_since_cps_change === 0) return;
+    const last = anchors.at(-1);
+    if (last === undefined || last.c !== scheduler.num_cycles_at_cps_change || last.cps !== scheduler.cps) {
+      anchors.push({ c: scheduler.num_cycles_at_cps_change, s: scheduler.seconds_at_cps_change, cps: scheduler.cps });
+    }
+  });
+  rig.clock.want([A]);
+  rig.cyclist.nowOverride = NEAR_CYCLE_0;
+  rig.cyclist.start();
+  rig.time.advance(1000);
+  for (let step = 1; step <= 20; step++) {
+    rig.cyclist.setCps((100 + step) / 4 / 60);
+    rig.time.advance(spacingMs);
+  }
+  rig.time.advance(6000);
+  const audioOfCycle = (cycle) => {
+    let anchor = anchors[0];
+    for (const candidate of anchors) if (candidate.c <= cycle) anchor = candidate;
+    return (cycle - anchor.c) / anchor.cps + anchor.s + rig.cyclist.latency;
+  };
+  return { rig, anchors, audioOfCycle };
+}
+
+test('about 20 tempo steps at 50, 75 and 100 ms leave no hole and no doubled tick, and every cycle holds 96 ticks', () => {
+  for (const spacingMs of [50, 75, 100]) {
+    const { rig, anchors, audioOfCycle } = tempoStepRun(spacingMs);
+    const sent = ticks(rig.native);
+    const stamps = sent.map((entry) => entry.ts);
+    assert.ok(anchors.length >= 10, `${spacingMs} ms: the scheduler took over most of the steps (${anchors.length} anchors)`);
+    assert.equal(starts(rig.native).length, 1, `${spacingMs} ms: one Start`);
+    assert.deepEqual(rig.env.errors, [], `${spacingMs} ms: the clock reported nothing`);
+    // The first tick is on a cycle boundary; every later tick sits where its cycle position is heard.
+    const first = anchors[0];
+    const firstCycle = first.c + (rig.time.audioOfStrudelPerf(stamps[0]) - rig.cyclist.latency - first.s) * first.cps;
+    assert.ok(isIntegral(firstCycle), `${spacingMs} ms: the first tick is on cycle ${firstCycle}`);
+    const heardAt = (tick) => rig.time.strudelPerf(audioOfCycle(Math.round(firstCycle) + tick / CLOCK_TICKS_PER_CYCLE));
+    stamps.forEach((stamp, tick) => assert.ok(Math.abs(stamp - heardAt(tick)) < 0.05, `${spacingMs} ms: tick ${tick} is ${stamp - heardAt(tick)} ms from where it is heard`));
+    // No hole and no doubled tick: no interval above one tick at 100 BPM, none below half a tick at 120 BPM.
+    const intervals = gaps(sent);
+    assert.ok(intervals.length > 300, `${spacingMs} ms: ${intervals.length} intervals`);
+    for (const gap of intervals) {
+      assert.ok(gap <= nominalMs(100 / 4 / 60) + 0.01, `${spacingMs} ms: a hole of ${gap} ms`);
+      assert.ok(gap >= nominalMs(120 / 4 / 60) / 2, `${spacingMs} ms: a doubled tick, ${gap} ms`);
+    }
+    // 96 ticks from one cycle line to the next, for every whole cycle that was sent.
+    const wholeCycles = Math.floor(stamps.length / CLOCK_TICKS_PER_CYCLE) - 1;
+    assert.ok(wholeCycles >= 2, `${spacingMs} ms: ${wholeCycles} whole cycles`);
+    for (let cycle = 0; cycle < wholeCycles; cycle++) {
+      const from = rig.time.strudelPerf(audioOfCycle(Math.round(firstCycle) + cycle)) - 0.05;
+      const to = rig.time.strudelPerf(audioOfCycle(Math.round(firstCycle) + cycle + 1)) - 0.05;
+      assert.equal(stamps.filter((stamp) => stamp >= from && stamp < to).length, CLOCK_TICKS_PER_CYCLE, `${spacingMs} ms: ticks in cycle ${cycle}`);
+    }
+  }
 });

@@ -20,6 +20,7 @@ import {
   identicalLines,
   withoutHelperLines,
   structureMetrics,
+  versionStructure,
   structureLine,
   structureSummary,
   structureTopicSignatures,
@@ -180,6 +181,29 @@ test('tint-report: only code that does not parse counts as parse; any other erro
   assert.deepEqual(structureMetrics('const song = {'), { state: 'unreadable', reason: 'parse' });
   const broken = { toString() { throw new TypeError('the reader broke'); } };
   assert.throws(() => structureMetrics(broken), /the reader broke/);
+});
+
+test('tint-report: versionStructure names the history version whose code broke the structure reader', () => {
+  const boom = new Error('boom');
+  assert.throws(
+    () => versionStructure({ id: 7, code: 'x' }, () => { throw boom; }),
+    (err) => {
+      assert.ok(err instanceof Error);
+      assert.match(err.message, /^tint:report: the structure reader failed on version #7: boom$/);
+      assert.equal(err.cause, boom);
+      return true;
+    },
+  );
+  assert.throws(
+    () => versionStructure({ id: 9, code: 'x' }, () => { throw 'plain text'; }),
+    /version #9: plain text/,
+  );
+});
+
+test('tint-report: versionStructure gives the structure metrics of the code of one version', () => {
+  assert.deepEqual(versionStructure({ id: 3, code: STRUCTURED_PIECE }), structureMetrics(STRUCTURED_PIECE));
+  assert.deepEqual(versionStructure({ id: 4, code: 'const song = {' }), { state: 'unreadable', reason: 'parse' });
+  assert.deepEqual(versionStructure({ id: 5, code: 'drums: s("bd sd")' }), { state: 'none' });
 });
 
 test('tint-report: readTopicSignatures reads the structure topic, and a missing topic file is an error, not zero shapes', () => {

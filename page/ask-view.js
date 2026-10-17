@@ -1,12 +1,13 @@
 // The Ask Claude box's DOM: the small box a right-click opens near the pointer, its
-// chips, its field, its message line, the top-bar request status and the top-bar page-requests
+// chips, its field, its message line and the top-bar page-requests
 // status (whether page requests reach Claude live) with its (i) button and the
 // short popover the (i) opens, and a refused page token on the top-bar error line as soon as the
 // server says so. Every text reaches the page through
 // textContent, title, placeholder or setAttribute, never as markup: the chips carry names and code
 // written by a person or by Claude. No DOM access at import time: main.js calls createAskView() with
-// its document and a send function. The pure rules (copy, limits, placement, status timing) live in
-// page/ask.js.
+// its document and a send function. The pure rules (copy, limits, placement) live in page/ask.js. What became of
+// each request is the Requests list's business (page/request-status-view.js): this module hands every request and
+// every answer to the request tracker, and shows only the line under the Parts button.
 
 import {
   ASK_COPY,
@@ -16,7 +17,6 @@ import {
   pageRequestsText,
   askMessage,
   askTextProblem,
-  createAskStatus,
   cutText,
   describeContext,
   fitGestureToLine,
@@ -32,21 +32,17 @@ import {
  * Creates the box controller. `document` is the page's document (named so on purpose: every element
  * lookup below reads `document.getElementById`, the shape test/page-hidden.test.js scans); `send`
  * sends one JSON-able message to the server; `reportError` and `clearError` write and clear the
- * top-bar error line; `setTimer`, `clearTimer` and `now` are the page's clock; `fit` is the top bar's fit step, run
- * after the status changes because a new text changes the bar's width (a ResizeObserver does not fire for content
- * growing inside a full bar).
+ * top-bar error line; `setTimer`, `clearTimer` and `now` are the page's clock. `requests` is the per-request tracker
+ * of page/request-status.js: every request sent is handed to it, and so is every server answer to one. The tracker
+ * tells the page (main.js) when a request was never confirmed; the page then calls `notConfirmed(id)` here.
  */
-export function createAskView({ document, send, reportError, clearError, setTimer, clearTimer, now, fit }) {
+export function createAskView({ document, send, reportError, clearError, setTimer, clearTimer, now, requests }) {
   const askBox = document.getElementById('ask-box');
   const askContextChip = document.getElementById('ask-context-chip');
   const askCurrentChip = document.getElementById('ask-current-chip');
   const askField = document.getElementById('ask-field');
   const askMessageEl = document.getElementById('ask-message');
   const askHint = document.getElementById('ask-hint');
-  const askStatus = document.getElementById('ask-status');
-  // The status holds its long sentence and a short form (shown at fit step 3, aria-hidden).
-  const askLong = askStatus === null ? null : askStatus.querySelector('.ask-long');
-  const askShort = askStatus === null ? null : askStatus.querySelector('.ask-short');
   const partsAsk = document.getElementById('parts-ask');
   const partsAskStatus = document.getElementById('parts-ask-status');
   const pageRequests = document.getElementById('page-requests');
@@ -60,9 +56,6 @@ export function createAskView({ document, send, reportError, clearError, setTime
     !askField ||
     !askMessageEl ||
     !askHint ||
-    !askStatus ||
-    !askLong ||
-    !askShort ||
     !partsAsk ||
     !partsAskStatus ||
     !pageRequests ||
@@ -72,8 +65,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
   ) {
     throw new Error('Moontide: the Ask Claude markup is missing from the page.');
   }
-  if (typeof fit !== 'function') {
-    throw new Error('Moontide: createAskView needs the top bar\'s fit function.');
+  if (requests === undefined || typeof requests.sent !== 'function' || typeof requests.serverMessage !== 'function') {
+    throw new Error('Moontide: createAskView needs the request tracker.');
   }
 
   // The field's description lists the message line only while it shows, so it is never empty.
@@ -139,36 +132,10 @@ export function createAskView({ document, send, reportError, clearError, setTime
   // The side the box opened on (above the pointer or below), kept while its height changes; null
   // means choose again.
   let placedAbove = null;
-  // The Parts view's button: whether the code has no sections (so the button shows), the id of its
-  // request while it waits for Claude to take it, and the top-bar status text now on screen.
+  // The Parts view's button: whether the code has no sections (so the button shows) and the id of its
+  // request while it waits for Claude to take it.
   let partsAvailable = false;
   let partsPendingId = null;
-  let statusText = null;
-
-  const status = createAskStatus({
-    render: (text, short) => {
-      statusText = text;
-      askLong.textContent = text ?? '';
-      askShort.textContent = short ?? '';
-      askStatus.hidden = text === null;
-      fit();
-      renderPartsAsk();
-    },
-    onTimeout: (id) => {
-      reportError(ASK_COPY.didNotConfirm);
-      if (id === partsPendingId) {
-        // The canned request needs no draft: the button just comes back.
-        partsPendingId = null;
-        renderPartsAsk();
-        return;
-      }
-      notSent = true;
-      renderMessage();
-    },
-    setTimer,
-    clearTimer,
-    now,
-  });
 
   /** The fields of the request the box would send for `text` (trimmed), the id measured with the next one's shape. */
   function requestFields(text) {
@@ -202,6 +169,14 @@ export function createAskView({ document, send, reportError, clearError, setTime
     refit();
   }
 
+  /** The state phrase of the Parts request's row in the Requests list, or null when it has no row. */
+  function partsRowPhrase() {
+    if (partsPendingId === null) return null;
+    const model = requests.model();
+    const row = [...model.rows, ...model.recent].find((candidate) => candidate.id === partsPendingId);
+    return row === undefined ? null : row.phrase;
+  }
+
   /** The Parts button and the line under it, from partsAskState. */
   function renderPartsAsk() {
     partsAsk.hidden = !partsAvailable;
@@ -210,7 +185,7 @@ export function createAskView({ document, send, reportError, clearError, setTime
       partsAskStatus.hidden = true;
       return;
     }
-    const state = partsAskState({ connected, pending: partsPendingId !== null, statusText });
+    const state = partsAskState({ connected, pending: partsPendingId !== null, statusText: partsRowPhrase() });
     partsAsk.disabled = state.disabled;
     partsAskStatus.textContent = state.line ?? '';
     partsAskStatus.hidden = state.line === null;
@@ -344,7 +319,7 @@ export function createAskView({ document, send, reportError, clearError, setTime
     send(frame);
     // While the token is refused the line stays: the server's 'token' refusal writes it again, so it never blinks off.
     if (!authRefused) clearError();
-    status.sent(id);
+    requests.sent(id, { text, chip: describedContext.chip });
     return id;
   }
 
@@ -478,13 +453,13 @@ export function createAskView({ document, send, reportError, clearError, setTime
       return;
     }
     if (msg.type === 'ask-received') {
-      status.handedOver(msg.ids);
+      requests.serverMessage(msg);
       if (partsPendingId !== null && msg.ids.includes(partsPendingId)) partsPendingId = null;
       renderPartsAsk();
       return;
     }
     if (msg.type !== 'ask-result') return;
-    status.answered(msg);
+    requests.serverMessage(msg);
     const fromParts = msg.id === partsPendingId;
     if (msg.status === 'refused') {
       reportError(refusalText(msg.reason, msg.detail));
@@ -505,10 +480,25 @@ export function createAskView({ document, send, reportError, clearError, setTime
     renderPartsAsk();
   }
 
+  /**
+   * The tracker gave up on request `id`: the server never confirmed it, or the connection closed first. The error line
+   * says so, and the draft comes back (or, for the Parts button's canned request, the button is released).
+   */
+  function notConfirmed(id) {
+    reportError(ASK_COPY.didNotConfirm);
+    if (id === partsPendingId) {
+      // The canned request needs no draft: the button just comes back.
+      partsPendingId = null;
+      renderPartsAsk();
+      return;
+    }
+    notSent = true;
+    renderMessage();
+  }
+
   function setConnected(state) {
     connected = state === 'connected';
     if (state === 'disconnected') {
-      status.dropAll();
       partsPendingId = null;
       // The state is unknown once the socket is gone (the page does not reconnect by itself).
       pageRequests.hidden = true;
@@ -543,5 +533,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
     setCurrentVersion,
     setPartsAvailable,
     onServerMessage,
+    notConfirmed,
+    /** Draws the line under the Parts button again from its request's row; the page calls it after every tracker change. */
+    refreshPartsLine: () => renderPartsAsk(),
   };
 }

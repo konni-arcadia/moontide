@@ -45,7 +45,8 @@ mockup. Some of it already exists in the page. Only the entries in
   section or changes a cell.
 - **Jam.** The scale stays constant ("D Dorian"). The status says "all safe" or names the
   note to avoid while a chord leaves the scale, and a short list gives the next warnings and
-  part changes with a countdown. Chord names are secondary.
+  part changes with a countdown. Chord names are secondary. When several scales fit the notes, the
+  view proposes one with its reason and lists the others to pick from.
 
 ## Mixer, as Strudel really works
 

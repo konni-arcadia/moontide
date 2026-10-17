@@ -647,13 +647,28 @@ over on the next bar or the next phrase.
   code; doing that silently would promote the waiting change. They show a short neutral notice instead
   and work again at the line.
 - **No tempo tool.** The tempo shows in the top bar, and the `set_code` reply states it in one line when
-  it changes; a tempo ramp is a later design discussion.
+  it changes. A smooth change of tempo is an option of the tools that change the music, not a tool of its own
+  (see the tempo ramp, below).
 - **The top bar stays calm.** The tempo, the countdown (counted in beats of the music from the cycle
   position) and the setting are plain text with no animation, and the page gives up words in a fixed
   order instead of clipping a control.
 - Superseded by the top bar redesign: the "Edits:" button that cycled the setting is three buttons (now, next bar,
   next phrase) in the Settings card of the Session drawer, and the tempo is always in the bar (a dash while
   nothing plays). See "The top bar and the Session drawer".
+- Superseded by the tempo ramp: the earlier note that a tempo ramp waits for a later design discussion is
+  closed, because Claude wanted to move the tempo smoothly and a code that sets a tempo can only jump (the
+  tempo functions read their value once). The discussion settled this. The code holds the tempo to reach, and
+  `glideBars` on `set_code` and `edit_code` says over how many bars (1 to 64) the tempo moves to it. There is
+  no separate start value: a ramp leaves the tempo that plays. It is linear in BPM, in steps of at least a tenth
+  of a second and no finer than a tenth of a BPM. The steps go only through the tempo guard and are placed by
+  the music's own cycle, so a scheduler that stalls stalls the ramp with it, and it ends exactly on the code's
+  tempo. The course is put back after every evaluation: a program that states the same tempo, and one that
+  fails, leave the ramp going; another tempo, or none, cancels it. A change that waits for a line starts its
+  ramp at the line. Stop cancels the ramp and the next Play starts at the code's tempo. The ramp lives in the
+  page's memory only: a reload or another tab loses it, and Claude is told once. A ramp is refused whole, with
+  nothing changed, when nothing plays, when the code sets no tempo or when it sets the tempo that already
+  plays. The top bar has no cancel control (Stop cancels). How a hardware instrument that follows the MIDI
+  clock reacts to a ramp has not been verified; the bench is still to do.
 
 ## Claude can send only the change
 
@@ -879,9 +894,10 @@ Four fixes that came from real sessions with tracks that Claude wrote with their
 - **A range is one lane, whole cycles, inside the page shown.** Dragging across an empty part of one lane, or sideways from
   a note, or Shift with Left or Right from a note, selects whole cycles of that lane, never more than the 32 cycles on
   the page; a pointer that leaves the lane is held at the first or last cycle and the box says it was cut. The request
-  names the lane, the cycles, the section of each end (the first and the last only, not those between) and at most 32 of
-  the lane's notes in them, with a count of the rest; it is cut from the end until the whole line is at most 8192 bytes,
-  as the right-click moment is. A range on a lane with no notes is valid.
+  names the lane, the cycles, every section the range crosses in playing order (a section that comes back after another
+  is named again; a list too long for 200 characters ends with how many more) and at most 32 of the lane's notes in them,
+  with a count of the rest; it is cut from the end until the whole line is at most 8192 bytes, as the right-click moment
+  is. The note panel and the Ask box chip name the same list. A range on a lane with no notes is valid.
 - **The numbers of the hand.** A press that moves less than a quarter of a rem is a click. A note is hit within half a
   rem in both directions, the nearest wins and equal distances go to the lower pitch. A drag changes the pitch by one
   semitone for each half rem of travel, up is higher, and the dominant axis decides: up or down on a note is a pitch drag,
@@ -896,9 +912,8 @@ Four fixes that came from real sessions with tracks that Claude wrote with their
 - **Left out on purpose.** Notes in degrees, adding or lengthening a note, and a range over more than one lane stay
   requests for Claude. Claude's reference was not changed to steer how notes are written (for example toward
   double-quoted notes the Timeline can edit): that would tint every piece toward one way of writing.
-- **Known limits.** A page that turns while a note is selected clears the selection; a range that crosses a repeat of the
-  song names the section of its first and last cycle only. The look and feel of the gestures, and how the edits sound,
-  are judged by hand and by ear, not by a check.
+- **Known limits.** A page that turns while a note is selected clears the selection. The look and feel of the gestures, and
+  how the edits sound, are judged by hand and by ear, not by a check.
 
 ## The Instruments view changes only what the user clicks
 
@@ -1013,6 +1028,43 @@ was picked from sketches before the build. These choices are settled.
 - **The Ask field is prefilled.** Ask Claude on the banner opens the box with the error text in it, cut at
   1500 characters, so the user can add a sentence or send it as it is.
 
+## A page request shows what happens to it
+
+- **A change is linked to a request only through the id Claude passes.** `set_code`, `edit_code` and
+  `restore_version` take an optional `answering` field with the request id. The page never guesses a link
+  from timing: a change that happens to follow a request says nothing about it, so a request shows as
+  applied only when it really was.
+- **An id that is not open never fails the music change.** A wrong or closed `answering` id changes no
+  request, the change goes ahead, and the reply says so once. `answer_request` refuses such an id loudly
+  instead, because it changes no music and a silent success would hide the mistake.
+- **Silence is never shown as failure.** A request without news for 30 seconds reads No change yet and keeps
+  counting. Claude may still be working, or may have missed it; the page cannot tell, so it does not guess.
+- **Started is an observation, and says its basis.** Claude has started on it means Claude made a Moontide
+  call after the request arrived. The basis is in the row's tooltip and in its detail, so the user can judge
+  how much it means.
+- **A timed change that is replaced or canceled says so.** A change that waits for its bar or phrase and is
+  replaced by a newer change, or canceled by Stop, ends as Replaced by a newer change or Canceled. It never
+  stays on Waiting for its line.
+- **The board lives in memory and is bounded.** The server keeps at most 50 requests, with the start of the
+  text (200 characters) so a reloaded page can show what it asked. The text never reaches the disk or the
+  History view, and everything is gone when the server stops. The bound drops the oldest finished request
+  first; an open one goes only when all 50 are still open, so a request the user still waits on stays
+  closable.
+- **Statuses go only to the page that sent the request.** A second tab never sees the requests of the first.
+  A reloaded page takes over the requests whose page has gone, so a reload keeps the list.
+- **The closing sentence is short.** `answer_request` takes answered or declined and one sentence of at most
+  200 characters, shown under the request. A longer or empty sentence is refused, never trimmed.
+- **The duty to pass the id is told where Claude needs it.** It lives in the description of the `answering`
+  field and in the facts Claude reads with each request, not in the server instructions, whose 2048
+  characters are kept for the framing every session needs.
+- **The page shows only the states that were measured to hold.** Before this shipped, fresh Claude sessions
+  were given one plain request each from the real page, with no hint of ids or tools. In all 5 sessions whose
+  request changed the music, Claude named the request with its change, and in all 5 sessions whose request
+  needed only an answer, Claude closed it with `answer_request` on the right id, answered or declined as
+  expected. The bar was 4 of 5 for each kind. No session named another id or linked a change to a request
+  that needed none. A state that was not measured to hold would not be shown: the row would stay on its last
+  honest state.
+
 ## The border between the editor and the view
 
 - **The border is draggable and works from the keyboard.** The value is the view's share of the main axis,
@@ -1069,9 +1121,41 @@ was picked from sketches before the build. These choices are settled.
 - **A single token naming one of the nine scales shows under the page's own name.** Anything else shows as
   written.
 - **The declared scale does not drive the piano, the avoid marks or the warnings.** That would blur what
-  is heard with what is meant. The declaration is read once per version, with the reading.
+  is heard with what is meant. The one exception: it breaks a tie among the scales that fit the notes
+  (see "Jam proposes a scale when several fit"). The declaration is read once per version, with the
+  reading.
 - **Left for later:** asking Claude about the Declared line, and telling Claude in the `set_code` reply
   when the declaration cannot be read.
+
+## Jam proposes a scale when several fit
+
+- **Same notes or different notes.** Scales that share their notes (C major and A minor) agree on which
+  notes are outside, but not on the root mark, the avoid notes or the spelling, which depend on the root.
+  So Jam uses one, says why, and lets the user switch. Scales with different notes (A minor and A Dorian)
+  change which notes are outside, so Jam does not guess between them.
+- **The order of the choice.** First the user's pick for this same set of candidates. Then the declared
+  scale of the section that plays (or of the piece without sections), matched on root and mode, when it is
+  among the candidates. Then the proposal kept from the evidence for the same set, so two near-equal
+  readings do not make the choice jump. Last, the strongest evidence in the notes (bass and chord roots
+  first, then the weight of the notes).
+- **The reason is always a sentence, never the word alone.** "Proposed: C major, C is the note heard
+  most." Five reasons exist: declared by the section, declared by the code, the bass and chords lean on
+  the root, the root is the note heard most, and nothing in the notes says which scale is the key.
+- **Cannot choose.** Different notes and nothing usable declared: warnings are off, one sentence says
+  why, the scales are named in a plain list and no control is shown. A declaration that names none of
+  the candidates reads the same.
+- **The pick.** One click or Enter on a scale of the list switches the whole view in the same turn. It
+  holds while the same set of candidates comes back, across sections and pieces, and wins over the
+  declared scale. It lives in page memory only: 32 sets at most, forgotten on reload, no browser storage.
+- **Warnings of every candidate are computed with the reading**, so a switch is a lookup, not a new
+  reading.
+- **The piano shares the guitar's roles and legend.** Every role has a shape or text cue besides its
+  colour (fill and note text for scale, a ring and bold text for the root, a slash and struck-through text
+  for avoid, a dashed border for outside, a corner square for a chord tone), and the piano and guitar
+  names say the source of the scale, the scale notes, the root, what to avoid, what is outside and the
+  chord tones. Each piano key also has a hover title of its note and role.
+- **Known limits.** Candidates are shown in evidence order, eight at most, then a count of the rest. The
+  later parts of the reading window resolve with the declaration in effect where the music plays.
 
 ## MIDI drum tracks do not count as pitches in Jam
 

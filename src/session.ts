@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { AskChannel, listenerScriptPath } from './ask.js';
+import { NOT_OPEN_REQUEST_MESSAGE, RequestStatusBoard, cleanAnswerText } from './request-status.js';
 import { MIDI_PERMISSION_WAIT_MESSAGE, MidiChannel } from './midi-state.js';
 import { applyEdits, type EditInput, type EditRange } from './edit-code.js';
 import {
@@ -53,6 +54,7 @@ import {
   MAX_DATA_FOLDER_LENGTH,
   type AudioState,
   type ChangeTiming,
+  type GlideReport,
   type LoadFailedScript,
   type MidiFacts,
   type PageMessage,
@@ -109,6 +111,8 @@ export interface EvalOutcome {
   bpm: number | null;
   /** True when `bpm` differs from the last tempo a reply stated (and on the first one); the caller says it once. */
   tempoChanged: boolean;
+  /** Present when this change started a tempo ramp; the reply says the ramp in place of the tempo. */
+  glide?: GlideReport;
 }
 
 /** Which code an edit_code call was applied to. */
@@ -195,6 +199,14 @@ export function cleanErrorDetail(detail: string): string {
     return withoutTrailingPeriods;
   }
   return codePoints.slice(0, MAX_DETAIL_CODE_POINTS).join('') + '…';
+}
+
+/** The page's refusal text of a tempo ramp it could not make, trimmed and cut like any error detail but kept as a sentence. */
+function cleanRefusal(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed === '') return UNKNOWN_ERROR_DETAIL;
+  const codePoints = Array.from(trimmed);
+  return codePoints.length <= MAX_DETAIL_CODE_POINTS ? trimmed : codePoints.slice(0, MAX_DETAIL_CODE_POINTS).join('') + '…';
 }
 
 /**
@@ -330,6 +342,27 @@ export function takeoverCanceledLine(cycle: number, reason: 'stop' | 'replaced' 
 }
 
 /**
+ * The note Claude gets, once, when a tempo ramp ended without Claude asking for it: a program stated another tempo, a
+ * program stated no tempo, a step failed, or the page that ran it was closed, reloaded or replaced by another tab.
+ * Stop, a finished ramp and a replaced ramp say nothing. Only the cause (a fixed word) and a number come in: no
+ * page text. `bpm` is the tempo that plays after the end; the wording leaves it out when the page gave none.
+ */
+export function glideEndedLine(reason: 'other-tempo' | 'no-tempo' | 'error' | 'page', bpm?: number): string {
+  const shown = bpm === undefined ? undefined : Number.isInteger(bpm) ? String(bpm) : bpm.toFixed(1);
+  const head = 'Note: the tempo ramp ended early:';
+  if (reason === 'other-tempo') {
+    return `${head} a program stated another tempo${shown === undefined ? '' : `, and ${shown} BPM plays now`}.`;
+  }
+  if (reason === 'no-tempo') {
+    return `${head} a program stated no tempo${shown === undefined ? '' : `, so the tempo stays at ${shown} BPM, where the ramp had got to`}.`;
+  }
+  if (reason === 'error') {
+    return `${head} a step failed in the page${shown === undefined ? '' : `, so the tempo stays at ${shown} BPM`}.`;
+  }
+  return `${head} the page was closed, reloaded or replaced by another tab, so the tempo of the code plays.`;
+}
+
+/**
  * The note when a change that waited for its line took over and replaced code that had been edited by hand
  * in the page. Said at the takeover, never at the request: until the line the hand edit is still what plays, and a
  * change that is canceled or replaced replaces nothing.
@@ -368,6 +401,10 @@ interface RecordIntent {
   at?: ChangeTiming;
   // The phrase length Claude asked for with at: 'phrase' (absent means the default).
   phraseCycles?: number;
+  // The number of bars Claude asked the tempo to move over (absent means no ramp).
+  glideBars?: number;
+  // The id of the page request this change answers, named by Claude (absent means it answers none).
+  answering?: string;
   // The change is an edit applied on top of a hand-edited playing code, so at its takeover it carries the
   // hand edit instead of replacing it (absent means false).
   carriesHandEdit?: boolean;
@@ -386,6 +423,8 @@ interface WaitingChange {
   /** The timing Claude asked for; 'bar' when the intent was lost (the cycle is what matters then). */
   at: ChangeTiming;
   intent: RecordIntent | undefined;
+  /** The ramp the page reported for this change (it starts at the line); becomes the recorded ramp at the takeover. */
+  glide?: Extract<GlideReport, { state: 'at-line' }>;
 }
 
 /**
@@ -467,6 +506,11 @@ export class Session {
   private pendingChange: WaitingChange | null = null;
   // The notes of waiting changes that did not take over, queued once and drained once, like historyNotes.
   private readonly takeoverNotes: string[] = [];
+  // The tempo ramp the page runs, as far as the server knows: set when a reply says a ramp started (or the takeover of a
+  // change whose ramp starts at its line), cleared by Stop, a page end and a page loss. Null when none runs.
+  private glide: { toBpm: number } | null = null;
+  // The notes of a ramp that ended early, queued once and drained once, like takeoverNotes.
+  private readonly glideNotes: string[] = [];
   // The notes of load failure reports a page sent, one per distinct text (at most three), drained once.
   private readonly loadFailureNotes = new Set<string>();
   // BPM: the tempo (rounded to one decimal) the last set_code or restore_version reply stated; null before any.
@@ -486,6 +530,8 @@ export class Session {
   private readonly supersededPages = new Set<PageConnection>();
   /** The page-to-Claude channel (tokens, trust, limits, queue, listener). */
   readonly ask: AskChannel;
+  /** What became of each page request: started, waiting for its line, applied and the other states. */
+  readonly requests: RequestStatusBoard;
   /** The MIDI facts of the active page, worded once per change into notice lines. */
   readonly midi: MidiChannel;
   // The setup file's store (null without one), the JSON of the last midi-rig each page was
@@ -525,11 +571,38 @@ export class Session {
     this.rig = options?.rig ?? null;
     this.build = options?.build ?? null;
     this.recordIntentTtlMs = options?.recordIntentTtlMs ?? RECORD_INTENT_TTL_MS;
+    const send = (conn: PageConnection, msg: ServerMessage, what: string): void => this.sendToPage(conn, msg, what);
+    this.requests = new RequestStatusBoard({ send });
     this.ask = new AskChannel({
-      send: (conn, msg, what) => this.sendToPage(conn, msg, what),
+      send,
+      board: this.requests,
       ackTimeoutMs: options?.askAckTimeoutMs,
     });
     this.midi = new MidiChannel();
+  }
+
+  /** A Moontide tool call began: the requests already handed to Claude are being worked on. */
+  noteToolCall(): void {
+    this.requests.noteToolCall();
+  }
+
+  /**
+   * Claude closes an open page request in words. The sentence is cleaned first; one that is empty after
+   * cleaning, and an id that is not an open request, are refused with a plain error and change nothing.
+   */
+  answerRequest(id: string, outcome: 'answered' | 'declined', text: string): void {
+    const sentence = cleanAnswerText(text);
+    if (sentence === '') {
+      throw new Error('The sentence is empty after removing spaces and control characters; give one sentence of words.');
+    }
+    if (!this.requests.closed(id, outcome, sentence)) {
+      throw new Error(NOT_OPEN_REQUEST_MESSAGE);
+    }
+  }
+
+  /** Whether a page request with this id is on the board and not finished. */
+  requestIsOpen(id: string): boolean {
+    return this.requests.isOpen(id);
   }
 
   setPageUrl(url: string): void {
@@ -583,6 +656,39 @@ export class Session {
     if (waiting === null) return;
     this.pendingChange = null;
     this.takeoverNotes.push(takeoverCanceledLine(waiting.cycle, reason));
+    const answering = waiting.intent?.answering;
+    if (answering === undefined) return;
+    if (reason !== 'replaced') {
+      this.requests.canceled(answering);
+    } else if (!this.answeringStillCarried(answering, waiting.id)) {
+      this.requests.replaced(answering);
+    }
+  }
+
+  /**
+   * The ramp ended. Clears the record and queues its one note for the next tool reply, except for a finished ramp and
+   * for Stop, which are not told. A no-op when no ramp is recorded, so a second cause (a cancel, then a closing page)
+   * never adds a second line.
+   */
+  private dropGlide(reason: 'finished' | 'stop' | 'other-tempo' | 'no-tempo' | 'error' | 'page', bpm?: number): void {
+    if (this.glide === null) return;
+    this.glide = null;
+    if (reason === 'finished' || reason === 'stop') return;
+    this.glideNotes.push(glideEndedLine(reason, bpm));
+  }
+
+  /**
+   * Whether a change other than this one still in flight answers the same request. A newer change that
+   * names the request carries its answer on, so the request must not end as replaced while that answer is
+   * still coming: the newer change settles it (applied, failed or replaced in its turn).
+   */
+  private answeringStillCarried(answering: string, exceptEvaluateId: string): boolean {
+    for (const [evaluateId, entry] of this.pending) {
+      if (entry.kind === 'evaluate' && evaluateId !== exceptEvaluateId) {
+        if (this.recordIntents.get(evaluateId)?.answering === answering) return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -591,19 +697,35 @@ export class Session {
    * itself (takeover-canceled 'replaced').
    */
   private keepWaitingChange(change: WaitingChange): void {
-    if (this.pendingChange !== null && this.pendingChange.id !== change.id) {
+    const replaced = this.pendingChange;
+    if (replaced !== null && replaced.id !== change.id) {
       console.error(
-        `[moontide] A waiting change (${this.pendingChange.id}) was replaced by request ${change.id} without a cancel message`,
+        `[moontide] A waiting change (${replaced.id}) was replaced by request ${change.id} without a cancel message`,
       );
+      // The same rule as a cancel message: the request ends as replaced unless the new change answers it too.
+      const answering = replaced.intent?.answering;
+      if (answering !== undefined && answering !== change.intent?.answering) {
+        this.requests.replaced(answering);
+      }
     }
     this.pendingChange = change;
+    if (change.intent?.answering !== undefined) {
+      this.requests.line(change.intent.answering, change.at === 'phrase' ? 'phrase' : 'bar');
+    }
   }
 
   /**
    * BPM: rounds the tempo of a reply to one decimal and says whether it differs from the last tempo a reply
    * stated. A reply without a tempo leaves the last told tempo alone.
    */
-  private noteTempo(bpm: number | undefined): { bpm: number | null; tempoChanged: boolean } {
+  private noteTempo(bpm: number | undefined, glide?: GlideReport): { bpm: number | null; tempoChanged: boolean } {
+    // A reply that states a ramp says the ramp, not a tempo change: the ramp's target is the tempo told from here on, so the
+    // next reply never announces it as a change when the ramp gets there.
+    if (glide !== undefined) {
+      const target = Math.round(glide.toBpm * 10) / 10;
+      this.lastToldBpm = target;
+      return { bpm: bpm === undefined ? null : Math.round(bpm * 10) / 10, tempoChanged: false };
+    }
     if (bpm === undefined) return { bpm: null, tempoChanged: false };
     const rounded = Math.round(bpm * 10) / 10;
     const tempoChanged = this.lastToldBpm === null || this.lastToldBpm !== rounded;
@@ -629,6 +751,7 @@ export class Session {
     // A change that waits does not survive a page taking the role: the page that held its gate is
     // gone or replays its code, so Claude is told once (the line is queued once however many causes meet).
     this.dropWaitingChange('page');
+    this.dropGlide('page');
     this.supersededPages.delete(conn);
     if (previous !== null && previous !== conn) {
       this.supersededPages.add(previous);
@@ -680,6 +803,7 @@ export class Session {
     if (this.activePage === conn) {
       this.activePage = null;
       this.dropWaitingChange('page');
+      this.dropGlide('page');
       this.midi.clear();
       this.lastMidiFacts = null;
       // A superseded tab says "playing in another tab": tell it that no tab plays any more, or it
@@ -807,6 +931,10 @@ export class Session {
       this.handleTakeoverCanceled(conn, msg);
       return;
     }
+    if (msg.type === 'glide-ended') {
+      this.handleGlideEnded(conn, msg);
+      return;
+    }
     if (msg.type === 'user-stopped') {
       this.handleUserStopped(conn);
       return;
@@ -846,6 +974,13 @@ export class Session {
     // An ask is not gated by conn === activePage (any authenticated tab may ask).
     if (msg.type === 'ask') {
       this.ask.handleAsk(conn, msg);
+      return;
+    }
+    if (msg.type === 'ask-board-request') {
+      const requests = this.requests.snapshotFor(conn);
+      // The board told the page where each request stands; the hand-over messages that follow reach it too.
+      this.ask.adoptOrigin(conn, requests.map((row) => row.id));
+      this.sendToPage(conn, { type: 'ask-board', requests }, 'the request board');
       return;
     }
     if (msg.type === 'history-request') {
@@ -1385,6 +1520,8 @@ export class Session {
       return;
     }
     this.stopped = true;
+    // Stop ends a ramp too; it is the user's own act, so Claude is not told.
+    this.dropGlide('stop');
     // A stop the page reports ends a wait too; the page's takeover-canceled for the same id (sent
     // just before) already queued the line, and a second cause adds nothing.
     this.dropWaitingChange('stop');
@@ -1407,6 +1544,7 @@ export class Session {
           cycle: msg.pending.cycle,
           at: lateIntent?.at ?? 'bar',
           intent: lateIntent,
+          ...(msg.glide?.state === 'at-line' ? { glide: msg.glide } : {}),
         });
         console.error(`[moontide] Late pending confirmation kept for request ${msg.id}`);
       } else if (msg.ok && conn === this.activePage) {
@@ -1428,6 +1566,15 @@ export class Session {
         this.handFailureLine = null;
         const lateVersionId = this.recordConfirmed(conn, msg.code, lateOrigin, lateIntent);
         this.rememberVersion(msg.id, lateVersionId);
+        // A reply whose audio is stopped records no ramp: Stop ends every ramp, so none runs.
+        // An at-line report on a reply with no pending line is a waiting change that already took over: its ramp started at its line.
+        if ((msg.glide?.state === 'started' || msg.glide?.state === 'at-line') && msg.audio !== 'stopped') {
+          this.glide = { toBpm: msg.glide.toBpm };
+        }
+        // This branch does not pass through confirmSuccess, so it tells the page itself.
+        if (lateIntent?.answering !== undefined) {
+          this.requests.applied(lateIntent.answering, lateVersionId);
+        }
         console.error(`[moontide] Late confirmation stored for request ${msg.id}`);
       } else if (msg.ok) {
         // Came from a page that is no longer active: it doesn't reflect what the active
@@ -1461,6 +1608,7 @@ export class Session {
             cycle: msg.pending.cycle,
             at: intent?.at ?? 'bar',
             intent,
+            ...(msg.glide?.state === 'at-line' ? { glide: msg.glide } : {}),
           });
           entry.resolve({
             code: msg.code,
@@ -1469,16 +1617,23 @@ export class Session {
             replacedHandEdit: false,
             versionId: null,
             pending: msg.pending,
-            ...this.noteTempo(msg.bpm),
+            ...this.noteTempo(msg.bpm, msg.glide),
+            ...(msg.glide !== undefined ? { glide: msg.glide } : {}),
           });
         } else {
           const { replacedHandEdit, versionId } = this.confirmSuccess(conn, msg.id, msg.code, msg.audio, intent);
+          // A reply whose audio is stopped states and records no ramp: Stop ends every ramp, so none runs.
+          const glide = msg.audio === 'stopped' ? undefined : msg.glide;
+          // A ramp this change started is the one the server tells about when it ends early; a running report leaves the record.
+          // An at-line report here is a waiting change that already took over when it was answered: its ramp started at its line.
+          if (glide?.state === 'started' || glide?.state === 'at-line') this.glide = { toBpm: glide.toBpm };
           entry.resolve({
             code: msg.code,
             audio: msg.audio,
             replacedHandEdit,
             versionId,
-            ...this.noteTempo(msg.bpm),
+            ...this.noteTempo(msg.bpm, glide),
+            ...(glide !== undefined ? { glide } : {}),
           });
         }
       } else {
@@ -1491,7 +1646,26 @@ export class Session {
         entry.reject(new Error(STALE_PAGE_MESSAGE));
       }
     } else {
+      const failedIntent = this.recordIntents.get(msg.id);
       this.recordIntents.delete(msg.id);
+      const failedFor = failedIntent?.answering;
+      // The same rule as a replaced change: an earlier change for the same request that still waits for
+      // its line, or is still on its way, carries the answer on and settles the request in its turn.
+      // A ramp the page refused was refused whole and nothing changed, so the request stays open for the change Claude sends
+      // next (without glideBars), which can still answer it.
+      if (
+        msg.glideRefused !== true &&
+        failedFor !== undefined &&
+        this.pendingChange?.intent?.answering !== failedFor &&
+        !this.answeringStillCarried(failedFor, msg.id)
+      ) {
+        this.requests.failed(failedFor, cleanErrorDetail(msg.error));
+      }
+      if (msg.glideRefused === true) {
+        // The page's own refusal text, whole: it already says that nothing was changed, so no evaluation-failure tail is added.
+        entry.reject(new Error(cleanRefusal(msg.error)));
+        return;
+      }
       const tail = this.code === '' ? NOTHING_PLAYING_TAIL : this.stopped ? STILL_STOPPED_TAIL : STILL_PLAYING_TAIL;
       entry.reject(new Error(evalFailedMessage(msg.error, msg.line, tail)));
     }
@@ -1523,13 +1697,18 @@ export class Session {
     this.handFailureLine = null;
     const versionId = this.recordConfirmed(conn, code, origin, intent);
     this.rememberVersion(id, versionId);
+    if (intent?.answering !== undefined) {
+      this.requests.applied(intent.answering, versionId);
+    }
     return { replacedHandEdit, versionId };
   }
 
   /**
    * The page says the waiting change is audible now. Accepted only from the active page and only for
    * the id of the change that waits; anything else is one stderr line and changes nothing. The message carries
-   * only the id, so the recorded code is the one stored from the pending reply.
+   * the id and, when the ramp the waiting change started at its line still runs, `glideRuns: true`; the recorded code
+   * is the one stored from the pending reply, and the ramp record is set from `glideRuns` (or cleared without it) for a
+   * change that asked for a ramp.
    */
   private handleTakeover(conn: PageConnection, msg: Extract<PageMessage, { type: 'takeover' }>): void {
     if (conn !== this.activePage) {
@@ -1543,6 +1722,10 @@ export class Session {
     }
     this.pendingChange = null;
     const { replacedHandEdit } = this.confirmSuccess(conn, waiting.id, waiting.code, 'playing', waiting.intent);
+    // A change that asked for a ramp at its line ended any older ramp there. Its own ramp is the recorded ramp from here on only
+    // when the page says it still runs; otherwise none runs (nothing to ramp between, or it already ended) and the record is
+    // cleared with no line. A change replaced or canceled before its line never gets here.
+    if (waiting.glide !== undefined) this.glide = msg.glideRuns === true ? { toBpm: waiting.glide.toBpm } : null;
     // An edit that carried a hand edit replaced nothing of it: the Mixer and Parts refuse while a change
     // waits and a hand evaluation cancels the wait, so the code playing at this takeover is still the hand-edited
     // text the edit was built on, and the note would be false.
@@ -1567,6 +1750,18 @@ export class Session {
       return;
     }
     this.dropWaitingChange(msg.reason);
+  }
+
+  /**
+   * The page says its tempo ramp ended on its own. Only the active page is trusted; the numbers are bounded by the
+   * protocol schema and the wording is the server's.
+   */
+  private handleGlideEnded(conn: PageConnection, msg: Extract<PageMessage, { type: 'glide-ended' }>): void {
+    if (conn !== this.activePage) {
+      console.error('[moontide] Ignoring glide-ended from a non-active page');
+      return;
+    }
+    this.dropGlide(msg.reason, msg.bpm === undefined ? undefined : Math.round(msg.bpm * 10) / 10);
   }
 
   /**
@@ -1735,6 +1930,7 @@ export class Session {
       if (conn === this.activePage) {
         // A late stop confirmation still reflects reality — the page did stop.
         this.stopped = true;
+        this.dropGlide('stop');
         this.dropWaitingChange('stop');
         console.error(`[moontide] Late stop confirmation stored for request ${msg.id}`);
       } else {
@@ -1753,6 +1949,7 @@ export class Session {
     this.pending.delete(msg.id);
     if (conn === this.activePage) {
       this.stopped = true;
+      this.dropGlide('stop');
       this.dropWaitingChange('stop');
       entry.resolve(undefined);
     } else {
@@ -2107,6 +2304,9 @@ export class Session {
     // A change that waited for a line and did not take over, told once.
     lines.push(...this.takeoverNotes);
     this.takeoverNotes.length = 0;
+    // A tempo ramp that ended early, told once.
+    lines.push(...this.glideNotes);
+    this.glideNotes.length = 0;
     // The build line comes before the setup file lines, then the MIDI lines, then the ask
     // lines (the arming line stays last). Runtime error lines and the history notes come earlier.
     lines.push(...this.buildNotes);
@@ -2170,7 +2370,7 @@ export class Session {
 
   evaluate(
     code: string,
-    options?: { label?: string; at?: ChangeTiming; phraseCycles?: number },
+    options?: { label?: string; at?: ChangeTiming; phraseCycles?: number; glideBars?: number; answering?: string },
   ): Promise<EvalOutcome> {
     if (code.trim() === '') {
       return Promise.reject(new Error(EMPTY_CODE_MESSAGE));
@@ -2180,6 +2380,8 @@ export class Session {
       force: false,
       at: options?.at,
       phraseCycles: options?.phraseCycles,
+      glideBars: options?.glideBars,
+      answering: options?.answering,
     });
   }
 
@@ -2192,7 +2394,7 @@ export class Session {
    */
   editCode(
     edits: readonly EditInput[],
-    options?: { base?: number; label?: string; at?: ChangeTiming; phraseCycles?: number },
+    options?: { base?: number; label?: string; at?: ChangeTiming; phraseCycles?: number; glideBars?: number; answering?: string },
   ): Promise<EditOutcome> {
     // First, so the text and the speed equal set_code's.
     if (this.activePage === null) {
@@ -2244,6 +2446,8 @@ export class Session {
       force: false,
       at: options?.at,
       phraseCycles: options?.phraseCycles,
+      glideBars: options?.glideBars,
+      answering: options?.answering,
       carriesHandEdit,
     }).then((outcome) => ({ outcome, code: result.code, ranges: result.ranges, base, carriesHandEdit }));
   }
@@ -2281,7 +2485,7 @@ export class Session {
    * entry even when its code equals the last recorded version; the
    * source id rides `restoredFrom`, machine-readable independently of the label text.
    */
-  restoreVersion(id: number, options?: { origin?: VersionOrigin }): Promise<EvalOutcome> {
+  restoreVersion(id: number, options?: { origin?: VersionOrigin; answering?: string }): Promise<EvalOutcome> {
     let entry;
     try {
       entry = this.requireVersion(id);
@@ -2292,6 +2496,7 @@ export class Session {
       label: restoredLabel(id),
       restoredFrom: id,
       origin: options?.origin,
+      answering: options?.answering,
       force: true,
     });
   }
@@ -2310,6 +2515,8 @@ export class Session {
       force: boolean;
       at?: ChangeTiming;
       phraseCycles?: number;
+      glideBars?: number;
+      answering?: string;
       carriesHandEdit?: boolean;
     },
   ): Promise<EvalOutcome> {
@@ -2321,6 +2528,7 @@ export class Session {
       const message: ServerMessage = { type: 'evaluate', id, code };
       if (intent.at !== undefined) message.at = intent.at;
       if (intent.phraseCycles !== undefined) message.phraseCycles = intent.phraseCycles;
+      if (intent.glideBars !== undefined) message.glideBars = intent.glideBars;
       return message;
     });
   }

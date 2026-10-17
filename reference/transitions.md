@@ -133,8 +133,20 @@ A tempo set by the waiting code with `setcps` or `setcpm` applies in the schedul
 
 ## Tempo
 
-`setcps(n)` and `setcpm(n)` (or the chained `.cpm(n)`, see reference/functions.md "Tempo") take effect the instant the code is evaluated — each is a single value read once at that moment, not a control that is queried continuously like a signal. In a change that waits for a bar or phrase line, they take effect at the line (see "Taking over on a bar or phrase line", above). Whether tempo itself can follow a continuous signal: this bundle's own `setcps`/`setcpm` accept a plain number, and unwrap a single-value ("pure") pattern into that same plain number if given one, but do not continuously sample a changing signal.
+`setcps(n)` and `setcpm(n)` (or the chained `.cpm(n)`, see reference/functions.md "Tempo") take effect the instant the code is evaluated — each is a single value read once at that moment, not a control that is queried continuously like a signal. In a change that waits for a bar or phrase line, they take effect at the line (see "Taking over on a bar or phrase line", above). Whether tempo itself can follow a continuous signal: this bundle's own `setcps`/`setcpm` accept a plain number, and unwrap a single-value ("pure") pattern into that same plain number if given one, but do not continuously sample a changing signal. A smooth change of tempo is asked for with `glideBars` (see "Tempo ramp", below).
 
 ```js
 setcpm(120)   // takes effect immediately when this code evaluates, then stays fixed
 ```
+
+## Tempo ramp
+
+`set_code` and `edit_code` take `glideBars`, a whole number of bars from 1 to 64, to move the tempo smoothly instead of jumping. The code states the tempo to reach with `setcps` or `setcpm`. The tempo moves from the tempo that plays to that tempo over that many bars, in equal small steps of BPM, and ends exactly on the code's tempo. It starts at once, or at the line when `at` is `'bar'` or `'phrase'`, from the tempo that plays then.
+
+A ramp is refused, and nothing changes, when nothing plays or the music is stopped, when the code sets no tempo, and when the code sets the tempo that already plays. Send the change again without `glideBars`.
+
+A ramp goes on through any later program that states the same tempo again, whatever its source (a Mixer move, a Song grid edit, a Timeline edit, a hand edit, `set_code`, `edit_code`, `restore_version`), and through a program that fails. A program that states another tempo cancels it, and that tempo plays at once. A program with no tempo statement cancels it, and the tempo stays where it was. A new `glideBars` replaces it, from the tempo that plays then. Stop cancels it, and the next Play starts at the code's tempo. A page reload, or another tab taking over, ends it, and the code's tempo plays.
+
+The reply to a change states the ramp once. A ramp that ended early is told once, in a later reply; a ramp that finished is not announced. A ramp is an event of the page, never a version: it writes no tempo into the code or the history.
+
+A pattern's `.cpm()` is worked out once, when the program runs, against the tempo at that moment (the code's own tempo when its `setcps` or `setcpm` comes first), and its length in cycles stays fixed after that, so it moves with a ramp like the rest of the music. The MIDI clock follows every step of a ramp. How a hardware instrument that follows the MIDI clock reacts to a ramp has not been verified.

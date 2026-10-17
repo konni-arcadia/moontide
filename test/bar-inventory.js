@@ -4,11 +4,12 @@
 // and by both probes (scripts/probe-page.mjs, scripts/probe-midi.mjs). A change that moves, renames or removes an
 // item edits its entry in the same change, so a failing contract names the broken item.
 import { BUILD_MISMATCH_COPY, CONNECTION_LABELS } from '../page/ui-state.js';
-import { PAGE_REQUESTS_COPY, waitingText } from '../page/ask.js';
+import { PAGE_REQUESTS_COPY } from '../page/ask.js';
 import { timingOptions } from '../page/change-timing.js';
 
 /** Every id the top bar shows or reaches, and its home: 'bar' is inside #top-bar, 'drawer' inside #session-drawer
- * (a card), 'strip' inside #session-strip. An item that moves needs its home edited here. */
+ * (a card), 'strip' inside #session-strip, 'banner' between the bar and the strip, 'chrome' directly inside #chrome (the
+ * Requests panel under the bar and its spoken line). An item that moves needs its home edited here. */
 const HOMES = {
   'product-name': 'bar',
   'connection-state': 'drawer',
@@ -27,7 +28,10 @@ const HOMES = {
   'view-buttons': 'bar',
   'bar-spacer': 'bar',
   'layout-buttons': 'bar',
-  'ask-status': 'bar',
+  // The Requests chip before the Session button, the panel under the bar and the visually hidden line it speaks through.
+  'requests-toggle': 'bar',
+  'requests-panel': 'chrome',
+  'requests-live': 'chrome',
   'midi-state': 'drawer',
   'midi-dots': 'drawer',
   'midi-state-text': 'drawer',
@@ -91,6 +95,9 @@ export const SIZED_FAMILIES = Object.freeze([
   { rule: '#view-buttons button', controls: ['1', '2', '3', '4', '5', '6'].map((key) => `#view-buttons button[data-key="${key}"]`) },
   { rule: '#layout-buttons button', controls: ['a', 'b', 'c'].map((key) => `#layout-buttons button[data-key="${key}"]`) },
   { rule: '#change-timing button', controls: ['now', 'bar', 'phrase'].map((value) => `#change-timing button[data-value="${value}"]`) },
+  { rule: '#requests-toggle', controls: ['#requests-toggle'] },
+  { rule: '.rq-row', controls: ['.rq-row'] },
+  { rule: '.rq-recent-head', controls: ['.rq-recent-head'] },
   { rule: '#session-button', controls: ['#session-button'] },
   { rule: '#strip-take-back', controls: ['#strip-take-back'] },
   { rule: '#take-back', controls: ['#take-back'] },
@@ -102,6 +109,9 @@ export const SIZED_FAMILIES = Object.freeze([
   { rule: '#page-requests-info', controls: ['#page-requests-info'] },
 ]);
 
+/** The sized controls the page builds while it runs (the rows of the Requests panel and its Recent header): the probe measures them when there are some. */
+export const DYNAMIC_CONTROLS = Object.freeze(['.rq-row', '.rq-recent-head']);
+
 /** Selectors of the controls that must be at least 24x24 px: every control of every family. */
 export const SIZED_CONTROLS = Object.freeze(SIZED_FAMILIES.flatMap((family) => family.controls));
 
@@ -111,7 +121,8 @@ export const WORST_CASE = Object.freeze({
   tempo: '118.5 → 1000.5 BPM',
   pending: 'Change in 12 bars',
   version: 'v12345 · from v12344',
-  askStatus: waitingText(12),
+  // The Requests chip's pill at two digits (the board holds at most 50 requests).
+  requests: '50',
   connection: CONNECTION_LABELS.refused,
   build: BUILD_MISMATCH_COPY.line,
   takeover: 'Moontide is playing in another tab',

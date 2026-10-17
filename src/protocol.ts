@@ -201,6 +201,13 @@ export type ChangeTiming = 'now' | 'bar' | 'phrase';
 export const MIN_PHRASE_CYCLES = 2;
 export const MAX_PHRASE_CYCLES = 64;
 
+/**
+ * The shortest and longest tempo ramp, in whole bars (one bar is one cycle), that set_code and edit_code accept with
+ * glideBars. page/tempo-glide.js mirrors both by hand (test/protocol.test.js checks both sides).
+ */
+export const MIN_GLIDE_BARS = 1;
+export const MAX_GLIDE_BARS = 64;
+
 /** The largest tempo the page may report in BPM; a bigger number is not music and the schema refuses it. */
 export const MAX_REPORTED_BPM = 100000;
 
@@ -209,7 +216,9 @@ export type ServerMessage =
   // `at` asks for the change to take over on the next bar or phrase line; absent or 'now' takes over
   // at once. page/main.js mirrors it by hand (parseTiming in page/change-timing.js).
   // `phraseCycles` (2 to 64) is the length of the phrase for at: 'phrase'; it is sent only with that timing.
-  | { type: 'evaluate'; id: string; code: string; at?: ChangeTiming; phraseCycles?: number }
+  // `glideBars` (1 to 64) asks for the tempo to move smoothly from the tempo that plays to the tempo the code sets over that
+  // many bars; it is sent only when Claude asked for a ramp.
+  | { type: 'evaluate'; id: string; code: string; at?: ChangeTiming; phraseCycles?: number; glideBars?: number }
   | { type: 'stop'; id: string }
   // The history id of the code the page has loaded; null when that code could not be saved
   // to history. Sent after every confirmed success and right after hello when a version is
@@ -251,6 +260,26 @@ export type ServerMessage =
   | { type: 'ask-result'; id: string; status: 'refused'; reason: AskRefusalReason; detail?: string }
   // Requests that were waiting have just been handed to Claude (a tool reply or a listener).
   | { type: 'ask-received'; ids: string[] }
+  // What became of a request after Claude received it. It goes only to the page that sent the request, never to
+  // another page, and each request only moves forward: started (Claude made a Moontide call after the
+  // request arrived), line (a change that answers it waits for its bar or phrase line, `at` says which),
+  // applied (that change plays, `version` is the history version it was recorded as, null when it could not
+  // be saved), failed (that change could not be evaluated, `reason` is the short evaluation message),
+  // replaced (a newer change took the place of the waiting one) and canceled (Stop or a closed page ended
+  // the wait). page/request-status.js mirrors these by hand.
+  | { type: 'ask-status'; id: string; state: 'started' }
+  | { type: 'ask-status'; id: string; state: 'line'; at: 'bar' | 'phrase' }
+  | { type: 'ask-status'; id: string; state: 'applied'; version: number | null }
+  | { type: 'ask-status'; id: string; state: 'failed'; reason: string }
+  | { type: 'ask-status'; id: string; state: 'replaced' | 'canceled' }
+  // Claude closed the request in words, without a change to the music: answered (it was answered) or
+  // declined (it will not or cannot be done). `answer` is the one sentence Claude gave, at most
+  // MAX_ANSWER_TEXT_LENGTH characters, cleaned of control characters by the server.
+  | { type: 'ask-status'; id: string; state: 'answered' | 'declined'; answer: string }
+  // The answer to ask-board-request, sent only to the page that asked and only if it presented the token: the
+  // requests whose page has gone and the ones that page sent itself, oldest first. A request of another page
+  // that is still connected is never listed. page/main.js mirrors it by hand.
+  | { type: 'ask-board'; requests: AskBoardEntry[] }
   // Whether page requests reach Claude live. Pushed to authenticated pages only,
   // right after ask-auth ok and whenever a listener connects or the connected one goes; live is true
   // while a listener is connected. It never carries a token. page/main.js mirrors it by hand.
@@ -293,6 +322,36 @@ export type ServerMessage =
   | { type: 'instrument-result'; id: string; ok: false; kind: 'refused' | 'write-failed'; reason: string }
   | { type: 'instrument-result'; id: string; ok: false; kind: 'invalid'; problems: RigProblem[]; more: number };
 
+/**
+ * One request on the board a reloaded page asks for. `text` is the start of what the user wrote (at most
+ * MAX_ASK_CONTEXT_LENGTH characters, an ellipsis when cut) and `chip` the chip the page sent; both are kept
+ * in server memory only. The ages say how long ago the request was sent and when its state last moved.
+ * `version` goes with applied, `at` with line, `reason` with failed, `answer` with answered and declined.
+ */
+export interface AskBoardEntry {
+  id: string;
+  text: string;
+  chip: string;
+  state:
+    | 'sent'
+    | 'waiting'
+    | 'received'
+    | 'started'
+    | 'line'
+    | 'applied'
+    | 'failed'
+    | 'replaced'
+    | 'canceled'
+    | 'answered'
+    | 'declined';
+  openedAgoMs: number;
+  newsAgoMs: number;
+  version?: number | null;
+  at?: 'bar' | 'phrase';
+  reason?: string;
+  answer?: string;
+}
+
 /** The line a waiting change takes over on, and about how many seconds away it is. */
 export interface PendingChange {
   cycle: number;
@@ -303,14 +362,30 @@ export interface PendingChange {
 export const LOAD_FAILED_SCRIPTS = ['strudel', 'acorn'] as const;
 export type LoadFailedScript = (typeof LOAD_FAILED_SCRIPTS)[number];
 
+/**
+ * What the page says about the tempo ramp of a change, in beats per minute and whole bars. page/main.js mirrors the
+ * shape by hand.
+ * - started: the change took over at once and a ramp began from the tempo that played;
+ * - at-line: the change waits for its line and its ramp starts there, from the tempo that plays then (the reply's
+ *   pending cycle is the line);
+ * - running: the change restated the target of a ramp that runs, which goes on; `nowBpm` is the tempo that plays now.
+ */
+export type GlideReport =
+  | { state: 'started'; fromBpm: number; toBpm: number; bars: number }
+  | { state: 'at-line'; toBpm: number; bars: number }
+  | { state: 'running'; nowBpm: number; toBpm: number };
+
 export type PageMessage =
   // `pending` is present when the change was checked and accepted but waits for a bar or phrase line:
   // the cycle it takes over on and about how many seconds away that is. The page sends `takeover` with the same
   // id when the line is audible; the server records the code it stored from this reply, so the message
   // carries only the id. page/main.js mirrors both by hand.
   // `bpm` is the tempo that plays after the change (the held tempo of a waiting change), in beats per minute.
-  | { type: 'evaluated'; id: string; ok: true; code: string; audio: AudioState; pending?: PendingChange; bpm?: number }
-  | { type: 'evaluated'; id: string; ok: false; code: string; error: string; line?: number }
+  // `glide` is present when the change started a tempo ramp.
+  | { type: 'evaluated'; id: string; ok: true; code: string; audio: AudioState; pending?: PendingChange; bpm?: number; glide?: GlideReport }
+  // `glideRefused` is true when the failure is a tempo ramp that could not be made (nothing plays, the code sets no
+  // tempo, or it sets the tempo that already plays): the call was refused whole and nothing changed.
+  | { type: 'evaluated'; id: string; ok: false; code: string; error: string; line?: number; glideRefused?: true }
   // evaluateId: the id of the Moontide evaluate request whose code was playing when this
   // error was raised; absent when that code came from a hand evaluation or the page's
   // reload replay. page/main.js mirrors this field by hand.
@@ -320,11 +395,18 @@ export type PageMessage =
   // is the evaluate id whose code was playing, like runtime-error's. page/main.js mirrors this shape by hand.
   | { type: 'structure-note'; lines: string[]; evaluateId?: string }
   | { type: 'stop-result'; id: string }
-  | { type: 'takeover'; id: string }
+  // `glideRuns` is true when the ramp the waiting change started at its line still runs as the message goes out; the server
+  // records an at-line ramp only then, so a ramp that did not start, or already ended, is never held as running.
+  | { type: 'takeover'; id: string; glideRuns?: true }
   // A waiting change will not take over: Stop canceled it, or a newer change replaced it. The page sends
   // it only for a change whose pending reply went out; a closing or superseded page sends nothing (the server
   // handles both). page/main.js mirrors it by hand.
   | { type: 'takeover-canceled'; id: string; reason: 'stop' | 'replaced' }
+  // A tempo ramp ended on its own: it finished, or a program stated another tempo or none, or a step failed. `bpm` is the
+  // tempo that plays after the end and is sent for every reason but 'finished'. The page sends nothing for Stop, for its
+  // own loss and for a ramp a new ramp replaced (the server learns the first two itself, and a replacing ramp comes in
+  // its own reply). page/main.js mirrors this by hand.
+  | { type: 'glide-ended'; reason: 'finished' | 'other-tempo' | 'no-tempo' | 'error'; bpm?: number }
   | { type: 'user-stopped' }
   | { type: 'hand-eval'; ok: true; code: string }
   | { type: 'hand-eval'; ok: false; error: string; line?: number }
@@ -342,6 +424,9 @@ export type PageMessage =
   // window; history-restore brings a past version back through the restore_version path.
   // page/main.js mirrors these shapes by hand.
   | { type: 'history-request' }
+  // Sent by the page after page-auth on every connection; answered with ask-board, only to a page that
+  // presented the token.
+  | { type: 'ask-board-request' }
   // Asked once per connection, right after page-auth and history-request; answered with
   // data-folder only to a connection that presented the page token. page/main.js mirrors it by hand.
   | { type: 'data-folder-request' }
@@ -420,6 +505,10 @@ export const MOMENT_BEATS = 4;
 
 // The most characters in a request id (the page makes the id up so answers can be matched).
 export const MAX_ASK_ID_LENGTH = 64;
+
+// The longest sentence Claude can close a page request with. The page shows it with an ellipsis in a
+// row and whole in the detail.
+export const MAX_ANSWER_TEXT_LENGTH = 200;
 
 // The kinds of thing a right-click can point at. The Jam view is
 // the source of 'note' (a pitch class with its role in the scale) and 'warning' (a chord that leaves it).
@@ -514,9 +603,10 @@ export type AskContext =
   | { kind: 'bus-param'; bus: 'reverb' | 'delay'; orbit: number; parameter: string; value: string }
   | { kind: 'part'; name: string; owner?: string }
   | { kind: 'lane'; track: string; cycle?: number }
-  // Whole cycles `from` to `to` (both included) of one lane; `section` is the section of `from` and `sectionTo` the section of
-  // `to` when it differs, both only for a piece with a song.
-  | { kind: 'range'; track: string; from: number; to: number; section?: string; sectionTo?: string }
+  // Whole cycles `from` to `to` (both included) of one lane; `sections` names the sections those cycles cross in playing order
+  // (a section played twice in a row once), only for a piece with a song, and `moreSections` counts the sections left out of
+  // the list so that it fits, only together with `sections`.
+  | { kind: 'range'; track: string; from: number; to: number; sections?: string[]; moreSections?: number }
   | { kind: 'note'; note: string; role?: 'root' | 'scale' | 'avoid' | 'outside' | 'off'; scale?: string }
   | { kind: 'warning'; chord: string; outside: string; avoid?: string; seconds: number; scale: string }
   // One cell of the Song grid: the section, the track and the variation it plays (or `rest: true` for a rest, with no
@@ -634,11 +724,14 @@ const askContextSchema = z.discriminatedUnion('kind', [
       track: askName,
       from: z.number().int().nonnegative(),
       to: z.number().int().nonnegative(),
-      section: askName.optional(),
-      sectionTo: askName.optional(),
+      sections: z.array(askName).min(1).max(MAX_RANGE_CYCLES).optional(),
+      moreSections: z.number().int().min(1).max(MAX_RANGE_CYCLES - 1).optional(),
     })
     .refine((range) => range.to >= range.from && range.to - range.from < MAX_RANGE_CYCLES, {
       message: `a range covers 1 to ${MAX_RANGE_CYCLES} whole cycles, to not before from`,
+    })
+    .refine((range) => range.moreSections === undefined || range.sections !== undefined, {
+      message: 'moreSections comes only with sections',
     }),
   // `note` is a pitch class name, never an octave, string or fret; `role` and `scale` are both present or
   // both absent (the page enforces that), absent while the scale is not clear.
@@ -687,6 +780,28 @@ const pendingChangeSchema = z.object({
   seconds: z.number().finite().nonnegative().max(MAX_PENDING_SECONDS),
 });
 
+const glideBpmSchema = z.number().finite().positive().max(MAX_REPORTED_BPM);
+
+// A discriminated union on `state` so a later state is one more member.
+const glideReportSchema = z.discriminatedUnion('state', [
+  z.object({
+    state: z.literal('started'),
+    fromBpm: glideBpmSchema,
+    toBpm: glideBpmSchema,
+    bars: z.number().int().min(MIN_GLIDE_BARS).max(MAX_GLIDE_BARS),
+  }),
+  z.object({
+    state: z.literal('at-line'),
+    toBpm: glideBpmSchema,
+    bars: z.number().int().min(MIN_GLIDE_BARS).max(MAX_GLIDE_BARS),
+  }),
+  z.object({
+    state: z.literal('running'),
+    nowBpm: glideBpmSchema,
+    toBpm: glideBpmSchema,
+  }),
+]);
+
 // A plain z.union (not discriminatedUnion): 'runtime-error' has no 'ok' field, so the
 // single-key discriminant used for the two 'evaluated' variants can't cover it.
 const pageMessageSchema = z.union([
@@ -698,10 +813,12 @@ const pageMessageSchema = z.union([
     audio: audioStateSchema,
     pending: pendingChangeSchema.optional(),
     bpm: z.number().finite().positive().max(MAX_REPORTED_BPM).optional(),
+    glide: glideReportSchema.optional(),
   }),
   z.object({
     type: z.literal('takeover'),
     id: z.string().min(1).max(64),
+    glideRuns: z.literal(true).optional(),
   }),
   z.object({
     type: z.literal('takeover-canceled'),
@@ -715,6 +832,12 @@ const pageMessageSchema = z.union([
     code: z.string(),
     error: z.string(),
     line: z.number().int().positive().optional(),
+    glideRefused: z.literal(true).optional(),
+  }),
+  z.object({
+    type: z.literal('glide-ended'),
+    reason: z.enum(['finished', 'other-tempo', 'no-tempo', 'error']),
+    bpm: glideBpmSchema.optional(),
   }),
   z.object({
     type: z.literal('runtime-error'),
@@ -761,6 +884,7 @@ const pageMessageSchema = z.union([
     label: z.string().min(1).max(MAX_MIXER_LABEL_LENGTH),
   }),
   z.object({ type: z.literal('history-request') }),
+  z.object({ type: z.literal('ask-board-request') }),
   z.object({ type: z.literal('data-folder-request') }),
   z.object({ type: z.literal('take-over') }),
   z.object({ type: z.literal('history-restore'), id: z.number().int().positive() }),

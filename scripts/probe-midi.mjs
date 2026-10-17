@@ -23,12 +23,37 @@
 //
 // Timeline edits: the check of timelineMidiBlocks() proves that a drum note of a rhythm lane is selected and dragged like any note,
 // with its ring on its row and the drums named in the sentence. It runs once before the final verdict of a full run, or alone with
-// `--only timeline`. These three are the only groups this script can run alone.
+// `--only timeline`.
+//
+// Tempo steps: the check of rampMidiBlocks() proves that the page's MIDI clock follows about 20 small tempo steps (100 to 120 BPM
+// while the code holds 120) with no hole, no doubled tick and 96 ticks in every cycle. The steps come from a driver this script
+// injects into its own browser tab (RAMP_DRIVER_SOURCE): a measurement tool, never page code, so nothing about it reaches the
+// user or Claude. It runs once before the final verdict of a full run, or alone with `--only ramp`. These four are the only
+// groups this script can run alone, besides `--only ramp-measure` (the same ramp measured with both drivers at three step spacings,
+// idle and busy) and `--only ramp-measure-late` (the hook on the query path with each step applied a little after its tick):
+// rampMeasureBlocks() prints one `probe:midi RAMP {...}` line per run, lasts minutes and is never part of a full run.
+//
+// The page's own ramp: after the permanent check above, the same group asks the page itself for a ramp up (100 to 120 BPM) and a
+// ramp down (120 to 100 BPM), each over 4 bars, with set_code and glideBars on the ramp piece. It checks that the reply says the
+// ramp, that the tempo is unchanged when the evaluation ends, that the steps only rise (or only fall) and end exactly on the code's
+// tempo, and that the clock follows the whole ramp with no hole, no doubled tick, 96 ticks in every cycle, no late send and one Start.
+//
+// A waiting change in a ramp: the same group arms a change at a bar line a quarter of the way up a steep ramp (80 to 160 BPM over 4
+// bars) and down again, with a sound change on an mt32 track, and checks that its setup is stamped between the old notes and the new, that
+// its countdown ends when the line is heard, that its reply says the right seconds and that the tempo at the line is on the ramp.
+//
+// Gestures in the middle of a ramp: `--only ramp-gestures` (also the tail of `--only ramp-measure`) starts the page's own ramp (set_code
+// with glideBars, 100 to 120 BPM over 8 bars) once for each point and makes one gesture in it: a Mixer fader drag, a Song grid cell
+// change, a Timeline note edit and a hand edit at a tenth, a quarter, half and nine tenths of the ramp and 1.5 s after its end, then a
+// hand edit and a Song grid section launch that wait for their bar line, and Stop followed by Play, all at half. It prints one
+// `probe:midi RAMP-GESTURE {...}` line per point and passes a point when every evaluation ended within one step of the ramp's course,
+// with no off-course tick, hole, doubled tick or late send. Never part of a full run.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CLOCK_NOTE_LEAD_MS, CLOCK_STAMPED_NOTE_SLACK_MS, CLOCK_START_LEAD_MS, CLOCK_TICKS_PER_CYCLE, CYCLIST_FIELDS } from '../page/midi-clock.js';
+import { glideCpsOf, glideStepAt, planGlide } from '../page/tempo-glide.js';
 import { INSTRUMENTS_COPY } from '../page/instruments-model.js';
 import { MIDI_COPY, MIDI_TITLE_PREFIX, fill, listNames, panicMessages } from '../page/midi-plan.js';
 import { MIXER_COPY } from '../page/mixer-model.js';
@@ -50,7 +75,9 @@ import {
   midiPortBackLine,
   midiPortUnpluggedLine,
 } from '../dist/midi-state.js';
+import { glideLine } from '../dist/mcp.js';
 import {
+  PROBE_VIEWPORT,
   ProbeCouldNotRun,
   askAt,
   askAtCoords,
@@ -69,10 +96,13 @@ import {
   makeCdp,
   openDrawer,
   parseArgs,
+  pickTiming,
+  playMusic,
   pollDevToolsPort,
   pressKey,
   reloadPage,
   removeTempDirs,
+  shotsFolder,
   sleep,
   spawnBrowser,
   MIXER_LIGHT_WATCH_START,
@@ -80,6 +110,7 @@ import {
   SONG_HELPER_TEXT,
   SONG_NOTE_LISTEN_START,
   SONG_NOTE_LISTEN_STOP,
+  TEMPO_TRACE_SOURCE,
   songHelperCode,
   songMidiOf,
   startServerAndClient,
@@ -693,13 +724,1116 @@ export async function timelineMidiBlocks(context) {
   }
 }
 
+/**
+ * Page-side text that installs `window.__rampProbe` in the probe's own browser tab: a tempo ramp driver. It is a measurement
+ * tool the probe and the bench inject into their own browser profile through the DevTools protocol; it is not page code and
+ * nobody else ever runs it.
+ *
+ * The ramp is a pure function of the music's cycle position, never of wall-clock time: it starts at the next whole cycle of the
+ * scheduler and step k (1 to `steps`) begins at a cycle boundary worked out so that consecutive steps are `spacingMs` apart at
+ * the tempo they play at. Step k plays `fromBpm + (toBpm - fromBpm) * k / steps`, so the last step lands on `toBpm`. A step
+ * is set through the scheduler's raw setter (the prototype's setCps), the one the page's tempo guard applies a tempo with, never
+ * through the guard's wrapper, which would record the step as the tempo of a program being evaluated.
+ *
+ * `start({ driver, fromBpm, toBpm, steps, spacingMs, busy })`: driver 'interval' wakes every `spacingMs`, reads the scheduler's
+ * position (`now()`) and applies the tempo of that position when it differs from the last one applied, so a late wake catches
+ * up instead of replaying steps. Driver 'query' wraps the `query` of the current pattern (and of every pattern handed to
+ * `setPattern`), and on a query of the scheduler's own slices (the ones that carry the scheduler's `_cps` control) queues a
+ * microtask that applies the tempo of the position `lastEnd`, where a new tempo starts; it never sets a tempo inside the query.
+ * `applyDelayMs` (query driver only, default 0) applies the step in a timer that many ms later instead of a microtask, so the
+ * anchor a step creates stays in place for a while before the next step replaces it. `busy` blocks the main thread 30 to 90 ms
+ * every 200 ms while the ramp runs. Every applied step is logged as
+ * `{ perf, cycle, plannedCycle, lastEnd, bpm, k, merged, landPerf, landed }`: `lastEnd` is the cycle the new tempo starts at,
+ * `merged` says the previous step had not been taken over by a scheduler tick yet, and `landPerf` is the performance time at
+ * which that cycle is heard, worked out from the scheduler's anchor and the audio clock once a tick has taken the step over
+ * (`landed` true), else a rough estimate; `landed` false means a 5 ms watcher never saw the anchor of that step, because the
+ * next step replaced it first. `state()` gives `{ done, log, errors, plan }` (`plan` holds the cycle each step begins at), done once the last step has been applied; the landing
+ * times keep being filled in until `stop()`.
+ */
+export const RAMP_DRIVER_SOURCE = `(() => {
+  if (window.__rampProbe) window.__rampProbe.stop();
+  const scheduler = document.getElementById('repl').editor.repl.scheduler;
+  const rawSetCps = Object.getPrototypeOf(scheduler).setCps;
+  if (typeof rawSetCps !== 'function') throw new Error('ramp driver: the scheduler has no setCps function on its prototype');
+  if (!Object.hasOwn(scheduler, 'setCps')) throw new Error('ramp driver: the scheduler has no own setCps, so the page tempo guard is not installed');
+  const cpsOf = (bpm) => bpm / 60 / 4;
+  let run = null;
+
+  const unhook = () => {
+    if (run === null) return;
+    if (run.timer !== null) clearInterval(run.timer);
+    if (run.busyTimer !== null) clearInterval(run.busyTimer);
+    run.timer = null;
+    run.busyTimer = null;
+    for (const [pattern, original] of run.wrapped) pattern.query = original;
+    run.wrapped.length = 0;
+    if (run.hooked) {
+      if (run.hadOwnSetPattern) scheduler.setPattern = run.originalSetPattern;
+      else delete scheduler.setPattern;
+      run.hooked = false;
+    }
+  };
+
+  const start = ({ driver, fromBpm, toBpm, steps, spacingMs, busy = false, applyDelayMs = 0 }) => {
+    if (driver !== 'interval' && driver !== 'query') throw new Error('ramp driver: driver must be interval or query');
+    if (!(steps >= 1) || !(spacingMs > 0) || !(fromBpm > 0) || !(toBpm > 0)) throw new Error('ramp driver: steps, spacingMs, fromBpm and toBpm must be above 0');
+    stop();
+    const startCycle = Math.ceil(scheduler.lastEnd);
+    const bpmOfStep = (k) => fromBpm + ((toBpm - fromBpm) * k) / steps;
+    const boundaries = [startCycle, startCycle];
+    for (let k = 2; k <= steps; k++) boundaries[k] = boundaries[k - 1] + (spacingMs / 1000) * cpsOf(bpmOfStep(k - 1));
+    const stepAt = (cycle) => {
+      let k = 0;
+      while (k < steps && boundaries[k + 1] <= cycle) k++;
+      return k;
+    };
+    run = { driver, steps, fromBpm, toBpm, boundaries, applied: 0, done: false, log: [], errors: [], timer: null, busyTimer: null, watcher: null, wrapped: [], hooked: false, hadOwnSetPattern: false, originalSetPattern: null };
+    const mine = run;
+    // A tick that takes a step over sets the scheduler's anchor (the cycle the new tempo starts at, and the audio time it is
+    // heard at, before the scheduler's latency). Seen between that tick and the next step, it gives the time the step is heard.
+    mine.watcher = setInterval(() => {
+      try {
+        if (scheduler.num_ticks_since_cps_change === 0) return;
+        const waiting = mine.log.filter((entry) => !entry.landed && entry.lastEnd === scheduler.num_cycles_at_cps_change);
+        if (waiting.length === 0) return;
+        const heardAt = performance.now() + (scheduler.seconds_at_cps_change + scheduler.latency - globalThis.getAudioContext().currentTime) * 1000 + 34;
+        for (const entry of waiting) {
+          entry.landPerf = heardAt;
+          entry.landed = true;
+        }
+      } catch (err) {
+        mine.errors.push(String(err && err.message ? err.message : err));
+      }
+    }, 5);
+    const apply = (k) => {
+      const oldCps = scheduler.cps;
+      const lastEnd = scheduler.lastEnd;
+      const cycle = scheduler.now();
+      const merged = scheduler.num_ticks_since_cps_change === 0;
+      const perf = performance.now();
+      rawSetCps.call(scheduler, cpsOf(bpmOfStep(k)));
+      // The new tempo starts at lastEnd, which is heard (lastEnd - now) cycles from now at the old tempo, plus the
+      // scheduler's latency and the 34 ms the page's clock adds to line its timestamps up.
+      const landPerf = perf + ((lastEnd - cycle) / oldCps + scheduler.latency) * 1000 + 34;
+      mine.log.push({ perf, cycle, plannedCycle: boundaries[k], lastEnd, bpm: bpmOfStep(k), k, merged, landPerf, landed: false });
+      mine.applied = k;
+      if (k === steps) {
+        mine.done = true;
+        unhook();
+      }
+    };
+    const guarded = (position) => {
+      try {
+        if (mine !== run || mine.done) return;
+        // A stopped scheduler asks for no step: a step that was waiting for its timer when the music stopped is dropped.
+        if (scheduler.started === false) return;
+        const k = stepAt(position());
+        if (k > mine.applied) apply(k);
+      } catch (err) {
+        mine.errors.push(String(err && err.message ? err.message : err));
+      }
+    };
+    if (driver === 'interval') {
+      mine.timer = setInterval(() => guarded(() => scheduler.now()), spacingMs);
+    } else {
+      let pending = false;
+      const wrap = (pattern) => {
+        if (pattern === null || typeof pattern !== 'object' || typeof pattern.query !== 'function') return;
+        if (mine.wrapped.some(([wrapped]) => wrapped === pattern)) return;
+        const original = pattern.query;
+        mine.wrapped.push([pattern, original]);
+        pattern.query = function (state) {
+          if (state && state.controls && state.controls._cps !== undefined && !pending && !mine.done) {
+            pending = true;
+            const apply = () => {
+              pending = false;
+              guarded(() => scheduler.lastEnd);
+            };
+            if (applyDelayMs > 0) setTimeout(apply, applyDelayMs);
+            else queueMicrotask(apply);
+          }
+          return original.call(this, state);
+        };
+      };
+      mine.hadOwnSetPattern = Object.hasOwn(scheduler, 'setPattern');
+      mine.originalSetPattern = scheduler.setPattern;
+      scheduler.setPattern = function (pattern, ...rest) {
+        wrap(pattern);
+        return mine.originalSetPattern.call(this, pattern, ...rest);
+      };
+      mine.hooked = true;
+      wrap(scheduler.pattern);
+    }
+    if (busy) {
+      mine.busyTimer = setInterval(() => {
+        const end = performance.now() + 60 * (0.5 + Math.random());
+        while (performance.now() < end) {}
+      }, 200);
+    }
+  };
+
+  const stop = () => {
+    unhook();
+    if (run !== null && run.watcher !== null) {
+      clearInterval(run.watcher);
+      run.watcher = null;
+    }
+  };
+
+  window.__rampProbe = {
+    set: (bpm) => rawSetCps.call(scheduler, cpsOf(bpm)),
+    start,
+    state: () => ({
+      done: run !== null && run.done,
+      log: run === null ? [] : run.log.slice(),
+      errors: run === null ? [] : run.errors.slice(),
+      plan: run === null ? null : { fromBpm: run.fromBpm, toBpm: run.toBpm, steps: run.steps, boundaries: run.boundaries.slice() },
+    }),
+    stop,
+  };
+})()`;
+
+const roundTo = (value, digits = 2) => Math.round(value * 10 ** digits) / 10 ** digits;
+
+/** The nominal distance between two clock ticks at `bpm`: 96 ticks per cycle, one cycle being four beats. */
+function nominalTickMs(bpm) {
+  return 2500 / bpm;
+}
+
+/**
+ * The numbers of a ramp from the fake device's send log (pure). `entries` is the log (`{ t, port, bytes, ts }`), `clockPort`
+ * the port of the clock instrument and `beatPort` the port of a track that plays one note on every cycle line. `steps` lists the
+ * steps of the ramp as `{ landPerf, bpm }` (the time each is heard, roughly), `fromBpm` is the tempo before the first, and
+ * `windowFrom` / `windowTo` bound the part of the log that is judged (a message counts at its requested timestamp, or at its send
+ * time when it asked for none). Returns:
+ * - `holes`: tick intervals above the nominal tick of the slowest tempo within 200 ms of them, plus 0.5 ms;
+ * - `doubled`: intervals below half the nominal tick of the fastest tempo within 200 ms of them;
+ * - `maxGapMs` / `minGapMs`: the largest and smallest interval within 200 ms of any step, with `perStep` per step;
+ * - `ticksPerCycle`: `{ cycles, counts, min, max }`, the ticks from the tick on one beat note to the tick on the next, for every whole
+ *   cycle in the window, and `beatOffsetMs`, how far each beat note sits from its tick (smallest and largest, tick minus note);
+ * - `late`: ticks sent after their own timestamp, or with none;
+ * - `aheadMs`: how far ahead of its send time a tick was queued (minimum and 5th percentile) before and during the ramp;
+ * - `starts`: Start messages on the clock port in the whole log.
+ */
+export function rampTickStats(entries, { clockPort, beatPort, steps, fromBpm, windowFrom = -Infinity, windowTo = Infinity }) {
+  const atOf = (entry) => (typeof entry.ts === 'number' ? entry.ts : entry.t);
+  const inWindow = (entry) => atOf(entry) >= windowFrom && atOf(entry) <= windowTo;
+  const onPort = (port) => entries.filter((entry) => entry.port === port);
+  const byAt = (a, b) => atOf(a) - atOf(b);
+  const isTick = (entry) => entry.bytes.length === 1 && entry.bytes[0] === 0xf8;
+  const isNoteOn = (entry) => entry.bytes.length === 3 && (entry.bytes[0] & 0xf0) === 0x90 && entry.bytes[2] > 0;
+  const ticks = onPort(clockPort).filter(isTick).sort(byAt).filter(inWindow);
+  const landed = [...steps].sort((a, b) => a.landPerf - b.landPerf);
+
+  const bpmsNear = (at, radius) => {
+    let before = fromBpm;
+    for (const step of landed) if (step.landPerf <= at - radius) before = step.bpm;
+    return [before, ...landed.filter((step) => step.landPerf > at - radius && step.landPerf <= at + radius).map((step) => step.bpm)];
+  };
+  const intervals = ticks.slice(1).map((tick, index) => ({ at: atOf(tick), ms: atOf(tick) - atOf(ticks[index]) }));
+  let holes = 0;
+  let doubled = 0;
+  for (const interval of intervals) {
+    const near = bpmsNear(interval.at, 200);
+    if (interval.ms > nominalTickMs(Math.min(...near)) + 0.5) holes++;
+    if (interval.ms < nominalTickMs(Math.max(...near)) / 2) doubled++;
+  }
+  const perStep = landed.map((step) => {
+    const around = intervals.filter((interval) => Math.abs(interval.at - step.landPerf) <= 200).map((interval) => interval.ms);
+    return around.length === 0 ? { max: null, min: null } : { max: roundTo(Math.max(...around)), min: roundTo(Math.min(...around)) };
+  });
+  const maxima = perStep.filter((step) => step.max !== null).map((step) => step.max);
+  const minima = perStep.filter((step) => step.min !== null).map((step) => step.min);
+
+  // A cycle runs from the tick that sits on one beat note to the tick that sits on the next, so a cycle's ticks are counted
+  // between those two ticks: a hole or a doubled tick changes the count, while a note stamped a fraction of a millisecond away
+  // from its own tick (the note and the tick are timed separately) does not move a tick from one cycle to the next.
+  const beats = onPort(beatPort).filter(isNoteOn).sort(byAt).filter(inWindow);
+  const nearestTick = (at) => {
+    let best = -1;
+    for (let index = 0; index < ticks.length; index++) if (best === -1 || Math.abs(atOf(ticks[index]) - at) < Math.abs(atOf(ticks[best]) - at)) best = index;
+    return best;
+  };
+  const beatTicks = ticks.length === 0 ? [] : beats.map((beat) => nearestTick(atOf(beat)));
+  const beatOffsets = beatTicks.map((tickIndex, index) => atOf(ticks[tickIndex]) - atOf(beats[index]));
+  const counts = beatTicks.slice(1).map((tickIndex, index) => tickIndex - beatTicks[index]);
+
+  const aheadOf = (list) => {
+    const values = list.map((tick) => tick.ts - tick.t).sort((a, b) => a - b);
+    return values.length === 0 ? { n: 0, min: null, p5: null } : { n: values.length, min: roundTo(values[0]), p5: roundTo(values[Math.floor(0.05 * (values.length - 1))]) };
+  };
+  const stamped = ticks.filter((tick) => typeof tick.ts === 'number');
+  const rampFrom = landed.length === 0 ? Infinity : landed[0].landPerf - 200;
+  const rampTo = landed.length === 0 ? -Infinity : landed.at(-1).landPerf + 200;
+
+  return {
+    ticks: ticks.length,
+    holes,
+    doubled,
+    maxGapMs: maxima.length === 0 ? null : Math.max(...maxima),
+    minGapMs: minima.length === 0 ? null : Math.min(...minima),
+    perStep,
+    ticksPerCycle: { cycles: counts.length, counts, min: counts.length === 0 ? null : Math.min(...counts), max: counts.length === 0 ? null : Math.max(...counts) },
+    beatOffsetMs: beatOffsets.length === 0 ? null : { min: roundTo(Math.min(...beatOffsets)), max: roundTo(Math.max(...beatOffsets)) },
+    late: ticks.filter((tick) => typeof tick.ts !== 'number' || tick.t > tick.ts).length,
+    aheadMs: { before: aheadOf(stamped.filter((tick) => tick.ts < rampFrom)), during: aheadOf(stamped.filter((tick) => tick.ts >= rampFrom && tick.ts <= rampTo)) },
+    starts: onPort(clockPort).filter((entry) => entry.bytes.length === 1 && entry.bytes[0] === 0xfa).length,
+  };
+}
+
+// The piece of the ramp checks: the code holds the target tempo (120 BPM), a silent track names the clock instrument on one
+// fake port and a track on the other port plays one note on every cycle line, which marks the cycles. The last track is a sine
+// far below what anyone hears (about -64 dB): a page that makes no sound at all has its audio output stopped by Chrome after
+// about 25 seconds, and from then on the clock's tick timestamps jitter by about 2 ms whatever the tempo does, which would hide
+// what a ramp does to them. That jitter is a property of a silent page, measured on its own, not of tempo steps.
+const RAMP_PIECE = `setcpm(120/4)\nclock: silence.midi('Fake Synth A', { midichannel: 2 })\nbeat: note("c3").midi('Fake Synth B', { midichannel: 1 })\nkeepalive: s("sine").gain(0.0006).slow(2)`;
+const RAMP_FROM_BPM = 100;
+const RAMP_TO_BPM = 120;
+const RAMP_STEPS = 20;
+// The longest a cycle lasts in these runs (100 BPM): a wait for a number of cycles gets a deadline sized from it.
+const RAMP_SLOWEST_CYCLE_MS = 2400;
+
+// How the permanent ramp check steps the tempo: the hook on the scheduler's query path, one step for each pair of scheduler ticks
+// (100 ms of music), applied 25 ms after the tick that found it. The scheduler takes a tempo over at its next tick and the
+// clock reads the scheduler every 10 ms, so a step set in the task of the tick that took the previous one over replaces that
+// takeover before the clock ever sees it; 25 ms later keeps every takeover in place for at least two clock passes.
+const RAMP_CHECK_RUN = Object.freeze({ driver: 'query', spacingMs: 100, applyDelayMs: 25 });
+
+const rampClockPorts = { clockPort: 'Fake Synth A', beatPort: 'Fake Synth B' };
+
+/** Writes the rig of the ramp checks (a clock instrument on port A, a plain one on port B), loads the page and plays the ramp piece
+ * until the clock instrument's Start is out. Returns the rig file to remove afterwards. */
+async function startRampPiece({ cdp, client, setScenario, dataDir }) {
+  const rigFile = path.join(dataDir, 'instruments.json');
+  fs.writeFileSync(
+    rigFile,
+    JSON.stringify({
+      instruments: [
+        { id: 'seq', model: 'mt32', port: 'Fake Synth A', clock: true },
+        { id: 'sc55', model: 'sc55', port: 'Fake Synth B' },
+      ],
+    }),
+  );
+  await setScenario({ permission: 'granted' });
+  await callTool(client, 'set_code', { code: RAMP_PIECE, label: 'probe:midi ramp piece' });
+  const started = await waitFor(cdp, `window.__midiLog.some((e) => e.port === 'Fake Synth A' && e.bytes.length === 1 && e.bytes[0] === 0xfa) ? true : null`, 15000);
+  if (started !== true) throw new ProbeCouldNotRun('the clock instrument got no Start within 15 seconds of the ramp piece');
+  await evaluateExpr(cdp, RAMP_DRIVER_SOURCE);
+  return rigFile;
+}
+
+/**
+ * One ramp in the running ramp piece: sets `fromBpm` at once, waits two cycles, ramps to `toBpm` in `steps` steps `spacingMs`
+ * apart with `driver`, waits two more cycles and reads the numbers. Waits are for the beat track's notes, one per cycle: two
+ * whole cycles are three notes after the mark. Returns `{ stats, log, errors, stepErrors }`.
+ */
+/** Waits for two whole cycles of the ramp piece: three beat notes after the mark. */
+async function waitTwoRampCycles(cdp, what) {
+  const mark = await evaluateExpr(cdp, 'window.__midiLog.length');
+  const beatsAfter = `(() => { const n = window.__midiLog.slice(${mark}).filter((e) => e.port === 'Fake Synth B' && e.bytes.length === 3 && (e.bytes[0] & 0xf0) === 0x90 && e.bytes[2] > 0).length; return n >= 3 ? true : null; })()`;
+  if ((await waitFor(cdp, beatsAfter, 4 * RAMP_SLOWEST_CYCLE_MS + 5000)) !== true) throw new ProbeCouldNotRun(`two cycles of beat notes did not arrive ${what}`);
+}
+
+async function runOneRamp(cdp, { driver, spacingMs, busy = false, applyDelayMs = 0, fromBpm = RAMP_FROM_BPM, toBpm = RAMP_TO_BPM, steps = RAMP_STEPS }) {
+  const waitTwoCycles = (what) => waitTwoRampCycles(cdp, what);
+  await evaluateExpr(cdp, `window.__rampProbe.set(${fromBpm})`);
+  await waitTwoCycles('after the ramp start tempo was set');
+  const windowFrom = await evaluateExpr(cdp, 'performance.now()');
+  await evaluateExpr(cdp, `window.__rampProbe.start(${JSON.stringify({ driver, fromBpm, toBpm, steps, spacingMs, busy, applyDelayMs })})`);
+  // The ramp begins at the next whole cycle (at most one slow cycle away) and lasts about steps * spacingMs.
+  const done = await waitFor(cdp, `window.__rampProbe.state().done ? true : null`, steps * spacingMs + RAMP_SLOWEST_CYCLE_MS + 5000);
+  if (done !== true) throw new ProbeCouldNotRun(`the ${driver} ramp driver did not apply its last step within ${steps * spacingMs + RAMP_SLOWEST_CYCLE_MS + 5000} ms`);
+  await waitTwoCycles('after the last step');
+  const windowTo = (await evaluateExpr(cdp, 'performance.now()')) - 500;
+  const { log, errors } = await evaluateExpr(cdp, 'window.__rampProbe.state()');
+  await evaluateExpr(cdp, 'window.__rampProbe.stop()');
+  const entries = await evaluateExpr(cdp, 'window.__midiLog');
+  const stats = rampTickStats(entries, { ...rampClockPorts, steps: log.map((step) => ({ landPerf: step.landPerf, bpm: step.bpm })), fromBpm, windowFrom, windowTo });
+  const stepErrors = log.map((step) => step.lastEnd - step.plannedCycle);
+  return { stats, log, errors, stepErrors };
+}
+
+/**
+ * The clock under about 20 tempo steps, in the real page: the code holds 120 BPM, the probe's own driver steps the tempo from 100
+ * to 120 BPM, and the fake device's log shows whether the clock's ticks followed with no hole, no doubled tick and 96 ticks in
+ * every cycle. The driver is the probe's measurement tool, never page code. `setScenario` reloads the page with a fresh fake
+ * device, `dataDir` is the server's data folder.
+ */
+export async function rampMidiBlocks(context) {
+  const { cdp, client, report } = context;
+  let rigFile = null;
+  try {
+    rigFile = await startRampPiece(context);
+    const { stats, log, errors, stepErrors } = await runOneRamp(cdp, RAMP_CHECK_RUN);
+    const detail = { ...RAMP_CHECK_RUN, applied: log.length, anchorsSeen: log.filter((step) => step.landed).length, driverErrors: errors, stepErrorMaxCycles: stepErrors.length === 0 ? null : roundTo(Math.max(...stepErrors.map(Math.abs)), 3), maxGapMs: stats.maxGapMs, minGapMs: stats.minGapMs, holes: stats.holes, doubled: stats.doubled, ticksPerCycle: { cycles: stats.ticksPerCycle.cycles, min: stats.ticksPerCycle.min, max: stats.ticksPerCycle.max }, late: stats.late, starts: stats.starts };
+    report(
+      'ramp: the clock follows about 20 tempo steps with no hole, no doubled tick and 96 ticks in every cycle',
+      log.length >= 18 &&
+        errors.length === 0 &&
+        stats.holes === 0 &&
+        stats.doubled === 0 &&
+        stats.ticksPerCycle.cycles >= 2 &&
+        stats.ticksPerCycle.min === CLOCK_TICKS_PER_CYCLE &&
+        stats.ticksPerCycle.max === CLOCK_TICKS_PER_CYCLE &&
+        stats.starts === 1,
+      JSON.stringify(detail),
+    );
+    await pageRampBlocks(context);
+    await waitingRampBlocks(context);
+  } finally {
+    await evaluateExpr(cdp, 'window.__rampProbe && window.__rampProbe.stop()');
+    await evaluateExpr(cdp, 'window.__tempoTrace && window.__tempoTrace.stop()');
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi ramp done' });
+    if (rigFile !== null) fs.rmSync(rigFile, { force: true });
+  }
+}
+
+// How long the page's own ramp lasts in the checks below, in bars.
+const PAGE_RAMP_BARS = 4;
+
+/**
+ * The page's own ramp, asked for with set_code and glideBars on the running ramp piece: from 100 to 120 BPM, then back from
+ * 120 to 100 BPM. One check for each direction. The steps are the changes of the scheduler's tempo after the evaluation ended
+ * (the tempo trace of the gesture runs), with the time each is heard at. Needs the piece of startRampPiece to be playing.
+ */
+async function pageRampBlocks({ cdp, client, report }) {
+  await evaluateExpr(cdp, 'window.__rampProbe.stop()');
+  const cpsOfBpm = (bpm) => bpm / 4 / 60;
+  const pieceAt = (bpm) => RAMP_PIECE.replace('setcpm(120/4)', `setcpm(${bpm}/4)`);
+  // The piece at 100 BPM first, at once, so the first ramp has something to leave from.
+  await callTool(client, 'set_code', { code: pieceAt(RAMP_FROM_BPM), label: 'probe:midi page ramp start tempo' });
+  await waitTwoRampCycles(cdp, 'after the start tempo of the page ramp was set');
+  await evaluateExpr(cdp, TEMPO_TRACE_SOURCE);
+  for (const [name, fromBpm, toBpm] of [
+    ['up', RAMP_FROM_BPM, RAMP_TO_BPM],
+    ['down', RAMP_TO_BPM, RAMP_FROM_BPM],
+  ]) {
+    await evaluateExpr(cdp, 'window.__tempoTrace.clear()');
+    const target = cpsOfBpm(toBpm);
+    const reply = await callTool(client, 'set_code', { code: pieceAt(toBpm), label: `probe:midi page ramp ${name}`, glideBars: PAGE_RAMP_BARS });
+    const arrived = await waitFor(cdp, `document.getElementById('repl').editor.repl.scheduler.cps === ${target} ? true : null`, 60000);
+    if (arrived !== true) throw new ProbeCouldNotRun(`the page's own ramp ${name} did not reach the code's tempo within 60 seconds`);
+    await waitTwoRampCycles(cdp, `after the page ramp ${name} ended`);
+    const windowTo = (await evaluateExpr(cdp, 'performance.now()')) - 500;
+    const events = await evaluateExpr(cdp, 'window.__tempoTrace.events()');
+    const entries = await evaluateExpr(cdp, 'window.__midiLog');
+    const start = events.find((event) => event.kind === 'eval-start');
+    const end = events.find((event) => event.kind === 'eval-end' && start !== undefined && event.perf > start.perf);
+    if (start === undefined || end === undefined) throw new ProbeCouldNotRun(`the tempo trace saw no whole evaluation for the page's own ramp ${name}`);
+    const steps = events.filter((event) => event.kind === 'cps' && event.perf > end.perf);
+    const direction = toBpm > fromBpm ? 1 : -1;
+    const monotonic = steps.every((step, index) => direction * (step.cps - (index === 0 ? end.cps : steps[index - 1].cps)) > 0);
+    const plan = planGlide({ fromCps: cpsOfBpm(fromBpm), toCps: target, bars: PAGE_RAMP_BARS, startCycle: 0 });
+    const stats = rampTickStats(entries, { ...rampClockPorts, steps: steps.map((step) => ({ landPerf: step.landPerf, bpm: step.cps * 240 })), fromBpm, windowFrom: end.perf, windowTo });
+    const expectedLine = glideLine({ state: 'started', fromBpm, toBpm, bars: PAGE_RAMP_BARS });
+    const detail = {
+      reply: reply.split('\n').find((line) => line.startsWith('Tempo ramp')) ?? null,
+      cpsAtStart: start.cps,
+      cpsAtEnd: end.cps,
+      steps: steps.length,
+      plannedSteps: plan.steps,
+      lastStepCps: steps.length === 0 ? null : steps.at(-1).cps,
+      target,
+      holes: stats.holes,
+      doubled: stats.doubled,
+      ticksPerCycle: { cycles: stats.ticksPerCycle.cycles, min: stats.ticksPerCycle.min, max: stats.ticksPerCycle.max },
+      late: stats.late,
+      starts: stats.starts,
+    };
+    report(
+      `ramp: the page's own ramp ${name} (${fromBpm} to ${toBpm} BPM over ${PAGE_RAMP_BARS} bars) leaves the tempo as it was, ends exactly on the code's tempo and the clock follows it whole`,
+      reply.includes(expectedLine) &&
+        end.cps === start.cps &&
+        steps.length >= 10 &&
+        steps.length <= plan.steps &&
+        monotonic &&
+        steps.at(-1).cps === target &&
+        stats.holes === 0 &&
+        stats.doubled === 0 &&
+        stats.ticksPerCycle.cycles >= 3 &&
+        stats.ticksPerCycle.min === CLOCK_TICKS_PER_CYCLE &&
+        stats.ticksPerCycle.max === CLOCK_TICKS_PER_CYCLE &&
+        stats.late === 0 &&
+        stats.starts === 1,
+      JSON.stringify(detail),
+    );
+  }
+}
+
+// How many steps from the course the tempo at the end of an evaluation (or at a line) may be: the ramp is read at the scheduler's
+// frontier, which runs a step or so ahead of the last step the page has set.
+const COURSE_STEPS = 1;
+
+/**
+ * Where the plan has the tempo at the cycle `lastEnd` (the scheduler's frontier, the position the page reads a ramp at) and how
+ * many steps `bpm` is from it (pure): `{ courseBpm, stepsOff }`.
+ */
+function courseDistance(plan, bpm, lastEnd) {
+  const bpmOf = (cps) => roundTo(cps * 240, 3);
+  const courseStep = glideStepAt(plan, lastEnd);
+  const stepOf = ((bpm - bpmOf(plan.fromCps)) / (bpmOf(plan.toCps) - bpmOf(plan.fromCps))) * plan.steps;
+  return { courseBpm: bpmOf(glideCpsOf(plan, courseStep)), stepsOff: roundTo(Math.abs(stepOf - courseStep), 2) };
+}
+
+/**
+ * Page-side watcher of the countdown of a waiting change (probe text, never page code): `#pending-change` is shown while a change
+ * waits and hidden when its line is heard, so each time it is hidden the watcher records `{ perf, cps, lastEnd }` (the
+ * scheduler's tempo and the cycle a new tempo would start at). `samples()` gives the list and `stop()` removes the observer.
+ */
+const LINE_WATCH_SOURCE = `(() => {
+  if (window.__lineWatch) window.__lineWatch.stop();
+  const scheduler = document.getElementById('repl').editor.repl.scheduler;
+  const element = document.getElementById('pending-change');
+  const samples = [];
+  let shown = !element.hidden;
+  const observer = new MutationObserver(() => {
+    const now = !element.hidden;
+    if (shown && !now) samples.push({ perf: performance.now(), cps: scheduler.cps, lastEnd: scheduler.lastEnd });
+    shown = now;
+  });
+  observer.observe(element, { attributes: true, attributeFilter: ['hidden'] });
+  window.__lineWatch = { samples: () => samples.slice(), stop: () => { observer.disconnect(); delete window.__lineWatch; } };
+})()`;
+
+// A steep ramp for the waiting-change check: 80 to 160 BPM and back, over 4 bars, so a countdown worked out at one tempo is
+// visibly wrong.
+const WAITING_BARS = 4;
+const WAITING_LOW_BPM = 80;
+const WAITING_HIGH_BPM = 160;
+
+/**
+ * A change armed at a bar line while the page's own ramp runs, a quarter of the way in, going up (80 to 160 BPM) and then down:
+ * the ramp piece with an mt32 track whose sound changes in the waiting change. One check for each direction: the program change
+ * for the new sound is stamped between the last note of the old code and the first note of the new and was sent before its stamp;
+ * the countdown (#pending-change) ends no earlier than 50 ms before the first new note is heard; the reply's seconds to the line
+ * are within 0.15 s of the measured time from the reply to that note (the estimate at one tempo is printed beside it); and the
+ * tempo at the line is on the ramp's course. Needs the piece of startRampPiece to be playing, and the tempo trace to be injected.
+ */
+async function waitingRampBlocks({ cdp, client, report }) {
+  const pieceAt = (bpm, sound, pitch) =>
+    `${RAMP_PIECE.replace('setcpm(120/4)', `setcpm(${bpm}/4)`)}\nmt32: note("${pitch}*4").midi('Fake Synth A', { midichannel: 3, sound: '${sound}' })`;
+  const noteOn = (pitch) => (entry) => entry.port === 'Fake Synth A' && entry.bytes.length === 3 && entry.bytes[0] === 0x92 && entry.bytes[1] === pitch && entry.bytes[2] > 0 && typeof entry.ts === 'number';
+  for (const [name, fromBpm, toBpm] of [
+    ['up', WAITING_LOW_BPM, WAITING_HIGH_BPM],
+    ['down', WAITING_HIGH_BPM, WAITING_LOW_BPM],
+  ]) {
+    await callTool(client, 'set_code', { code: pieceAt(fromBpm, 'Str Sect 1', 'c3'), label: `probe:midi waiting ramp ${name} start tempo` });
+    await waitTwoRampCycles(cdp, `after the start tempo of the waiting change ramp ${name} was set`);
+    await evaluateExpr(cdp, 'window.__tempoTrace.clear()');
+    await evaluateExpr(cdp, LINE_WATCH_SOURCE);
+    const rampReply = await callTool(client, 'set_code', { code: pieceAt(toBpm, 'Str Sect 1', 'c3'), label: `probe:midi waiting ramp ${name}`, glideBars: WAITING_BARS });
+    const startEvents = await waitFor(
+      cdp,
+      `(() => { const e = window.__tempoTrace.events(); const s = e.find((x) => x.kind === 'eval-start'); const end = e.find((x) => x.kind === 'eval-end'); return s && end ? { start: s, end } : null; })()`,
+      5000,
+    );
+    if (startEvents === null) throw new ProbeCouldNotRun(`the tempo trace saw no whole evaluation for the ramp ${name} of the waiting change`);
+    const plan = planGlide({ fromCps: startEvents.start.cps, toCps: toBpm / 4 / 60, bars: WAITING_BARS, startCycle: startEvents.end.lastEnd });
+    // A quarter of the ramp: the scheduler's frontier has moved a bar past the ramp's start.
+    const quarter = await waitFor(cdp, `window.__tempoTrace.events().some((e) => e.kind === 'cps' && e.perf > ${startEvents.end.perf} && e.lastEnd - ${plan.startCycle} >= ${WAITING_BARS / 4}) ? true : null`, 20000);
+    if (quarter !== true) throw new ProbeCouldNotRun(`the ramp ${name} of the waiting change did not get a quarter of the way`);
+    const mark = await evaluateExpr(cdp, 'window.__midiLog.length');
+    const reply = await callTool(client, 'set_code', { code: pieceAt(toBpm, 'Harpsi 2', 'd3'), label: `probe:midi waiting change in a ramp ${name}`, at: 'bar' });
+    const facts = await readSchedulerFacts(cdp);
+    const cycle = cycleOfReply(reply);
+    const seconds = secondsOfReply(reply);
+    if (cycle === null || seconds === null) {
+      report(`ramp: a bar change armed a quarter of the way ${name} a steep ramp (${fromBpm} to ${toBpm} BPM over ${WAITING_BARS} bars) sends its setup before its line, ends its countdown at the line and says the right seconds`, false, `the reply has no cycle or seconds: ${JSON.stringify(reply.slice(0, 300))}`);
+      continue;
+    }
+    const sampled = await waitFor(cdp, 'window.__lineWatch.samples().length > 0 ? window.__lineWatch.samples()[0] : null', 30000);
+    if (sampled === null) throw new ProbeCouldNotRun(`the countdown of the waiting change in the ramp ${name} never ended`);
+    await sleep(2500);
+    const log = (await evaluateExpr(cdp, 'window.__midiLog')).slice(mark);
+    const newOns = log.filter(noteOn(50));
+    const oldOns = log.filter(noteOn(48));
+    const firstNew = newOns.length === 0 ? null : Math.min(...newOns.map((entry) => entry.ts));
+    const lastOld = firstNew === null ? null : Math.max(...oldOns.filter((entry) => entry.ts < firstNew).map((entry) => entry.ts));
+    const program = programChangesA(log);
+    const change = program[0];
+    const repliedAtMs = facts.perf;
+    const measuredS = firstNew === null ? null : (firstNew - repliedAtMs) / 1000;
+    const estimateS = (lineEstimateMs(facts, cycle) - facts.perf) / 1000;
+    const course = courseDistance(plan, Math.round(sampled.cps * 240 * 1000) / 1000, sampled.lastEnd);
+    const detail = {
+      line: cycle,
+      replySeconds: seconds,
+      measuredSeconds: measuredS === null ? null : roundTo(measuredS, 2),
+      oneSegmentEstimateSeconds: roundTo(estimateS, 2),
+      programChanges: program.length,
+      programSentMsBeforeItsStamp: change === undefined ? null : roundTo(change.ts - change.t, 1),
+      programStampAfterLastOldNoteMs: change === undefined || lastOld === null ? null : roundTo(change.ts - lastOld, 1),
+      programStampBeforeFirstNewNoteMs: change === undefined || firstNew === null ? null : roundTo(firstNew - change.ts, 1),
+      countdownEndedMsBeforeFirstNewNote: firstNew === null ? null : roundTo(firstNew - sampled.perf, 1),
+      tempoAtLineBpm: roundTo(sampled.cps * 240, 3),
+      courseBpm: course.courseBpm,
+      stepsOff: course.stepsOff,
+      rampReply: rampReply.split('\n').find((line) => line.startsWith('Tempo ramp')) ?? null,
+    };
+    console.log(`probe:midi RAMP-WAITING ${JSON.stringify(detail)}`);
+    report(
+      `ramp: a bar change armed a quarter of the way ${name} a steep ramp (${fromBpm} to ${toBpm} BPM over ${WAITING_BARS} bars) sends its setup before its line, ends its countdown at the line and says the right seconds`,
+      program.length === 1 &&
+        firstNew !== null &&
+        lastOld !== null &&
+        Number.isFinite(lastOld) &&
+        change.ts >= lastOld &&
+        change.ts <= firstNew &&
+        change.t < change.ts &&
+        sampled.perf >= firstNew - 50 &&
+        Math.abs(seconds - measuredS) <= 0.15 &&
+        course.stepsOff <= COURSE_STEPS,
+      JSON.stringify(detail),
+    );
+  }
+  await evaluateExpr(cdp, 'window.__lineWatch && window.__lineWatch.stop()');
+}
+
+// The runs of `--only ramp-measure`: both drivers at three step spacings with the page idle, then the interval driver again
+// with the main thread busy.
+const RAMP_MEASURE_RUNS = Object.freeze([
+  ...['interval', 'query'].flatMap((driver) => [50, 75, 100].map((spacingMs) => ({ driver, spacingMs, busy: false }))),
+  ...[50, 75, 100].map((spacingMs) => ({ driver: 'interval', spacingMs, busy: true })),
+]);
+// The runs of `--only ramp-measure-late`: the hook on the query path, each step applied 25 ms after the tick that found it
+// (outside the tick's own task) instead of right after it.
+const RAMP_LATE_RUNS = Object.freeze([
+  { driver: 'query', spacingMs: 100, busy: false, applyDelayMs: 25 },
+  { driver: 'query', spacingMs: 100, busy: true, applyDelayMs: 25 },
+  { driver: 'query', spacingMs: 75, busy: false, applyDelayMs: 25 },
+  { driver: 'query', spacingMs: 50, busy: false, applyDelayMs: 25 },
+]);
+
+/**
+ * The measurement behind the ramp check: each run of `runs` ramps the tempo in the running ramp piece and prints one
+ * `probe:midi RAMP {...}` line with how far the steps landed from their planned cycle (signed median and largest absolute, in
+ * cycles), `anchorsSeen` (the steps whose tempo anchor a 5 ms watcher saw before the next step replaced it), the largest and
+ * smallest tick interval around the steps, holes, doubled ticks, ticks per cycle, late sends, how far ahead ticks were queued and
+ * the Starts seen. The numbers are the result, judged by whoever reads them; a run passes when it applied at least half of the
+ * steps without a driver error and printed its line (a driver that cannot step as fast as asked is a result, not a failure). It
+ * lasts minutes, so it only runs alone (`--only ramp-measure`, or `--only ramp-measure-late`), never in a full run.
+ */
+export async function rampMeasureBlocks(context, runs = RAMP_MEASURE_RUNS) {
+  const { cdp, client, report } = context;
+  let rigFile = null;
+  try {
+    rigFile = await startRampPiece(context);
+    for (const run of runs) {
+      const load = run.busy ? 'busy' : 'idle';
+      const late = run.applyDelayMs ? `, applied ${run.applyDelayMs} ms late` : '';
+      const { stats, log, errors, stepErrors } = await runOneRamp(cdp, run);
+      const sortedErrors = [...stepErrors].sort((a, b) => a - b);
+      const line = {
+        driver: run.driver,
+        ...(run.applyDelayMs ? { applyDelayMs: run.applyDelayMs } : {}),
+        spacingMs: run.spacingMs,
+        load,
+        steps: log.length,
+        merged: log.filter((step) => step.merged).length,
+        anchorsSeen: log.filter((step) => step.landed).length,
+        stepErrorCycles: sortedErrors.length === 0 ? null : { p50: roundTo(sortedErrors[Math.floor((sortedErrors.length - 1) / 2)], 3), max: roundTo(Math.max(...sortedErrors.map(Math.abs)), 3) },
+        maxGapMs: stats.maxGapMs,
+        minGapMs: stats.minGapMs,
+        holes: stats.holes,
+        doubled: stats.doubled,
+        ticksPerCycle: { cycles: stats.ticksPerCycle.cycles, min: stats.ticksPerCycle.min, max: stats.ticksPerCycle.max },
+        late: stats.late,
+        aheadMs: stats.aheadMs,
+        starts: stats.starts,
+        driverErrors: errors,
+      };
+      console.log(`probe:midi RAMP ${JSON.stringify(line)}`);
+      report(`ramp-measure: ${run.driver} at ${run.spacingMs} ms (${load}${late}) was measured`, log.length >= RAMP_STEPS / 2 && errors.length === 0, JSON.stringify({ steps: log.length, driverErrors: errors }));
+    }
+  } finally {
+    await evaluateExpr(cdp, 'window.__rampProbe && window.__rampProbe.stop()');
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi ramp measure done' });
+    if (rigFile !== null) fs.rmSync(rigFile, { force: true });
+  }
+  // The gestures of the same group come after the clock runs (the delayed-hook follow-up leaves them out).
+  if (runs === RAMP_MEASURE_RUNS) await rampGestureBlocks(context);
+}
+
+/** The cycle a reply says a waiting change takes over on, or null. */
+function cycleOfReply(reply) {
+  const match = /takes over at cycle (\d+)/.exec(reply);
+  return match === null ? null : Number(match[1]);
+}
+
+/** The seconds a reply says a waiting change takes over in, or null. */
+function secondsOfReply(reply) {
+  const match = /in about (\d+(?:\.\d+)?) s/.exec(reply);
+  return match === null ? null : Number(match[1]);
+}
+
+/** One reading of the page's scheduler: the time, the cycle position, the tempo and the latency. */
+function readSchedulerFacts(cdp) {
+  return evaluateExpr(cdp, `(() => { const s = document.getElementById('repl').editor.repl.scheduler; return { perf: performance.now(), now: s.now(), cps: s.cps, latency: s.latency }; })()`);
+}
+
+/** The performance.now() time the line is heard at, estimated from one reading of the scheduler at one tempo (good to tens of ms). */
+const lineEstimateMs = (facts, cycle) => facts.perf + ((cycle - facts.now) / facts.cps + facts.latency) * 1000;
+
+/** The program changes on the first fake port's channel 3. */
+const programChangesA = (entries) => entries.filter((entry) => entry.port === 'Fake Synth A' && entry.bytes.length === 2 && entry.bytes[0] === 0xc2);
+
+/** The tempo the gesture pieces set in their code (120 BPM) and the ramp each gesture lands in: the page's own, from 100 to 120 BPM over 8 bars. */
+const GESTURE_CODE_CPS = 0.5;
+const GESTURE_RAMP = Object.freeze({ fromBpm: 100, toBpm: 120, bars: 8 });
+// How far from the ramp's course (in BPM) a tick's own tempo has to be to count as off course: far above the jitter of a tick
+// interval (about 0.1 ms of 21 ms, half a BPM) and far below the jump a gesture would make if it left the target tempo in place.
+const OFF_COURSE_BPM = 2;
+// Where in the ramp each gesture is made: a tenth, a quarter, half, nine tenths, and about 1.5 s after its end.
+const GESTURE_POINTS = Object.freeze([0.1, 0.25, 0.5, 0.9, 1]);
+
+/**
+ * What one gesture did to the tempo and the clock (pure), judged against the page's own ramp. `events` is the tempo trace of the
+ * run (tempo changes with `lastEnd`, the cycle a new tempo starts at, and the start and end of every evaluation, also with
+ * `lastEnd`), `entries` the fake device's send log, `markPerf` the time the gesture began at and `plan` the ramp's plan from
+ * planGlide (its start cycle is the position the ramp started at). The ramp's steps are the tempo changes outside an evaluation:
+ * a tempo set inside one is the program's own, which the page takes back in the same task. `lines` lists what was read when a
+ * waiting change's line passed (`{ perf, cps, lastEnd }`). Returns null when the page ran no evaluation after the mark. Fields:
+ * - `at`: how far the ramp had got (steps set before the first evaluation, of all steps);
+ * - `evaluations`: for each evaluation that began after the mark, `{ ms, bpmBefore, bpmAtEnd, courseBpm, stepsOff, snapped }`:
+ *   the tempo when it began and when it ended, the tempo the plan has at the cycle where it ended, how many steps apart the two
+ *   are, and whether the program's tempo was set inside it (the snap, taken back in the same task) -- or `ended: false` when it
+ *   never ended; `evaluationsOnCourse` is true when every one ended and is within COURSE_STEPS of the course;
+ * - `lines`: the same for each sample taken at a line, `{ bpmAtLine, courseBpm, stepsOff }`; `linesOnCourse` likewise;
+ * - `offCourseTicks`, `heardMs`, `peakOffCourseBpm`, `earlyMs`: from the clock's ticks, how many intervals were more than
+ *   OFF_COURSE_BPM from the step heard there, how long they ran, the largest distance, and by how many milliseconds in all those
+ *   ticks came earlier than the course would have placed them;
+ * - `holes`, `doubled`, `ticks`, `late`: the tick statistics of the window around the gesture.
+ */
+export function rampGestureReading({ events, entries, markPerf, plan, clockPort, lines = [] }) {
+  const bpmOf = (cps) => roundTo(cps * 240, 3);
+  const fromBpm = bpmOf(plan.fromCps);
+  const starts = events.filter((event) => event.kind === 'eval-start');
+  const ends = events.filter((event) => event.kind === 'eval-end');
+  const windows = starts.map((start, index) => ({ start, end: ends[index] ?? null }));
+  const inEvaluation = (perf) => windows.some((window) => perf >= window.start.perf && (window.end === null || perf <= window.end.perf));
+  const steps = events.filter((event) => event.kind === 'cps' && !inEvaluation(event.perf));
+  const mine = windows.filter((window) => window.start.perf >= markPerf);
+  if (mine.length === 0) return null;
+  const judge = (bpm, lastEnd) => courseDistance(plan, bpm, lastEnd);
+  const evaluations = mine.map((window) => {
+    const row = { bpmBefore: bpmOf(window.start.cps), snapped: events.some((event) => event.kind === 'cps' && event.perf > window.start.perf && (window.end === null || event.perf < window.end.perf) && Math.abs(event.cps - plan.toCps) < 1e-9) };
+    if (window.end === null) return { ...row, ended: false };
+    return { ...row, ended: true, ms: roundTo(window.end.perf - window.start.perf, 1), bpmAtEnd: bpmOf(window.end.cps), ...judge(bpmOf(window.end.cps), window.end.lastEnd) };
+  });
+  const lineRows = lines.map((line) => ({ bpmAtLine: bpmOf(line.cps), ...judge(bpmOf(line.cps), line.lastEnd) }));
+
+  const courseSteps = steps.filter((step) => typeof step.landPerf === 'number').sort((a, b) => a.landPerf - b.landPerf);
+  const courseAt = (at) => {
+    let bpm = fromBpm;
+    for (const step of courseSteps) if (step.landPerf <= at) bpm = bpmOf(step.cps);
+    return bpm;
+  };
+  const windowFrom = markPerf - 300;
+  const lastPerf = Math.max(...mine.map((window) => (window.end === null ? window.start.perf : window.end.perf)), ...lines.map((line) => line.perf));
+  const windowTo = lastPerf + 1500;
+  const ticks = entries
+    .filter((entry) => entry.port === clockPort && entry.bytes.length === 1 && entry.bytes[0] === 0xf8)
+    .map((entry) => (typeof entry.ts === 'number' ? entry.ts : entry.t))
+    .sort((a, b) => a - b)
+    .filter((at) => at >= windowFrom && at <= windowTo);
+  const off = [];
+  for (let index = 1; index < ticks.length; index++) {
+    const bpm = 2500 / (ticks[index] - ticks[index - 1]);
+    const course = courseAt(ticks[index]);
+    if (Math.abs(bpm - course) > OFF_COURSE_BPM) off.push({ at: ticks[index], distance: bpm - course, earlyMs: 2500 / course - (ticks[index] - ticks[index - 1]) });
+  }
+  const stats = rampTickStats(entries, { clockPort, beatPort: clockPort, steps: courseSteps.map((step) => ({ landPerf: step.landPerf, bpm: bpmOf(step.cps) })), fromBpm, windowFrom, windowTo });
+  return {
+    at: roundTo(steps.filter((step) => step.perf <= mine[0].start.perf).length / plan.steps, 2),
+    evaluations,
+    evaluationsOnCourse: evaluations.every((row) => row.ended && row.stepsOff <= COURSE_STEPS),
+    lines: lineRows,
+    linesOnCourse: lineRows.every((row) => row.stepsOff <= COURSE_STEPS),
+    offCourseTicks: off.length,
+    heardMs: off.length === 0 ? 0 : roundTo(off.at(-1).at - off[0].at + 2500 / courseAt(off.at(-1).at), 1),
+    peakOffCourseBpm: off.length === 0 ? 0 : roundTo(Math.max(...off.map((tick) => Math.abs(tick.distance))), 2),
+    earlyMs: roundTo(off.reduce((sum, tick) => sum + tick.earlyMs, 0), 1),
+    holes: stats.holes,
+    doubled: stats.doubled,
+    ticks: stats.ticks,
+    late: stats.late,
+  };
+}
+
+/**
+ * The page's own ramp met by gestures and by Stop then Play, measured in real Chrome with the code holding the target tempo. Each
+ * point is its own ramp (set_code with glideBars 8, from 100 to 120 BPM) with one gesture made at a tenth, a quarter, half, nine
+ * tenths of it and 1.5 s after its end: a Mixer fader drag, a Song grid cell change, a Timeline note edit and a hand edit; one more
+ * ramp each holds a hand edit that waits for its bar line and a Song grid section launch (both at half, judged at their line
+ * too), and one holds Stop at half and then Play. Each point prints one `probe:midi RAMP-GESTURE {...}` line (fields in
+ * rampGestureReading, and for Stop and Play in the code below) and passes when every evaluation of the gesture ended within one step
+ * of the ramp's course (a waiting one also at its line), no tick ran off the course, the clock had no hole, no doubled tick and no
+ * late send, and the gesture added one History row with its own label and none about the tempo; Stop then Play passes on the
+ * readings of its own lines. It lasts minutes, so it only runs alone (`--only ramp-measure` after the clock runs, or
+ * `--only ramp-gestures`), never in a full run.
+ */
+export async function rampGestureBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir } = context;
+  const rigFile = path.join(dataDir, 'instruments.json');
+  fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'seq', model: 'mt32', port: 'Fake Synth A', clock: true }] }));
+  const ramp = GESTURE_RAMP;
+  const cpsOfBpm = (bpm) => bpm / 4 / 60;
+  // The structured helper piece with t2 on the clock port, and the inaudible sine of the ramp piece so the page keeps its audio
+  // output alive (a page with no sound jitters its tick timestamps after 25 seconds, which would look like holes). `cps` is the
+  // tempo its code states.
+  const pieceAt = (cps) => `${songHelperCode({ midi: true, cps }).replace(".midi('Fake Synth A')", ".midi('Fake Synth A', { midichannel: 2 })")}\nkeepalive: s("sine").gain(0.0006).slow(2)`;
+  const startPiece = pieceAt(cpsOfBpm(ramp.fromBpm));
+  const targetPiece = pieceAt(GESTURE_CODE_CPS);
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const schedulerExpr = `document.getElementById('repl').editor.repl.scheduler`;
+  const blur = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  const openView = async (key, name) => {
+    await blur();
+    await pressKey(cdp, 'Escape');
+    await pressKey(cdp, String(key));
+    if ((await waitFor(cdp, `document.getElementById('workspace').dataset.view === ${JSON.stringify(name)} ? true : null`, 3000)) !== true) {
+      throw new ProbeCouldNotRun(`the ${name} view did not open for a gesture run`);
+    }
+  };
+  const historyRows = async () =>
+    String(await callTool(client, 'list_history', {}))
+      .split('\n')
+      .filter((row) => /^#\d+ /.test(row))
+      .map((row) => ({ id: Number(/^#(\d+) /.exec(row)[1]), label: /"([^"]*)"/.exec(row)?.[1] ?? row.replace(/^#\d+ /, '') }));
+  const tickCountSince = (mark) => `window.__midiLog.slice(${mark}).filter((e) => e.port === 'Fake Synth A' && e.bytes.length === 1 && e.bytes[0] === 0xf8).length`;
+  const waitTicks = async (count, what) => {
+    const mark = await evaluateExpr(cdp, 'window.__midiLog.length');
+    if ((await waitFor(cdp, `${tickCountSince(mark)} >= ${count} ? true : null`, 20000)) !== true) throw new ProbeCouldNotRun(`the clock sent no ${count} ticks ${what}`);
+  };
+  const schedulerRead = `(() => { const s = ${schedulerExpr}; return { perf: performance.now(), cps: s.cps, started: s.started, now: s.now(), lastEnd: s.lastEnd, changes: window.__tempoTrace.events().filter((e) => e.kind === 'cps').length }; })()`;
+
+  /**
+   * One ramp with `act` made at `atFraction` of it (1: 1.5 s after its end). The piece plays at 100 BPM, `prepare` readies the view
+   * (before the ramp starts), set_code starts the ramp, `arm` readies what a redraw of the code would have undone (after it), and
+   * the gesture is made when the ramp has got `atFraction` of its bars. Returns the plan, the trace, the device log and the History
+   * rows the gesture added.
+   */
+  const runRamp = async (name, { prepare = async () => {}, arm = async () => {}, act, atFraction = 0.5, settle }) => {
+    await callTool(client, 'set_code', { code: startPiece, label: `probe:midi page ramp gesture ${name}` });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(startPiece)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun(`the page did not start running the piece of the ${name} gesture within 8 seconds`);
+    }
+    await prepare();
+    await waitTicks(CLOCK_TICKS_PER_CYCLE, `after the start tempo was set (${name})`);
+    await evaluateExpr(cdp, 'window.__tempoTrace.clear()');
+    const reply = await callTool(client, 'set_code', { code: targetPiece, label: `probe:midi page ramp for the ${name} gesture`, glideBars: ramp.bars });
+    // The History rows of the ramp's own change are not the gesture's: the baseline is read after it.
+    const historyBefore = (await historyRows())[0];
+    const expectedLine = glideLine({ state: 'started', fromBpm: ramp.fromBpm, toBpm: ramp.toBpm, bars: ramp.bars });
+    if (!reply.includes(expectedLine)) throw new ProbeCouldNotRun(`the reply of the ramp for the ${name} gesture does not say "${expectedLine}": ${reply.slice(0, 300)}`);
+    // The plan is the page's own: the tempo before the evaluation that started it, the code's tempo, and the cycle it started at
+    // (the scheduler's frontier when that evaluation ended, in the same task).
+    const startEvents = await waitFor(
+      cdp,
+      `(() => { const e = window.__tempoTrace.events(); const s = e.find((x) => x.kind === 'eval-start'); const end = e.find((x) => x.kind === 'eval-end'); return s && end ? { start: s, end } : null; })()`,
+      5000,
+    );
+    if (startEvents === null) throw new ProbeCouldNotRun(`the tempo trace saw no whole evaluation for the ramp of the ${name} gesture`);
+    const plan = planGlide({ fromCps: startEvents.start.cps, toCps: GESTURE_CODE_CPS, bars: ramp.bars, startCycle: startEvents.end.lastEnd });
+    await arm();
+    const rampEndPerf = startEvents.end.perf;
+    const position = atFraction >= 1 ? `(e.cps === ${GESTURE_CODE_CPS})` : `((e.lastEnd - ${plan.startCycle}) / ${plan.bars} >= ${atFraction})`;
+    const reached = await waitFor(
+      cdp,
+      `window.__tempoTrace.events().some((e) => e.kind === 'cps' && e.perf > ${rampEndPerf} && ${position}) ? true : null`,
+      ramp.bars * 3000 + 8000,
+    );
+    if (reached !== true) throw new ProbeCouldNotRun(`the ramp of the ${name} gesture did not reach ${Math.round(atFraction * 100)} % of its bars`);
+    // A gesture after the ramp waits a moment past its last step, so the scheduler has taken the target tempo over.
+    if (atFraction >= 1) await sleep(1500);
+    await evaluateExpr(cdp, LINE_WATCH_SOURCE);
+    const markPerf = await evaluateExpr(cdp, `window.__tempoTrace.mark(${JSON.stringify(name)})`);
+    const acted = await act(markPerf);
+    await settle(markPerf);
+    await sleep(900);
+    const events = await evaluateExpr(cdp, 'window.__tempoTrace.events()');
+    const lines = await evaluateExpr(cdp, 'window.__lineWatch.samples()');
+    await evaluateExpr(cdp, 'window.__lineWatch.stop()');
+    const entries = await evaluateExpr(cdp, 'window.__midiLog');
+    // The page tells the server of a change once it has taken over, a moment after the evaluation ended.
+    let rowsAfter = await historyRows();
+    for (let attempt = 0; attempt < 12 && rowsAfter[0]?.id === historyBefore?.id; attempt++) {
+      await sleep(400);
+      rowsAfter = await historyRows();
+    }
+    const added = rowsAfter.filter((row) => row.id > (historyBefore?.id ?? 0));
+    return { plan, markPerf, acted, events, lines, entries, historyBefore, historyAdded: added };
+  };
+  /** Waits until the gesture's evaluation ended (and, with `waitsForLine`, until its line passed). */
+  const settleOnEvaluation = (waitsForLine) => async (markPerf) => {
+    const done = await waitFor(
+      cdp,
+      `(() => {
+        const e = window.__tempoTrace.events();
+        const s = e.find((x) => x.kind === 'eval-start' && x.perf >= ${markPerf});
+        if (!s) return null;
+        if (!e.some((x) => x.kind === 'eval-end' && x.perf >= s.perf)) return null;
+        return ${waitsForLine ? 'window.__lineWatch.samples().length > 0' : 'true'} ? true : null;
+      })()`,
+      waitsForLine ? 30000 : 12000,
+    );
+    if (done !== true) throw new ProbeCouldNotRun(waitsForLine ? "the gesture's evaluation did not finish and its line did not pass within 30 seconds" : "the gesture's evaluation did not finish within 12 seconds");
+  };
+  const tempoWords = /tempo|ramp|bpm|glide|cps/i;
+  /** One gesture of the re-evaluation kind at each of its points: one ramp for each, one line printed, one check reported. */
+  const evaluationGesture = async (name, title, { points = GESTURE_POINTS, waitsForLine = false, ...options }) => {
+    for (const atFraction of points) {
+      const run = await runRamp(name, { ...options, atFraction, settle: settleOnEvaluation(waitsForLine) });
+      const reading = rampGestureReading({ events: run.events, entries: run.entries, markPerf: run.markPerf, plan: run.plan, clockPort: 'Fake Synth A', lines: run.lines });
+      const label = run.historyAdded[0]?.label ?? null;
+      const line = { gesture: name, point: atFraction, ...(reading ?? {}), historyLabel: label, historyRows: run.historyAdded.length };
+      console.log(`probe:midi RAMP-GESTURE ${JSON.stringify(line)}`);
+      const pass =
+        reading !== null &&
+        reading.evaluationsOnCourse &&
+        reading.linesOnCourse &&
+        (!waitsForLine || reading.lines.length > 0) &&
+        reading.offCourseTicks === 0 &&
+        reading.holes === 0 &&
+        reading.doubled === 0 &&
+        reading.late === 0 &&
+        run.historyAdded.length === 1 &&
+        label !== null &&
+        label !== run.historyBefore?.label &&
+        !tempoWords.test(label);
+      report(
+        `ramp-gestures: ${title} at ${Math.round(atFraction * 100)} % of the ramp ends on its course with no off-course tick, hole, doubled tick or late send, and adds one History row`,
+        pass,
+        JSON.stringify({ evaluations: reading?.evaluations.map((row) => [row.bpmAtEnd, row.courseBpm, row.stepsOff]) ?? null, lines: reading?.lines.map((row) => [row.bpmAtLine, row.courseBpm, row.stepsOff]) ?? null, offCourseTicks: reading?.offCourseTicks ?? null, holes: reading?.holes ?? null, doubled: reading?.doubled ?? null, late: reading?.late ?? null, historyRows: run.historyAdded.length, historyLabel: label }),
+      );
+    }
+  };
+
+  /** Stop and then Play at half of a ramp: prints a `stop` line and a `play` line and reports both. */
+  const stopAndPlay = async () => {
+    const bpmOf = (cps) => roundTo(cps * 240, 3);
+    const run = await runRamp('stop', {
+      settle: async () => {},
+      act: async () => {
+        const before = await evaluateExpr(cdp, schedulerRead);
+        await stopMusic(cdp);
+        const afterStop = await evaluateExpr(cdp, schedulerRead);
+        await sleep(1500);
+        const stillStopped = await evaluateExpr(cdp, schedulerRead);
+        const playMark = await evaluateExpr(cdp, "window.__tempoTrace.mark('play')");
+        await playMusic(cdp);
+        const afterPlay = await evaluateExpr(cdp, schedulerRead);
+        await sleep(3500);
+        const later = await evaluateExpr(cdp, schedulerRead);
+        return { before, afterStop, stillStopped, playMark, afterPlay, later };
+      },
+    });
+    const { before, afterStop, stillStopped, playMark, afterPlay, later } = run.acted;
+    const windows = [];
+    for (const event of run.events) {
+      if (event.kind === 'eval-start') windows.push({ start: event.perf, end: Infinity });
+      else if (event.kind === 'eval-end' && windows.length > 0 && windows.at(-1).end === Infinity) windows.at(-1).end = event.perf;
+    }
+    const steps = run.events.filter((event) => event.kind === 'cps' && !windows.some((window) => event.perf >= window.start && event.perf <= window.end));
+    const sent = (byte, from, to = Infinity) => run.entries.filter((e) => e.port === 'Fake Synth A' && e.bytes.length === 1 && e.bytes[0] === byte && (typeof e.ts === 'number' ? e.ts : e.t) >= from && (typeof e.ts === 'number' ? e.ts : e.t) <= to);
+    const lastStepBeforeStop = steps.filter((step) => step.perf <= afterStop.perf).at(-1);
+    const stopLine = {
+      gesture: 'stop',
+      point: roundTo(steps.filter((step) => step.perf <= run.markPerf).length / run.plan.steps, 2),
+      bpmBefore: bpmOf(before.cps),
+      bpmAfterStop: bpmOf(afterStop.cps),
+      startedAfterStop: afterStop.started,
+      cycleAtStop: roundTo(afterStop.now, 3),
+      stepsWhileStopped: stillStopped.changes - afterStop.changes,
+      bpmAfterWait: bpmOf(stillStopped.cps),
+      clockStops: sent(0xfc, run.markPerf).length,
+      ticksQueuedAfterStop: sent(0xf8, afterStop.perf + 200, playMark).length,
+    };
+    const playEval = run.events.find((event) => event.kind === 'eval-start' && event.perf >= playMark);
+    const playEnd = playEval === undefined ? undefined : run.events.find((event) => event.kind === 'eval-end' && event.perf >= playEval.perf);
+    const stats = rampTickStats(run.entries, { clockPort: 'Fake Synth A', beatPort: 'Fake Synth A', steps: [], fromBpm: GESTURE_CODE_CPS * 240, windowFrom: playMark, windowTo: later.perf });
+    const playLine = {
+      gesture: 'play',
+      bpmAfterEvaluation: playEnd === undefined ? null : bpmOf(playEnd.cps),
+      bpmAfterPlay: bpmOf(afterPlay.cps),
+      cycleBeforeStop: roundTo(before.now, 3),
+      cycleAfterPlay: roundTo(afterPlay.now, 3),
+      stepsAfterPlay: steps.filter((step) => step.perf > playMark).length,
+      bpmThreeSecondsAfterPlay: bpmOf(later.cps),
+      starts: sent(0xfa, playMark).length,
+      ticks: stats.ticks,
+      holes: stats.holes,
+      doubled: stats.doubled,
+      late: stats.late,
+      historyRows: run.historyAdded.length,
+      historyLabels: run.historyAdded.map((row) => row.label),
+    };
+    console.log(`probe:midi RAMP-GESTURE ${JSON.stringify(stopLine)}`);
+    console.log(`probe:midi RAMP-GESTURE ${JSON.stringify(playLine)}`);
+    const mid = stopLine.bpmBefore > ramp.fromBpm && stopLine.bpmBefore < ramp.toBpm;
+    report(
+      'ramp-gestures: Stop at half of the ramp leaves the tempo where the ramp was, with no step while stopped, one clock Stop and no tick after it',
+      mid &&
+        stopLine.startedAfterStop === false &&
+        lastStepBeforeStop !== undefined &&
+        stopLine.bpmAfterStop === bpmOf(lastStepBeforeStop.cps) &&
+        stopLine.bpmAfterWait === stopLine.bpmAfterStop &&
+        stopLine.stepsWhileStopped === 0 &&
+        stopLine.clockStops === 1 &&
+        stopLine.ticksQueuedAfterStop === 0,
+      JSON.stringify(stopLine),
+    );
+    report(
+      "ramp-gestures: Play after it sets exactly the code's tempo, no ramp step follows in 3.5 s, and the clock sends one Start with no hole, doubled tick or late send",
+      playEnd !== undefined &&
+        playEnd.cps === GESTURE_CODE_CPS &&
+        playLine.stepsAfterPlay === 0 &&
+        later.cps === GESTURE_CODE_CPS &&
+        playLine.starts === 1 &&
+        playLine.ticks > 0 &&
+        playLine.holes === 0 &&
+        playLine.doubled === 0 &&
+        playLine.late === 0 &&
+        run.historyAdded.length === 0,
+      JSON.stringify(playLine),
+    );
+  };
+
+  try {
+    await setScenario({ permission: 'granted' });
+    await callTool(client, 'set_code', { code: startPiece, label: 'probe:midi ramp gesture start' });
+    const started = await waitFor(cdp, `window.__midiLog.some((e) => e.port === 'Fake Synth A' && e.bytes.length === 1 && e.bytes[0] === 0xfa) ? true : null`, 15000);
+    if (started !== true) throw new ProbeCouldNotRun('the clock instrument got no Start within 15 seconds of the gesture piece');
+    await evaluateExpr(cdp, TEMPO_TRACE_SOURCE);
+    await pickTiming(cdp, 'now');
+    // The Song grid and the note panel need more room than the probe's usual short window.
+    await cdp('Emulation.setDeviceMetricsOverride', { ...PROBE_VIEWPORT, height: 900 });
+    await sleep(400);
+
+    await evaluationGesture('mixer', 'a Mixer fader drag', {
+      prepare: async () => {
+        await openView(3, 'mixer');
+        const strip = await waitFor(cdp, `document.querySelector('.mx-strip[data-track="label:t1"] .mx-fader') ? true : null`, 5000);
+        if (strip !== true) throw new ProbeCouldNotRun('the Mixer shows no fader for t1');
+      },
+      act: async () => {
+        await dragSlider(cdp, '.mx-strip[data-track="label:t1"] .mx-fader', 0.2, 0.6, 6);
+        return null;
+      },
+    });
+
+    await evaluationGesture('cell', 'a Song grid cell change', {
+      prepare: async () => {
+        await openView(4, 'parts');
+        if ((await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-cell').length === 9 ? true : null`, 8000)) !== true) throw new ProbeCouldNotRun('the Parts view shows no Song grid');
+      },
+      arm: async () => {
+        await clickElement(cdp, '#parts-rows .song-cell[data-track="t1"][data-section="1"]');
+        if ((await waitFor(cdp, `document.getElementById('song-cell-list').hidden ? null : true`, 3000)) !== true) throw new ProbeCouldNotRun('the cell list did not open');
+      },
+      act: async () => {
+        await clickElement(cdp, '#song-cell-list [role="option"]:first-of-type');
+        return null;
+      },
+    });
+
+    await evaluationGesture('timeline', 'a Timeline note edit', {
+      prepare: async () => {
+        await openView(2, 'timeline');
+        const drawn = await waitFor(cdp, `document.getElementById('timeline-view').dataset.state === 'ok' && document.querySelector('#timeline-lanes .lane[data-track="label:t1"] rect.event') ? true : null`, 10000);
+        if (drawn !== true) throw new ProbeCouldNotRun('the Timeline drew no note for t1');
+      },
+      act: async () => {
+        const point = await evaluateExpr(
+          cdp,
+          `(() => { const mark = document.querySelector('#timeline-lanes .lane[data-track="label:t1"] rect.event'); mark.scrollIntoView({ block: 'nearest' }); const r = mark.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+        );
+        await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 });
+        await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', ...point, button: 'left', buttons: 0, clickCount: 1 });
+        const selected = await waitFor(cdp, `document.querySelector('#timeline-note .tl-note-state').textContent !== '' ? document.querySelector('#timeline-note .tl-note-state').textContent : null`, 3000);
+        await pressKey(cdp, 'ArrowUp');
+        return { selected };
+      },
+    });
+
+    const handEdit = (timing) => ({
+      prepare: async () => {
+        await pickTiming(cdp, timing);
+      },
+      // The caret goes to the end of the code, then a comment line is typed there: the program stays the same, the text differs.
+      arm: async () => {
+        await evaluateExpr(cdp, `(() => { const view = document.getElementById('repl').editor.editor; view.dispatch({ selection: { anchor: view.state.doc.length } }); view.focus(); })()`);
+        await cdp('Input.insertText', { text: '\n// ramp gesture' });
+        const typed = await waitFor(cdp, `document.getElementById('repl').editor.editor.state.doc.toString().endsWith('// ramp gesture') ? true : null`, 2000);
+        if (typed !== true) throw new ProbeCouldNotRun('the comment line was not typed at the end of the code');
+      },
+      act: async () => {
+        await pressKey(cdp, 'Enter', { ctrl: true });
+        return null;
+      },
+    });
+    await evaluationGesture('hand', 'a hand edit', handEdit('now'));
+    try {
+      await evaluationGesture('hand-bar', 'a hand edit that waits for its bar line', { ...handEdit('bar'), points: [0.5], waitsForLine: true });
+    } finally {
+      await pickTiming(cdp, 'now');
+    }
+
+    const launchButton = (value) => `#song-launch button[data-value="${value}"]`;
+    let launchWas = null;
+    try {
+      await evaluationGesture('launch', 'a Song grid section launch', {
+        points: [0.5],
+        waitsForLine: true,
+        prepare: async () => {
+          await openView(4, 'parts');
+          if ((await waitFor(cdp, `document.querySelectorAll('#parts-rows .song-head').length === 3 ? true : null`, 8000)) !== true) throw new ProbeCouldNotRun('the Parts view shows no Song grid');
+          launchWas = await evaluateExpr(cdp, `(document.querySelector('#song-launch button[aria-pressed="true"]') || {}).dataset?.value ?? null`);
+          await clickElement(cdp, launchButton('bar'));
+          await waitFor(cdp, `document.querySelector(${JSON.stringify(launchButton('bar'))}).getAttribute('aria-pressed') === 'true' ? true : null`, 3000);
+        },
+        act: async () => {
+          // The header after the one that plays; a launch that needs no code change is asked again for the one after that.
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const playing = await waitFor(cdp, `(() => { const at = [...document.querySelectorAll('#parts-rows .song-head')].findIndex((head) => head.dataset.state === 'playing'); return at >= 0 ? at : null; })()`, 5000);
+            if (playing === null) throw new ProbeCouldNotRun('no section header showed as playing for the launch');
+            const index = (playing + 1 + attempt) % 3;
+            await clickElement(cdp, `#parts-rows .song-head[data-index="${index}"]`);
+            const queued = await waitFor(cdp, `(() => { const head = document.querySelector('#parts-rows .song-head[data-index="${index}"]'); return head && head.dataset.state === 'queued' ? head.dataset.line : null; })()`, 3000);
+            const kind = await evaluateExpr(cdp, `document.getElementById('song-line').getAttribute('data-kind')`);
+            if (queued !== null && kind !== 'already') return { index, line: queued };
+            if (queued !== null) await clickElement(cdp, `#parts-rows .song-head[data-index="${index}"]`);
+            await sleep(500);
+          }
+          throw new ProbeCouldNotRun('no Song grid launch could be queued');
+        },
+      });
+    } finally {
+      if (launchWas !== null && launchWas !== 'bar') await clickElement(cdp, launchButton(launchWas));
+    }
+
+    await pickTiming(cdp, 'now');
+    await stopAndPlay();
+  } finally {
+    await evaluateExpr(cdp, 'window.__lineWatch && window.__lineWatch.stop()');
+    await evaluateExpr(cdp, 'window.__tempoTrace && window.__tempoTrace.stop()');
+    await cdp('Emulation.setDeviceMetricsOverride', PROBE_VIEWPORT);
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi ramp gesture done' });
+    fs.rmSync(rigFile, { force: true });
+  }
+}
+
+
+/** The groups of checks this script can run alone with `--only`. */
+export const MIDI_GROUPS = Object.freeze(['song', 'mixer', 'timeline', 'ramp', 'ramp-measure', 'ramp-measure-late', 'ramp-gestures']);
+
 async function main() {
   let args;
+  // Where the pictures go: validated once, before any browser work, as outside the repository (null: no pictures).
+  let shotsDir = null;
   try {
-    args = parseArgs(process.argv.slice(2));
-    if (args.only !== null && args.only !== 'song' && args.only !== 'mixer' && args.only !== 'timeline') {
-      throw new ProbeCouldNotRun(`probe:midi runs one group alone only with --only song, --only mixer or --only timeline (got ${JSON.stringify(args.only)})`);
-    }
+    args = parseArgs(process.argv.slice(2), { groups: MIDI_GROUPS, checks: [] });
+    shotsDir = shotsFolder();
   } catch (err) {
     console.error(`probe:midi COULD NOT RUN: ${err instanceof Error ? err.message : String(err)}`);
     process.exitCode = 2;
@@ -831,6 +1965,26 @@ async function main() {
     }
     if (args.only === 'timeline') {
       await timelineMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'ramp') {
+      await rampMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'ramp-measure') {
+      await rampMeasureBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'ramp-gestures') {
+      await rampGestureBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
+    if (args.only === 'ramp-measure-late') {
+      await rampMeasureBlocks({ cdp, client, report, setScenario, dataDir }, RAMP_LATE_RUNS);
       summarize();
       return;
     }
@@ -3442,9 +4596,9 @@ async function main() {
         JSON.stringify(longDrumResults.map((seen) => `${seen.size}${seen.layout}:${seen.cardFits && seen.listFits ? 'fits' : 'OVERFLOW'},ellipsis${seen.ellipsis},whole${seen.whole},columns${seen.columns}`)),
       );
 
-      // Backstop screenshots for a final look (the directory comes from MOONTIDE_PROBE_SHOTS; nothing is saved without it):
+      // Backstop screenshots for a final look (the folder comes from MOONTIDE_PROBE_SHOTS, validated at startup as outside the repository; nothing is saved without it):
       // a card with its Drum map closed, open, and unknown, at two sizes in the three layouts.
-      if (process.env.MOONTIDE_PROBE_SHOTS) {
+      if (shotsDir !== null) {
         await showDrumCards(
           [
             { id: 'sc55', model: 'sc55', port: 'Fake Synth A' },
@@ -3453,7 +4607,6 @@ async function main() {
           `drums: note("36 38 42 38").midi('Fake Synth A', { midichannel: 10, sound: 'Standard Set' })\nkit: note("36 38").midi('Fake Synth D', { midichannel: 5, sound: 'Kit C' })`,
           'probe:midi drum card shots',
         );
-        fs.mkdirSync(process.env.MOONTIDE_PROBE_SHOTS, { recursive: true });
         const startLayoutCards = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
         const cardShots = [];
         try {
@@ -3478,7 +4631,7 @@ async function main() {
                 );
                 await sleep(150);
                 const shot = await cdp('Page.captureScreenshot', { format: 'png' });
-                const file = path.join(process.env.MOONTIDE_PROBE_SHOTS, `instruments-drum-${state}-${width}x${height}-layout-${layout}.png`);
+                const file = path.join(shotsDir, `instruments-drum-${state}-${width}x${height}-layout-${layout}.png`);
                 fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
                 cardShots.push(path.basename(file));
               }
@@ -5176,9 +6329,9 @@ async function main() {
       );
       if (await evaluateExpr(cdp, "!document.getElementById('ask-box').hidden")) await pressKey(cdp, 'Escape');
 
-      // Backstop screenshots for a final look (the directory comes from MOONTIDE_PROBE_SHOTS; nothing is saved without it):
+      // Backstop screenshots for a final look (the folder comes from MOONTIDE_PROBE_SHOTS, validated at startup as outside the repository; nothing is saved without it):
       // a General MIDI pattern on the two lightest track hues, at two sizes in the three layouts.
-      if (process.env.MOONTIDE_PROBE_SHOTS) {
+      if (shotsDir !== null) {
         await setScenario({ permission: 'granted', outputs: ['Fake Synth A', 'Fake Synth B', 'Fake Synth C', 'Fake Synth D'] });
         const luminances = await evaluateExpr(
           cdp,
@@ -5204,7 +6357,6 @@ async function main() {
         await sleep(800);
         await openView(2);
         await waitFor(cdp, `document.querySelectorAll('#timeline-lanes .lane[data-drum-rows]').length === 2 ? true : null`, 8000);
-        fs.mkdirSync(process.env.MOONTIDE_PROBE_SHOTS, { recursive: true });
         const startLayoutShots = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
         const shots = [];
         try {
@@ -5218,7 +6370,7 @@ async function main() {
               await evaluateExpr(cdp, `document.querySelector('#timeline-lanes .lane[data-drum-rows]').scrollIntoView({ block: 'start' })`);
               await sleep(100);
               const shot = await cdp('Page.captureScreenshot', { format: 'png' });
-              const file = path.join(process.env.MOONTIDE_PROBE_SHOTS, `drum-lane-${width}x${height}-layout-${layout}.png`);
+              const file = path.join(shotsDir, `drum-lane-${width}x${height}-layout-${layout}.png`);
               fs.writeFileSync(file, Buffer.from(shot.data, 'base64'));
               shots.push(path.basename(file));
             }
@@ -5970,25 +7122,16 @@ async function main() {
             ],
           }),
         );
-      const cycleOfReply = (reply) => {
-        const match = /takes over at cycle (\d+)/.exec(reply);
-        return match === null ? null : Number(match[1]);
-      };
-      const readSchedulerFacts = () =>
-        evaluateExpr(cdp, `(() => { const s = document.getElementById('repl').editor.repl.scheduler; return { perf: performance.now(), now: s.now(), cps: s.cps, latency: s.latency }; })()`);
-      // The performance.now() time the line is heard at, estimated from one reading of the scheduler (good to tens of ms).
-      const lineEstimateMs = (facts, cycle) => facts.perf + ((cycle - facts.now) / facts.cps + facts.latency) * 1000;
       const waitForCycle = async (test, ms = 40000) => {
         const deadline = Date.now() + ms;
         for (;;) {
-          const facts = await readSchedulerFacts();
+          const facts = await readSchedulerFacts(cdp);
           if (test(facts.now)) return facts;
           if (Date.now() > deadline) return null;
           await sleep(50);
         }
       };
       const noteOnOf = (pitch, status) => (entry) => entry.port === 'Fake Synth A' && entry.bytes.length === 3 && entry.bytes[0] === status && entry.bytes[2] > 0 && entry.bytes[1] === pitch;
-      const programChangesA = (entries) => entries.filter((entry) => entry.port === 'Fake Synth A' && entry.bytes.length === 2 && entry.bytes[0] === 0xc2);
       const bar = 'setcps(1)\n';
 
       // The sound change, and the history follows the line in the MIDI case too.
@@ -6005,7 +7148,7 @@ async function main() {
         await waitForCycle((now) => now % 8 > 0.3 && now % 8 < 3);
         const mark = (await midiLog()).length;
         const reply = await callTool(client, 'set_code', { code: newCode, label, at: 'phrase', phraseCycles: 8 });
-        const facts = await readSchedulerFacts();
+        const facts = await readSchedulerFacts(cdp);
         const cycle = cycleOfReply(reply);
         const codeBefore = await callTool(client, 'get_code', {});
         const historyBefore = await callTool(client, 'list_history', {});
@@ -6063,7 +7206,7 @@ async function main() {
         await sleep(1500);
         const mark = (await midiLog()).length;
         const reply = await callTool(client, 'set_code', { code: `${bar}${lead}`, label: 'probe:midi takeover tracks new', at: 'bar' });
-        const facts = await readSchedulerFacts();
+        const facts = await readSchedulerFacts(cdp);
         const cycle = cycleOfReply(reply);
         if (cycle === null) {
           report('takeover midi: a removed track is silenced at the takeover', false, `the reply has no cycle: ${JSON.stringify(reply.slice(0, 200))}`);
@@ -6118,7 +7261,7 @@ async function main() {
           label: 'probe:midi takeover clock new',
           at: 'bar',
         });
-        const facts = await readSchedulerFacts();
+        const facts = await readSchedulerFacts(cdp);
         const cycle = cycleOfReply(reply);
         if (cycle === null) {
           report('takeover midi: a new clock instrument starts on the line', false, `the reply has no cycle: ${JSON.stringify(reply.slice(0, 200))}`);
@@ -6155,6 +7298,7 @@ async function main() {
     await songMidiBlocks({ cdp, client, report, setScenario, dataDir });
     await mixerMidiBlocks({ cdp, client, report, setScenario, dataDir });
     await timelineMidiBlocks({ cdp, client, report, setScenario, dataDir });
+    await rampMidiBlocks({ cdp, client, report, setScenario, dataDir });
 
     summarize();
   } catch (err) {

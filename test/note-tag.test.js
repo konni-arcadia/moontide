@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { installNoteTag, subscribe } from '../page/note-tag.js';
+import { MAX_REPORTED_FAILURES, installNoteTag, subscribe } from '../page/note-tag.js';
 
 const isMoontide = (err) => err instanceof Error && err.message.startsWith('Moontide:');
 
@@ -270,6 +270,95 @@ test('a subscriber that throws never breaks a note: the next one runs, the sound
   assert.deepEqual(s.sound, ['a', 'b']);
   assert.equal(errors.length, 1, 'once for two failing notes');
   assert.match(String(errors[0][0]), /^Moontide:/);
+});
+
+/** Runs `body` with console.error collected, and gives the collected calls. */
+function collectingErrors(body) {
+  const errors = [];
+  const original = console.error;
+  console.error = (...args) => errors.push(args);
+  try {
+    body();
+  } finally {
+    console.error = original;
+  }
+  return errors;
+}
+
+test('each different listener or stamp failure is reported once, however many notes pass', () => {
+  let stampFails = false;
+  const s = setup(() => {
+    if (stampFails) throw new Error('stamp failed');
+    return null;
+  });
+  s.stop();
+  let listenerMessage = 'a';
+  const stopBad = subscribe(() => {
+    throw new Error(listenerMessage);
+  });
+  const received = [];
+  const stopGood = subscribe((event) => received.push(event.key));
+  let errors;
+  try {
+    errors = collectingErrors(() => {
+      new s.Pattern(notesOf('n1', 'n2', 'n3')).p('t1');
+      for (const hap of s.registered.t1.notes) s.fire(hap);
+      assert.equal(received.length, 3, 'the other listener still hears every note');
+      listenerMessage = 'b';
+      new s.Pattern(notesOf('n4', 'n5')).p('t2');
+      for (const hap of s.registered.t2.notes) s.fire(hap);
+      stampFails = true;
+      new s.Pattern(notesOf('n6', 'n7')).p('t3');
+      for (const hap of s.registered.t3.notes) s.fire(hap);
+    });
+  } finally {
+    stopBad();
+    stopGood();
+  }
+  assert.deepEqual(errors.map((call) => call[1].message), ['a', 'b', 'stamp failed']);
+  assert.deepEqual(s.sound, ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7']);
+});
+
+test('after MAX_REPORTED_FAILURES different messages one last line says the rest are not reported, and then nothing is printed', () => {
+  const s = setup();
+  s.stop();
+  let count = 0;
+  const stopBad = subscribe(() => {
+    throw new Error(`failure ${count}`);
+  });
+  let errors;
+  try {
+    errors = collectingErrors(() => {
+      for (count = 0; count < MAX_REPORTED_FAILURES + 15; count++) {
+        new s.Pattern(notesOf('x')).p(`t${count}`);
+        s.fire(s.registered[`t${count}`].notes[0]);
+      }
+    });
+  } finally {
+    stopBad();
+  }
+  assert.equal(errors.length, MAX_REPORTED_FAILURES + 1);
+  assert.equal(errors[MAX_REPORTED_FAILURES][0], 'Moontide: more note listener failures happened; they are not reported.');
+  assert.equal(errors[MAX_REPORTED_FAILURES].length, 1);
+});
+
+test('a failure that is not an Error is reported once by its text', () => {
+  const s = setup();
+  s.stop();
+  const stopBad = subscribe(() => {
+    throw 'plain text';
+  });
+  let errors;
+  try {
+    errors = collectingErrors(() => {
+      new s.Pattern(notesOf('a', 'b')).p('t1');
+      for (const hap of s.registered.t1.notes) s.fire(hap);
+    });
+  } finally {
+    stopBad();
+  }
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0][1], 'plain text');
 });
 
 test('a stampOf that throws never breaks a note: the event still arrives with a null stamp', () => {

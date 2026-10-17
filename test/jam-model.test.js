@@ -5,11 +5,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as model from '../page/jam-model.js';
 import { buildReading, readingAt, MODES } from '../page/jam-analysis.js';
+import { resolveReading, createScaleMemory } from '../page/jam-resolve.js';
 import { SCALE_NAME_IDS } from '../page/harmony.js';
 
 // Namespace import: an export the module does not have yet fails inside its own test, a targeted
 // failure, instead of crashing the file at load.
-const { JAM_COPY, declaredLine, jamStuckFor, jamIsStuck, JAM_RETRY_DELAY_MS, ambiguitySentence, partSubLine, messageModel, buildJamModel, secondsUntil, secondsText, capNotes, cyclesText, statusAnnounceKey } = model;
+const { JAM_COPY, declaredLine, jamStuckFor, jamIsStuck, JAM_RETRY_DELAY_MS, ambiguitySentence, partSubLine, messageModel, buildJamModel, secondsUntil, secondsText, capNotes, cyclesText, statusAnnounceKey, fillJam, reasonLine, MAX_CANDIDATES_SHOWN } = model;
 
 const ev = (track, begin, end, note) => ({ begin, end, value: { note }, track });
 const run = (track, begin, step, names) => names.map((name, i) => ev(track, begin + i * step, begin + (i + 1) * step, name));
@@ -18,7 +19,17 @@ const loop = (cycles, fn) => Array.from({ length: cycles }, (_, cycle) => fn(cyc
 
 const DORIAN = ['d3', 'e3', 'f3', 'g3', 'a3', 'b3', 'c4', 'd4'];
 const HARMONIC_E = ['e3', 'f#3', 'g3', 'a3', 'b3', 'c4', 'd#4', 'e4'];
-const at = (reading, cycle) => readingAt(reading, { cycle, cps: 0.5, playing: true });
+// A reading is resolved the way the page resolves it before it asks for a position: the scale in use is the declared one when it
+// is among the candidates, else the strongest evidence, and a reading that cannot choose says why.
+const resolved = (reading, declared = reading.declared ?? { state: 'none' }) => resolveReading(reading, { declared, memory: createScaleMemory() });
+const at = (reading, cycle) => readingAt(resolved(reading), { cycle, cps: 0.5, playing: true });
+// The position of an unresolved reading, as readingAt gives it: for what only reads the scale or the roles.
+const rawAt = (reading, cycle, cps = 1) => readingAt(reading, { cycle, cps, playing: true });
+// The same position with its scale as a reading that cannot choose gives it.
+const cannotChoose = (position, why = 'nothing-declared') => ({
+  ...position,
+  scale: { ...position.scale, source: 'unresolved', why, setKey: '0:ionian', sameNotes: false, candidates: [] },
+});
 
 test('JAM_COPY holds exactly the fixed sentences', () => {
   assert.deepEqual(JAM_COPY, {
@@ -69,6 +80,34 @@ test('JAM_COPY holds exactly the fixed sentences', () => {
       outside: { word: 'Outside', title: 'Chord note outside the scale, fine to play' },
       chord: { word: 'Chord tone', title: 'Note of the chord sounding now' },
     },
+    reason: {
+      proposedLead: 'Proposed:',
+      chosenLead: 'Your pick:',
+      section: ' {scale}, declared by the section.',
+      code: ' {scale}, declared by the code.',
+      'bass-chords': ' {scale}, the bass and chords lean on {root}.',
+      'most-heard': ' {scale}, {root} is the note heard most.',
+      nothing: ' {scale}, nothing in the notes says which scale is the key.',
+      chosen: ' {scale}. It holds while these same scales fit.',
+    },
+    candidates: {
+      pickCaption: 'Scales that fit, click to switch:',
+      listCaption: 'Scales that fit:',
+      more: 'and {n} more',
+    },
+    instrument: {
+      proposedScale: 'Proposed scale: {scale}.',
+      chosenScale: 'Chosen scale: {scale}.',
+      outside: 'Outside: {notes}.',
+      chordTones: 'Chord tones: {notes}.',
+      cannotChoose: 'Several scales fit with different notes, so none is coloured.',
+    },
+    roleWords: { scale: 'scale', root: 'root', avoid: 'avoid', outside: 'outside', chord: 'chord tone' },
+    cannotChoose: {
+      'nothing-declared': 'Several scales fit, with different notes, and nothing is declared.',
+      'declared-not-among': 'Several scales fit, with different notes, and none of them is the declared scale.',
+      sub: 'Warnings are off until a scale is declared or the notes settle on one.',
+    },
   });
 });
 
@@ -77,20 +116,14 @@ test('messageModel carries the text and an optional muted line', () => {
   assert.deepEqual(messageModel('a', 'b'), { state: 'message', text: 'a', sub: 'b' });
 });
 
-const tie = (names, kind = 'tie') => ({ status: 'ambiguous', kind, candidates: names.map((name) => ({ name })) });
-
-test('ambiguitySentence lists two, three, or the first three and a count of the rest', () => {
-  assert.equal(ambiguitySentence(tie(['C major', 'A minor'])), 'No clear scale: the notes fit C major and A minor equally.');
-  assert.equal(ambiguitySentence(tie(['A', 'B', 'C'])), 'No clear scale: the notes fit A, B and C equally.');
-  assert.equal(ambiguitySentence(tie(['A', 'B', 'C', 'D'])), 'No clear scale: the notes fit A, B, C and 1 more equally.');
-  const nine = Array.from({ length: 9 }, (_, i) => `S${i}`);
-  assert.equal(ambiguitySentence(tie(nine)), 'No clear scale: the notes fit S0, S1, S2 and 6 more equally.');
-});
-
-test('ambiguitySentence says almost equally for a near tie and the no-fit sentence for no fit', () => {
-  assert.equal(ambiguitySentence(tie(['C major', 'G major'], 'near')), 'No clear scale: the notes fit C major and G major almost equally.');
+test('ambiguitySentence gives the no-fit sentence, or its declared form, and refuses any other reading', () => {
   assert.equal(ambiguitySentence({ status: 'no-fit' }), 'No clear scale: the notes fit none of the nine scales.');
-  assert.throws(() => ambiguitySentence({ status: 'clear' }), /Moontide:/);
+  assert.equal(ambiguitySentence({ status: 'no-fit' }, { declared: true }), 'The notes fit none of the nine scales.');
+  assert.equal(ambiguitySentence({ status: 'no-fit' }, { declared: false }), JAM_COPY.noFit);
+  for (const status of ['ambiguous', 'clear', 'none']) {
+    assert.throws(() => ambiguitySentence({ status }), /Moontide:/, status);
+    assert.throws(() => ambiguitySentence({ status }, { declared: true }), /Moontide:/, status);
+  }
 });
 
 test('partSubLine names the part and says the scale is read from it', () => {
@@ -131,20 +164,119 @@ test('buildJamModel: a clear scale gives its name, the plain sub-line and seven 
   assert.equal(out.degrees[2].label, 'F, degree ♭3');
 });
 
-test('buildJamModel: an ambiguous scale gives the sentence, the warnings-off line and no degrees', () => {
-  const pads = [
-    ...stack(0, 0, 1, ['a3', 'c4', 'e4']),
-    ...stack(0, 1, 2, ['f3', 'a3', 'c4']),
-    ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
-    ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
-  ];
-  const out = buildJamModel({ position: at(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1) });
+// An A drone under a line that fits A minor and A Dorian: several scales with different notes.
+const DRONE_LINE = [...loop(8, (c) => ev(1, c, c + 1, 'a2')), ...loop(8, (c) => run(0, c, 1 / 6, ['a3', 'b3', 'c4', 'd4', 'e4', 'g4']))];
+
+test('buildJamModel: scales with different notes and nothing declared say why none is used, with no degrees', () => {
+  const out = buildJamModel({ position: at(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1) });
   assert.equal(out.state, 'ready');
   assert.equal(out.scale.kind, 'ambiguous');
-  assert.equal(out.scale.text, 'No clear scale: the notes fit C major, G Mixolydian, A minor and 1 more equally.');
+  assert.equal(out.scale.text, 'Several scales fit, with different notes, and nothing is declared.');
   assert.equal(out.scale.title, out.scale.text);
-  assert.equal(out.scale.sub, 'Warnings are off until the scale is clear.');
+  assert.equal(out.scale.sub, 'Warnings are off until a scale is declared or the notes settle on one.');
   assert.deepEqual(out.degrees, []);
+  assert.equal(out.reason, null);
+  assert.equal(out.scaleSource, 'heard');
+});
+
+test('buildJamModel: a declared scale that is not one of the candidates says none of them is the declared scale', () => {
+  const declared = { state: 'declared', kind: 'scale', text: 'C:lydian', scale: { rootPc: 0, modeId: 'lydian' } };
+  const out = buildJamModel({ position: at(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64, declared }), 1) });
+  assert.equal(out.scale.kind, 'ambiguous');
+  assert.equal(out.scale.text, 'Several scales fit, with different notes, and none of them is the declared scale.');
+  assert.equal(out.scale.sub, 'Warnings are off until a scale is declared or the notes settle on one.');
+});
+
+test('buildJamModel throws for a scale that is ambiguous and was never resolved', () => {
+  const position = rawAt(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1);
+  assert.equal(position.scale.status, 'ambiguous');
+  assert.throws(() => buildJamModel({ position }), /Moontide:/);
+  assert.throws(() => buildJamModel({ position: cannotChoose(position, 'because') }), /Moontide:.*because/);
+});
+
+// --- a proposed scale ---
+
+const PAD_CHORDS = [['a3', 'c4', 'e4'], ['f3', 'a3', 'c4'], ['c4', 'e4', 'g4'], ['g3', 'b3', 'd4']];
+const FOUR_PADS = loop(8, (c) => stack(0, c, c + 1, PAD_CHORDS[c % 4]));
+const aMinor = { state: 'declared', kind: 'scale', text: 'A:minor', scale: { rootPc: 9, modeId: 'aeolian' } };
+
+test('buildJamModel: the four pads give C major as a proposed clear scale with its degrees, its status and its reason', () => {
+  const out = buildJamModel({ position: at(buildReading({ events: FOUR_PADS, windowStart: 0, windowLength: 64 }), 1) });
+  assert.equal(out.scale.kind, 'clear');
+  assert.equal(out.scale.text, 'C major');
+  assert.deepEqual(out.degrees.map((d) => d.note), ['C', 'D', 'E', 'F', 'G', 'A', 'B']);
+  assert.equal(out.degrees.length, 7);
+  assert.ok(['safe', 'warning'].includes(out.status.kind));
+  assert.equal(out.scaleSource, 'proposed');
+  assert.deepEqual(out.reason, { lead: 'Proposed:', rest: ' C major, C is the note heard most.' });
+  assert.equal(out.noteScaleName, 'C major');
+  assert.equal(out.instrument.roles[0], 'root');
+  assert.deepEqual(out.instrument.roles.filter((role) => role === 'scale').length, 6);
+  assert.equal(out.instrument.rootPc, 0);
+});
+
+test('buildJamModel: a declared scale among the candidates is proposed, by the section when the model has one and by the code otherwise', () => {
+  const reading = buildReading({ events: FOUR_PADS, windowStart: 0, windowLength: 64, declared: aMinor });
+  const byCode = buildJamModel({ position: at(reading, 1) });
+  assert.equal(byCode.scale.text, 'A minor');
+  assert.deepEqual(byCode.reason, { lead: 'Proposed:', rest: ' A minor, declared by the code.' });
+  const bySection = buildJamModel({ position: at(reading, 1), section: "'verse'" });
+  assert.deepEqual(bySection.reason, { lead: 'Proposed:', rest: ' A minor, declared by the section.' });
+});
+
+test('buildJamModel: a heard clear scale has no reason line and the heard source', () => {
+  const out = buildJamModel({ position: atCps(dorianReading, 0.5) });
+  assert.equal(out.reason, null);
+  assert.equal(out.scaleSource, 'heard');
+});
+
+test('buildJamModel: no fit, nothing pitched and a part with no pitched note have no reason line and the heard source', () => {
+  const chroma = buildJamModel({ position: at(buildReading({ events: loop(2, (c) => run(0, c, 1 / 12, ['c4', 'c#4', 'd4', 'd#4', 'e4', 'f4', 'f#4', 'g4', 'g#4', 'a4', 'a#4', 'b4'])), windowStart: 0, windowLength: 64 }), 0.5) });
+  assert.equal(chroma.reason, null);
+  assert.equal(chroma.scaleSource, 'heard');
+  const quiet = { ...TWO_PARTS, sections: [{ name: 'calm', length: 4, start: 0 }, { name: 'quiet', length: 4, start: 4 }] };
+  const events = loop(64, (c) => (c % 8 < 4 ? [ev(1, c, c + 1, 'd2'), ...run(0, c, 0.125, DORIAN)] : []));
+  const none = buildJamModel({ position: at(buildReading({ events, windowStart: 0, windowLength: 64, arrangements: [quiet] }), 6) });
+  assert.equal(none.reason, null);
+  assert.equal(none.scaleSource, 'heard');
+});
+
+test('buildJamModel: the warnings of a proposed scale are on, and they follow the proposal', () => {
+  // The four pads with an F# played alone for a cycle: outside C major and A minor alike.
+  const events = [...FOUR_PADS, ev(1, 2.5, 2.75, 'f#4')];
+  const out = buildJamModel({ position: at(buildReading({ events, windowStart: 0, windowLength: 64 }), 2.6) });
+  assert.equal(out.scale.kind, 'clear');
+  assert.equal(out.status.kind, 'warning');
+  assert.equal(out.instrument.roles[6], 'outside');
+});
+
+test('reasonLine: nothing for a heard scale, the lead and the sentence for every reason of a proposal', () => {
+  const scale = { status: 'clear', name: 'D Dorian', root: 2, spell: ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'G#', 'A', 'Bb', 'B'] };
+  assert.equal(reasonLine(scale, { section: null }), null);
+  assert.equal(reasonLine({ ...scale, source: 'heard' }, { section: null }), null);
+  const proposed = (reason) => ({ ...scale, source: 'proposed', reason });
+  assert.deepEqual(reasonLine(proposed('declared'), { section: "section 'x'" }), { lead: 'Proposed:', rest: ' D Dorian, declared by the section.' });
+  assert.deepEqual(reasonLine(proposed('declared'), { section: null }), { lead: 'Proposed:', rest: ' D Dorian, declared by the code.' });
+  assert.deepEqual(reasonLine(proposed('declared')), { lead: 'Proposed:', rest: ' D Dorian, declared by the code.' });
+  assert.deepEqual(reasonLine(proposed('bass-chords'), { section: null }), { lead: 'Proposed:', rest: ' D Dorian, the bass and chords lean on D.' });
+  assert.deepEqual(reasonLine(proposed('most-heard'), { section: null }), { lead: 'Proposed:', rest: ' D Dorian, D is the note heard most.' });
+  assert.deepEqual(reasonLine(proposed('nothing'), { section: null }), { lead: 'Proposed:', rest: ' D Dorian, nothing in the notes says which scale is the key.' });
+  assert.deepEqual(reasonLine({ ...scale, source: 'chosen', reason: 'chosen' }, { section: null }), { lead: 'Your pick:', rest: ' D Dorian. It holds while these same scales fit.' });
+});
+
+test('reasonLine names the root as the scale spells it and throws for what it cannot say', () => {
+  const flat = { status: 'clear', name: 'Eb major', root: 3, spell: ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'], source: 'proposed', reason: 'most-heard' };
+  assert.equal(reasonLine(flat, { section: null }).rest, ' Eb major, Eb is the note heard most.');
+  assert.throws(() => reasonLine({ ...flat, source: 'guessed' }, { section: null }), /Moontide:.*guessed/);
+  assert.throws(() => reasonLine({ ...flat, reason: 'vibes' }, { section: null }), /Moontide:.*vibes/);
+  assert.throws(() => reasonLine({ ...flat, reason: undefined }, { section: null }), /Moontide:/);
+});
+
+test('fillJam fills every placeholder and throws on one with no value', () => {
+  assert.equal(fillJam(' {scale}, {root} and {scale}.', { scale: 'C major', root: 'C' }), ' C major, C and C major.');
+  assert.equal(fillJam('no placeholder', {}), 'no placeholder');
+  assert.equal(fillJam('{a}', { a: '$&$1' }), '$&$1');
+  assert.throws(() => fillJam(' {scale}, {root}.', { scale: 'C major' }), /Moontide:.*root/);
 });
 
 test('buildJamModel: a chromatic reading says none of the nine scales fit', () => {
@@ -210,7 +342,7 @@ const DORIAN_LOOP = loop(64, (c) => [
   ...run(0, c, 0.125, DORIAN),
 ]);
 const dorianReading = buildReading({ events: DORIAN_LOOP, windowStart: 0, windowLength: 64 });
-const atCps = (reading, cycle, cps = 1, playing = true) => readingAt(reading, { cycle, cps, playing });
+const atCps = (reading, cycle, cps = 1, playing = true) => readingAt(resolved(reading), { cycle, cps, playing });
 
 test('secondsUntil rounds up to whole seconds and never drops below 1', () => {
   assert.equal(secondsUntil(4, 0, 1), 4);
@@ -300,14 +432,8 @@ test('buildJamModel status: a warning with no note to avoid, or no way back in t
   assert.equal(stuck.status.time, 'not back in key within 32 cycles');
 });
 
-test('buildJamModel status: an ambiguous scale has no status box', () => {
-  const pads = [
-    ...stack(0, 0, 1, ['a3', 'c4', 'e4']),
-    ...stack(0, 1, 2, ['f3', 'a3', 'c4']),
-    ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
-    ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
-  ];
-  const out = buildJamModel({ position: atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1) });
+test('buildJamModel status: a scale that cannot be chosen has no status box', () => {
+  const out = buildJamModel({ position: atCps(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1) });
   assert.equal(out.status.kind, 'off');
   assert.equal(out.status.time, null);
 });
@@ -440,18 +566,23 @@ test('buildJamModel rows: with several part changes before the first warning the
   assert.deepEqual(rowsOf(out).map((r) => r.kind), ['part', 'part', 'part']);
 });
 
-test('buildJamModel rows: an unclear scale lists part rows only, or the warnings-off row when there is none', () => {
-  const pads = [
-    ...stack(0, 0, 1, ['a3', 'c4', 'e4']),
-    ...stack(0, 1, 2, ['f3', 'a3', 'c4']),
-    ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
-    ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
-  ];
-  const out = buildJamModel({ position: atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1) });
+test('buildJamModel rows: a scale that cannot be chosen lists part rows only, or the warnings-off row when there is none', () => {
+  const out = buildJamModel({ position: atCps(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1) });
   assert.equal(rowsOf(out).length, 1);
   assert.equal(rowsOf(out)[0].kind, 'off');
   assert.equal(rowsOf(out)[0].text, 'Warnings are off until the scale is clear.');
   assert.equal(rowsOf(out)[0].time, EN);
+});
+
+test('buildJamModel rows: a proposed scale lists the warnings that scale would have, and the calm row when there are none', () => {
+  const calm = buildJamModel({ position: atCps(buildReading({ events: FOUR_PADS, windowStart: 0, windowLength: 64 }), 1) });
+  assert.equal(rowsOf(calm).at(-1).kind, 'calm');
+  assert.match(rowsOf(calm).at(-1).text, /nothing leaves C major/);
+  // An F# played alone after two cycles of the pads is outside C major: a warning row to come.
+  const events = [...FOUR_PADS, ev(1, 3.5, 3.75, 'f#4')];
+  const out = buildJamModel({ position: atCps(buildReading({ events, windowStart: 0, windowLength: 64 }), 1) });
+  assert.equal(out.scale.text, 'C major');
+  assert.ok(rowsOf(out).some((row) => row.kind === 'warning'));
 });
 
 test('buildJamModel paused: times read an en dash, the status drops its time part and the rows keep their seconds', () => {
@@ -525,7 +656,7 @@ test('rolesByPc: an ambiguous scale gives off on all twelve', () => {
     ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
     ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
   ];
-  const roles = rolesByPc(atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1));
+  const roles = rolesByPc(rawAt(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1));
   assert.deepEqual(roles, new Array(12).fill('off'));
 });
 
@@ -563,7 +694,7 @@ test('instrumentLabel piano: the scale notes, the root and what to avoid, or no 
   );
   assert.equal(
     instrumentLabel('piano', atCps(dorianReading, 2.5)),
-    'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C.',
+    'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#.',
   );
   const pads = [
     ...stack(0, 0, 1, ['a3', 'c4', 'e4']),
@@ -572,7 +703,7 @@ test('instrumentLabel piano: the scale notes, the root and what to avoid, or no 
     ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
   ];
   assert.equal(
-    instrumentLabel('piano', atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1)),
+    instrumentLabel('piano', rawAt(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1)),
     'Piano, two octaves from C3. No clear scale.',
   );
   assert.throws(() => instrumentLabel('banjo', atCps(dorianReading, 0.5)), /Moontide:/);
@@ -585,7 +716,7 @@ test('buildJamModel carries the instrument: roles, names, root and the piano lab
   assert.equal(out.instrument.roles[1], 'outside');
   assert.equal(out.instrument.names[1], 'C#');
   assert.equal(out.instrument.rootPc, 2);
-  assert.equal(out.instrument.pianoLabel, 'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C.');
+  assert.equal(out.instrument.pianoLabel, 'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#.');
   const none = buildReading({ events: [{ begin: 0, end: 1, value: { s: 'bd' }, track: 0 }], windowStart: 0, windowLength: 64 });
   assert.equal(buildJamModel({ position: atCps(none, 1) }).instrument, undefined);
 });
@@ -633,9 +764,116 @@ test('instrumentLabel guitar: the scale notes, the root and what to avoid, or no
   );
   assert.equal(
     instrumentLabel('guitar', atCps(dorianReading, 2.5)),
-    'Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C.',
+    'Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#.',
   );
   assert.equal(buildJamModel({ position: atCps(dorianReading, 2.5) }).instrument.guitarLabel, instrumentLabel('guitar', atCps(dorianReading, 2.5)));
+});
+
+// --- the names that say the source, the outside notes and the chord tones ---
+
+const { keyTitle } = model;
+const PAD_ROW = [['a3', 'c4', 'e4'], ['f3', 'a3', 'c4'], ['c4', 'e4', 'g4'], ['g3', 'b3', 'd4']];
+const FOUR_PAD_LOOP = loop(8, (c) => stack(0, c, c + 1, PAD_ROW[c % 4]));
+const fourPadReading = buildReading({ events: FOUR_PAD_LOOP, windowStart: 0, windowLength: 64 });
+const FOUR_PADS_MEMORY_PICK = (key) => {
+  const memory = createScaleMemory();
+  const reading = resolveReading(fourPadReading, { declared: { state: 'none' }, memory });
+  memory.pick(reading.spans[0].scale.setKey, key);
+  return resolveReading(fourPadReading, { declared: { state: 'none' }, memory });
+};
+
+test('instrumentLabel: a heard scale with no warning and no overlay is byte-for-byte the label of a heard scale', () => {
+  assert.equal(
+    instrumentLabel('piano', atCps(dorianReading, 0.5), { chordTones: false }),
+    'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: none.',
+  );
+});
+
+test('instrumentLabel: a proposed scale names its source before the scale notes, and a pick says chosen in the same place', () => {
+  const proposed = atCps(fourPadReading, 1);
+  assert.equal(proposed.scale.source, 'proposed');
+  assert.equal(
+    instrumentLabel('piano', proposed),
+    'Piano, two octaves from C3. Proposed scale: C major. Scale notes: C, D, E, F, G, A, B. Root C. Avoid: none.',
+  );
+  assert.equal(
+    instrumentLabel('guitar', proposed),
+    'Guitar fretboard, standard tuning, 12 frets. Proposed scale: C major. Scale notes: C, D, E, F, G, A, B. Root C. Avoid: none.',
+  );
+  const picked = readingAt(FOUR_PADS_MEMORY_PICK('9:aeolian'), { cycle: 1, cps: 1, playing: true });
+  assert.equal(picked.scale.source, 'chosen');
+  assert.equal(
+    instrumentLabel('piano', picked),
+    'Piano, two octaves from C3. Chosen scale: A minor. Scale notes: A, B, C, D, E, F, G. Root A. Avoid: none.',
+  );
+});
+
+test('instrumentLabel: the outside notes come after the avoid sentence, and the chord tones last, from the bass up', () => {
+  const warning = atCps(dorianReading, 2.5);
+  assert.equal(
+    instrumentLabel('piano', warning),
+    'Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#.',
+  );
+  assert.equal(
+    instrumentLabel('piano', warning, { chordTones: true }),
+    `Piano, two octaves from C3. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: C. Outside: C#. Chord tones: ${warning.chord.notes.join(', ')}.`,
+  );
+  assert.equal(warning.chord.notes[0], 'D', 'the chord notes start from the bass');
+  assert.equal(
+    instrumentLabel('guitar', atCps(dorianReading, 0.5), { chordTones: true }),
+    'Guitar fretboard, standard tuning, 12 frets. Scale notes: D, E, F, G, A, B, C. Root D. Avoid: none. Chord tones: D, F, A, C.',
+  );
+  const out = buildJamModel({ position: warning, chordTones: true });
+  assert.equal(out.instrument.pianoLabel, instrumentLabel('piano', warning, { declared: false, chordTones: true }));
+  assert.equal(out.instrument.guitarLabel, instrumentLabel('guitar', warning, { declared: false, chordTones: true }));
+});
+
+test('instrumentLabel: a scale that cannot be chosen says none is coloured, then the chord tones when the overlay shows them', () => {
+  const position = cannotChoose(rawAt(fourPadReading, 0.5));
+  assert.equal(
+    instrumentLabel('piano', position),
+    'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.',
+  );
+  assert.equal(
+    instrumentLabel('guitar', position),
+    'Guitar fretboard, standard tuning, 12 frets. Several scales fit with different notes, so none is coloured.',
+  );
+  assert.equal(
+    instrumentLabel('piano', position, { declared: true, chordTones: true }),
+    'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured. Chord tones: A, C, E.',
+  );
+});
+
+test('instrumentLabel: no fit and no pitched note keep their labels, and the overlay adds the chord tones when a chord sounds', () => {
+  const noFit = rawAt(buildReading({ events: loop(2, (c) => run(0, c, 1 / 12, ['c4', 'c#4', 'd4', 'd#4', 'e4', 'f4', 'f#4', 'g4', 'g#4', 'a4', 'a#4', 'b4'])), windowStart: 0, windowLength: 64 }), 1);
+  assert.equal(noFit.scale.status, 'no-fit');
+  assert.equal(instrumentLabel('piano', noFit), 'Piano, two octaves from C3. No clear scale.');
+  assert.equal(instrumentLabel('piano', noFit, { chordTones: true }), `Piano, two octaves from C3. No clear scale.${noFit.chord === null ? '' : ` Chord tones: ${noFit.chord.notes.join(', ')}.`}`);
+  const none = rawAt(buildReading({ events: [{ begin: 0, end: 1, value: { s: 'bd' }, track: 0 }], windowStart: 0, windowLength: 64 }), 1);
+  assert.equal(instrumentLabel('piano', none, { declared: true }), `Piano, two octaves from C3. ${JAM_COPY.noPitched}`);
+});
+
+test('keyTitle: the note and its role word, with root for an avoided root and chord tone for a chord tone, nothing for an off key', () => {
+  const keys = pianoKeys();
+  const safe = atCps(dorianReading, 0.5);
+  const warning = atCps(dorianReading, 2.5);
+  const names = pcNames(warning);
+  const rolesNow = rolesByPc(warning);
+  const chordNow = new Array(12).fill(false);
+  chordNow[1] = true; // C#, outside
+  chordNow[6] = true; // F#, off
+  assert.equal(keyTitle(keys[2], rolesByPc(safe), pcNames(safe), null, 2), 'D, root');
+  assert.equal(keyTitle(keys[11], rolesByPc(safe), pcNames(safe), null, 2), 'B, scale');
+  assert.equal(keyTitle(keys[0], rolesNow, names, null, 2), 'C, avoid');
+  assert.equal(keyTitle(keys[1], rolesNow, names, chordNow, 2), 'C#, outside, chord tone');
+  assert.equal(keyTitle(keys[13], rolesNow, names, null, 2), 'C#, outside');
+  assert.equal(keyTitle(keys[6], rolesNow, names, chordNow, 2), 'F#, chord tone');
+  assert.equal(keyTitle(keys[6], rolesNow, names, null, 2), '');
+  assert.equal(keyTitle(keys[3], rolesNow, names, chordNow, 2), '');
+  const rootAvoided = [...rolesNow];
+  rootAvoided[2] = 'avoid';
+  assert.equal(keyTitle(keys[2], rootAvoided, names, null, 2), 'D, avoid, root');
+  assert.equal(keyTitle(keys[14], rootAvoided, names, null, 2), 'D, avoid, root');
 });
 
 // --- the chord tones overlay ---
@@ -700,14 +938,14 @@ test('buildJamModel chordTones on with no chord sounding: no mark and the no-cho
   assert.deepEqual(out.instrument.chordPcs, new Array(12).fill(false));
 });
 
-test('buildJamModel chordTones on with an ambiguous scale: roles stay off, the chord still carries its mark and names', () => {
+test('buildJamModel chordTones on with a scale that cannot be chosen: roles stay off, the chord still carries its mark and names', () => {
   const pads = [
     ...stack(0, 0, 1, ['a3', 'c4', 'e4']),
     ...stack(0, 1, 2, ['f3', 'a3', 'c4']),
     ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
     ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
   ];
-  const out = buildJamModel({ position: atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 0.5), chordTones: true });
+  const out = buildJamModel({ position: cannotChoose(rawAt(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 0.5)), chordTones: true });
   assert.deepEqual(out.instrument.roles, new Array(12).fill('off'));
   assert.deepEqual(out.instrument.chordPcs.map((on, pc) => (on ? pc : null)).filter((pc) => pc !== null), [0, 4, 9]);
   assert.equal(out.chordLine, 'Chord now: Am · A C E');
@@ -778,7 +1016,7 @@ test('noteDescriptor: the note with its role and scale, or the bare note while t
   assert.deepEqual(noteDescriptor({ note: 'D', role: 'off', scaleName: null }), { kind: 'note', note: 'D' });
 });
 
-test('buildJamModel noteScaleName: the clear scale name, null while the scale is ambiguous, not fitting or a part has no pitched note', () => {
+test('buildJamModel noteScaleName: the clear or proposed scale name, null while no scale can be chosen, none fits or a part has no pitched note', () => {
   assert.equal(buildJamModel({ position: atCps(dorianReading, 0) }).noteScaleName, 'D Dorian');
   assert.equal(buildJamModel({ position: atCps(dorianReading, 2.5) }).noteScaleName, 'D Dorian');
   const pads = [
@@ -787,7 +1025,10 @@ test('buildJamModel noteScaleName: the clear scale name, null while the scale is
     ...stack(0, 2, 3, ['c4', 'e4', 'g4']),
     ...stack(0, 3, 4, ['g3', 'b3', 'd4']),
   ];
-  const ambiguous = buildJamModel({ position: atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1) });
+  const proposed = buildJamModel({ position: atCps(buildReading({ events: pads, windowStart: 0, windowLength: 64 }), 1) });
+  assert.equal(proposed.scale.kind, 'clear');
+  assert.equal(proposed.noteScaleName, 'C major');
+  const ambiguous = buildJamModel({ position: atCps(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1) });
   assert.equal(ambiguous.scale.kind, 'ambiguous');
   assert.equal(ambiguous.noteScaleName, null);
   const chroma = loop(4, (c) => run(0, c, 1 / 12, ['c3', 'c#3', 'd3', 'd#3', 'e3', 'f3', 'f#3', 'g3', 'g#3', 'a3', 'a#3', 'b3']));
@@ -944,21 +1185,8 @@ test('every mode id the harmony reader can return is the id of a MODES entry', (
   for (const [name, modeId] of SCALE_NAME_IDS) assert.ok(ids.has(modeId), `${name} -> ${modeId}`);
 });
 
-test('ambiguitySentence in declared mode drops the verdict prefix and keeps the list rules', () => {
-  const declared = { declared: true };
-  assert.equal(ambiguitySentence(tie(['C major', 'A minor']), declared), 'The notes fit C major and A minor equally.');
-  assert.equal(ambiguitySentence(tie(['A', 'B', 'C']), declared), 'The notes fit A, B and C equally.');
-  assert.equal(ambiguitySentence(tie(['A', 'B', 'C', 'D']), declared), 'The notes fit A, B, C and 1 more equally.');
-  const nine = Array.from({ length: 9 }, (_, i) => `S${i}`);
-  assert.equal(ambiguitySentence(tie(nine), declared), 'The notes fit S0, S1, S2 and 6 more equally.');
-  assert.equal(ambiguitySentence(tie(['C major', 'G major'], 'near'), declared), 'The notes fit C major and G major almost equally.');
-  assert.equal(ambiguitySentence({ status: 'no-fit' }, declared), 'The notes fit none of the nine scales.');
-  assert.equal(ambiguitySentence({ status: 'no-fit' }, { declared: false }), JAM_COPY.noFit);
-  assert.throws(() => ambiguitySentence({ status: 'clear' }, declared), /Moontide:/);
-});
-
 test('instrumentLabel in declared mode says the heard scale is not clear; a clear scale reads the same in both modes', () => {
-  const tied = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64 }), 1);
+  const tied = rawAt(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64 }), 1);
   assert.equal(instrumentLabel('piano', tied, { declared: true }), 'Piano, two octaves from C3. The heard scale is not clear.');
   assert.equal(instrumentLabel('guitar', tied, { declared: true }), 'Guitar fretboard, standard tuning, 12 frets. The heard scale is not clear.');
   assert.equal(instrumentLabel('piano', tied), 'Piano, two octaves from C3. No clear scale.');
@@ -968,30 +1196,35 @@ test('instrumentLabel in declared mode says the heard scale is not clear; a clea
 
 test('buildJamModel without a declaration: every ready model has declared null and the texts are as before', () => {
   assert.equal(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64 }).declared.state, 'none');
-  const tied = modelOf(TIE_PADS);
+  const tied = modelOf(DRONE_LINE);
   assert.equal(tied.declared, null);
-  assert.ok(tied.scale.text.startsWith('No clear scale: the notes fit '));
-  assert.ok(tied.instrument.pianoLabel.endsWith(' No clear scale.'));
+  assert.equal(tied.scale.text, JAM_COPY.cannotChoose['nothing-declared']);
+  assert.equal(tied.instrument.pianoLabel, 'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.');
   assert.equal(modelOf(loop(2, (c) => run(0, c, 1 / 12, CHROMATIC)), undefined).declared, null);
   assert.equal(buildJamModel({ position: atCps(dorianReading, 2.5) }).declared, null);
   assert.equal(modelOf(DRUMS).state, 'message');
   assert.equal('declared' in modelOf(DRUMS), false);
-  const explicit = modelOf(TIE_PADS, { state: 'none' });
+  const explicit = modelOf(DRONE_LINE, { state: 'none' });
   assert.deepEqual(explicit, tied);
 });
 
-test('buildJamModel in declared mode: a tie says what the notes fit, with no verdict words anywhere', () => {
-  const plain = modelOf(TIE_PADS);
-  for (const declared of [scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }), { state: 'unreadable', reason: 'empty', source: null }]) {
-    const out = modelOf(TIE_PADS, declared);
+test('buildJamModel in declared mode: scales that cannot be chosen say why in their own sentence, with no verdict words anywhere', () => {
+  const plain = modelOf(DRONE_LINE);
+  const cases = [
+    [scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }), JAM_COPY.cannotChoose['declared-not-among']],
+    [{ state: 'unreadable', reason: 'empty', source: null }, JAM_COPY.cannotChoose['nothing-declared']],
+    [{ state: 'declared', kind: 'chords', text: '<Am G>', scale: null }, JAM_COPY.cannotChoose['nothing-declared']],
+  ];
+  for (const [declared, sentence] of cases) {
+    const out = modelOf(DRONE_LINE, declared);
     assert.equal(out.state, 'ready');
     assert.equal(out.scale.kind, 'ambiguous');
-    assert.equal(out.scale.text, plain.scale.text.replace('No clear scale: the', 'The'));
-    assert.ok(out.scale.text.startsWith('The notes fit ') && out.scale.text.endsWith(' equally.'));
+    assert.equal(out.scale.text, sentence);
     assert.equal(out.scale.title, out.scale.text);
-    assert.equal(out.scale.sub, 'Warnings are off until the scale is clear.');
-    assert.equal(out.instrument.pianoLabel, 'Piano, two octaves from C3. The heard scale is not clear.');
-    assert.equal(out.instrument.guitarLabel, 'Guitar fretboard, standard tuning, 12 frets. The heard scale is not clear.');
+    assert.equal(out.scale.sub, JAM_COPY.cannotChoose.sub);
+    assert.equal(out.reason, null);
+    assert.equal(out.instrument.pianoLabel, 'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.');
+    assert.equal(out.instrument.guitarLabel, 'Guitar fretboard, standard tuning, 12 frets. Several scales fit with different notes, so none is coloured.');
     assert.deepEqual(allStrings(out).filter((text) => /no clear scale/i.test(text)), []);
     assert.deepEqual(out.degrees, plain.degrees);
     assert.deepEqual(out.status, plain.status);
@@ -1067,10 +1300,11 @@ test('buildJamModel: a declared override replaces the declaration of the reading
 });
 
 test('buildJamModel: a none override hides the Declared line and leaves declared mode', () => {
-  const position = atCps(buildReading({ events: TIE_PADS, windowStart: 0, windowLength: 64, declared: scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }) }), 1, 0.5);
+  const position = atCps(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64, declared: scaleDeclared('C:major', { rootPc: 0, modeId: 'ionian' }) }), 1, 0.5);
   const out = buildJamModel({ position, declaredOverride: { state: 'none' }, section: "'x'" });
   assert.equal(out.declared, null);
-  assert.ok(out.scale.text.startsWith('No clear scale: the notes fit '));
+  assert.equal(out.scale.text, JAM_COPY.cannotChoose['declared-not-among']);
+  assert.equal(out.instrument.pianoLabel, 'Piano, two octaves from C3. Several scales fit with different notes, so none is coloured.');
   assert.equal(out.section, "section 'x'");
 });
 
@@ -1088,4 +1322,98 @@ test('buildJamModel: an unreadable override says why in the usual sentence', () 
   const out = buildJamModel({ position, declaredOverride: { state: 'unreadable', reason: 'empty', source: null }, section: "'z'" });
   assert.equal(out.declared.kind, 'unreadable');
   assert.equal(out.declared.text, 'Not readable: harmony is empty.');
+});
+
+// --- the scales that fit, listed under the scale ---
+
+const padsPosition = (memory = createScaleMemory(), declared = { state: 'none' }) =>
+  readingAt(resolveReading(buildReading({ events: FOUR_PADS, windowStart: 0, windowLength: 64 }), { declared, memory }), { cycle: 1, cps: 0.5, playing: true });
+
+// A position whose scale in use carries a made-up list of `count` candidates, `inUse` being the place of the scale in use.
+function withCandidates(position, count, inUse, source = 'proposed') {
+  const candidates = Array.from({ length: count }, (_, i) => ({ key: `${i}:ionian`, name: `Scale ${i}` }));
+  return { ...position, scale: { ...position.scale, source, key: candidates[inUse].key, setKey: 'made-up', candidates } };
+}
+
+test('MAX_CANDIDATES_SHOWN is eight', () => {
+  assert.equal(MAX_CANDIDATES_SHOWN, 8);
+});
+
+test('buildJamModel: a proposed scale lists the scales that fit in pick mode with the scale in use pressed', () => {
+  const out = buildJamModel({ position: padsPosition() });
+  assert.equal(out.candidates.mode, 'pick');
+  assert.equal(out.candidates.caption, 'Scales that fit, click to switch:');
+  assert.equal(out.candidates.more, null);
+  assert.equal(out.candidates.setKey, '0:ionian,5:lydian,7:mixolydian,9:aeolian');
+  assert.deepEqual(out.candidates.items.map((item) => item.name).sort(), ['A minor', 'C major', 'F Lydian', 'G Mixolydian']);
+  assert.equal(out.candidates.items.length, 4);
+  assert.deepEqual(out.candidates.items.filter((item) => item.pressed).map((item) => item.name), ['C major']);
+});
+
+test('buildJamModel: a pick presses its scale, keeps the order and reads Your pick', () => {
+  const before = buildJamModel({ position: padsPosition() });
+  const memory = createScaleMemory();
+  memory.pick(before.candidates.setKey, '9:aeolian');
+  const out = buildJamModel({ position: padsPosition(memory) });
+  assert.deepEqual(out.candidates.items.map((item) => item.key), before.candidates.items.map((item) => item.key));
+  assert.deepEqual(out.candidates.items.filter((item) => item.pressed).map((item) => item.key), ['9:aeolian']);
+  assert.equal(out.candidates.mode, 'pick');
+  assert.equal(out.scaleSource, 'chosen');
+  assert.equal(out.scale.text, 'A minor');
+  assert.deepEqual(out.reason, { lead: 'Your pick:', rest: ' A minor. It holds while these same scales fit.' });
+});
+
+test('buildJamModel: scales that cannot be chosen are listed as plain items, none pressed', () => {
+  const out = buildJamModel({ position: at(buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 }), 1) });
+  assert.equal(out.candidates.mode, 'list');
+  assert.equal(out.candidates.caption, 'Scales that fit:');
+  assert.deepEqual(out.candidates.items.map((item) => item.name), ['A Dorian', 'A minor']);
+  assert.ok(out.candidates.items.every((item) => item.pressed === false));
+  assert.equal(out.candidates.more, null);
+});
+
+test('buildJamModel: a pick held while a declaration allowed it shows the picked scale in pick mode', () => {
+  const reading = buildReading({ events: DRONE_LINE, windowStart: 0, windowLength: 64 });
+  const memory = createScaleMemory();
+  memory.pick('9:aeolian,9:dorian', '9:dorian');
+  const out = buildJamModel({ position: readingAt(resolveReading(reading, { declared: { state: 'none' }, memory }), { cycle: 1, cps: 0.5, playing: true }) });
+  assert.equal(out.candidates.mode, 'pick');
+  assert.equal(out.scale.text, 'A Dorian');
+  assert.deepEqual(out.candidates.items.filter((item) => item.pressed).map((item) => item.name), ['A Dorian']);
+});
+
+test('buildJamModel: a heard scale, no fit and no pitched note have no candidates', () => {
+  assert.equal(buildJamModel({ position: atCps(dorianReading, 0.5) }).candidates, null);
+  const chroma = buildJamModel({ position: at(buildReading({ events: loop(2, (c) => run(0, c, 1 / 12, ['c4', 'c#4', 'd4', 'd#4', 'e4', 'f4', 'f#4', 'g4', 'g#4', 'a4', 'a#4', 'b4'])), windowStart: 0, windowLength: 64 }), 0.5) });
+  assert.equal(chroma.candidates, null);
+});
+
+test('buildJamModel: past eight candidates, eight items and the count of the rest', () => {
+  const out = buildJamModel({ position: withCandidates(padsPosition(), 12, 0) });
+  assert.equal(out.candidates.items.length, 8);
+  assert.equal(out.candidates.more, 'and 4 more');
+  assert.deepEqual(out.candidates.items.map((item) => item.name), Array.from({ length: 8 }, (_, i) => `Scale ${i}`));
+  const nine = buildJamModel({ position: withCandidates(padsPosition(), 9, 0) });
+  assert.equal(nine.candidates.more, 'and 1 more');
+  const eight = buildJamModel({ position: withCandidates(padsPosition(), 8, 7) });
+  assert.equal(eight.candidates.items.length, 8);
+  assert.equal(eight.candidates.more, null);
+});
+
+test('buildJamModel: the scale in use is always among the eight drawn, in the eighth place when it comes later', () => {
+  const out = buildJamModel({ position: withCandidates(padsPosition(), 12, 10) });
+  assert.equal(out.candidates.items.length, 8);
+  assert.deepEqual(out.candidates.items.slice(0, 7).map((item) => item.name), Array.from({ length: 7 }, (_, i) => `Scale ${i}`));
+  assert.equal(out.candidates.items[7].name, 'Scale 10');
+  assert.equal(out.candidates.items[7].pressed, true);
+  assert.equal(out.candidates.more, 'and 4 more');
+  // in the eighth place already, or earlier: not moved
+  const inEighth = buildJamModel({ position: withCandidates(padsPosition(), 12, 7, 'chosen') });
+  assert.equal(inEighth.candidates.items[7].name, 'Scale 7');
+  assert.deepEqual(inEighth.candidates.items.filter((item) => item.pressed).map((item) => item.name), ['Scale 7']);
+});
+
+test('buildJamModel refuses a scale in use that is not among its candidates', () => {
+  const position = padsPosition();
+  assert.throws(() => buildJamModel({ position: { ...position, scale: { ...position.scale, key: '1:lydian' } } }), /Moontide:.*1:lydian/);
 });

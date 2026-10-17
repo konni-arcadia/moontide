@@ -19,6 +19,7 @@ import { METHOD_KEYS } from '../page/mixer-registry.js';
 // The helper lines every structured piece carries, written as is: the structure topic must hold exactly this text.
 // A local file of this repository, never text read from the download.
 import { HELPER_TEXT } from '../page/structure.js';
+import { MAX_GLIDE_BARS, MIN_GLIDE_BARS } from '../page/tempo-glide.js';
 
 /** Parses the pinned @strudel/repl script tag out of page/index.html's text. */
 export function parsePin(html) {
@@ -60,7 +61,9 @@ const NON_API_LITERALS = new Set(['true', 'false', 'null', 'undefined']);
 // checking it is inconvenient). Mirrors the SYNTH_EXCLUSIONS pattern below, applied to prose
 // instead of the sound palette.
 const BARE_NAME_EXCLUSIONS = new Map([
+  ['edit_code', "this project's own MCP tool name (src/mcp.ts), not a Strudel API name"],
   ['get_code', "this project's own MCP tool name (src/mcp.ts), not a Strudel API name"],
+  ['glideBars', "an option of this project's own MCP tools set_code and edit_code (src/mcp.ts), not a Strudel API name"],
   ['phraseCycles', "an option of this project's own MCP tool set_code (src/mcp.ts), not a Strudel API name"],
   ['restore_version', "this project's own MCP tool name (src/mcp.ts), not a Strudel API name"],
   ['set_code', "this project's own MCP tool name (src/mcp.ts), not a Strudel API name"],
@@ -1241,6 +1244,49 @@ function defaultTempoClaim(bundleText, texts, claim) {
   return failures;
 }
 
+// --- tempo-glide ---
+
+// The tempo ramp section of transitions.md states three facts that can drift. The bounds are compared with the page's own
+// (MIN_GLIDE_BARS and MAX_GLIDE_BARS). The `.cpm()` sentence rests on the bundle: cpm is registered as a method that reads
+// the scheduler's cps once, when the method is called, which is when the program runs. The not-verified sentence is
+// checked by its wording so it cannot be dropped while the bench is still open. The section also holds no digit other than
+// the bounds, so an example tempo or bar count can never tint Claude's pieces. All regexes are hard-coded.
+const CPM_REGISTRATION_RE = /register\("cpm",function\((\w+),(\w+)\)\{return \2\._fast\(\1\/60\/[\w$]+\.cps\)\}\)/;
+const GLIDE_HEADING = '## Tempo ramp';
+const GLIDE_BOUNDS_RE = /`glideBars`, a whole number of bars from (\d+) to (\d+)/;
+const GLIDE_CPM_RE = /A pattern's `\.cpm\(\)` is worked out once, when the program runs, against the tempo at that moment/;
+const GLIDE_NOT_VERIFIED_RE = /How a hardware instrument that follows the MIDI clock reacts to a ramp has not been verified/;
+
+/** The text of the tempo ramp section: from its heading up to the next heading of the same level, or the end. */
+function tempoGlideSection(text) {
+  const start = text.indexOf(GLIDE_HEADING);
+  if (start === -1) return null;
+  const rest = text.slice(start + GLIDE_HEADING.length);
+  const next = rest.search(/\n## /);
+  return next === -1 ? rest : rest.slice(0, next);
+}
+
+function tempoGlideClaim(bundleText, texts, claim) {
+  if (!CPM_REGISTRATION_RE.test(bundleText)) {
+    return [claimFailure(claim.id, 'the cpm registration that reads the scheduler tempo once when the program runs')];
+  }
+  const section = tempoGlideSection(texts['transitions.md'] ?? '');
+  if (section === null) return [fileMissingClaim('transitions.md', claim.id)];
+  const failures = [];
+  const bounds = GLIDE_BOUNDS_RE.exec(section);
+  if (!bounds) {
+    failures.push(fileMissingClaim('transitions.md', claim.id));
+  } else if (Number(bounds[1]) !== MIN_GLIDE_BARS || Number(bounds[2]) !== MAX_GLIDE_BARS) {
+    failures.push(fileMismatch('transitions.md', `glideBars from ${bounds[1]} to ${bounds[2]}`, `glideBars from ${MIN_GLIDE_BARS} to ${MAX_GLIDE_BARS}`));
+  }
+  if (!GLIDE_CPM_RE.test(section) || !GLIDE_NOT_VERIFIED_RE.test(section)) failures.push(fileMissingClaim('transitions.md', claim.id));
+  const withoutBounds = bounds ? section.replace(bounds[0], '') : section;
+  if (/\d/.test(withoutBounds)) {
+    failures.push(`transitions.md: the ${claim.id} section holds a digit other than the bounds (no example tempo or bar count belongs there)`);
+  }
+  return failures;
+}
+
 // --- solo-label ---
 
 // The bundle's own two label rules, read from its text: a registered label longer than one character
@@ -2146,6 +2192,7 @@ export const PROSE_CLAIMS = [
   { id: 'scale-patterned', files: ['structure.md'], check: scalePatternedClaim },
   { id: 'add-number-control', files: ['structure.md'], check: addNumberControlClaim },
   { id: 'duckorbit-exists', files: [], check: duckorbitExistsClaim },
+  { id: 'tempo-glide', files: ['transitions.md'], check: tempoGlideClaim },
 ];
 
 /**

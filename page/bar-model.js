@@ -6,7 +6,7 @@
 
 import { ASK_COPY } from './ask.js';
 import { MIDI_COPY } from './midi-plan.js';
-import { BEATS_PER_CYCLE, bpmText } from './change-timing.js';
+import { BEATS_PER_CYCLE, bpmText, fillChange } from './change-timing.js';
 import { BUILD_MISMATCH_COPY, CONNECTION_LABELS, SERVER_UPDATED_COPY, SOUND_LABELS, errorLineText } from './ui-state.js';
 
 /** The copy the bar and the Session drawer add. */
@@ -60,6 +60,13 @@ export const BAR_COPY = Object.freeze({
   tempoTitle: 'Tempo of the music that plays',
   tempoTitleIdle: 'Nothing plays',
   tempoNameIdle: 'No tempo, nothing plays',
+  // While a tempo ramp runs: the accessible name and the hover text say the direction, the target and the bars left.
+  tempoNameRising: 'Tempo {num} BPM, rising to {target} BPM',
+  tempoNameFalling: 'Tempo {num} BPM, falling to {target} BPM',
+  tempoTitleUp: 'Tempo moving up to {target} BPM. {left}',
+  tempoTitleDown: 'Tempo moving down to {target} BPM. {left}',
+  tempoBarsLeft: '{k} bars left.',
+  tempoOneBarLeft: '1 bar left.',
   // The failed-change banner: the lead of each kind, and the three sentences about the music. The first two
   // equal the server's NOTHING_PLAYING_TAIL and STILL_STOPPED_TAIL; the third is the user-facing wording of
   // STILL_PLAYING_TAIL ('The previous code is still playing.' stays the server's text for Claude). A test pins all three.
@@ -218,8 +225,15 @@ export function cycleBeat(now) {
  * the waiting tempo differs from the playing one after that rounding. Returns { idle, num, arrow, unit, text, name,
  * title }: `arrow` is '→ 124' or '', `unit` is 'BPM' (the view puts the spaces), `text` the whole line and `name`
  * the accessible name. A number bpmText cannot format throws; the caller logs it and shows the idle form.
+ *
+ * `ramp` is null or absent, or `{ targetBpm, barsLeft }` while a tempo ramp runs (`rising` is an optional true or false
+ * that says the direction when the live tempo already reads like the target). A ramp wins over `waitingBpm`. The number is then
+ * the live tempo rounded to a whole BPM (after bpmText has validated it), the arrow part is the target through bpmText
+ * and is empty when the number reads like the target, the name says 'rising to' or 'falling to' and the hover text says
+ * 'moving up' or 'moving down' with the whole bars left (a whole number from 1; '1 bar left.' for one). A call without
+ * a ramp returns exactly what it returned before the ramp existed. A bad ramp throws.
  */
-export function tempoText({ playing, bpm, waitingBpm }) {
+export function tempoText({ playing, bpm, waitingBpm, ramp }) {
   requireBoolean('playing', playing);
   if (!playing) {
     return {
@@ -233,6 +247,7 @@ export function tempoText({ playing, bpm, waitingBpm }) {
     };
   }
   const num = bpmText(bpm);
+  if (ramp !== null && ramp !== undefined) return rampTempoText(bpm, ramp);
   const hasWaiting = waitingBpm !== null && waitingBpm !== undefined;
   const waiting = hasWaiting ? bpmText(waitingBpm) : null;
   const changing = waiting !== null && waiting !== num;
@@ -244,6 +259,32 @@ export function tempoText({ playing, bpm, waitingBpm }) {
     text: changing ? `${num} ${BAR_COPY.tempoArrow} ${waiting} ${BAR_COPY.tempoUnit}` : `${num} ${BAR_COPY.tempoUnit}`,
     name: changing ? `Tempo ${num} ${BAR_COPY.tempoUnit}, changing to ${waiting} ${BAR_COPY.tempoUnit}` : `Tempo ${num} ${BAR_COPY.tempoUnit}`,
     title: BAR_COPY.tempoTitle,
+  };
+}
+
+/** The readout while a tempo ramp runs; `bpm` was validated by the caller. See tempoText. */
+function rampTempoText(bpm, ramp) {
+  if (typeof ramp !== 'object') {
+    throw new Error(`Moontide: the tempo ramp must be an object with targetBpm and barsLeft, got ${JSON.stringify(ramp)}.`);
+  }
+  const { targetBpm, barsLeft, rising } = ramp;
+  const target = bpmText(targetBpm);
+  if (!Number.isInteger(barsLeft) || barsLeft < 1) {
+    throw new Error(`Moontide: the bars left of a tempo ramp must be a whole number from 1, got ${JSON.stringify(barsLeft)}.`);
+  }
+  if (rising !== undefined) requireBoolean('rising', rising);
+  const num = String(Math.round(bpm));
+  const up = rising !== undefined ? rising : targetBpm > bpm;
+  const arrow = num === target ? '' : `${BAR_COPY.tempoArrow} ${target}`;
+  const left = barsLeft === 1 ? BAR_COPY.tempoOneBarLeft : fillChange(BAR_COPY.tempoBarsLeft, { k: barsLeft });
+  return {
+    idle: false,
+    num,
+    arrow,
+    unit: BAR_COPY.tempoUnit,
+    text: arrow === '' ? `${num} ${BAR_COPY.tempoUnit}` : `${num} ${arrow} ${BAR_COPY.tempoUnit}`,
+    name: fillChange(up ? BAR_COPY.tempoNameRising : BAR_COPY.tempoNameFalling, { num, target }),
+    title: fillChange(up ? BAR_COPY.tempoTitleUp : BAR_COPY.tempoTitleDown, { target, left }),
   };
 }
 

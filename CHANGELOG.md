@@ -3,6 +3,51 @@
 Notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-10-17
+
+Claude can now move the tempo over several bars, the page shows what became of each request, and
+the Jam view proposes a scale when several fit.
+
+Not yet checked by hand: how hardware that follows the MIDI clock (an arpeggiator, a step
+sequencer) reacts to a tempo ramp, how a ramp sounds on speakers and instruments, whether the
+request states and the proposed scale with its reason read right in real sessions, and how the
+top bar during a ramp, the request list and the piano look on large screens. The automated tests
+and the checks in a real browser cover how they behave.
+
+### Added
+
+- A tempo ramp. `set_code` and `edit_code` take `glideBars`, a whole number of bars from 1 to 64,
+  and the code states the tempo to reach. The tempo moves in equal small steps and ends exactly
+  on it. The top bar shows the live tempo, an arrow and the tempo to reach, and the bars left
+  when you hover it. Your Mixer, Song grid, Timeline and hand edits keep the ramp going. Code
+  with another tempo or with none cancels it, and so does Stop, after which Play starts at the
+  code's tempo. A ramp that cannot be made (nothing plays, no tempo in the code, or the tempo
+  that already plays) is refused and nothing changes. The MIDI clock follows every step. How
+  hardware that follows the clock, such as an arpeggiator or a step sequencer, reacts to a ramp
+  has not been verified.
+- Request status. A Requests button in the top bar opens one row per request, with its state in
+  the page's words: received or waiting for Claude's next action, started, waiting for its line,
+  applied as a version, Answered or Declined with Claude's sentence, failed with the error,
+  replaced or canceled, and No change yet after a quiet wait, which is not a failure. A request
+  shows as applied only when Claude names it with its change (the `answering` field on `set_code`,
+  `edit_code` and `restore_version`). The new `answer_request` tool closes a request in words.
+  The rows are kept in memory only.
+- A proposed scale in the Jam view. When the notes fit several scales, the view proposes one and
+  says why in a sentence, and lists the scales that fit so one click or Enter switches. Your pick
+  holds while the same scales fit and is forgotten on reload. When it cannot choose, it says so
+  and lists the scales. The piano is now coloured like the guitar, with the same legend and a
+  shape or text cue besides colour.
+
+### Changed
+
+- A Timeline range that crosses several sections now names each of them, in playing order.
+- The one-line status of your latest request is replaced by the Requests list.
+
+### Fixed
+
+- A Menu key or Shift+F10 press opens the Ask box once, with no browser menu over it.
+- A Mixer light no longer stays lit in the middle of a fade.
+
 ## [2.1.0] - 2026-10-15
 
 Pieces now declare their sections, and the page shows them, launches them and lets you edit them.
@@ -89,6 +134,7 @@ A maintenance release: nothing changes in how Moontide works.
 - Moontide starts when you ask for music or say start, not with every Claude session. Each page and its
   tab title name the folder and the port of their server.
 
+[2.2.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.2.0
 [2.1.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.1.0
 [2.0.2]: https://github.com/konni-arcadia/moontide/releases/tag/v2.0.2
 [2.0.1]: https://github.com/konni-arcadia/moontide/releases/tag/v2.0.1

@@ -1,6 +1,6 @@
 {
   "name": "moontide-mcp",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "mcpName": "io.github.konni-arcadia/moontide",
   "description": "Claude steers live music by writing Strudel code played in a browser page",
   "keywords": [
