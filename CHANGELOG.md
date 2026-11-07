@@ -3,6 +3,22 @@
 Notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.3] - 2026-11-07
+
+A maintenance release. It carries two small fixes found by the first code scan.
+
+### Fixed
+
+- The chord reader of the harmony check no longer slows down on a long run of slash chords with an
+  altered bass note. Typed text could not reach that case; every chord read before still reads.
+- A failed step in the page now logs its context as written, even when the context holds a `%`.
+
+### Changed
+
+- Code scanning leaves out the real-browser check scripts and the unit tests, which run only locally:
+  they send code to a test page on purpose, so their findings were noise.
+- The Node types move to 22.20.5.
+
 ## [2.4.2] - 2026-11-07
 
 A maintenance release. Nothing changes in Moontide itself.
@@ -230,6 +246,7 @@ A maintenance release: nothing changes in how Moontide works.
 - Moontide starts when you ask for music or say start, not with every Claude session. Each page and its
   tab title name the folder and the port of their server.
 
+[2.4.3]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.3
 [2.4.2]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.2
 [2.4.1]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.1
 [2.4.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.0

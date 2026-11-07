@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { parse } from 'acorn';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { HARMONY_REASONS, MAX_HARMONY_TEXT, MAX_SOURCE_LENGTH, SCALE_NAME_IDS, readHarmony } from '../page/harmony.js';
+import { CHORD_STEP, HARMONY_REASONS, MAX_HARMONY_TEXT, MAX_SOURCE_LENGTH, SCALE_NAME_IDS, readHarmony } from '../page/harmony.js';
 import { MODES } from '../page/jam-analysis.js';
 import { TINT_WORDS, findWords, stripNamesBlocks } from './tint-rules.js';
 
@@ -214,4 +214,13 @@ test('reference/theory.md states the declaration as a fact, between Voicings and
   assert.deepEqual(findWords(stripNamesBlocks(section), TINT_WORDS), [], 'no tint word');
   assert.doesNotMatch(section, /arrange/i, 'the section never points toward arrange');
   assert.doesNotMatch(section, /\b(should|must|try|recommend|prefer)\b/i, 'the section states facts and gives no advice');
+});
+
+test('the chord test reads a slash bass with an altered number one way only, so a long run of them fails at once', () => {
+  for (const chord of ['C/E', 'Bb/D', 'C/Bb', 'C/Bb7', 'A/A#9', 'Am7/G', 'F#m7b5']) assert.ok(CHORD_STEP.test(chord), chord);
+  // With two readings of each "#0/A" (the sharp on the bass, or on the number), 30 of them took minutes before the fix.
+  const long = 'A/A' + '#0/A'.repeat(30) + 'x';
+  const start = performance.now();
+  assert.equal(CHORD_STEP.test(long), false);
+  assert.ok(performance.now() - start < 50, 'the chord test must not backtrack');
 });

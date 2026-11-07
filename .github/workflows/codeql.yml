@@ -2,6 +2,11 @@
 # every push to main, every pull request to main, and once a week. Its findings show under the
 # repository's Security tab. Nothing is built: CodeQL reads the sources as they are.
 #
+# Two places are left out of the scan. The page probes (scripts/probe-page.mjs, scripts/probe-midi.mjs)
+# drive a real Chrome page and send it code to run on purpose, so every such call would show as code
+# injection. The unit tests (test/) run only on a developer's machine against fixtures written in the
+# repository. Neither is part of the published package.
+#
 # Every action reference is a full commit SHA with its version as a comment. Do not use a tag or
 # a branch name: a tag can be moved, a commit cannot.
 name: codeql
@@ -37,6 +42,11 @@ jobs:
         with:
           languages: javascript-typescript
           build-mode: none
+          config: |
+            paths-ignore:
+              - scripts/probe-page.mjs
+              - scripts/probe-midi.mjs
+              - test
 
       - name: Analyze
         uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3

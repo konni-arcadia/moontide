@@ -2760,7 +2760,8 @@ ws.addEventListener('error', () => {
 let chain = Promise.resolve();
 
 function reportChainError(context, err) {
-  console.error(`Moontide: failed to apply ${context}:`, err);
+  // The context goes in as a value, never as the format string: an id with a % in it prints as written.
+  console.error('Moontide: failed to apply %s:', context, err);
 }
 
 // One Mixer gesture becomes few live evaluations and one record. Every job runs

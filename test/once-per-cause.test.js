@@ -57,3 +57,9 @@ test('a song check that stopped on an error and one that ran over its budget giv
     assert.ok(line.startsWith('The page could not check what plays against the declaration:'), line);
   }
 });
+
+test('a failed step of the serial chain logs its context as a value, never as the format string', () => {
+  // The context can hold a message id from the server: a % in it must print as written.
+  const text = functionText('reportChainError');
+  assert.match(text, /console\.error\('Moontide: failed to apply %s:', context, err\);/);
+});

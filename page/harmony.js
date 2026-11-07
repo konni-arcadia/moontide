@@ -57,8 +57,10 @@ const SCALE_TOKEN = /^([A-Ga-g])(#*|b*)(-?\d+)?:([A-Za-z0-9_: ]+)$/;
 const SCALE_STEP = /^[A-Ga-g](#*|b*)(-?\d+)?:[A-Za-z0-9_:]+$/;
 /** A chord symbol: an uppercase root, an optional flat or sharp, then only the pieces a chord name is made of
  * (a quality such as m, maj, min, dim, aug, sus, add, alt, ^, -, +, o or a half-diminished sign; a number, flat or sharp
- * with a number; a slash bass note). A plain word that starts with A to G ("Dorian", "Cat") is not a chord. */
-const CHORD_STEP = /^[A-G][b#]?(?:maj|min|dim|aug|sus|add|alt|m|M|\^|-|\+|o|°|ø|\d|[b#]\d|\/[A-G][b#]?)*$/;
+ * with a number; a slash bass note). A plain word that starts with A to G ("Dorian", "Cat") is not a chord. A flat or
+ * sharp right after a bass note and before a number belongs to the number ("A/A#9" reads A/A, #9): with two ways to read
+ * it, a long run of them would make the test backtrack for minutes. Exported for its test. */
+export const CHORD_STEP = /^[A-G][b#]?(?:maj|min|dim|aug|sus|add|alt|m|M|\^|-|\+|o|°|ø|\d|[b#]\d|\/[A-G](?:[b#](?!\d))?)*$/;
 /** A group in parentheses that only holds numbers (an euclid rhythm) or altered numbers (the "(#9)" of a chord). */
 const NUMBER_GROUP = /\((?:[b#]?\d+)(?:,[b#]?\d+)*\)/g;
 /** The argument of a * or / step modifier: a number, a <...> group or a [...] group. */
