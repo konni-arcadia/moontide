@@ -3,6 +3,22 @@
 Notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.2] - 2026-11-07
+
+A maintenance release. Nothing changes in Moontide itself.
+
+### Security
+
+- Dependency updates with security fixes: zod 4.6.7, and body-parser, hono, @hono/node-server, fast-uri
+  and ip-address raised within their ranges. `npm audit` reports no known vulnerability.
+
+### Changed
+
+- Minor updates: the MCP SDK 1.32.2, ws 8.22.1, and newer pinned versions of the GitHub Actions used
+  by the workflows.
+- Dependabot no longer proposes a major version of the Node types, which follow the oldest supported
+  Node, nor acorn, which the page pins together with its integrity hash.
+
 ## [2.4.1] - 2026-11-07
 
 A maintenance release. Nothing changes in Moontide itself.
@@ -214,6 +230,7 @@ A maintenance release: nothing changes in how Moontide works.
 - Moontide starts when you ask for music or say start, not with every Claude session. Each page and its
   tab title name the folder and the port of their server.
 
+[2.4.2]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.2
 [2.4.1]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.1
 [2.4.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.0
 [2.2.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.2.0
