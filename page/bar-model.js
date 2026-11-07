@@ -30,6 +30,7 @@ export const BAR_COPY = Object.freeze({
   cardChange: 'Last change',
   rightClickHint: 'Right-click anything to ask Claude.',
   rightClickHintTitle: ASK_COPY.shiftRightClickTitle,
+  earlyNote: 'Early: Moontide is young and has known bugs.',
   midiHint: 'Instruments view: key 6.',
   settingsLabel: 'Your edits take over',
   timingNote: "Claude's changes say their own timing.",

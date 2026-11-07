@@ -11,7 +11,7 @@ import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { z } from 'zod';
-import { catalogLine, categoriesSentence, readCatalogFile, searchCatalog, searchReply, type Catalog } from './catalog.js';
+import { catalogLine, categoriesSentence, engineClause, engineOf, readCatalogFile, searchCatalog, searchReply, type Catalog } from './catalog.js';
 import {
   MAX_DRUM_MAPS,
   drumMapById,
@@ -26,6 +26,7 @@ import { renameWithRetry } from './history.js';
 import { cleanMidiName, quoteMidiName } from './midi-state.js';
 import {
   MAX_MIDI_NAME_LENGTH,
+  MAX_RIG_INPUTS,
   MAX_RIG_INSTRUMENTS,
   MAX_RIG_PROBLEMS,
   MAX_RIG_SOUNDS,
@@ -48,6 +49,7 @@ import {
   soundKey,
   type Problem,
 } from './rig-util.js';
+import { settingsMessage, settingsProblems, settingsSchema, settingsSummary } from './vocabulary.js';
 
 // The helpers other modules and tests already read from here live in src/rig-util.ts.
 export { MAX_RIG_FILE_BYTES, RIG_FILE_NAME, RIG_STATE_FILE_NAME, problemsFromZod, soundKey, type Problem } from './rig-util.js';
@@ -137,12 +139,18 @@ export const modelSchema = z.strictObject({
   notes: z.array(z.string().min(1).max(240)).max(10),
   // Whether the instrument follows MIDI clock. Optional, so a model saved before the field existed still loads.
   clock: z.boolean().optional(),
+  // Whether the instrument plays one note at a time, so a chord is heard as one note. Optional: absent means unknown (never polyphonic),
+  // and a model saved before the field existed still loads.
+  monophonic: z.boolean().optional(),
   // Whether the rhythm channels choose a kit by bank select and program. Optional, absent means off, so every earlier model loads unchanged.
   rhythmBank: z.boolean().optional(),
   // Which note plays which drum. The maps of the model, the id of the map its kits take unless they name
   // another, both optional, so every earlier model loads unchanged. The General MIDI map is built in.
   drumMaps: z.array(drumMapSchema).max(MAX_DRUM_MAPS).optional(),
   drumMap: idSchema.optional(),
+  // Which tone, part and scene settings the instrument has and the message each becomes. Optional, absent means
+  // none, so every earlier model loads unchanged.
+  settings: settingsSchema.optional(),
 });
 
 /** The setup file: one entry per instrument the user plays. */
@@ -160,6 +168,16 @@ export const rigFileSchema = z.strictObject({
     )
     .min(1, 'at least one instrument is required')
     .max(MAX_RIG_INSTRUMENTS, 'at most 16 instruments'),
+  // The MIDI input ports the page listens to, by exact full name. Optional: absent means no input. An entry has
+  // the shape of an instrument's output port, so a refusal names inputs[0].port. The file is never written for this.
+  inputs: z
+    .array(
+      z.strictObject({
+        port: z.string().min(1, 'must not be empty').max(MAX_MIDI_NAME_LENGTH, `at most ${MAX_MIDI_NAME_LENGTH} characters`),
+      }),
+    )
+    .max(MAX_RIG_INPUTS, `at most ${MAX_RIG_INPUTS} inputs`)
+    .optional(),
 });
 
 /** The state file: the instruments the user switched off in the page, by id. A missing file means none. */
@@ -185,7 +203,7 @@ export interface RigInstrument {
 export type RigState =
   | { setup: 'absent' }
   | { setup: 'invalid'; problems: Problem[]; more: number }
-  | { setup: 'valid'; instruments: RigInstrument[] };
+  | { setup: 'valid'; instruments: RigInstrument[]; inputs: string[] };
 
 function invalid(problems: Problem[]): RigState {
   const cleaned = problems.map((problem) => ({ field: cleanProblemText(problem.field), reason: cleanProblemText(problem.reason) }));
@@ -347,6 +365,9 @@ function modelProblems(model: InstrumentModel): Problem[] {
       else checkSevenBit(bytes, 0, bytes.length, `${at}.${name}`, problems);
     }
   });
+  for (const problem of settingsProblems(model.settings)) {
+    add(problem.field === '' ? 'settings' : `settings.${problem.field}`, problem.reason);
+  }
   return problems;
 }
 
@@ -608,11 +629,19 @@ export class RigStore {
         }
         instruments.push({ id: entry.id, port: entry.port, model, channels, catalog: catalogs.get(model.id) ?? null, clock: entry.clock ?? model.clock ?? false, enabled: !off.has(entry.id) });
       });
+      // Inputs are matched exactly and in full, so the outputs' part-of-each-other rule does not apply to them, and an input may
+      // carry the name of an output (one device can be both). Only the same port twice is refused.
+      const firstInput = new Map<string, number>();
+      (parsed.data.inputs ?? []).forEach((input, index) => {
+        const same = firstInput.get(input.port);
+        if (same === undefined) firstInput.set(input.port, index);
+        else problems.push({ field: `inputs[${index}].port`, reason: `same port as inputs[${same}]` });
+      });
     }
     if (!state.ok) problems.push(...state.problems);
     problems.push(...user.problems);
     if (problems.length > 0) return invalid(problems);
-    return { setup: 'valid', instruments };
+    return { setup: 'valid', instruments, inputs: (parsed.success ? parsed.data.inputs ?? [] : []).map((input) => input.port) };
   }
 }
 
@@ -721,6 +750,11 @@ export function rigMessage(state: RigState): Extract<ServerMessage, { type: 'mid
     const catalogSounds = (instrument.catalog?.sounds ?? []).map((sound) =>
       sound.bank === undefined ? { name: sound.name, program: sound.program } : { name: sound.name, program: sound.program, bank: sound.bank },
     );
+    // Each melodic sound tells the page its engine when the catalog places its bank in one (the model's own sounds too).
+    const withEngine = <T extends { bank?: { msb: number; lsb?: number } }>(sound: T): T & { engine?: string } => {
+      const engine = engineOf(instrument.catalog, sound.bank);
+      return engine === null ? sound : { ...sound, engine };
+    };
     // The catalog kits follow the model's own in the rhythm list, resolved by the same sound option.
     const catalogKits = (instrument.catalog?.kits ?? []).map((kit) => ({
       name: kit.name,
@@ -742,7 +776,7 @@ export function rigMessage(state: RigState): Extract<ServerMessage, { type: 'mid
       reset,
       // The rhythm sounds are copied key by key, so no other key of the model rides along to the page.
       sounds: {
-        melodic: [...model.sounds.melodic, ...catalogSounds],
+        melodic: [...model.sounds.melodic, ...catalogSounds].map(withEngine),
         rhythm: [
           ...model.sounds.rhythm.map((sound) => ({
             name: sound.name,
@@ -761,14 +795,18 @@ export function rigMessage(state: RigState): Extract<ServerMessage, { type: 'mid
       catalogKits: catalogKits.length,
       // The fields the Instruments view's switch and settings editor read.
       enabled: instrument.enabled,
+      // True only when the model states that the instrument plays one note at a time; a model that says nothing sends false.
+      monophonic: model.monophonic === true,
       // Every channel of the model, so the editor can offer them all (the chosen ones are in `channels`).
       modelChannels: [
         ...model.channels.melodic.map((channel) => ({ channel, role: 'melodic' as const })),
         ...model.channels.rhythm.map((channel) => ({ channel, role: 'rhythm' as const })),
       ].sort((a, b) => a.channel - b.channel),
+      // The settings the model describes, as names and ranges only: nothing about how they are sent.
+      settings: settingsMessage(model.settings),
     };
   });
-  return { type: 'midi-rig', setup: 'valid', instruments };
+  return { type: 'midi-rig', setup: 'valid', instruments, inputs: [...state.inputs] };
 }
 
 /**
@@ -867,6 +905,34 @@ function drumMapLine(instrument: RigInstrument): string {
 /** The line under an instrument the user switched off in the page (indented in the summary, bare in the single-instrument text). */
 const SWITCHED_OFF_LINE = '  Switched off: the user switched this instrument off in the page.';
 
+/** Setting rows as Claude reads them: each name with its range, in the model's row order; no rows is "none.". */
+function settingNamesText(rows: readonly { name: string; min: number; max: number }[]): string {
+  return rows.length === 0 ? 'none.' : `${rows.map((row) => `${row.name} ${row.min}-${row.max}`).join(', ')}.`;
+}
+
+/**
+ * The Settings lines of one instrument: the names and ranges of each level, the tone ones per engine the model
+ * declares. An instrument whose model describes no settings has none, so its reply stays as it was. An engine name
+ * comes from the user's model file and is quoted like a port name.
+ */
+function settingsLines(model: InstrumentModel): string[] {
+  const { settings } = model;
+  if (settings === undefined) return [];
+  const lines = ['  Settings: the tone, part and scene options of .midi(); the settings topic of get_strudel_reference has their rules.'];
+  const tone = settings.tone ?? [];
+  if (settings.engines === undefined) {
+    lines.push(`    Tone: ${settingNamesText(tone)}`);
+  } else {
+    for (const engine of settings.engines) {
+      lines.push(`    Tone, for a sound of engine ${quotePort(engine.name)}: ${settingNamesText(tone.filter((row) => row.engines?.includes(engine.id) === true))}`);
+    }
+    lines.push('    Tone, for a sound in no engine: none.');
+  }
+  lines.push(`    Part, reaches the part its channel plays: ${settingNamesText(settings.part ?? [])}`);
+  lines.push(`    Scene, reaches every part of the instrument: ${settingNamesText(settings.scene ?? [])}`);
+  return lines;
+}
+
 /** The summary Claude reads without an argument: each instrument of the setup file, as facts. */
 export function describeRig(state: RigState, options: DescribeOptions): string {
   if (state.setup !== 'valid') return noInstrumentsText(state, options);
@@ -912,11 +978,14 @@ export function describeRig(state: RigState, options: DescribeOptions): string {
         ? '  Clock: follows MIDI clock; Moontide sends the clock, Start and Stop while the playing code names this instrument.'
         : '  Clock: none.',
     );
+    // Only a model that states it: nothing is said about an instrument whose model is silent on it.
+    if (model.monophonic === true) lines.push('  Notes at once: one; a chord is heard as one note.');
     lines.push(
       model.controls.length === 0
         ? '  Controls: none.'
         : `  Controls: ${model.controls.map((control) => `${control.id} CC${control.cc} ${control.min}-${control.max} (default ${control.default})`).join(', ')}`,
     );
+    lines.push(...settingsLines(model));
     if (model.notes.length > 0) lines.push(`  Notes: ${model.notes.join(' ')}`);
   }
   lines.push(
@@ -927,10 +996,10 @@ export function describeRig(state: RigState, options: DescribeOptions): string {
   return lines.join('\n');
 }
 
-function soundLine(sound: ModelSound): string {
-  if (sound.bank === undefined) return `${sound.program} ${sound.name}`;
+function soundLine(sound: ModelSound, engine: string | null = null): string {
+  if (sound.bank === undefined) return `${sound.program} ${sound.name}${engine === null ? '' : ` (${engine})`}`;
   const bank = sound.bank.lsb === undefined ? `${sound.bank.msb}` : `${sound.bank.msb}/${sound.bank.lsb}`;
-  return `${sound.program} ${sound.name} (bank ${bank})`;
+  return `${sound.program} ${sound.name} (bank ${bank}${engine === null ? '' : `, ${engine}`})`;
 }
 
 /** A drum map as Claude reads it: its name, its count, what it is for when it is not the whole model's, and its notes in note order. */
@@ -983,7 +1052,8 @@ export function describeInstrument(state: RigState, id: string, options: Describ
       (a, b) => a.program - b.program || (a.bank?.msb ?? -1) - (b.bank?.msb ?? -1) || (a.bank?.lsb ?? -1) - (b.bank?.lsb ?? -1),
     );
     if (sounds.length === 0) lines.push('no sounds to choose.');
-    for (const sound of sounds) lines.push(soundLine(sound));
+    // A drum kit never carries an engine; a melodic sound of a model that declares engines does.
+    for (const sound of sounds) lines.push(soundLine(sound, role === 'melodic' ? engineClause(instrument.catalog, instrument.model, sound.bank) : null));
   }
   if (instrument.channels.some((entry) => entry.role === 'rhythm')) lines.push('', ...drumMapLines(instrument.model, instrument.catalog?.kits ?? []));
   if (instrument.catalog !== null) lines.push('', catalogLine(instrument.id, instrument.catalog));
@@ -1083,6 +1153,8 @@ export function summarizeDraft(model: InstrumentModel): string {
     lines.push(`Reset when it connects: ${messages}, then a ${model.reset.waitMs} ms wait.`);
   }
   lines.push(model.clock === true ? 'Clock: follows MIDI clock.' : 'Clock: none.');
+  if (model.monophonic === true) lines.push('Notes at once: one.');
+  if (model.settings !== undefined) lines.push(...settingsSummary(model.settings));
   if (model.notes.length > 0) {
     lines.push('Notes:');
     for (const note of model.notes) lines.push(`- ${note}`);

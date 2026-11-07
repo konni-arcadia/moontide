@@ -47,16 +47,20 @@ function accentSelectors(source, varName = '--accent') {
   return selectors.sort();
 }
 
-// The accent ("live now") also covers a Parts header that is the one
+// The accent ("live now") also covers the Scratchpad's live view: the playhead of the keyboard buffer, its notes and the key held now.
+// It also covers a Parts header that is the one
 // currently playing: its border and its progress-bar fill, and the
 // current History row: its node dot and the word "Current", only while sound is playing.
-test('accent is applied by exactly the reserved rules, extended to the Timeline playhead, the playing Parts card and the current History row', () => {
+test('accent is applied by exactly the reserved rules, extended to the Timeline playhead, the Scratchpad live view, the playing Parts card and the current History row', () => {
   const expected = [
     '#audio-unlock-overlay [data-accent="true"]',
     '#sound-state[data-accent="true"] .state-dot',
     '#top-bar [data-accent="true"]',
     '#timeline-playhead',
     '#timeline-playhead .playhead-cycle',
+    '#scratch-playhead',
+    '.sp-live',
+    '.sp-key[data-held="true"]',
     '.part-card[data-state="playing"]',
     '.part-card[data-state="playing"] .part-progress-fill',
     '.hist-row[data-live="true"] .hist-current',
@@ -66,7 +70,7 @@ test('accent is applied by exactly the reserved rules, extended to the Timeline 
   assert.deepEqual(
     accentSelectors(css),
     expected,
-    'accent (var(--accent)) must be reserved for exactly Playing (Connected is plain text since the top bar redesign), the overlay CTA, the Timeline playhead, the playing Parts card and the current History row',
+    'accent (var(--accent)) must be reserved for exactly Playing (Connected is plain text since the top bar redesign), the overlay CTA, the Timeline playhead, the Scratchpad live playhead, live notes and held key, the playing Parts card and the current History row',
   );
 });
 

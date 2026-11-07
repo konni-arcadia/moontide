@@ -6,7 +6,9 @@ import path from 'node:path';
 import * as instruments from '../dist/instruments.js';
 import { Session } from '../dist/session.js';
 import { bankDrumsModel, gmDrumsModel } from './drum-fixtures.js';
+import { ccSynthModel, engineSynthCatalog, engineSynthModel, toneSynthCatalog, toneSynthModel } from './settings-fixtures.js';
 import { STEERING_WORDS, TINT_WORDS, findWords } from './tint-rules.js';
+import { startMcpClient } from './helpers.js';
 
 // Every problem of instruments.json is a field and a reason, the models are read, and the
 // state of the file is worded once per change. Every test works on a temp data folder: never the
@@ -63,6 +65,70 @@ test('a valid instruments.json gives the instrument with the channels and roles 
     mt32.channels.map((c) => `${c.channel}:${c.role}`),
     ['2:melodic', '3:melodic', '4:melodic', '5:melodic', '6:melodic', '7:melodic', '8:melodic', '9:melodic', '10:rhythm'],
   );
+});
+
+test('a file with inputs is valid and its message carries the ports in file order; without the field the inputs are empty', (t) => {
+  const withInputs = readRig(t, { 'instruments.json': { ...rigFile(entry()), inputs: [{ port: 'Keys A' }, { port: 'Keys B' }] } });
+  assert.equal(withInputs.setup, 'valid');
+  assert.deepEqual(withInputs.inputs, ['Keys A', 'Keys B']);
+  assert.deepEqual(instruments.rigMessage(withInputs).inputs, ['Keys A', 'Keys B']);
+  const without = readRig(t, { 'instruments.json': rigFile(entry()) });
+  assert.equal(without.setup, 'valid');
+  assert.deepEqual(without.inputs, []);
+  assert.deepEqual(instruments.rigMessage(without).inputs, []);
+});
+
+const withInputs = (inputs) => ({ ...rigFile(entry()), inputs });
+
+test('an empty input port and one of 201 characters are refused with the field of the entry', (t) => {
+  assertInvalidWith(t, { 'instruments.json': withInputs([{ port: '' }]) }, 'inputs[0].port', 'must not be empty');
+  assertInvalidWith(t, { 'instruments.json': withInputs([{ port: 'Keys' }, { port: 'k'.repeat(201) }]) }, 'inputs[1].port', 'at most 200 characters');
+});
+
+test('more than 4 inputs are refused, and 4 are valid', (t) => {
+  const ports = ['a', 'b', 'c', 'd', 'e'].map((port) => ({ port }));
+  assertInvalidWith(t, { 'instruments.json': withInputs(ports) }, 'inputs', 'at most 4 inputs');
+  assert.equal(readRig(t, { 'instruments.json': withInputs(ports.slice(0, 4)) }).setup, 'valid');
+});
+
+test('an extra key in an input entry is an unknown field at the entry, and a missing port is required', (t) => {
+  assertInvalidWith(t, { 'instruments.json': withInputs([{ port: 'Keys', channel: 1 }]) }, 'inputs[0].channel', 'unknown field');
+  assertInvalidWith(t, { 'instruments.json': withInputs([{}]) }, 'inputs[0].port', 'required');
+});
+
+test('inputs that is not a list is refused at the field inputs, and so is an entry that is not an object', (t) => {
+  const notList = problemsOf(readRig(t, { 'instruments.json': withInputs('Keys') }));
+  assert.ok(notList.some((problem) => problem.field === 'inputs'), JSON.stringify(notList));
+  const notObject = problemsOf(readRig(t, { 'instruments.json': withInputs(['Keys']) }));
+  assert.ok(notObject.some((problem) => problem.field.startsWith('inputs[0]')), JSON.stringify(notObject));
+});
+
+test('the same input port twice is refused at the second entry', (t) => {
+  assertInvalidWith(t, { 'instruments.json': withInputs([{ port: 'Keys' }, { port: 'Pads' }, { port: 'Keys' }]) }, 'inputs[2].port', 'same port as inputs[0]');
+});
+
+test('inputs are matched in full: Keys and Keys 2 are both valid, and an input may have the name of an output port', (t) => {
+  const parts = readRig(t, { 'instruments.json': withInputs([{ port: 'Keys' }, { port: 'Keys 2' }]) });
+  assert.equal(parts.setup, 'valid', JSON.stringify(parts));
+  assert.deepEqual(parts.inputs, ['Keys', 'Keys 2']);
+  const shared = readRig(t, { 'instruments.json': withInputs([{ port: 'Fake Synth A' }]) });
+  assert.equal(shared.setup, 'valid', JSON.stringify(shared));
+  assert.deepEqual(shared.inputs, ['Fake Synth A']);
+  assert.equal(shared.instruments[0].port, 'Fake Synth A');
+});
+
+test('a file with inputs only is still refused: at least one instrument is required', (t) => {
+  assertInvalidWith(t, { 'instruments.json': { instruments: [], inputs: [{ port: 'Keys' }] } }, 'instruments', 'at least one instrument is required');
+});
+
+test('a problem of an input never carries a path: the field and the reason are plain text', (t) => {
+  const dir = makeDir(t, { 'instruments.json': withInputs([{ port: 'Keys' }, { port: 'Keys' }]) });
+  const state = store(dir).read();
+  const problems = problemsOf(state);
+  assert.ok(!JSON.stringify(problems).includes(dir), 'no data folder path in a problem');
+  const message = instruments.rigMessage(state);
+  assert.equal(message.setup, 'invalid');
+  assert.ok(message.problems.some((problem) => problem.field === 'inputs[1].port' && problem.reason === 'same port as inputs[0]'));
 });
 
 test('no instruments.json is absent, and so is a missing data folder file', (t) => {
@@ -635,6 +701,29 @@ test('a catalog of a used model is attached to the instrument, and two instrumen
   assert.equal(state.instruments[0].catalog, state.instruments[1].catalog, 'the file is read once per read');
 });
 
+test('the rig message gives each melodic sound the engine its bank is placed in, and leaves it out where the catalog places none', (t) => {
+  const dir = makeDir(t, {
+    'instruments.json': rigFile({ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }, { id: 'ccsynth', model: 'ccsynth', port: 'Port C' }),
+    'models/tonesynth.json': toneSynthModel(),
+    'models/ccsynth.json': ccSynthModel(),
+    'catalogs/tonesynth.json': toneSynthCatalog(),
+    'catalogs/ccsynth.json': { model: 'ccsynth', source: 'Test sound list', sounds: [{ name: 'Plain Tone', program: 1 }] },
+  });
+  const state = new RigStore({ dataDir: dir }).read();
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const [tone, plain] = instruments.rigMessage(state).instruments;
+  assert.deepEqual(tone.sounds.melodic, [
+    { name: 'Own Tone', program: 0, bank: { msb: 97, lsb: 64 }, engine: 'model' },
+    { name: 'Model Tone', program: 0, bank: { msb: 97, lsb: 64 }, engine: 'model' },
+    { name: 'Core Tone', program: 0, bank: { msb: 87, lsb: 64 }, engine: 'core' },
+    { name: 'Loose Tone', program: 0, bank: { msb: 71, lsb: 3 } },
+  ]);
+  assert.ok(tone.sounds.rhythm.every((sound) => !('engine' in sound)), 'a drum kit never carries an engine');
+  assert.deepEqual(plain.sounds.melodic, [{ name: 'Own Tone', program: 0 }, { name: 'Plain Tone', program: 1 }]);
+  // The model's own sounds are not changed by the message.
+  assert.deepEqual(state.instruments[0].model.sounds.melodic, [{ name: 'Own Tone', program: 0, bank: { msb: 97, lsb: 64 } }]);
+});
+
 test('a catalog of a user model is attached too, and an instrument with no catalog file has none', (t) => {
   const synth = { id: 'synth', name: 'Test Synth', channels: { melodic: [1], rhythm: [] }, bankSelect: 'msb-lsb', defaultVolume: 100, controls: [], sounds: { melodic: [], rhythm: [] }, notes: [] };
   const state = readRig(t, {
@@ -778,6 +867,68 @@ test('the midi-rig message carries the resolved clock of each instrument', (t) =
     message.instruments.map((instrument) => [instrument.id, instrument.clock]),
     [['seq', true], ['plain', false]],
   );
+});
+
+// A model can say its instrument plays one note at a time. Absent means unknown, never polyphonic.
+
+test('a model may say monophonic true or false, a model without the field still loads, and anything else is refused with its field named', () => {
+  assert.equal(instruments.parseModel(baseModel({ monophonic: true })).model.monophonic, true);
+  assert.equal(instruments.parseModel(baseModel({ monophonic: false })).model.monophonic, false);
+  const plain = instruments.parseModel(baseModel());
+  assert.equal(plain.ok, true);
+  assert.equal(plain.model.monophonic, undefined, 'absent stays absent');
+  const problems = modelProblems(baseModel({ monophonic: 'yes' }));
+  assert.ok(problems.some((problem) => problem.field === 'monophonic' && /boolean/.test(problem.reason)), JSON.stringify(problems));
+});
+
+test('no shipped model claims the instrument plays one note at a time', () => {
+  for (const id of ['mt32', 'sc55']) {
+    const shipped = JSON.parse(fs.readFileSync(new URL(`../instruments/${id}.json`, import.meta.url), 'utf8'));
+    assert.equal('monophonic' in shipped, false, id);
+  }
+});
+
+test('the midi-rig message carries monophonic true for a model that says so and false for one that says nothing or false', (t) => {
+  const files = {
+    'instruments.json': rigFile(
+      entry({ id: 'lead', model: 'lead', port: 'Port A', channels: [1] }),
+      entry({ id: 'quiet', model: 'quiet', port: 'Port B', channels: [1] }),
+      entry({ id: 'wide', model: 'wide', port: 'Port C', channels: [1] }),
+    ),
+    'models/lead.json': baseModel({ id: 'lead', monophonic: true }),
+    'models/quiet.json': baseModel({ id: 'quiet' }),
+    'models/wide.json': baseModel({ id: 'wide', monophonic: false }),
+  };
+  const state = readRig(t, files);
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  assert.deepEqual(
+    instruments.rigMessage(state).instruments.map((instrument) => [instrument.id, instrument.monophonic]),
+    [['lead', true], ['quiet', false], ['wide', false]],
+  );
+});
+
+test('get_midi_instruments and the model summary say one note at a time only for a model that says so', (t) => {
+  const files = {
+    'instruments.json': rigFile(entry({ id: 'lead', model: 'lead', port: 'Port A', channels: [1] }), entry({ id: 'plain', model: 'mt32', port: 'Port B' })),
+    'models/lead.json': baseModel({ id: 'lead', monophonic: true }),
+  };
+  const state = readRig(t, files);
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const text = instruments.describeRig(state, { connection: () => 'unknown', shipped: [], dataDirText: 'the data folder' });
+  const line = '  Notes at once: one; a chord is heard as one note.';
+  const lines = text.split('\n');
+  assert.equal(lines.filter((candidate) => candidate === line).length, 1, text);
+  const clockAt = lines.findIndex((candidate) => candidate.startsWith('  Clock:'));
+  assert.equal(lines[clockAt + 1], line, 'the line follows the clock line of the instrument that says it');
+  assert.equal(lines.filter((candidate) => candidate.startsWith('  Notes at once')).length, 1, 'the other instrument says nothing about it');
+  assert.deepEqual(findWords(text, TINT_WORDS), [], text);
+  assert.deepEqual(findWords(text, STEERING_WORDS), [], text);
+
+  const withFact = instruments.summarizeDraft(draftOf({ monophonic: true })).split('\n');
+  assert.equal(withFact[withFact.indexOf('Clock: none.') + 1], 'Notes at once: one.');
+  for (const overrides of [undefined, { monophonic: false }]) {
+    assert.ok(!instruments.summarizeDraft(draftOf(overrides)).split('\n').some((candidate) => candidate.startsWith('Notes at once')));
+  }
 });
 
 // Drum maps are model data; every rule refuses with its field and its reason.
@@ -1337,4 +1488,159 @@ test('the on/off lines never name instruments.json, and drain after the build no
     assert.ok(!line.includes('instruments.json'), line);
     assert.deepEqual(findWords(line, TINT_WORDS), [], line);
   }
+});
+
+// --- the settings description: the user's yes covers every setting, and a wrong file is reported with its field ---
+
+test('a user model with a wrong settings description makes the setup invalid with the file, the field and the reason', (t) => {
+  const model = toneSynthModel();
+  model.settings.tone[0].name = 'filterCutof';
+  const files = { 'instruments.json': rigFile({ id: 'synth', model: 'tonesynth', port: 'Port T' }), 'models/tonesynth.json': model };
+  const problems = problemsOf(readRig(t, files));
+  assert.ok(
+    problems.some((problem) => problem.field === 'models/tonesynth.json:settings.tone[0].name' && problem.reason.startsWith('"filterCutof" is not a tone setting name')),
+    JSON.stringify(problems),
+  );
+  const found = store(makeDir(t, files)).modelFor('tonesynth');
+  assert.equal(found.ok, false);
+  assert.ok(found.problems.every((problem) => problem.field.startsWith('models/tonesynth.json:')), JSON.stringify(found.problems));
+  assert.ok(found.problems.some((problem) => problem.field === 'models/tonesynth.json:settings.tone[0].name'));
+  // A description with no row at all is reported at settings.
+  const empty = toneSynthModel();
+  empty.settings = {};
+  const emptyProblems = problemsOf(readRig(t, { 'instruments.json': rigFile({ id: 'synth', model: 'tonesynth', port: 'Port T' }), 'models/tonesynth.json': empty }));
+  assertProblem(emptyProblems, 'models/tonesynth.json:settings', 'describes no setting');
+});
+
+test('summarizeDraft shows every setting with its level, range, message and engines', () => {
+  const tone = instruments.summarizeDraft(toneSynthModel()).split('\n');
+  assert.ok(tone.includes('Settings engines: model (Model Engine), core (Core Engine).'), tone.join('\n'));
+  assert.ok(tone.includes('Settings Roland model ID: 00 00 00 65.'));
+  assert.ok(tone.includes('Tone setting filterCutoff: 0-1023, Roland data set at 02 10 00 4F over 4 bytes, engines model.'));
+  assert.ok(tone.includes('Tone setting lfoOscDepth: 28-228, Roland data set at 02 10 00 0B over 2 bytes, engines model.'));
+  assert.ok(tone.includes('Part setting pan: 0-127, Roland data set at 01 00 10 06 over 1 byte.'));
+  assert.ok(tone.includes('Scene setting reverbLevel: 0-127, Roland data set at 01 00 52 02 over 1 byte.'));
+  assert.equal(tone.filter((line) => /^(Tone|Part|Scene) setting /.test(line)).length, 9);
+  const clock = tone.indexOf('Clock: none.');
+  assert.ok(clock > 0 && tone[clock + 1].startsWith('Settings engines:'), 'the settings follow the clock line');
+  const cc = instruments.summarizeDraft(ccSynthModel()).split('\n');
+  assert.ok(cc.includes('Tone setting env1Attack: 14-114, NRPN 1 99.'), cc.join('\n'));
+  assert.ok(cc.includes('Settings NRPN family: gs.'), cc.join('\n'));
+  assert.ok(cc.includes('Tone setting filterCutoff: 0-127, control change 74.'));
+  assert.ok(cc.includes('Part setting level: 0-127, control change 7.'));
+  assert.ok(!cc.some((line) => line.startsWith('Settings engines') || line.startsWith('Settings Roland')), 'no engines and no Roland model ID, no line for them');
+});
+
+test('a model without settings gets the summary it got before', () => {
+  const model = toneSynthModel();
+  delete model.settings;
+  const lines = instruments.summarizeDraft(model).split('\n');
+  assert.ok(!lines.some((line) => /^(Settings|Tone setting|Part setting|Scene setting)/.test(line)), lines.join('\n'));
+  assert.equal(lines[lines.indexOf('Clock: none.') + 1], 'Notes:', 'the clock line is followed by the notes, as before');
+});
+
+// --- The Settings lines of get_midi_instruments ---
+
+const SETTINGS_OPTIONS = { connection: () => 'unknown', shipped: [], dataDirText: 'the data folder' };
+const SETTINGS_FILES = {
+  'instruments.json': rigFile({ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }),
+  'models/tonesynth.json': toneSynthModel(),
+  'catalogs/tonesynth.json': toneSynthCatalog(),
+};
+const TONE_SYNTH_SETTINGS_LINES = [
+  '  Settings: the tone, part and scene options of .midi(); the settings topic of get_strudel_reference has their rules.',
+  '    Tone, for a sound of engine "Model Engine": filterCutoff 0-1023, filterResonance 0-1023, osc1Wave 0-27, env1Attack 0-1023, lfoOscDepth 28-228.',
+  '    Tone, for a sound of engine "Core Engine": none.',
+  '    Tone, for a sound in no engine: none.',
+  '    Part, reaches the part its channel plays: level 0-127, pan 0-127.',
+  '    Scene, reaches every part of the instrument: reverbLevel 0-127, chorusSwitch 0-1.',
+];
+
+test('get_midi_instruments lists the settings of an instrument per level and per engine, right after its Controls line', (t) => {
+  const state = readRig(t, SETTINGS_FILES);
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const lines = instruments.describeRig(state, SETTINGS_OPTIONS).split('\n');
+  const at = lines.findIndex((line) => line.startsWith('  Settings:'));
+  assert.deepEqual(lines.slice(at, at + TONE_SYNTH_SETTINGS_LINES.length), TONE_SYNTH_SETTINGS_LINES);
+  assert.ok(lines[at - 1].startsWith('  Controls:'), 'the Settings lines follow the Controls line');
+  assert.ok(lines[at + TONE_SYNTH_SETTINGS_LINES.length].startsWith('  Notes:'), 'the Notes line follows the Settings lines');
+});
+
+test('get_midi_instruments lists a name described for two engines under both, each with its own range, and an engine\'s own names only under it', (t) => {
+  const model = engineSynthModel();
+  model.settings.tone[5].max = 500;
+  const state = readRig(t, {
+    'instruments.json': rigFile({ id: 'enginesynth', model: 'enginesynth', port: 'Port E' }),
+    'models/enginesynth.json': model,
+    'catalogs/enginesynth.json': engineSynthCatalog(),
+  });
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const lines = instruments.describeRig(state, SETTINGS_OPTIONS).split('\n');
+  const at = lines.findIndex((line) => line.startsWith('  Settings:'));
+  assert.deepEqual(lines.slice(at + 1, at + 6), [
+    '    Tone, for a sound of engine "Model Engine": filterCutoff 0-1023, filterResonance 0-1023.',
+    '    Tone, for a sound of engine "Core Engine": partial1Cutoff 0-1023, toneCoarseTune 16-112.',
+    '    Tone, for a sound of engine "Vintage Engine": filterCutoff 0-1023, filterResonance 0-500.',
+    '    Tone, for a sound in no engine: none.',
+    '    Part, reaches the part its channel plays: level 0-127.',
+  ]);
+});
+
+test('a model that declares no engines gets one Tone line, and a level with no rows says none', (t) => {
+  const state = readRig(t, { 'instruments.json': rigFile({ id: 'ccsynth', model: 'ccsynth', port: 'Port C' }), 'models/ccsynth.json': ccSynthModel() });
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const lines = instruments.describeRig(state, SETTINGS_OPTIONS).split('\n');
+  const at = lines.findIndex((line) => line.startsWith('  Settings:'));
+  assert.deepEqual(lines.slice(at + 1, at + 4), [
+    '    Tone: filterCutoff 0-127, filterResonance 0-127, env1Attack 14-114.',
+    '    Part, reaches the part its channel plays: level 0-127.',
+    '    Scene, reaches every part of the instrument: none.',
+  ]);
+  assert.equal(lines.filter((line) => line.startsWith('    Tone,')).length, 0, 'no per-engine Tone line without engines');
+});
+
+test('the reply for instruments whose model describes no settings holds no Settings line', (t) => {
+  const state = readRig(t, { 'instruments.json': rigFile(entry(), entry({ id: 'sc55', model: 'sc55', port: 'Port B' })) });
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  const text = instruments.describeRig(state, SETTINGS_OPTIONS);
+  assert.ok(!text.includes('Settings:'), text);
+  assert.ok(!text.includes('settings topic'), text);
+});
+
+test('the Settings lines carry no tint word and no steering word', (t) => {
+  const state = readRig(t, SETTINGS_FILES);
+  const text = TONE_SYNTH_SETTINGS_LINES.join('\n');
+  assert.ok(instruments.describeRig(state, SETTINGS_OPTIONS).includes(text));
+  assert.deepEqual(findWords(text, TINT_WORDS), [], text);
+  assert.deepEqual(findWords(text, STEERING_WORDS), [], text);
+});
+
+test('an engine name from the model file is quoted in the Settings lines', (t) => {
+  const model = toneSynthModel();
+  model.settings.engines[0].name = 'Say "hi"';
+  const state = readRig(t, { 'instruments.json': rigFile({ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }), 'models/tonesynth.json': model });
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  assert.ok(instruments.describeRig(state, SETTINGS_OPTIONS).includes('    Tone, for a sound of engine "Say \\"hi\\"": filterCutoff'));
+});
+
+test('through a real MCP client: get_midi_instruments lists the settings and get_strudel_reference returns the settings topic', async (t) => {
+  const server = await startMcpClient({ start: false });
+  t.after(() => server.client.close());
+  const write = (name, content) => {
+    const file = path.join(server.dataDir, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(content));
+  };
+  write('models/tonesynth.json', toneSynthModel());
+  write('catalogs/tonesynth.json', toneSynthCatalog());
+  write('instruments.json', rigFile({ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }));
+  const list = await server.client.callTool({ name: 'get_midi_instruments', arguments: {} });
+  assert.ok(!list.isError, JSON.stringify(list.content));
+  const listText = list.content[0].text;
+  for (const line of TONE_SYNTH_SETTINGS_LINES) assert.ok(listText.includes(line), `${line}\n${listText}`);
+  const topic = await server.client.callTool({ name: 'get_strudel_reference', arguments: { topic: 'settings' } });
+  assert.ok(!topic.isError, JSON.stringify(topic.content));
+  const topicText = topic.content[0].text;
+  assert.ok(topicText.startsWith('# Synth settings'), topicText.slice(0, 80));
+  assert.ok(topicText.includes('get_midi_instruments'));
 });

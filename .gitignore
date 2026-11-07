@@ -6,3 +6,4 @@ dist/
 *.tgz
 .npmrc
 *.pem
+_site/

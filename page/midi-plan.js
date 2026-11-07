@@ -167,6 +167,10 @@ function isChannelLiteral(node) {
 
 const problem = (key, hints = []) => ({ key, hints });
 
+/** The option keys that carry settings, one per level; the level is always written, never deduced from a name. */
+const SETTING_LEVEL_KEYS = ['tone', 'part', 'scene'];
+const emptySettings = () => ({ tone: new Map(), part: new Map(), scene: new Map() });
+
 /** The value of a finite number literal, or of a negated one (`-N`); null for anything else. (A private copy of the
  * page/mixer-rewrite.js rule: this module stays a leaf, so there is no import cycle.) */
 function numberLiteral(node) {
@@ -245,7 +249,17 @@ function midiUpChain(node, parents) {
 function readSetupCall(node, midichan) {
   const [first, second] = node.arguments;
   const start = first ? first.start : node.callee.property.start;
-  const result = { start, port: null, channel: 1, sound: null, controls: new Map(), problems: { port: null, channel: null, sound: null, controls: null } };
+  const result = {
+    start,
+    port: null,
+    channel: 1,
+    sound: null,
+    controls: new Map(),
+    settings: emptySettings(),
+    problems: { port: null, channel: null, sound: null, controls: null, settings: null },
+  };
+  // Whether the last `tone`, `part` or `scene` key written was a plain object, by level in the order first written.
+  const settingsPlain = new Map();
   const sources = [];
   if (first && isSingleQuoted(first)) {
     result.port = first.value;
@@ -301,7 +315,19 @@ function readSetupCall(node, midichan) {
         const read = readControlsObject(property.value);
         result.controls = read ?? new Map();
         result.problems.controls = read === null ? problem('controlsNotPlain') : null;
+      } else if (SETTING_LEVEL_KEYS.includes(key)) {
+        // Same rule for each level: the last key wins, anything but a plain object of number literals leaves
+        // that level empty and is a problem of the call (the first such level in written order).
+        const read = readControlsObject(property.value);
+        result.settings[key] = read ?? new Map();
+        settingsPlain.set(key, read !== null);
       }
+    }
+  }
+  for (const [level, plain] of settingsPlain) {
+    if (!plain) {
+      result.problems.settings = { ...problem('settingsNotPlain'), level };
+      break;
     }
   }
   // A .midichan(n) on the same chain overrides the options' channel (a hap's own midichan wins in Strudel).
@@ -316,18 +342,28 @@ function readSetupCall(node, midichan) {
 function entryProblem(node, key, hints = []) {
   const first = node.arguments[0];
   const start = first ? first.start : node.callee.type === 'MemberExpression' ? node.callee.property.start : node.start;
-  return { start, port: null, channel: 1, sound: null, controls: new Map(), problems: { port: problem(key, hints), channel: null, sound: null, controls: null } };
+  return {
+    start,
+    port: null,
+    channel: 1,
+    sound: null,
+    controls: new Map(),
+    settings: emptySettings(),
+    problems: { port: problem(key, hints), channel: null, sound: null, controls: null, settings: null },
+  };
 }
 
 /**
  * The port, channel and sound written in every `.midi(` call of `code`, in source order, for the
  * setup file's checks. Returns { ok: false } when the code does not parse (nothing is
  * refused then: Strudel reports its own syntax error), else { ok: true, calls }, each call
- * { start, port: string | null, channel, sound: string | null, controls: Map<string, number>, problems: { port,
- * channel, sound, controls } } where a problem is null or { key, hints }: `key` and each hint are RIG_COPY
- * keys. Only values written in plain form in the call are read; the port must be a single-quoted literal in
+ * { start, port: string | null, channel, sound: string | null, controls: Map<string, number>, settings: { tone,
+ * part, scene } (each a Map<string, number>), problems: { port, channel, sound, controls, settings } } where a
+ * problem is null or { key, hints }: `key` and each hint are RIG_COPY keys. Only values written in plain form in the call are read; the port must be a single-quoted literal in
  * the call, a channel a whole number from 1 to 16, a sound a single-quoted literal and `controls` a plain
- * object of number literals (read in written order; any other value gives the `controlsNotPlain` problem and no controls). A `.midichan(n)` with a whole-number literal
+ * object of number literals (read in written order; any other value gives the `controlsNotPlain` problem and no controls).
+ * The `tone`, `part` and `scene` options are read the same way, the last key of a level wins, and a level that is not a plain
+ * object of number literals stays empty and gives the `settingsNotPlain` problem ({ key, hints, level }, the first such level in written order). A `.midichan(n)` with a whole-number literal
  * on the member chain of one `.midi(` call sets that call's channel; a `.midichan(` that is not plain,
  * is a second one on a chain, or has no `.midi(` call on its chain, and every `.midiport(` call, become
  * entries of their own that carry a problem at their own position.

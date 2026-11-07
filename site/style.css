@@ -1,0 +1,289 @@
+/* The one stylesheet of the manual. System fonts, no import, no script. */
+
+:root {
+  color-scheme: light dark;
+  --text: #1d2330;
+  --muted: #566074;
+  --page: #fbfbf8;
+  --panel: #eef1f6;
+  --line: #ccd3de;
+  --link: #0b5cad;
+  --accent: #1f6f5c;
+  --box: #e8f3ef;
+  --code: #eceff4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #e4e8f0;
+    --muted: #a3adbf;
+    --page: #151a23;
+    --panel: #1d2430;
+    --line: #333d4f;
+    --link: #7fb8f5;
+    --accent: #6cc7ac;
+    --box: #17302a;
+    --code: #222a38;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font: 1rem/1.65 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+a {
+  color: var(--link);
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+  overflow-wrap: anywhere;
+}
+
+a:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.skip {
+  position: absolute;
+  left: -999px;
+  top: 0;
+  padding: 0.5rem 1rem;
+  background: var(--panel);
+}
+
+.skip:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+  z-index: 10;
+}
+
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.brand {
+  font-weight: 700;
+  font-size: 1.15rem;
+  text-decoration: none;
+  color: var(--text);
+}
+
+.layout {
+  display: flex;
+  flex-direction: column;
+  gap: 2.5rem;
+  max-width: 66rem;
+  margin: 0 auto;
+  padding: 1.5rem 1.5rem 2.5rem;
+}
+
+main {
+  min-width: 0;
+  max-width: 70ch;
+}
+
+h1,
+h2,
+h3 {
+  line-height: 1.25;
+  scroll-margin-top: 1rem;
+}
+
+h1 {
+  font-size: 2rem;
+  margin: 0.5rem 0 1rem;
+}
+
+h2 {
+  font-size: 1.45rem;
+  margin: 2.2rem 0 0.6rem;
+}
+
+h3 {
+  font-size: 1.15rem;
+  margin: 1.6rem 0 0.4rem;
+}
+
+p,
+ul,
+ol {
+  margin: 0.8rem 0;
+}
+
+li {
+  margin: 0.3rem 0;
+}
+
+li > ul,
+li > ol {
+  margin: 0.3rem 0;
+}
+
+code {
+  font: 0.9em/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  background: var(--code);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  margin: 1rem 0;
+  padding: 0.8rem 1rem;
+  background: var(--code);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+pre code {
+  padding: 0;
+  background: none;
+  overflow-wrap: normal;
+  white-space: pre;
+}
+
+figure {
+  margin: 1.4rem 0;
+}
+
+figure img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+figcaption {
+  margin-top: 0.5rem;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+section.verified {
+  margin: 2.5rem 0 1rem;
+  padding: 0.2rem 1rem 0.6rem;
+  background: var(--box);
+  border: 1px solid var(--accent);
+  border-left-width: 6px;
+  border-radius: 6px;
+}
+
+section.verified h2 {
+  margin-top: 0.8rem;
+  font-size: 1.15rem;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--line);
+}
+
+.pager p {
+  margin: 0;
+}
+
+.pager .next {
+  margin-left: auto;
+  text-align: right;
+}
+
+.pager span {
+  display: block;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.manual {
+  padding: 0.5rem 1rem 1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.manual h2 {
+  margin: 1.2rem 0 0.3rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.manual ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.manual li {
+  margin: 0.25rem 0;
+}
+
+.manual a[aria-current="page"] {
+  font-weight: 700;
+  color: var(--text);
+  text-decoration-thickness: 3px;
+}
+
+.bottom {
+  max-width: 62rem;
+  margin: 1rem auto 2rem;
+  padding: 1rem;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+@media (min-width: 60rem) {
+  .layout {
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 3rem;
+  }
+
+  main {
+    flex: 1 1 auto;
+  }
+
+  .manual {
+    order: -1;
+    flex: 0 0 15rem;
+    position: sticky;
+    top: 1rem;
+    max-height: calc(100vh - 2rem);
+    overflow-y: auto;
+  }
+
+  .contents {
+    display: none;
+  }
+}

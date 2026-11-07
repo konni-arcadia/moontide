@@ -6300,6 +6300,848 @@ span.jam-candidate {
   white-space: nowrap;
 }
 
+/* The Scratchpad view. #scratch-view fills the panel like the Jam view and scrolls on its own. The roll, its ruler and the
+   piano names share one box that scrolls sideways, so their columns stay aligned. The lines are painted with gradients (cycle,
+   beat, grid step and an octave line above each C row), the notes and the cursor are absolutely placed elements that read their
+   place from the custom properties the view sets. Neutral colors only: the accent is for "live now" and red is for the failed-change
+   banner. Sizes in rem, 1px hairlines only, no motion. */
+#scratch-view {
+  /* Before the view is first sized, and when it has no size to read: the smallest beat and a middle row. The view's sizing sets both
+     again on #scratch-scroll, which the ruler and the roll inherit. */
+  --sp-beat-w: 4rem;
+  --sp-row-h: 0.875rem;
+  /* The rows the roll shows: the view sets the real count on #scratch-roll from the notes, a whole number of octaves (24 to 108). */
+  --sp-rows: 24;
+  --sp-line-cycle: color-mix(in srgb, var(--text-muted) 70%, var(--dominant));
+  --sp-line-beat: color-mix(in srgb, var(--text-muted) 35%, var(--border));
+  --sp-line-step: color-mix(in srgb, var(--border) 60%, transparent);
+  --sp-line-octave: color-mix(in srgb, var(--text-muted) 50%, var(--dominant));
+  --sp-row-natural: color-mix(in srgb, var(--surface-2) 55%, var(--dominant));
+  --sp-row-black: var(--dominant);
+  /* The height of the listening strip: one line, two in layout b. The information line above it is pinned just over it. */
+  --sp-listen-h: 2rem;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 1rem;
+  gap: 0.5rem;
+}
+
+#scratch-view[hidden] {
+  display: none;
+}
+
+#workspace[data-layout="b"] #scratch-view {
+  --sp-listen-h: 4rem;
+  padding: 1rem;
+}
+
+#workspace[data-layout="c"] #scratch-view {
+  padding: 1.5rem;
+}
+
+#workspace[data-layout="b"] #scratch-scroll,
+#workspace[data-layout="c"] #scratch-scroll {
+  min-height: 23.5rem;
+}
+
+/* The toolbar: the grid, the length of the motif and the pitch window. The buttons are the page's .tl-btn; the grid group takes the
+   segmented look of the Jam instrument switch (a frame, the pressed segment on the raised fill, no weight change). A button that has
+   reached its end keeps focus and shows it with a muted word and a dashed frame. */
+#scratch-controls {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+#scratch-grids,
+#scratch-length,
+#scratch-pitch,
+#scratch-mode,
+#scratch-edit,
+#scratch-history,
+#scratch-record-group {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+/* The Early experimental label: the last item of the toolbar, plain text at its right end, no control and no tab stop. */
+#scratch-early {
+  margin-left: auto;
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  line-height: 1.25rem;
+  white-space: nowrap;
+}
+
+#scratch-grids {
+  gap: 0;
+  border: 1px solid var(--border);
+}
+
+#scratch-grids .tl-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+}
+
+#scratch-grids .tl-btn:hover:not([aria-disabled="true"]) {
+  color: var(--text);
+}
+
+#scratch-grids .tl-btn[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+#scratch-grids .tl-btn:focus-visible {
+  outline-offset: -1px;
+}
+
+#scratch-controls .tl-btn[aria-disabled="true"] {
+  color: var(--text-muted);
+}
+
+/* The Draw and Tap rhythm toggles read pressed by the text color on their frame (the frame of the other buttons is the faint border). */
+#scratch-draw[aria-pressed="true"],
+#scratch-tap[aria-pressed="true"] {
+  border-color: var(--text);
+}
+
+.sp-readout {
+  box-sizing: border-box;
+  min-width: 4.5rem;
+  padding: 0 0.5rem;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* The scroll box takes the room the view has (its height is never taken from its content, so the rows can follow it) and never less
+   than 22rem. It scrolls both ways: sideways when the beats at their smallest do not fit, and up and down when the rows at their
+   smallest height do not fit (a motif of more than three octaves in a short strip). The ruler is held at the top of the box, the piano
+   names at its left and the velocity lane at its bottom, so only the roll moves. A shorter strip scrolls the view. */
+#scratch-scroll {
+  flex: 1 1 0%;
+  min-height: 22rem;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  background: var(--dominant);
+  /* No padding at the left, the top or the bottom: the piano names, the ruler and the lane stick to those edges of the box, and a padding
+     there would show a sliver of the scrolled roll beside them. The ruler and the lane carry the air themselves. */
+  padding: 0 0.25rem 0 0;
+  overflow: auto;
+  /* The room for a scrollbar is kept whether or not the rows need one, so the beat width worked out from the box does not change when
+     the rows start to scroll. */
+  scrollbar-gutter: stable;
+  /* The ruler and the lane hold a z-index of their own over the roll. Kept inside the box, it cannot rise over the information line and the
+     strip that layout a pins over the bottom of the view (they sit lower), which cut the top of the line's text. */
+  isolation: isolate;
+}
+
+/* Held at the top of the box while the roll scrolls up and down; the bar over the names and the grid hides what passes under it. */
+#scratch-ruler {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  box-sizing: border-box;
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+  height: 1.5rem;
+  padding-top: 0.25rem;
+  background: var(--dominant);
+  user-select: none;
+}
+
+/* The width of the piano names stays at the left while the ruler scrolls, so a label never slides over the names (the column is as wide as
+   the one below, which the fit counts). */
+#scratch-ruler::before {
+  content: "";
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: none;
+  width: 4.5rem;
+  background: var(--dominant);
+}
+
+.sp-beat {
+  flex: none;
+  box-sizing: border-box;
+  width: var(--sp-beat-w);
+  padding-left: 0.25rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.25rem;
+  white-space: nowrap;
+}
+
+.sp-beat-first {
+  color: var(--text);
+}
+
+#scratch-roll {
+  display: flex;
+  width: max-content;
+  user-select: none;
+}
+
+/* The ring sits just outside the roll: the names and the grid are positioned and would paint over a ring drawn inside it. */
+#scratch-roll:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#scratch-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: none;
+  width: 4.5rem;
+  background: var(--dominant);
+}
+
+.sp-key {
+  box-sizing: border-box;
+  height: var(--sp-row-h);
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 0.25rem;
+  overflow: hidden;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.sp-key[data-black="true"] {
+  background: var(--dominant);
+}
+
+.sp-key[data-cursor="true"] {
+  color: var(--text);
+}
+
+/* A key held now: a bar of the accent at the left and its name in the text color, heavier. */
+.sp-key[data-held="true"] {
+  border-left: 0.25rem solid var(--accent);
+  color: var(--text);
+  font-weight: 600;
+}
+
+#scratch-grid {
+  position: relative;
+  flex: none;
+  width: calc(var(--sp-cycles) * 4 * var(--sp-beat-w));
+  height: calc(var(--sp-rows) * var(--sp-row-h));
+  overflow: hidden;
+  user-select: none;
+  touch-action: none;
+  cursor: default;
+  background-color: var(--sp-row-black);
+  background-image:
+    repeating-linear-gradient(to right, var(--sp-line-cycle) 0, var(--sp-line-cycle) 1px, transparent 1px, transparent calc(var(--sp-beat-w) * 4)),
+    repeating-linear-gradient(to right, var(--sp-line-beat) 0, var(--sp-line-beat) 1px, transparent 1px, transparent var(--sp-beat-w)),
+    repeating-linear-gradient(to right, var(--sp-line-step) 0, var(--sp-line-step) 1px, transparent 1px, transparent calc(var(--sp-beat-w) * 4 / var(--sp-steps))),
+    linear-gradient(to bottom, var(--sp-line-octave) 0, var(--sp-line-octave) 1px, transparent 1px),
+    linear-gradient(
+      to bottom,
+      var(--sp-row-natural) 0,
+      var(--sp-row-natural) var(--sp-row-h),
+      var(--sp-row-black) var(--sp-row-h),
+      var(--sp-row-black) calc(var(--sp-row-h) * 2),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 2),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 3),
+      var(--sp-row-black) calc(var(--sp-row-h) * 3),
+      var(--sp-row-black) calc(var(--sp-row-h) * 4),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 4),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 5),
+      var(--sp-row-black) calc(var(--sp-row-h) * 5),
+      var(--sp-row-black) calc(var(--sp-row-h) * 6),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 6),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 8),
+      var(--sp-row-black) calc(var(--sp-row-h) * 8),
+      var(--sp-row-black) calc(var(--sp-row-h) * 9),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 9),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 10),
+      var(--sp-row-black) calc(var(--sp-row-h) * 10),
+      var(--sp-row-black) calc(var(--sp-row-h) * 11),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 11),
+      var(--sp-row-natural) calc(var(--sp-row-h) * 12)
+    );
+  background-size: auto, auto, auto, 100% calc(var(--sp-row-h) * 12), 100% calc(var(--sp-row-h) * 12);
+  background-position: 0 0, 0 0, 0 0, 0 calc(var(--sp-row-h) * -1), 0 0;
+}
+
+/* The pointer is a crosshair on empty cells only while Draw is on: a drag then writes a note, else it draws a selection box. */
+#scratch-view[data-draw="on"] #scratch-grid {
+  cursor: crosshair;
+}
+
+#scratch-notes {
+  position: absolute;
+  inset: 0;
+}
+
+.sp-note,
+.sp-live,
+#scratch-cursor,
+#scratch-preview,
+#scratch-hover-cell {
+  position: absolute;
+  box-sizing: border-box;
+  left: calc(var(--sp-start) / var(--sp-units) * 100% + 0.125rem);
+  width: calc(var(--sp-len) / var(--sp-units) * 100% - 0.25rem);
+  top: calc(var(--sp-row) * var(--sp-row-h) + 0.125rem);
+  height: calc(var(--sp-row-h) - 0.25rem);
+}
+
+.sp-note {
+  background: color-mix(in srgb, var(--text) calc(30% + 60% * var(--v)), var(--dominant));
+  border: 1px solid var(--text-muted);
+}
+
+.sp-note {
+  cursor: grab;
+}
+
+/* The live layer: the keyboard buffer's notes, drawn over the motif in the accent ("live now", as the Timeline playhead is), translucent so a
+   motif note under them stays visible. A note still held has no right border: its right edge is open and follows the playhead. The layer
+   and its notes take no pointer event, so the motif underneath stays editable. */
+#scratch-live {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.sp-live {
+  width: max(0.25rem, calc(var(--sp-len) / var(--sp-units) * 100% - 0.25rem));
+  background: color-mix(in srgb, var(--accent) calc(15% + 25% * var(--v)), transparent);
+  border: 1px solid var(--accent);
+  pointer-events: none;
+}
+
+.sp-live[data-held="true"] {
+  border-right-width: 0;
+}
+
+/* The handle at a note's right side: half a rem wide, at most 40 percent of a short note. It only changes the cursor; the press is
+   told apart from the numbers of the pointer in page/scratch-gesture.js. */
+.sp-edge {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(0.5rem, 40%);
+  cursor: ew-resize;
+}
+
+.sp-hover {
+  outline: 1px solid var(--text);
+}
+
+.sp-selected {
+  outline: 0.125rem solid var(--text);
+}
+
+/* A drag of several selected notes draws each of them where the drop would put it, in the dashed ring of a preview. */
+.sp-draft {
+  outline-style: dashed;
+}
+
+/* A draw, move or resize in progress: the dashed ring of the cursor, over the notes. The hovered empty cell is a thin outline, so the
+   two are never confused. Neither takes a pointer event: the grid does. */
+#scratch-preview {
+  border: 0.125rem dashed var(--text);
+  pointer-events: none;
+}
+
+#scratch-preview[hidden] {
+  display: none;
+}
+
+#scratch-hover-cell {
+  outline: 1px solid var(--text-muted);
+  pointer-events: none;
+}
+
+#scratch-hover-cell[hidden] {
+  display: none;
+}
+
+/* The selection box of a drag in Select mode: a thin dashed outline and a faint fill, placed by the fractions of units and rows the
+   drag spans. It takes no pointer event: the grid does. */
+#scratch-select-rect {
+  position: absolute;
+  box-sizing: border-box;
+  left: calc(var(--sp-start) / var(--sp-units) * 100%);
+  width: calc(var(--sp-len) / var(--sp-units) * 100%);
+  top: calc(var(--sp-row) * var(--sp-row-h));
+  height: calc(var(--sp-rows-span) * var(--sp-row-h));
+  border: 1px dashed var(--text);
+  background: color-mix(in srgb, var(--text) 8%, transparent);
+  pointer-events: none;
+}
+
+#scratch-select-rect[hidden] {
+  display: none;
+}
+
+#scratch-cursor {
+  border: 0.125rem dashed var(--text);
+  pointer-events: none;
+}
+
+#scratch-cursor[hidden] {
+  display: none;
+}
+
+/* Tap's now-marker: a 1px line of the text color where the music is in the motif. It moves because the music moves, so it moves in
+   both motion modes and has no transition. It takes no pointer event. */
+#scratch-now {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sp-now) / var(--sp-units) * 100%);
+  width: 1px;
+  background: var(--text);
+  pointer-events: none;
+}
+
+#scratch-now[hidden] {
+  display: none;
+}
+
+/* The live playhead: where the cycle axis is on the ring of 8 cycles. Like the marker above it is a position readout, so it has no
+   transition and moves in both motion modes. */
+#scratch-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(var(--sp-playhead) / var(--sp-units) * 100%);
+  width: 0.125rem;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+#scratch-playhead[hidden] {
+  display: none;
+}
+
+/* The velocity lane: one bar per note under its start column, sharing the roll's columns inside the same scroll box, so a sideways
+   scroll moves both. Notes that start together sit side by side in their column, each bar at least a quarter rem wide. The bars take
+   no pointer event: the lane's bars area hears the press and finds the column from the pointer's place, so the whole column answers.
+   The lane is held at the bottom of the box while the roll scrolls up and down, with a fill so nothing shows through. */
+#scratch-lane {
+  position: sticky;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  width: max-content;
+  height: 3.5rem;
+  padding-bottom: 0.25rem;
+  background: var(--dominant);
+  user-select: none;
+}
+
+#workspace[data-layout="b"] #scratch-lane,
+#workspace[data-layout="c"] #scratch-lane {
+  height: 5rem;
+}
+
+#scratch-lane:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 1px;
+}
+
+#scratch-lane-label {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: none;
+  box-sizing: border-box;
+  width: 4.5rem;
+  padding-right: 0.25rem;
+  background: var(--dominant);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: right;
+}
+
+#scratch-bars {
+  position: relative;
+  flex: none;
+  box-sizing: border-box;
+  width: calc(var(--sp-cycles) * 4 * var(--sp-beat-w));
+  height: 100%;
+  border-top: 1px solid var(--border);
+  touch-action: none;
+  cursor: ns-resize;
+  background-image:
+    repeating-linear-gradient(to right, var(--sp-line-cycle) 0, var(--sp-line-cycle) 1px, transparent 1px, transparent calc(var(--sp-beat-w) * 4)),
+    repeating-linear-gradient(to right, var(--sp-line-beat) 0, var(--sp-line-beat) 1px, transparent 1px, transparent var(--sp-beat-w));
+}
+
+.sp-bar {
+  --sp-slot-w: max(0.375rem, calc(var(--sp-step) / var(--sp-slots) / var(--sp-units) * 100%));
+  position: absolute;
+  bottom: 0;
+  box-sizing: border-box;
+  left: calc(var(--sp-start) / var(--sp-units) * 100% + var(--sp-slot) * var(--sp-slot-w) + 0.0625rem);
+  width: max(0.25rem, calc(var(--sp-slot-w) - 0.125rem));
+  height: calc(var(--v) * 100%);
+  min-height: 1px;
+  background: var(--text-muted);
+  pointer-events: none;
+}
+
+.sp-bar.sp-selected {
+  outline: none;
+  background: var(--text);
+}
+
+#scratch-note {
+  position: relative;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  min-height: 2rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#workspace[data-layout="b"] #scratch-note {
+  min-height: 4rem;
+}
+
+/* In layout a the panel is a short band under the editor: the roll keeps its minimum height and the view scrolls. The information line and the
+   listening strip stay at the bottom edge of the view, in sight, because the strip is the one place that says why nothing is heard. */
+#workspace[data-layout="a"] #scratch-note,
+#workspace[data-layout="a"] #scratch-listen {
+  position: sticky;
+  z-index: 1;
+  background: var(--secondary);
+}
+
+#workspace[data-layout="a"] #scratch-note {
+  bottom: calc(var(--sp-listen-h) + 0.5rem);
+}
+
+/* Scrolling a control into view with "nearest" (a focused or revealed lane, a key) must stop above the two pinned lines, not under them: the
+   padding is the listening strip, the information line at its smallest height and the gaps between them. */
+#workspace[data-layout="a"] #scratch-view {
+  scroll-padding-bottom: calc(var(--sp-listen-h) + 3rem);
+}
+
+#workspace[data-layout="a"] #scratch-listen {
+  bottom: 0;
+}
+
+#scratch-note-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+
+#scratch-note-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+#scratch-note-rest {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+#scratch-note-line[data-kind="notice"] #scratch-note-rest {
+  color: var(--text);
+}
+
+/* The line of a hovered note or of a draw in progress: it takes the place of the shown line and is never read aloud (the words for a
+   screen reader stay in #scratch-note-spoken, which a hover does not touch). */
+#scratch-note[data-hover="true"] #scratch-note-shown {
+  visibility: hidden;
+}
+
+#scratch-note-hover {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  margin: 0;
+  max-width: 100%;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+#scratch-note-hover[hidden] {
+  display: none;
+}
+
+.sp-hover-name {
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Visually hidden, kept in the accessibility tree: the live region reads this full-words form of the line. */
+#scratch-note-spoken {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+#scratch-hint {
+  flex: 0 1 auto;
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* The listening strip under the information line: whether a MIDI keyboard is listened to, and the last note it played. It keeps a fixed
+   height like the information line (one line, two in layout b); a longer sentence ends in an ellipsis and carries its whole text in its
+   title. Only the state sentence is a live region, so a jam never floods a screen reader note by note. */
+#scratch-listen {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  height: var(--sp-listen-h);
+  overflow: hidden;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#scratch-listen-state,
+#scratch-heard {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#workspace[data-layout="b"] #scratch-listen-state,
+#workspace[data-layout="b"] #scratch-heard {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+#scratch-listen-state {
+  flex: 1 1 auto;
+  color: var(--text-muted);
+}
+
+/* The Allow MIDI to listen button sits after the state sentence; it shows only while asking can help, and its own rule keeps it hidden. */
+#scratch-allow {
+  flex: 0 0 auto;
+}
+
+#scratch-allow[hidden] {
+  display: none;
+}
+
+#scratch-heard {
+  flex: 0 1 auto;
+  max-width: 50%;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The hear strip under the keyboard strip: the menu of instruments and channels, the Start choice, Loop, Listen and Stop on one row that wraps, and
+   under them the strip's one live region, the sentence that says what became of a play. Like the send strip it scrolls with the view. The menu has
+   the look of the words box of the send strip, the Start choice the segmented look of the grid group, and a long name is cut inside the menu. */
+#scratch-play {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#scratch-play-output {
+  flex: 0 1 16rem;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  height: 2rem;
+  padding: 0 0.5rem;
+  background: var(--dominant);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#scratch-play-output:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 0;
+}
+
+#scratch-play-start {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  border: 1px solid var(--border);
+}
+
+#scratch-play-start .tl-btn {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+}
+
+#scratch-play-start .tl-btn:hover:not([aria-disabled="true"]) {
+  color: var(--text);
+}
+
+#scratch-play-start .tl-btn[aria-pressed="true"] {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+#scratch-play-start .tl-btn:focus-visible {
+  outline-offset: -1px;
+}
+
+#scratch-play .tl-btn[aria-disabled="true"] {
+  color: var(--text-muted);
+}
+
+#scratch-play-loop[aria-pressed="true"] {
+  border-color: var(--text);
+}
+
+#scratch-play-note {
+  flex: 1 0 100%;
+  margin: 0;
+  min-height: 1.25rem;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-hear-id {
+  font-weight: 600;
+}
+
+/* The send strip, the last block of the Scratchpad: the phrase of the motif (the very text a send carries, in a box of its own height with its own
+   scroll, wrapping at any character), the words for Claude with the Send to Claude button beside them, and the status line, the strip's one live
+   region. It scrolls with the view; the phrase can be thousands of characters and is never a live region. */
+#scratch-send {
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.8125rem;
+  font-weight: 400;
+  line-height: 1.5;
+}
+
+#scratch-phrase {
+  display: block;
+  box-sizing: border-box;
+  max-height: 4.5rem;
+  overflow: auto;
+  padding: 0.25rem 0.5rem;
+  background: var(--dominant);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+#scratch-phrase[data-empty="true"] {
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.8125rem;
+}
+
+#scratch-phrase:focus-visible,
+#scratch-words:focus-visible {
+  outline: 1px solid var(--text-muted);
+  outline-offset: 0;
+}
+
+#scratch-send-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#scratch-words {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  height: 2rem;
+  padding: 0 0.5rem;
+  background: var(--dominant);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-family: inherit;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+#scratch-send-button {
+  flex: 0 0 auto;
+}
+
+#scratch-send-status {
+  margin: 0;
+  min-height: 1.25rem;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
 /* The load failure notice, for a page whose Strudel or acorn script did not load. It stands alone: it needs nothing
    from the rest of the page, which may never start. The base rule is the strip of the partial case (acorn missing,
    everything else works): in flow above the bar, the look of a kind-notice failed-change banner, one level above the

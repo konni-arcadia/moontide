@@ -20,9 +20,9 @@ import * as views from '../page/views.js';
 const NONE = { view: 'none' };
 const NO_MODIFIERS = { ctrlKey: false, metaKey: false, altKey: false };
 
-test('VIEW_KEYS fixes all six view numbers; BUILT_VIEWS ships history, timeline, mixer, parts, jam and instruments', () => {
-  assert.deepEqual(VIEW_KEYS, { '1': 'history', '2': 'timeline', '3': 'mixer', '4': 'parts', '5': 'jam', '6': 'instruments' });
-  assert.deepEqual(BUILT_VIEWS, ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments']);
+test('VIEW_KEYS fixes all seven view numbers; BUILT_VIEWS ships history, timeline, mixer, parts, jam, instruments and scratchpad', () => {
+  assert.deepEqual(VIEW_KEYS, { '1': 'history', '2': 'timeline', '3': 'mixer', '4': 'parts', '5': 'jam', '6': 'instruments', '7': 'scratchpad' });
+  assert.deepEqual(BUILT_VIEWS, ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments', 'scratchpad']);
 });
 
 test("'1' toggles the history view open, then closed again", () => {
@@ -69,6 +69,21 @@ test("'6' does nothing while the cursor is in the code editor or a text field", 
   const inEditor = applyKey(NONE, { key: '6', focusInEditor: true, ...NO_MODIFIERS });
   assert.deepEqual(inEditor, { state: NONE, handled: false, blurEditor: false });
   const inField = applyKey(NONE, { key: '6', focusInEditor: false, focusInTextEntry: true, ...NO_MODIFIERS });
+  assert.deepEqual(inField, { state: NONE, handled: false, blurEditor: false });
+});
+
+test("'7' toggles the scratchpad view open, then closed again", () => {
+  const opened = applyKey(NONE, { key: '7', focusInEditor: false, ...NO_MODIFIERS });
+  assert.deepEqual(opened, { state: { view: 'scratchpad' }, handled: true, blurEditor: false });
+
+  const closed = applyKey(opened.state, { key: '7', focusInEditor: false, ...NO_MODIFIERS });
+  assert.deepEqual(closed, { state: { view: 'none' }, handled: true, blurEditor: false });
+});
+
+test("'7' does nothing while the cursor is in the code editor or a text field", () => {
+  const inEditor = applyKey(NONE, { key: '7', focusInEditor: true, ...NO_MODIFIERS });
+  assert.deepEqual(inEditor, { state: NONE, handled: false, blurEditor: false });
+  const inField = applyKey(NONE, { key: '7', focusInEditor: false, focusInTextEntry: true, ...NO_MODIFIERS });
   assert.deepEqual(inField, { state: NONE, handled: false, blurEditor: false });
 });
 
@@ -242,6 +257,13 @@ test('readViewPrefs accepts a stored instruments view and ignores any other unkn
   assert.equal(readViewPrefs(stored('7')).view, undefined);
 });
 
+test('readViewPrefs accepts a stored scratchpad view and refuses a near miss', () => {
+  const stored = (value) => ({ getItem: (key) => (key === STORAGE_KEYS.view ? value : null) });
+  assert.equal(readViewPrefs(stored('scratchpad')).view, 'scratchpad');
+  assert.equal(readViewPrefs(stored('Scratchpad')).view, undefined);
+  assert.equal(readViewPrefs(stored('scratch')).view, undefined);
+});
+
 test('readViewPrefs with a throwing storage reports unavailable and every value undefined', () => {
   const throwing = {
     getItem() {
@@ -327,10 +349,10 @@ const BUTTON_VIEW_LISTS = [
   BUILT_VIEWS,
   ['timeline'],
   ['parts', 'timeline'],
-  ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments'],
+  ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments', 'scratchpad'],
 ];
 
-test('viewButtonParts lists the six built views in key order with digit, name, label and title', () => {
+test('viewButtonParts lists the seven built views in key order with digit, name, label and title', () => {
   assert.deepEqual(views.viewButtonParts(), [
     { key: '1', digit: '1', name: 'History', label: '1 History', title: 'History (key 1)' },
     { key: '2', digit: '2', name: 'Timeline', label: '2 Timeline', title: 'Timeline (key 2)' },
@@ -338,6 +360,7 @@ test('viewButtonParts lists the six built views in key order with digit, name, l
     { key: '4', digit: '4', name: 'Parts', label: '4 Parts', title: 'Parts (key 4)' },
     { key: '5', digit: '5', name: 'Jam', label: '5 Jam', title: 'Jam (key 5)' },
     { key: '6', digit: '6', name: 'Instruments', label: '6 Instruments', title: 'Instruments (key 6)' },
+    { key: '7', digit: '7', name: 'Scratchpad', label: '7 Scratchpad', title: 'Scratchpad (key 7)' },
   ]);
 });
 
@@ -362,7 +385,7 @@ test('viewButtonParts keys are the digits of the built views in key order', () =
     .filter((digit) => BUILT_VIEWS.includes(VIEW_KEYS[digit]))
     .sort((a, b) => Number(a) - Number(b));
   assert.deepEqual(views.viewButtonParts(BUILT_VIEWS).map((part) => part.key), builtDigits);
-  assert.deepEqual(views.viewButtonParts().map((part) => part.key), ['1', '2', '3', '4', '5', '6']);
+  assert.deepEqual(views.viewButtonParts().map((part) => part.key), ['1', '2', '3', '4', '5', '6', '7']);
 });
 
 test('layoutButtonParts lists a, b and c with the letter as text and a plain-word label', () => {
@@ -423,6 +446,12 @@ test('hintButtonState presses the 6 button while the instruments view is open', 
   assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'instruments' }, '6'), { pressed: true });
   assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'instruments' }, '5'), { pressed: false });
   assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'none' }, '6'), { pressed: false });
+});
+
+test('hintButtonState presses the 7 button while the scratchpad view is open', () => {
+  assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'scratchpad' }, '7'), { pressed: true });
+  assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'scratchpad' }, '6'), { pressed: false });
+  assert.deepEqual(views.hintButtonState({ layout: 'a', view: 'none' }, '7'), { pressed: false });
 });
 
 test('hintButtonState throws a loud error naming any key outside the closed set, Escape included (no button exists for it)', () => {
@@ -530,7 +559,7 @@ test('setJamChordTones accepts on and off and throws on any other value', () => 
 
 test('while a number field, a text field or a select holds focus, no view key does anything', () => {
   const open = { layout: 'a', view: 'mixer' };
-  for (const key of ['a', 'b', 'c', '1', '2', '3', '4', '6', 'Escape']) {
+  for (const key of ['a', 'b', 'c', '1', '2', '3', '4', '6', '7', 'Escape']) {
     const result = applyKey(open, { key, focusInEditor: false, focusInTextEntry: true, ...NO_MODIFIERS });
     assert.deepEqual(result, { state: open, handled: false, blurEditor: false }, `key ${key}`);
     assert.equal(result.state, open, `key ${key} must return the same state object`);

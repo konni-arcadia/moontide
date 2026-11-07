@@ -1135,3 +1135,47 @@ test('cellFitPrefill cuts long names and hides hidden characters, and stays with
   assert.ok(!clean.includes('\n'));
   assert.ok(clean.includes("variation 'a b'"));
 });
+
+// --- the motif context ---
+
+const MOTIF_PHRASE = 'note("c4 ~ e4 _").velocity("0.8 ~ 1 _")';
+const motifDescriptor = (change = {}) => ({
+  kind: 'motif',
+  motif: { source: 'drawn', cycle: 12, cycles: 2, grid: 'quarter', notes: 5, phrase: MOTIF_PHRASE, ...change },
+});
+
+test('describeContext motif gives the motif kind, its chip and the motif next to the context', () => {
+  const described = describeContext(motifDescriptor());
+  assert.deepEqual(described.context, { kind: 'motif' });
+  assert.equal(described.chip, 'Motif · drawn · 2 cycles · 5 notes · at cycle 12');
+  assert.deepEqual(described.motif, { source: 'drawn', cycle: 12, cycles: 2, grid: 'quarter', notes: 5, phrase: MOTIF_PHRASE });
+  assert.equal(Object.hasOwn(described, 'moment'), false);
+  assert.equal(Object.hasOwn(described, 'gesture'), false);
+});
+
+test('describeContext motif without a cycle says nothing about a moment, and counts one note and one cycle in the singular', () => {
+  const described = describeContext(motifDescriptor({ cycle: undefined, cycles: 1, notes: 1, source: 'played' }));
+  assert.equal(described.chip, 'Motif · played · 1 cycle · 1 note');
+  assert.equal(Object.hasOwn(described.motif, 'cycle'), false);
+  assert.equal(describeContext(motifDescriptor({ cycle: 0 })).motif.cycle, 0);
+});
+
+test('describeContext motif refuses a wrong value loudly, the phrase included', () => {
+  for (const change of [
+    { source: 'typed' },
+    { cycle: -1 },
+    { cycle: 1.5 },
+    { cycles: 0 },
+    { cycles: 9 },
+    { grid: 'thirty-second' },
+    { notes: 0 },
+    { phrase: '' },
+    { phrase: `${MOTIF_PHRASE}.gain(2)` },
+    { phrase: 'x'.repeat(8001) },
+  ]) {
+    assert.throws(() => describeContext(motifDescriptor(change)), /^Error: Moontide: /, JSON.stringify(change).slice(0, 60));
+  }
+  assert.throws(() => describeContext({ kind: 'motif' }), /ask context motif needs a motif/);
+  assert.throws(() => describeContext({ kind: 'session', motif: motifDescriptor().motif }), /cannot carry a motif/);
+  assert.throws(() => describeContext({ ...motifDescriptor(), moment: { cycle: 1 } }), /cannot carry a moment/);
+});

@@ -208,6 +208,11 @@ export function createInstrumentsView({ document, onInstrumentSwitch, onInstrume
     return lines;
   }
 
+  /** The children of the Synth settings value: one line element per model line, the muted ones with the muted class. */
+  function synthSettingsLines(synthSettings) {
+    return synthSettings.lines.map((line) => element('span', line.muted ? 'instrument-inuse-line instrument-muted' : 'instrument-inuse-line', line.text));
+  }
+
   /** The lines of the Drum kit row: one span per line, muted when the model says so, with its hover title when it has one. */
   function drumKitLines(drumKit) {
     return drumKit.lines.map((line) => {
@@ -262,7 +267,7 @@ export function createInstrumentsView({ document, onInstrumentSwitch, onInstrume
 
   /** One card and the nodes a live redraw updates. The generated ids come from the index, never from user text. */
   function cardNode(card, index) {
-    const refs = { id: card.id, index, item: null, dot: null, words: null, inUse: null, drumKit: null, maps: null, opens: [], enabled: card.enabled, switchNodes: null, head: null, errorNode: null, editButton: null, editor: null };
+    const refs = { id: card.id, index, item: null, dot: null, words: null, inUse: null, synthSettings: null, drumKit: null, maps: null, opens: [], enabled: card.enabled, switchNodes: null, head: null, errorNode: null, editButton: null, editor: null };
     const item = element('li', 'instrument-card');
     refs.item = item;
     item.tabIndex = 0;
@@ -300,6 +305,12 @@ export function createInstrumentsView({ document, onInstrumentSwitch, onInstrume
     inUse.append(...inUseLines(card.inUse));
     refs.inUse = inUse;
     rows.append(row(INSTRUMENTS_COPY.labelInUse, inUse));
+    if (card.synthSettings !== null) {
+      const synth = element('div', 'instrument-lines');
+      synth.append(...synthSettingsLines(card.synthSettings));
+      refs.synthSettings = synth;
+      rows.append(row(INSTRUMENTS_COPY.labelSynthSettings, synth));
+    }
     item.append(head, rows, editButtonNode(card, refs));
     drawError(refs);
     // An editor that was open (a draft kept in memory) comes back with the card.
@@ -766,7 +777,7 @@ export function createInstrumentsView({ document, onInstrumentSwitch, onInstrume
     instrumentsBody.scrollTop = scrollTop;
   }
 
-  /** Updates the changed parts of each card in place: the dot, the state words, the Drum kit lines, the In use lines and the Drum map lines. */
+  /** Updates the changed parts of each card in place: the dot, the state words, the Drum kit lines, the In use lines, the Synth settings lines and the Drum map lines. */
   function updateCards(previous, model, skip = []) {
     model.cards.forEach((card, index) => {
       if (skip.includes(index)) return;
@@ -786,6 +797,7 @@ export function createInstrumentsView({ document, onInstrumentSwitch, onInstrume
       setText(refs.words, card.port.words);
       if (card.port.attention !== before.port.attention) refs.words.dataset.attention = String(card.port.attention);
       if (JSON.stringify(card.inUse) !== JSON.stringify(before.inUse)) refs.inUse.replaceChildren(...inUseLines(card.inUse));
+      if (card.synthSettings !== null && JSON.stringify(card.synthSettings) !== JSON.stringify(before.synthSettings)) refs.synthSettings.replaceChildren(...synthSettingsLines(card.synthSettings));
       if (card.drumKit !== null && JSON.stringify(card.drumKit) !== JSON.stringify(before.drumKit)) refs.drumKit.replaceChildren(...drumKitLines(card.drumKit));
       if (card.drumMaps !== null && JSON.stringify(card.drumMaps) !== JSON.stringify(before.drumMaps)) {
         // The drawn flags are read first and the focus noted, because the nodes are replaced: a map that stays keeps its state.

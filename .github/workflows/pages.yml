@@ -1,0 +1,67 @@
+# This workflow builds the user manual from the Markdown pages in site/ with the project's own
+# script, which needs no install, and deploys it to GitHub Pages. It runs on each push to the
+# main branch (a release) and by hand.
+#
+# The job that runs project code (build) installs nothing and runs one command. Only the job that
+# deploys (deploy) can write to Pages or get an OIDC token, and it runs no project code.
+#
+# A manual start can pick any branch, so both jobs run only on main: another branch can never reach
+# the live site, whatever the github-pages environment allows.
+#
+# Every action reference is a full commit SHA with its version as a comment. Do not use a tag or
+# a branch name: a tag can be moved, a commit cannot.
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deploy at a time. A run in progress is never canceled, so a deploy is never cut in half.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build the manual
+        run: node scripts/build-site.mjs --out _site
+
+      - name: Upload the manual
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

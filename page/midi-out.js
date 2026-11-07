@@ -5,8 +5,9 @@
 // It never keeps a webmidi Output or a native MIDIOutput in a variable across calls: a port can be
 // replaced at any time, so the current list is read each time.
 
-import { MIDI_LIMITS, buildMidiFacts, channelSilence, panicMessages, panicOrder, panicTargetsFrom, portState, readMidiCalls, readMidiSetup, usesMidi } from './midi-plan.js';
-import { checkSetup as checkRigSetup } from './midi-rig.js';
+import { MIDI_LIMITS, buildMidiFacts, channelSilence, fill, panicMessages, panicOrder, panicTargetsFrom, portState, readMidiCalls, readMidiSetup, usesMidi } from './midi-plan.js';
+import { RIG_COPY, checkSetup as checkRigSetup } from './midi-rig.js';
+import { SETTINGS_COPY, buildSettings, guardOf, ownMessageProblem, ownNrpnProblem, readSentBytes, sysexProblem } from './midi-settings.js';
 import { controlsByCc, defaultOf, midiStops, notesToStop, readMidiSlots } from './midi-controls.js';
 import { cutText } from './ask.js';
 import { createPageClock } from './midi-clock.js';
@@ -88,6 +89,10 @@ export const RECONNECT_REPEAT_MS = 1000;
 // evaluation, a send that failed) wait here until the next publish carries them to the server once.
 // src/protocol.ts holds the same number (MAX_MIDI_EVENTS); test/protocol.test.js checks both sides.
 export const MAX_PAGE_EVENTS = 20;
+// The most names one settings event carries and the longest setting name (the server's schema holds the same limits;
+// the limit of names equals MAX_RIG_SETTINGS, the most rows of a level).
+export const MAX_SETTING_NAMES = 512;
+const MAX_SETTING_NAME = 40;
 
 // How long after a MIDI track's notes were ended (its channel silenced, or its own note-offs sent) the same
 // bytes go out once more. Strudel queues the notes of the next 0.1 s ahead of time (latency 0.1 s and a 0.1 s
@@ -232,9 +237,18 @@ export function createMidiOut({
   const controlShadows = new Map();
   let activeControls = null;
   let activePlan = null;
+  // The settings the code writes, only to know which code's settings a reset, a replug or a rollback sends again
+  // (like activePlan and activeControls for the sounds and the controls): the tone and part settings per channel slot
+  // and the scene settings per instrument, each as the finished data sets. No Map here remembers what was sent: only
+  // the code is the truth, so the same code evaluated again sends all its settings again.
+  let activeSettings = null;
+  let activeScenes = null;
   // The last valid rig the page saw (null after the file went absent): a file that passes through an
   // invalid state between two valid ones is compared against it, not against the invalid state.
   let lastValid = null;
+  // The instruments of the last valid rig, kept while the file is invalid or gone: only to name the instrument behind
+  // a port in the memory guard's notice (the guard itself is keyed on the message and checks every port).
+  let guardInstruments = [];
   // The desired sounds of the evaluation being prepared (a reset that runs meanwhile sends them),
   // and what the page knows of each rig instrument's connection: { key, present, settleTimer, repeatTimer,
   // holding, holdLogged, epoch, resetPromise, resets, resetAt } by instrument id. `holding` is true from the instant a
@@ -243,6 +257,9 @@ export function createMidiOut({
   // active role is not `active`: it resets and sets up nothing.
   let pendingPlan = null;
   let pendingControls = null;
+  // The settings of the evaluation being prepared (like activeSettings and activeScenes, for the code that plays).
+  let pendingSettings = null;
+  let pendingScenes = null;
   // The plan (prepareSetup call) that owns pendingPlan: the same code checked twice gives the same desired Map, so the
   // Map cannot tell two plans apart.
   let pendingOwner = null;
@@ -251,6 +268,10 @@ export function createMidiOut({
   // The channels the evaluation being prepared changed, so a rollback can undo or report each one. A reset
   // that sends the pending sounds adds its channels here too (it wiped them first: nothing to send back).
   let pendingChanges = null;
+  // What the evaluation being prepared has sent of its settings, by itself or through a reset that sent them:
+  // { names: Set of settingKey, instruments: Set of instrument ids }. Its send skips what a reset already sent (once
+  // per evaluation), and a rollback tells and puts back only what was sent.
+  let pendingSent = null;
   let active = true;
   const states = new Map();
   // The rig check of a code string depends on the rig, the connected outputs and the playing flag; it
@@ -308,6 +329,73 @@ export function createMidiOut({
     onError(`Moontide: more than ${MAX_PAGE_EVENTS} MIDI events were waiting to be sent, so the oldest were dropped.`);
   }
 
+  /** The key of one setting sent: the channel slot (`<instrument id>:<channel>`, the instrument id for a scene), the level and the name. */
+  const settingKey = (slot, level, name) => `${slot}\n${level}\n${name}`;
+
+  /** The scene values of one instrument as one text: every name with the bytes of its value, in the order written. */
+  function sceneSignature(scene) {
+    return JSON.stringify(scene.sceneBytes.map((item) => [item.name, item.bytes]));
+  }
+
+  /**
+   * Queues the events about the scene settings of a code that takes over: for each instrument whose scene names or
+   * values differ from those of the code that played, one settings-scene event with its new names, since a scene
+   * setting reaches every part and not only the channel of its .midi() call. Facts about what the page sends.
+   * Returns how many events it added.
+   */
+  function addSceneEvents(scenes) {
+    let added = 0;
+    for (const [id, scene] of scenes) {
+      const before = activeScenes?.get(id);
+      if (before !== undefined && sceneSignature(before) === sceneSignature(scene)) continue;
+      addEvent({
+        kind: 'settings-scene',
+        instrument: cutText(id, MIDI_LIMITS.name),
+        names: scene.sceneBytes.slice(0, MAX_SETTING_NAMES).map((item) => cutText(item.name, MAX_SETTING_NAME)),
+      });
+      added++;
+    }
+    return added;
+  }
+
+  /** Publishes the facts when an event waits (events added after the facts of an evaluation went out). Never throws. */
+  function publishEvents() {
+    try {
+      if (events.length > 0) publishFacts();
+    } catch (err) {
+      onError('Moontide: MIDI state could not be read:', err);
+    }
+  }
+
+  /**
+   * Queues the events about settings that stay on the instrument: for each slot of `sent` (the settings of a code that was
+   * sent) the tone and part names that the `kept` slot of the same channel no longer writes, and for each scene the names
+   * the kept scene no longer writes, one settings-left event per instrument, channel and level. Nothing is sent for such a
+   * setting and the page keeps no value to restore, so the instrument holds the last one. `toneLoaded(slot)` says that
+   * the sound of the slot's channel was sent after those tone settings: the program change loaded the tone again, so
+   * no tone setting stays there. `sent` and `kept` may be null. Returns how many events it added.
+   */
+  function addLeftEvents(sent, sentScenes, kept, keptScenes, toneLoaded) {
+    let added = 0;
+    const gone = (names, keptNames) => names.filter((name) => !keptNames.includes(name)).slice(0, MAX_SETTING_NAMES).map((name) => cutText(name, MAX_SETTING_NAME));
+    const tell = (instrumentId, level, channel, names) => {
+      if (names.length === 0) return;
+      addEvent({ kind: 'settings-left', instrument: cutText(instrumentId, MIDI_LIMITS.name), level, channel, names });
+      added++;
+    };
+    for (const [key, slot] of sent ?? []) {
+      const now = kept?.get(key);
+      if (!toneLoaded(slot)) {
+        tell(slot.instrument, 'tone', slot.channel, gone(slot.toneBytes.map((item) => item.name), now?.toneBytes.map((item) => item.name) ?? []));
+      }
+      tell(slot.instrument, 'part', slot.channel, gone(slot.partBytes.map((item) => item.name), now?.partBytes.map((item) => item.name) ?? []));
+    }
+    for (const [id, scene] of sentScenes ?? []) {
+      tell(id, 'scene', null, gone(scene.sceneBytes.map((item) => item.name), keptScenes?.get(id)?.sceneBytes.map((item) => item.name) ?? []));
+    }
+    return added;
+  }
+
   // While held, only a forced publish goes out: the page holds the facts during a take-over replay, when
   // the code this tab last evaluated is not the code that plays any more.
   let factsHeld = false;
@@ -339,6 +427,8 @@ export function createMidiOut({
   const clockHoldLogged = new Set();
   // Rig instrument ids whose switched-off notes were logged: one line per switch-off, not one per dropped note.
   const offLogged = new Set();
+  // Instrument ids (or port names) whose refused message from the code was logged: one line per name per page session.
+  const sysexLogged = new Set();
   // Output -> channels (1 to 16) whose messages it drops (the stale-channel rule).
   // Strudel picks the Output when it triggers a note, up to 0.3 s ahead, and plays on that same object
   // later: the notes the old code triggered before a sound change hold the old Output, so the Output's
@@ -406,6 +496,47 @@ export function createMidiOut({
   }
 
   /**
+   * The memory guard on Strudel's path, on every port: the arguments of an Output.send call as they may go on, or null
+   * when the call is dropped. The bytes are read once as Web MIDI reads them (readSentBytes: the first argument and, in
+   * webmidi's older form, a list given as the second argument too), the whole buffer is checked (sysexProblem: keyed on
+   * the message, so a Roland message for a model whose temporary areas Moontide knows must be a data set inside them,
+   * and every other message passes as it is), and the call goes on with the bytes that were read, not the original, so
+   * what was checked is what is sent. A refusal drops the whole call; the first one per name logs one line with the
+   * reason. The name is the instrument of the last valid rig on that port (guardInstruments), else the port. Never
+   * throws: it runs inside Strudel's send.
+   */
+  function memoryGuardedArgs(output, args) {
+    try {
+      const first = readSentBytes(args[0]);
+      const second = Array.isArray(args[1]) ? readSentBytes(args[1]) : null;
+      const problem = first.problem ?? second?.problem ?? sysexProblem([...first.bytes, ...(second?.bytes ?? [])]);
+      if (problem !== null) {
+        refuseCodeMessage(output, problem);
+        return null;
+      }
+      const handed = args.slice();
+      handed[0] = typeof args[0] === 'number' ? first.bytes[0] : first.bytes;
+      if (second !== null) handed[1] = second.bytes;
+      return handed;
+    } catch (err) {
+      sayOnce('memory-guard', 'Moontide: a MIDI message from the code could not be checked, so it was not sent:', err);
+      return null;
+    }
+  }
+
+  /** Tells the first refusal of a message from the code per instrument (or port, for a port of no instrument). */
+  function refuseCodeMessage(output, problem) {
+    const port = typeof output.name === 'string' ? output.name : '';
+    const name = guardInstruments.find((instrument) => port.includes(instrument.port))?.id ?? (port === '' ? 'unnamed port' : port);
+    if (sysexLogged.has(name)) return;
+    sysexLogged.add(name);
+    const unread = problem.reason === 'not-bytes' || problem.reason === 'too-long';
+    onError(fill(unread ? SETTINGS_COPY.messageDropped : SETTINGS_COPY.sysexDropped, { id: name, reason: problem.text }));
+    addEvent({ kind: 'sysex-refused', instrument: cutText(name, MIDI_LIMITS.name), source: 'code', reason: problem.reason });
+    publishEvents();
+  }
+
+  /**
    * True when `output` drops this message. Five rules, in order: the message is clock or transport (status 0xF8,
    * 0xFA, 0xFB or 0xFC): Moontide sends these itself, so Strudel's are dropped on every port; the message is a channel
    * message (status 0x80 to 0xEF) of a channel the Output is stale on; the Output is the one of a port whose
@@ -413,7 +544,7 @@ export function createMidiOut({
    * the notes of code already playing included); the Output is the one of a port that is held (a rig instrument whose
    * presence state has `holding`; both rules test whether the output's name contains the port: the substring rule of
    * nativeFor, never broader); or the message is a note-on for a clock instrument that waits for its Start (see
-   * below). SysEx and the like pass unless the instrument is off. `data` is untrusted: its type is checked before the
+   * below). The memory guard runs before these rules (memoryGuardedArgs). `data` is untrusted: its type is checked before the
    * status byte is masked. `ts` is the timestamp the message carries (the page clock's mapping) or undefined: a stamped note-on is
    * held by its own timestamp, and the other rules apply to a stamped message as they do to any other.
    */
@@ -687,12 +818,15 @@ export function createMidiOut({
     guardedOutputs.add(output);
     const original = output.send;
     output.send = function guardedSend(...args) {
+      // The memory guard first: the rules below read the bytes it checked and hands on.
+      const checked = memoryGuardedArgs(output, args);
+      if (checked === null) return output;
       const intent = noteIntent;
-      if (dropsMessage(output, args[0], intent === null ? undefined : intent.ts)) return output;
-      if (intent === null) return original.apply(output, args);
-      const sendArgs = safeStampedArgs(args, intent);
+      if (dropsMessage(output, checked[0], intent === null ? undefined : intent.ts)) return output;
+      if (intent === null) return original.apply(output, checked);
+      const sendArgs = safeStampedArgs(checked, intent);
       const result = original.apply(output, sendArgs);
-      recordQueued(output, args[0], sendArgs, intent.triggerAt);
+      recordQueued(output, checked[0], sendArgs, intent.triggerAt);
       return result;
     };
   }
@@ -929,6 +1063,16 @@ export function createMidiOut({
         });
     }
     return pendingEnable;
+  }
+
+  /**
+   * The enable the page offers outside an evaluation. The keyboard input asks for MIDI through this same enable, so the page asks the
+   * browser once and the two never prompt separately. Like an evaluation it leaves 'enabled', 'denied' and 'unsupported' as they are
+   * for the page session; it never rejects, every outcome is an access state.
+   */
+  function enable() {
+    if (access === 'enabled' || access === 'denied' || access === 'unsupported') return Promise.resolve();
+    return ensureEnabled();
   }
 
   /**
@@ -1488,30 +1632,34 @@ export function createMidiOut({
     }
     // The sounds of the playing code are no longer true when the file went away, or when an instrument it
     // names left the file or changed its port or model: a later reset must not send them.
-    if (activePlan !== null && (rig.setup === 'absent' || rig.setup === 'valid')) {
+    // The same goes for the controls and the settings of the playing code.
+    if (rig.setup === 'absent' || rig.setup === 'valid') {
       const base = previous.setup === 'valid' ? previous : (lastValid ?? previous);
-      const kept = new Map();
-      for (const [slot, entry] of activePlan) {
-        const was = known(base, entry.instrument);
-        const current = known(rig, entry.instrument);
-        const gone = rig.setup === 'absent' || current === undefined || (was !== undefined && (was.port !== current.port || was.model !== current.model));
-        if (!gone) kept.set(slot, entry);
-      }
-      activePlan = kept;
-    }
-    if (activeControls !== null && (rig.setup === 'absent' || rig.setup === 'valid')) {
-      const base = previous.setup === 'valid' ? previous : (lastValid ?? previous);
-      const kept = new Map();
-      for (const [slot, entry] of activeControls) {
-        const was = known(base, entry.instrument);
-        const current = known(rig, entry.instrument);
-        const gone = rig.setup === 'absent' || current === undefined || (was !== undefined && (was.port !== current.port || was.model !== current.model));
-        if (!gone) kept.set(slot, entry);
-      }
-      activeControls = kept;
+      // The settings are finished bytes built from the model's rows: an edit of the description under the same model id
+      // (an address, a size, a row gone) makes them stale, so they go too.
+      const keptOf = (map, { bytesOfSettings = false } = {}) => {
+        if (map === null) return null;
+        const kept = new Map();
+        for (const [slot, entry] of map) {
+          const was = known(base, entry.instrument);
+          const current = known(rig, entry.instrument);
+          const gone =
+            rig.setup === 'absent' ||
+            current === undefined ||
+            (was !== undefined &&
+              (was.port !== current.port || was.model !== current.model || (bytesOfSettings && JSON.stringify(was.settings) !== JSON.stringify(current.settings))));
+          if (!gone) kept.set(slot, entry);
+        }
+        return kept;
+      };
+      activePlan = keptOf(activePlan);
+      activeControls = keptOf(activeControls);
+      activeSettings = keptOf(activeSettings, { bytesOfSettings: true });
+      activeScenes = keptOf(activeScenes, { bytesOfSettings: true });
     }
     if (rig.setup === 'valid') lastValid = rig;
     else if (rig.setup === 'absent') lastValid = null;
+    if (rig.setup === 'valid') guardInstruments = rig.instruments;
     // An instrument that is on again (or gone) logs its next switch-off.
     for (const id of [...offLogged]) if (!known(rig, id) || known(rig, id).enabled !== false) offLogged.delete(id);
     silenceSwitchedOff(offBase);
@@ -1670,6 +1818,14 @@ export function createMidiOut({
         if (replayCode !== null) counted.push(replayCode);
         const playingPorts = namedPorts(counted);
         result = checkRigSetup({ read, rig, outputs, playing, playingPorts });
+        // The bytes of the settings are built after the vocabulary check passes; a setting that cannot be sent safely
+        // fails the evaluation with its reason, like any other refusal.
+        const built = result.refusal === null ? buildSettings({ rig, settings: result.settings, scenes: result.scenes }) : null;
+        if (built !== null && built.lines !== null) {
+          const closing = playing ? RIG_COPY.closingPlaying : RIG_COPY.closingStopped;
+          result = { refusal: [...built.lines, closing].join('\n'), desired: new Map(), controls: new Map(), settings: new Map(), scenes: new Map() };
+        }
+        result = { ...result, settingSlots: built?.slots ?? new Map(), sceneSettings: built?.scenes ?? new Map() };
       }
     }
     setupMemo.set(key, result);
@@ -1719,6 +1875,58 @@ export function createMidiOut({
     bytesSent.count += 3;
     controlShadowOf(instrument.id, channel).set(cc, value);
     return true;
+  }
+
+  /**
+   * Sends one finished settings message (a Roland data set, or the fifteen bytes of an NRPN set) to a native port, untimed or
+   * with the timestamp `at`: the one place settings bytes reach a port. The message is checked again here, against the
+   * instrument as the rig holds it now (a data set against its temporary areas, an NRPN set against the NRPN family of its
+   * model), so a rig that changed since the plan was built cannot let a write outside the temporary areas, or an NRPN
+   * Moontide does not know, through. Its bytes count
+   * toward the guard. When the check refuses it or the port throws, the answer is false after a log line and a send-failed
+   * event; with `throws` (the setup after a reset, whose caller has its own failure path) the error is thrown instead,
+   * unreported here, and a refusal says why in its message.
+   */
+  function sendSetting(native, instrument, level, bytes, bytesSent, at, { throws = false } = {}) {
+    // Settings go only to an instrument whose temporary areas Moontide knows, as data sets for exactly its model; the one
+    // other message is the NRPN set of a part offset of a family Moontide knows (a message that does not start with F0).
+    let problem;
+    if (bytes[0] === 0xf0) {
+      const guard = guardOf(instrument.settings);
+      problem = guard === null ? { reason: 'unknown-areas', text: 'the temporary areas of this instrument are not known' } : ownMessageProblem(guard, bytes);
+    } else {
+      problem = ownNrpnProblem(instrument, level, bytes);
+    }
+    try {
+      if (problem !== null) throw guardRefusal(fill(SETTINGS_COPY.sendRefused, { level, id: instrument.id, reason: problem.text }), 'settings', problem.reason);
+      if (at === undefined) native.send(bytes);
+      else native.send(bytes, at);
+    } catch (err) {
+      if (throws) throw err;
+      if (problem !== null) onError(err.message, undefined);
+      else onError(`Moontide: could not send a setting to MIDI port "${native.name}":`, err);
+      addEvent(failureEvent(instrument, 'settings', err));
+      return false;
+    }
+    bytesSent.count += bytes.length;
+    return true;
+  }
+
+  /** An Error for a message the memory guard refused, carrying what was refused and why for failureEvent. */
+  function guardRefusal(text, source, reason) {
+    return Object.assign(new Error(text), { name: 'MemoryGuardRefused', guardRefusal: { source, reason } });
+  }
+
+  /**
+   * The event for Claude about a send that failed with `err`: the memory guard's refusal with its source and reason
+   * (a sysex-refused event), else a send-failed event about `what` with the error's name.
+   */
+  function failureEvent(instrument, what, err) {
+    const id = cutText(instrument.id, MIDI_LIMITS.name);
+    const refused = err !== null && typeof err === 'object' ? err.guardRefusal : undefined;
+    if (refused !== undefined) return { kind: 'sysex-refused', instrument: id, source: refused.source, reason: refused.reason };
+    const name = err && typeof err.name === 'string' && err.name !== '' ? err.name : 'Error';
+    return { kind: 'send-failed', instrument: id, what, failure: cutText(name, MIDI_LIMITS.failure) };
   }
 
   /**
@@ -1978,8 +2186,11 @@ export function createMidiOut({
     const timed = atCycle !== undefined;
     pendingPlan = null;
     pendingControls = null;
+    pendingSettings = null;
+    pendingScenes = null;
     pendingOwner = null;
     pendingChanges = null;
+    pendingSent = null;
     if (rig.setup === 'absent') return null;
     const checked = checkedSetup(code);
     if (checked === null) {
@@ -1987,14 +2198,19 @@ export function createMidiOut({
         refusal: null,
         send: async () => {},
         commit: () => {
+          // Code that names no MIDI writes no setting: every setting of the code that played is gone from the code.
+          const told = addLeftEvents(activeSettings, activeScenes, null, null, () => false);
           activePlan = new Map();
           activeControls = new Map();
+          activeSettings = new Map();
+          activeScenes = new Map();
+          if (told > 0) publishEvents();
         },
         rollback: async () => {},
         drop: () => {},
       };
     }
-    const { refusal, desired, controls } = checked;
+    const { refusal, desired, controls, settingSlots, sceneSettings } = checked;
     if (refusal !== null) {
       return { refusal, send: async () => {}, commit: () => {}, rollback: async () => {}, drop: () => {} };
     }
@@ -2003,9 +2219,16 @@ export function createMidiOut({
     const owner = {};
     pendingPlan = desired;
     pendingControls = controls;
+    pendingSettings = settingSlots;
+    pendingScenes = sceneSettings;
     pendingOwner = owner;
     const changes = [];
     pendingChanges = changes;
+    // The instruments this plan sent settings to, and each setting sent (settingKey), by its send or by a reset: a
+    // failure puts back the settings of the code returned to there and tells only what was sent.
+    const settingInstruments = new Set();
+    const sentNames = new Set();
+    pendingSent = { names: sentNames, instruments: settingInstruments };
     // The { output, channel } pairs this evaluation filters (see filterStaleChannel).
     const filtered = [];
     // The latest timestamp this evaluation's timed setup carries, or null when nothing was timed (a rollback goes after it).
@@ -2024,8 +2247,11 @@ export function createMidiOut({
       if (timed && pendingOwner !== owner) return;
       pendingPlan = null;
       pendingControls = null;
+      pendingSettings = null;
+      pendingScenes = null;
       pendingOwner = null;
       pendingChanges = null;
+      pendingSent = null;
     }
     return {
       refusal: null,
@@ -2053,9 +2279,11 @@ export function createMidiOut({
               .filter((entry) => entry.instrument === instrument.id)
               .sort((a, b) => a.channel - b.channel);
             const slots = Array.from(controls.values()).filter((slot) => slot.instrument === instrument.id);
+            const settingsOf = Array.from(settingSlots.values()).filter((slot) => slot.instrument === instrument.id);
+            const sceneOf = sceneSettings.get(instrument.id);
             // An instrument the code does not name is still brought back to its defaults for a control that left the code.
             const leaving = controlChannels(instrument, []).some((channel) => controlsToSend(instrument, undefined, controlShadows.get(instrument.id)?.get(channel)).length > 0);
-            if (wanted.length === 0 && slots.length === 0 && !leaving) continue;
+            if (wanted.length === 0 && slots.length === 0 && !leaving && settingsOf.length === 0 && sceneOf === undefined) continue;
             // A reset in its wait finishes first; it sends this evaluation's sounds itself, and the bytes it
             // sent count toward the guard.
             const pendingReset = states.get(instrument.id)?.resetPromise ?? null;
@@ -2065,11 +2293,28 @@ export function createMidiOut({
             if (native === null) continue;
             if (!shadows.has(instrument.id)) shadows.set(instrument.id, new Map());
             const shadow = shadows.get(instrument.id);
-            // Channels ascending; on each, the sound goes first, then the controls the code writes (after the
+            /**
+             * One setting of this instrument, unless a reset already sent it for this plan (and, for a tone setting, no
+             * program change of this send came after it); remembers what went out.
+             */
+            const sendWritten = (slot, level, item, at, soundSent = false) => {
+              const key = settingKey(slot, level, item.name);
+              if (sentNames.has(key) && !(level === 'tone' && soundSent)) return true;
+              const sent = sendSetting(native, instrument, level, item.bytes, bytesSent, at);
+              if (sent) {
+                settingInstruments.add(instrument.id);
+                sentNames.add(key);
+              }
+              return sent;
+            };
+            // Channels ascending; on each, the sound goes first, then the tone and part settings the code writes (right
+            // after the program change, which would erase a tone setting sent before it), then the controls (after the
             // program change, so a control never lands before the sound it belongs to).
-            const channels = controlChannels(instrument, slots, wanted.map((entry) => entry.channel));
+            const channels = controlChannels(instrument, slots, [...wanted.map((entry) => entry.channel), ...settingsOf.map((slot) => slot.channel)]);
+            let stopped = false;
             for (const channel of channels) {
               const entry = wanted.find((candidate) => candidate.channel === channel);
+              let soundSent = false;
               // A timed plan stamps the whole channel with the line; otherwise `at` is set only for a channel whose sound
               // changes while old code plays, and the other channels go out at once.
               let at = lineAt;
@@ -2094,9 +2339,11 @@ export function createMidiOut({
                     liftStaleFilters(filtered, channel);
                     // A partly sent change leaves the channel in a state nobody knows: forget it, so it is sent whole next time.
                     if (sent.partial) shadow.delete(channel);
+                    stopped = true;
                     break;
                   }
                   shadow.set(channel, next);
+                  soundSent = true;
                   changes.push({ instrument, channel, previous, sound: entry.sound });
                   // A held note on this channel may be cut by the change: the playing code used the channel.
                   if (previous !== null && isPlaying() === true && activePlan !== null && activePlan.has(`${instrument.id}:${channel}`)) {
@@ -2104,8 +2351,26 @@ export function createMidiOut({
                   }
                 }
               }
+              const written = settingsOf.find((candidate) => candidate.channel === channel);
+              if (written !== undefined) {
+                const slotKey = `${instrument.id}:${channel}`;
+                const toneOk = written.toneBytes.every((item) => sendWritten(slotKey, 'tone', item, at, soundSent));
+                if (!toneOk || !written.partBytes.every((item) => sendWritten(slotKey, 'part', item, at))) {
+                  stopped = true;
+                  break;
+                }
+              }
               const slot = slots.find((candidate) => candidate.channel === channel);
-              if (!sendControls(native, instrument, channel, slot, bytesSent, at, { record: lineAt !== undefined ? stampedControls : undefined })) break;
+              if (!sendControls(native, instrument, channel, slot, bytesSent, at, { record: lineAt !== undefined ? stampedControls : undefined })) {
+                stopped = true;
+                break;
+              }
+            }
+            // The scene settings come after the instrument's channels; a failed send ends the instrument's setup. On the
+            // line they are a queued message of no channel, so a later setup on any channel goes after them.
+            if (!stopped && sceneOf !== undefined) {
+              if (lineAt !== undefined) recordSetupQueued(native, null, lineAt + SETUP_BEFORE_LINE_MS);
+              for (const item of sceneOf.sceneBytes) if (!sendWritten(instrument.id, 'scene', item, lineAt)) break;
             }
           }
           // A timed plan goes out at the lead and nothing waits for it, so there is no guard to wait out.
@@ -2118,10 +2383,16 @@ export function createMidiOut({
       },
       commit() {
         committed = true;
-        // The facts, events included, went out with recordSuccess inside the evaluation.
+        // The facts of the evaluation went out with recordSuccess inside it; the events about the settings that
+        // changed are added here, before the code that plays is swapped, and published below.
+        const soundSent = (slot) => changes.some((change) => change.instrument.id === slot.instrument && change.channel === slot.channel);
+        const told = addSceneEvents(sceneSettings) + addLeftEvents(activeSettings, activeScenes, settingSlots, sceneSettings, soundSent);
         activePlan = desired;
         activeControls = controls;
+        activeSettings = settingSlots;
+        activeScenes = sceneSettings;
         releasePending();
+        if (told > 0) publishEvents();
         try {
           swapFilteredOutputs(filtered);
         } catch (err) {
@@ -2134,7 +2405,10 @@ export function createMidiOut({
         // An immediate change that replaces this one has prepared (and sent) its own setup before its pattern is
         // installed, and that setup is still pending here: it is what the instrument must end on. A timed newer change
         // prepares its setup later, at its own lead, so it finds nothing here and goes after the put-back.
-        const successor = timed && pendingOwner !== null && pendingOwner !== owner ? { plan: pendingPlan, controls: pendingControls } : null;
+        const successor =
+          timed && pendingOwner !== null && pendingOwner !== owner
+            ? { plan: pendingPlan, controls: pendingControls, settings: pendingSettings, scenes: pendingScenes }
+            : null;
         releasePending();
         // Bytes stamped on the line are already queued on the port and cannot be recalled: when the change is canceled
         // after they went out, the instrument would switch to the canceled change's sounds and controls on the line
@@ -2158,8 +2432,11 @@ export function createMidiOut({
         liftStaleFilters(filtered);
         pendingPlan = null;
         pendingControls = null;
+        pendingSettings = null;
+        pendingScenes = null;
         pendingOwner = null;
         pendingChanges = null;
+        pendingSent = null;
         await putBack();
         // The evaluation failed, so nothing else will publish: the events (kept sounds, cut notes) go out here,
         // before the failed reply that Claude reads.
@@ -2172,11 +2449,14 @@ export function createMidiOut({
     };
     /**
      * Sends the sounds this plan changed back to what the channels held before it, then the controls the playing code
-     * writes; both after the plan's own timed change while it is still ahead, never before it. With a `successor` (an
-     * immediate change that replaces this plan: { plan, controls }) a channel it sets up keeps the sound it holds, and
-     * the controls it writes are sent again after this plan's stamped ones. Never rejects.
+     * writes, then its settings (putBackSettings); all after the plan's own timed change while it is still ahead, never
+     * before it. With a `successor` (an immediate change that replaces this plan: { plan, controls, settings, scenes }) a
+     * channel it sets up keeps the sound it holds, and the controls and settings it writes are sent again after this
+     * plan's stamped ones. Never rejects.
      */
     async function putBack(successor = null) {
+      // The channels whose old sound went back: a program change erased their tone settings.
+      const soundsBack = [];
       try {
         for (const { instrument, channel, previous, sound } of changes) {
           // The successor's own setup went out after this plan's bytes (or the sound is the same one): the shadow is true.
@@ -2197,8 +2477,10 @@ export function createMidiOut({
           const bytesSent = { count: 0 };
           // After the timed change of this evaluation while it is still ahead, so no old note sounds with the refused sound.
           const sent = sendSound(native, instrument, channel, previous, bytesSent, afterTimed(latestTimed));
-          if (sent.ok) shadows.get(instrument.id)?.set(channel, previous);
-          else if (sent.partial) shadows.get(instrument.id)?.delete(channel);
+          if (sent.ok) {
+            shadows.get(instrument.id)?.set(channel, previous);
+            soundsBack.push({ instrument, channel });
+          } else if (sent.partial) shadows.get(instrument.id)?.delete(channel);
         }
       } catch (err) {
         onError('Moontide: the MIDI setup could not be rolled back:', err);
@@ -2210,6 +2492,61 @@ export function createMidiOut({
           ? { after: latestTimed ?? undefined }
           : { after: latestTimed ?? undefined, controls: successor.controls ?? undefined, resend: stampedControls },
       );
+      await putBackSettings(successor, soundsBack);
+      // The settings this plan sent that the code returned to does not write stay on the instrument: only those that
+      // went out, by this plan's send or by a reset, never those of a channel the send did not reach.
+      if (active && sentNames.size > 0) {
+        const wentOut = (slot, level, items) => items.filter((item) => sentNames.has(settingKey(slot, level, item.name)));
+        const sent = new Map(
+          Array.from(settingSlots, ([key, slot]) => [key, { ...slot, toneBytes: wentOut(key, 'tone', slot.toneBytes), partBytes: wentOut(key, 'part', slot.partBytes) }]),
+        );
+        const sentScenes = new Map(Array.from(sceneSettings, ([id, scene]) => [id, { ...scene, sceneBytes: wentOut(id, 'scene', scene.sceneBytes) }]));
+        const loaded = (slot) => soundsBack.some((item) => item.instrument.id === slot.instrument && item.channel === slot.channel);
+        addLeftEvents(sent, sentScenes, successor === null ? activeSettings : successor.settings, successor === null ? activeScenes : successor.scenes, loaded);
+      }
+    }
+
+    /**
+     * The settings of the code returned to (the successor's when an immediate change replaced this plan, else the code
+     * that plays), sent after the sounds and controls that went back: for every instrument this plan sent settings to,
+     * per channel the tone then the part settings, then the scene settings; for a channel whose old sound went back
+     * without this plan having sent settings there, its tone and part settings too, since the program change erased the
+     * tones. Timed just after this plan's own timed change while it is still ahead. Nothing is sent to an instrument this
+     * plan sent no settings to and changed no sound of. Never rejects.
+     */
+    async function putBackSettings(successor, soundsBack) {
+      try {
+        const slots = successor === null ? activeSettings : successor.settings;
+        const scenes = successor === null ? activeScenes : successor.scenes;
+        for (const instrument of rig.instruments) {
+          const sentSettings = settingInstruments.has(instrument.id);
+          const erased = soundsBack.filter((item) => item.instrument.id === instrument.id).map((item) => item.channel);
+          if (!sentSettings && erased.length === 0) continue;
+          const pendingReset = states.get(instrument.id)?.resetPromise ?? null;
+          if (pendingReset !== null) await pendingReset;
+          if (!active) return;
+          const native = nativeFor(instrument);
+          if (native === null) continue;
+          const bytesSent = { count: 0 };
+          const at = afterTimed(latestTimed);
+          const written = slots === null || slots === undefined ? [] : Array.from(slots.values()).filter((slot) => slot.instrument === instrument.id);
+          let stopped = false;
+          for (const slot of written.sort((a, b) => a.channel - b.channel)) {
+            if (!sentSettings && !erased.includes(slot.channel)) continue;
+            const items = [...slot.toneBytes.map((item) => ['tone', item]), ...slot.partBytes.map((item) => ['part', item])];
+            if (!items.every(([level, item]) => sendSetting(native, instrument, level, item.bytes, bytesSent, at))) {
+              stopped = true;
+              break;
+            }
+          }
+          const scene = scenes?.get(instrument.id);
+          if (sentSettings && !stopped && scene !== undefined) {
+            for (const item of scene.sceneBytes) if (!sendSetting(native, instrument, 'scene', item.bytes, bytesSent, at)) break;
+          }
+        }
+      } catch (err) {
+        onError('Moontide: the MIDI settings could not be put back:', err);
+      }
     }
   }
 
@@ -2342,14 +2679,29 @@ export function createMidiOut({
 
   /**
    * For each declared channel ascending: the sound the code declares there (the evaluation being prepared
-   * first, else the code that plays), then the volume the code writes (same order) else the model's default,
-   * always, then every other control the code writes there, in the model's order. The shadows take what was
+   * first, else the code that plays), then the tone and part settings the code writes there (same order), then the
+   * volume the code writes (same order) else the model's default,
+   * always, then every other control the code writes there, in the model's order; after the channels the scene
+   * settings. The shadows take what was
    * sent. `wiped` is true for a reset, which cleared the instrument first: a sound of the evaluation being
    * prepared is then listed in the change list, so a rollback tells Claude the channel kept it. Returns the
    * number of bytes sent; a send that throws throws out of here.
    */
   function sendDeclaredSetup(instrument, native, { wiped = false } = {}) {
     let setupBytes = 0;
+    const settingBytes = { count: 0 };
+    // The one record of settings a reset sends: the evaluation being prepared when there is one, for every slot and for
+    // the scene (a setting it does not write has left the code, so nothing is sent for it), else the code that plays.
+    // What it sends of the evaluation being prepared is noted for that evaluation (pendingSent).
+    const record =
+      pendingSettings !== null
+        ? { slots: pendingSettings, scenes: pendingScenes, sent: pendingSent }
+        : { slots: activeSettings, scenes: activeScenes, sent: null };
+    const sendOne = (slot, level, item) => {
+      sendSetting(native, instrument, level, item.bytes, settingBytes, undefined, { throws: true });
+      record.sent?.names.add(settingKey(slot, level, item.name));
+      record.sent?.instruments.add(instrument.id);
+    };
     if (!shadows.has(instrument.id)) shadows.set(instrument.id, new Map());
     const shadow = shadows.get(instrument.id);
     const channels = instrument.channels.map((entry) => entry.channel).sort((a, b) => a - b);
@@ -2371,6 +2723,13 @@ export function createMidiOut({
         }
         shadow.set(channel, next);
       }
+      // The settings of the record come right after the sound. A program change erases tone settings, so they never go
+      // before the sound.
+      const written = record.slots?.get(slot);
+      if (written !== undefined) {
+        for (const item of written.toneBytes) sendOne(slot, 'tone', item);
+        for (const item of written.partBytes) sendOne(slot, 'part', item);
+      }
       const controlSlot = pendingControls?.get(slot) ?? activeControls?.get(slot);
       const volume = controlSlot?.values.get(7)?.value ?? defaultOf(instrument, { cc: 7 });
       native.send([0xb0 | (channel - 1), 7, volume]);
@@ -2384,7 +2743,12 @@ export function createMidiOut({
         setupBytes += 3;
       }
     }
-    return setupBytes;
+    // The scene settings reach every part, so they follow the channels.
+    const scene = record.scenes?.get(instrument.id);
+    if (scene !== undefined) {
+      for (const item of scene.sceneBytes) sendOne(instrument.id, 'scene', item);
+    }
+    return setupBytes + settingBytes.count;
   }
 
   /**
@@ -2403,8 +2767,7 @@ export function createMidiOut({
       } catch (err) {
         forgetShadows(instrument.id);
         onError(`Moontide: could not send the second setup to MIDI port "${native.name}":`, err);
-        const name = err && typeof err.name === 'string' && err.name !== '' ? err.name : 'Error';
-        addEvent({ kind: 'send-failed', instrument: cutText(instrument.id, MIDI_LIMITS.name), what: 'reset', failure: cutText(name, MIDI_LIMITS.failure) });
+        addEvent(failureEvent(instrument, 'reset', err));
         publishFacts();
         return 0;
       }
@@ -2439,6 +2802,15 @@ export function createMidiOut({
     let failed = null;
     try {
       const reset = instrument.reset;
+      // No reset byte goes out unless every message of the reset passes the same check as the code's messages: a
+      // message for a model whose temporary areas Moontide knows must stay inside them, any other passes as it is. Only
+      // here may a message be the model's own reset (the guard's exact message), which the code can never send.
+      if (reset !== null) {
+        for (const message of reset.messages) {
+          const problem = sysexProblem(Array.from(message), { allowReset: true });
+          if (problem !== null) throw guardRefusal(fill(SETTINGS_COPY.resetRefused, { id: instrument.id, reason: problem.text }), 'reset', problem.reason);
+        }
+      }
       if (reset !== null) for (const message of reset.messages) native.send(message);
       shadows.set(instrument.id, new Map());
       controlShadows.set(instrument.id, new Map());
@@ -2467,8 +2839,7 @@ export function createMidiOut({
       if (failed === null) {
         addEvent({ kind: 'reset', instrument: id, reason });
       } else {
-        const name = failed && typeof failed.name === 'string' && failed.name !== '' ? failed.name : 'Error';
-        addEvent({ kind: 'send-failed', instrument: id, what: 'reset', failure: cutText(name, MIDI_LIMITS.failure) });
+        addEvent(failureEvent(instrument, 'reset', failed));
       }
       publishFacts();
     } catch (err) {
@@ -2566,6 +2937,130 @@ export function createMidiOut({
     }
   }
 
+  // Whether the last Listen send failed with an exception: one error is logged for a run of them, and the next success clears it.
+  let listenFailure = false;
+  function listenFailed(err) {
+    if (!listenFailure) {
+      listenFailure = true;
+      onError('Moontide: a Listen note could not be sent:', err);
+    }
+    return { refused: 'send-failed' };
+  }
+
+  /**
+   * The instrument and the one connected output Listen would play on, or the refusal word: 'superseded' (another tab plays), 'no-rig' (no valid
+   * setup file), 'no-instrument', 'off' (switched off), 'resetting' (the instrument resets, or is held after a replug: it would drop a note),
+   * 'ambiguous' (several connected outputs contain the port, with their `count`) and 'no-output' (none does, with the `names` of the connected
+   * outputs). The output is read now and never kept. Never throws.
+   */
+  function resolveListen(instrumentId) {
+    if (!active) return { refused: 'superseded' };
+    if (rig.setup !== 'valid') return { refused: 'no-rig' };
+    const instrument = rig.instruments.find((candidate) => candidate.id === instrumentId);
+    if (instrument === undefined) return { refused: 'no-instrument' };
+    if (instrument.enabled === false) return { refused: 'off' };
+    if (states.get(instrument.id)?.resetPromise != null || states.get(instrument.id)?.holding === true) return { refused: 'resetting' };
+    const output = listenOutput(instrument.port);
+    return output.refused === undefined ? { instrument, native: output.native } : output;
+  }
+
+  // The one connected output whose name contains `port`, as `{ native }`, or the refusal 'ambiguous' (with the `count`) or 'no-output' (with the
+  // `names` of the connected outputs).
+  function listenOutput(port) {
+    const native = portNative({ port });
+    if (native !== null) return { native };
+    const webMidi = enabledWebMidi();
+    const connected = webMidi === null ? [] : Array.from(webMidi.interface.outputs.values()).filter((candidate) => candidate.state === 'connected' && typeof candidate.name === 'string');
+    const count = connected.filter((candidate) => candidate.name.includes(port)).length;
+    if (count > 1) return { refused: 'ambiguous', port, count };
+    return { refused: 'no-output', port, names: connected.map((candidate) => candidate.name) };
+  }
+
+  // The port each instrument's last Listen note on went to, so its note off reaches the same device even after the setup file changed.
+  const listenPorts = new Map();
+
+  // Where a Listen note off goes. An off only ends a note, so it skips the checks that keep a new note from sounding (another tab plays, the
+  // setup file changed, the instrument is off or resets): a note left sounding is worse than an off the device ignores. It goes to the port
+  // of the instrument's last note on, else to the instrument's port in the setup file now, and needs one connected output there.
+  function resolveListenOff(instrumentId) {
+    const instrument = rig.setup === 'valid' ? rig.instruments.find((candidate) => candidate.id === instrumentId) : undefined;
+    const port = listenPorts.get(instrumentId) ?? instrument?.port;
+    if (typeof port !== 'string') return { refused: 'no-instrument' };
+    return listenOutput(port);
+  }
+
+  /** What Listen would play on for this instrument: `{ ok: true, id, port }`, or the refusal `{ refused, ... }` of resolveListen. Sends nothing, never throws. */
+  function listenTarget(instrumentId) {
+    try {
+      const target = resolveListen(instrumentId);
+      return target.refused === undefined ? { ok: true, id: target.instrument.id, port: target.instrument.port } : target;
+    } catch (err) {
+      return listenFailed(err);
+    }
+  }
+
+  /**
+   * Sends one note on or off for the Scratchpad's Listen: `{ instrumentId, channel, kind: 'on' | 'off', pitch, velocity, at }`, to the one
+   * connected output of that instrument, stamped `at` (a performance.now() time; none sends at once). It builds the bytes itself from whole
+   * numbers (status 0x9n or 0x8n, the pitch, and the velocity of an on, 0 for an off) and sends nothing else: no program change, no
+   * controller, no SysEx. The output is read again at every call. A note on is refused with the words of listenTarget; a note off is not held by
+   * them and goes to the port of the instrument's last note on (see resolveListenOff), so Stop can always end what Listen started. Returns
+   * `{ ok: true }` or `{ refused: word, ... }` (those words, 'invalid' for a number or kind out of range or a stamp more than
+   * NOTE_STAMP_MAX_AHEAD_MS ahead, and 'send-failed' for an output that threw).
+   * It never throws, because the player that calls it would stop. The notes it sends are Listen's own to end: the music's queue knows nothing of them.
+   */
+  function sendListenNote({ instrumentId, channel, kind, pitch, velocity, at }) {
+    try {
+      const whole = (value, low, high) => Number.isInteger(value) && value >= low && value <= high;
+      if (!whole(channel, 1, 16) || !whole(pitch, 0, 127) || (kind !== 'on' && kind !== 'off') || (kind === 'on' && !whole(velocity, 1, 127))) return { refused: 'invalid' };
+      if (at !== undefined && (typeof at !== 'number' || !Number.isFinite(at) || (typeof perfNow === 'function' && at - perfNow() > NOTE_STAMP_MAX_AHEAD_MS))) return { refused: 'invalid' };
+      const target = kind === 'on' ? resolveListen(instrumentId) : resolveListenOff(instrumentId);
+      if (target.refused !== undefined) return target;
+      const message = [(kind === 'on' ? 0x90 : 0x80) | (channel - 1), pitch, kind === 'on' ? velocity : 0];
+      if (at === undefined) target.native.send(message);
+      else target.native.send(message, at);
+      if (kind === 'on') listenPorts.set(instrumentId, target.instrument.port);
+      listenFailure = false;
+      return { ok: true };
+    } catch (err) {
+      return listenFailed(err);
+    }
+  }
+
+  // The one playingTracksOn failure that has been logged, so a run of them logs one line.
+  let playingTracksFailed = false;
+
+  /**
+   * The display names (trackName) of the unmuted tracks of the code this tab plays that sit on one instrument's output and channel, in code order, for
+   * the Scratchpad's Heads up line. A track is on it when it has a slot on that channel whose port the instrument's one connected output contains (the
+   * way a track reaches an output); when the instrument resolves to no single output the two port strings are compared as written. Only while this
+   * tab plays and the music plays; otherwise, and for a rig that is not valid, an instrument it does not name or code that does not parse, none.
+   * Reads only; it never throws (an error gives none and one logged line).
+   */
+  function playingTracksOn(instrumentId, channel) {
+    try {
+      if (!mayStop() || rig.setup !== 'valid') return [];
+      const instrument = rig.instruments.find((candidate) => candidate.id === instrumentId);
+      if (instrument === undefined || activeCode === '') return [];
+      const read = slotsOf(activeCode);
+      if (!read.ok) return [];
+      const native = portNative(instrument);
+      const onOutput = (port) => (native !== null ? native.name.includes(port) : port === instrument.port);
+      const names = [];
+      for (const track of read.tracks.values()) {
+        if (!track.muted && track.slots.some((slot) => slot.channel === channel && onOutput(slot.port))) names.push(trackName(track.identity));
+      }
+      playingTracksFailed = false;
+      return names;
+    } catch (err) {
+      if (!playingTracksFailed) {
+        playingTracksFailed = true;
+        onError('Moontide: the tracks on a Listen channel could not be read:', err);
+      }
+      return [];
+    }
+  }
+
   /**
    * Tells the page whether it is the tab that plays. A superseded tab (false) resets and sets up nothing and
    * its pending settle timers are cancelled. Taking the role back (true) is not a connection: the shadows
@@ -2602,6 +3097,10 @@ export function createMidiOut({
   return {
     beforeEvaluate,
     enableIfGranted,
+    // The access word now (one of ACCESS_STATES), the name of the failure when it is 'failed' (else null), and the shared enable.
+    accessState: () => access,
+    accessFailure: () => failure,
+    enable,
     setReplayBase,
     recordSuccess,
     publishFacts,
@@ -2619,9 +3118,16 @@ export function createMidiOut({
     prepareTakeover,
     abandonTakeover,
     previewControl,
+    listenTarget,
+    sendListenNote,
+    playingTracksOn,
     resync,
     setActive,
     installNoteStamps,
     noteStampOf,
+    // The performance.now() stamp of a cycle line on the one page clock, or null when the page has no clock or it cannot give one.
+    // The Scratchpad places its taps on this same cycle-to-time map as Moontide's own MIDI notes; a second clock would have its own
+    // tempo segments and drift from it.
+    stampOfCycle: (cycle) => (pageClock === null ? null : pageClock.stampOfCycle(cycle)),
   };
 }

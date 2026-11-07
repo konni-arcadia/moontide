@@ -594,3 +594,84 @@ test('a back line is skipped while the instrument is off, and clear() keeps the 
   other.update(facts({ ports: [port('Fake Synth B', 'unplugged'), port('Port A', 'unplugged')] }));
   assert.deepEqual(other.drainLines(), [midiInstrumentUnpluggedLine('mt32', 'Port A', ['A', 'B'])], 'a port that is on keeps its line');
 });
+
+// --- Events about settings written in the code ---
+
+test('a scene setting event says it reaches every part of the instrument, with the names and a quoted id', () => {
+  assert.equal(
+    midiEventLine({ kind: 'settings-scene', instrument: 'tonesynth', names: ['reverbLevel'] }),
+    'MIDI: the scene settings reverbLevel of "tonesynth" reach every part of the instrument, not only the channel of their .midi() call.',
+  );
+  assert.equal(
+    midiEventLine({ kind: 'settings-scene', instrument: 'tone"synth', names: ['reverbLevel', 'chorusSwitch'] }),
+    'MIDI: the scene settings reverbLevel, chorusSwitch of "tone\\"synth" reach every part of the instrument, not only the channel of their .midi() call.',
+  );
+});
+
+test('a scene setting event queues its line once, and the line holds no taste word', () => {
+  const channel = new MidiChannel();
+  channel.update(facts({ events: [{ kind: 'settings-scene', instrument: 'tonesynth', names: ['reverbLevel'] }] }));
+  channel.update(facts());
+  const lines = channel.drainLines();
+  assert.equal(lines.length, 1);
+  assert.deepEqual(findWords(lines[0], TINT_WORDS), []);
+  assert.deepEqual(findWords(lines[0], STEERING_WORDS), []);
+  assert.deepEqual(channel.drainLines(), []);
+});
+
+test('a setting that left the code is worded per level, true on every instrument: the tone until the instrument loads it again, the part and the scene until the instrument itself changes them', () => {
+  assert.equal(
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'tone', channel: 2, names: ['filterCutoff', 'env1Attack'] }),
+    'MIDI: the tone settings filterCutoff, env1Attack of "tonesynth" channel 2 are no longer in the code that plays. Nothing is sent for them, so the instrument keeps the last value until it loads the tone again.',
+  );
+  assert.equal(
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'part', channel: 1, names: ['pan'] }),
+    'MIDI: the part settings pan of "tonesynth" channel 1 are no longer in the code that plays. Nothing is sent for them, so the instrument keeps the last value until the instrument itself changes it.',
+  );
+  assert.equal(
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'scene', channel: null, names: ['reverbLevel'] }),
+    'MIDI: the scene settings reverbLevel of "tonesynth" are no longer in the code that plays. Nothing is sent for them, so the instrument keeps the last value until the instrument itself changes it.',
+  );
+});
+
+const GUARD = 'Moontide sends nothing to an instrument that could write to its memory, only Roland data sets into its temporary scene and tones.';
+
+test('a message the memory guard refused is worded with what was refused and the real reason in plain words', () => {
+  const line = (source, reason) => midiEventLine({ kind: 'sysex-refused', instrument: 'tonesynth', source, reason });
+  assert.equal(line('code', 'outside'), `MIDI: a system exclusive message from the code to "tonesynth" was not sent: it would write outside the temporary scene and tones. ${GUARD}`);
+  assert.equal(line('code', 'unknown-areas'), `MIDI: a system exclusive message from the code to "tonesynth" was not sent: Moontide does not know which addresses of this instrument are temporary. ${GUARD}`);
+  assert.equal(line('code', 'not-bytes'), `MIDI: a MIDI message from the code to "tonesynth" was not sent: it is not a list of numbers, so it cannot be checked. ${GUARD}`);
+  assert.equal(line('code', 'too-long'), `MIDI: a MIDI message from the code to "tonesynth" was not sent: it is too long to be checked. ${GUARD}`);
+  assert.equal(line('code', 'incomplete'), `MIDI: a system exclusive message from the code to "tonesynth" was not sent: it is not a complete system exclusive message. ${GUARD}`);
+  assert.equal(line('code', 'not-data-set'), `MIDI: a system exclusive message from the code to "tonesynth" was not sent: it is not a Roland data set (command 12) for the model of the instrument. ${GUARD}`);
+  assert.equal(line('code', 'checksum'), `MIDI: a system exclusive message from the code to "tonesynth" was not sent: its checksum does not match. ${GUARD}`);
+  assert.equal(line('settings', 'unknown-areas'), `MIDI: the settings for "tonesynth" were not sent: Moontide does not know which addresses of this instrument are temporary. ${GUARD}`);
+  assert.equal(
+    line('settings', 'nrpn'),
+    `MIDI: the settings for "tonesynth" were not sent: it is not one of the NRPN part offsets Moontide knows for this instrument. Moontide sends nothing to an instrument that could write to its memory, only Roland data sets into its temporary scene and tones, and the NRPN part offsets it knows.`,
+  );
+  assert.equal(line('reset', 'outside'), `MIDI: the reset of "tonesynth" was not sent: it would write outside the temporary scene and tones. ${GUARD}`);
+});
+
+test('a settings message the port could not take is worded as the settings, not as the sound setup', () => {
+  assert.equal(
+    midiEventLine({ kind: 'send-failed', instrument: 'tonesynth', what: 'settings', failure: 'InvalidStateError' }),
+    'MIDI: the settings could not be sent to instrument "tonesynth" ("InvalidStateError").',
+  );
+});
+
+test('the settings event lines carry no taste word and no instruction about music', () => {
+  const lines = [
+    midiEventLine({ kind: 'settings-scene', instrument: 'tonesynth', names: ['reverbLevel'] }),
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'tone', channel: 1, names: ['filterCutoff'] }),
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'part', channel: 1, names: ['pan'] }),
+    midiEventLine({ kind: 'settings-left', instrument: 'tonesynth', level: 'scene', channel: null, names: ['reverbLevel'] }),
+    ...['code', 'settings', 'reset'].flatMap((source) =>
+      ['not-bytes', 'too-long', 'incomplete', 'not-data-set', 'unknown-areas', 'outside', 'checksum', 'nrpn'].map((reason) => midiEventLine({ kind: 'sysex-refused', instrument: 'tonesynth', source, reason })),
+    ),
+  ];
+  for (const line of lines) {
+    assert.deepEqual(findWords(line, TINT_WORDS), [], line);
+    assert.deepEqual(findWords(line, STEERING_WORDS), [], line);
+  }
+});

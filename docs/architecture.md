@@ -132,6 +132,54 @@ reads `not checked` until MIDI is allowed, and a browser without Web MIDI is tol
 right-click on a card sends an `instrument` context through the same box, and `page/main.js` keeps
 the one right-click listener.
 
+The Scratchpad (key 7) is a small piano roll on the cycle grid where a motif is drawn, tapped and read before
+anything else uses it. It is three modules. `page/scratch-model.js` is the pure model: the motif kept in whole
+1/48-cycle units (so a change of grid is exact), the five grids, the commands that place, move, resize, erase and
+change notes, the same-pitch rule (notes of one pitch never overlap), the cycles and the grid, its own undo history,
+the rule that places a key press on the grid from its time stamp, and every word the view shows. `page/scratch-gesture.js`
+holds the pure numbers of a pointer on the roll (which cell, which part of a note, how far a drag went). `page/scratch-view.js`
+is the DOM: the roll, the ruler, the velocity lane, the toolbar and the information line, built with DOM methods
+only, with notes placed through CSS custom properties. `page/main.js` wires it: the key and the top-bar button, the roll's own
+right-click (the page keeps its one right-click listener and hands the roll's clicks over; everywhere else the Ask box
+opens as before), a document key listener in the capture phase for Tap, and the page clock. Tap reads the cycle-to-time
+map of the one page clock through `stampOfCycle` on the MIDI output, the same map that stamps Moontide's own MIDI notes;
+there is no second clock. The motif lives in memory only: it survives a switch to another view and is gone after a
+reload. A strip under the roll shows the motif's phrase (written by one function of the model, for the screen and for the
+request alike), a words field and a Send to Claude button. Only that press, or Enter in the words field, hands the motif
+to Claude: `page/scratch-view.js` calls the `onSend` it was given, `page/ask-view.js`'s `sendMotif` builds the `ask` frame with
+the `motif` field and its own pending id (so a refusal never arms the Ask box), `src/protocol.ts` names the field, and
+`src/ask.ts` writes it into the request line after the gesture. The request shows in the Requests panel like any other.
+The Scratchpad still stores nothing and touches neither the code, the History nor the instruments' settings.
+
+The roll selects by default. The model holds the group commands (move, resize, erase and re-weight several notes as one
+rigid step, Align and Clear) and the one function, `ringLayout`, that places played notes on a ring of 8 cycles; both the live
+layer and Record that call it, so what is drawn is what is written. `page/scratch-gesture.js` also holds the numbers of a
+selection rectangle and of a group drag. The view derives its pitch rows from the notes on every draw (`shownRows` in the
+model), so no note can be out of sight.
+
+While an input is listened to, `page/main.js` runs a frame loop that reads `midiIn.live()` (the cycle axis and a revision that
+moves when the buffer changes) and hands the view the axis cycle, the buffer's snapshot (only when the revision moved) and the frame
+time through `setLive`. The loop only reads. The view draws the live notes, the held keys and the playhead from that and has no
+clock of its own; "Record that" calls `midiIn.clearBuffer()` after it replaced the motif.
+
+Listen has its own small engine, `page/scratch-listen.js`, built like the keyboard listener: it takes the clock, the timer and the
+output as injected functions and touches no document, window or storage (a test keeps it so). The page's MIDI output exposes two
+functions for it, `listenTarget` (which output an instrument id and channel reach, or why none) and `sendListenNote` (one note-on
+or note-off with a time stamp, built from checked numbers, found again at every call), and they are its only way out. The engine
+hands notes over at most 150 ms ahead, keeps a record of what it handed over, and ends with targeted note-offs. `playingTracksOn`
+on the same layer tells the hear strip which unmuted tracks of the playing code use an instrument and channel, for the channel
+warning, and the optional `monophonic` field of a model, carried by the rig message, feeds the chord warning.
+
+A keyboard fills a buffer through two more modules. `page/played-buffer.js` is pure: it reads the bytes of a note
+message, keeps the played notes in a buffer (the 8 whole cycles that end with the current one, at most 2000 notes), gives
+a snapshot of its window in cycles, and holds the cycle axis, which follows the music's cycle lines while the music plays
+and the scheduler's tempo while it is stopped, and never goes back. `page/midi-in.js` is injected like `page/midi-out.js`:
+it listens to the inputs the rig message names, through the MIDI access Strudel's shared enable holds (it asks for MIDI
+only from the "Allow MIDI to listen" button, through that same enable), watches plugs and unplugs, places each note by
+its own time stamp on the page clock's cycle lines (the rule of the played-notes decision), and never sends. Only a visible
+tab that holds the music listens. The Scratchpad shows the listening state and the last note, and "Record that" asks
+`midi-in` for a snapshot and puts it on the roll through the model's one undoable step.
+
 With an `instruments.json` the same layer knows the user's instruments. `page/midi-rig.js`
 mirrors the `midi-rig` message by hand (the server's schema is the source), finds the instrument
 of each port, and checks the code against it: a port, channel or sound the file does not know is a
@@ -150,6 +198,20 @@ the second time `RECONNECT_REPEAT_MS` after the first, and a channel whose sound
 old code's notes until the new code takes over. In a browser without Web MIDI, `page/main.js` installs
 `installNoMidiShim` (from `page/midi-out.js`), which turns `.midi()` into a silent trigger so the other
 tracks still play.
+
+Synth settings ride the same setup step. `page/midi-settings.js` (pure, no import of the server build)
+builds the setting messages from the rig message and holds the byte check that lets only an area that
+holds nothing for good through. A Roland data set has an address of three or four bytes, counted in base
+128 with the model ID of its instrument, and the part of a channel is added with the step of the area the
+part 1 address lies in (the area, not the level, carries the step, and the result must stay in the area).
+A setting mapped to an NRPN of a family Moontide knows (the GS part offsets) is built as five channel
+messages on the channel of its call, from a short list of pairs, and checked again byte by byte against
+the rig when it is sent. The setup step sends each channel's tone and part settings after its program
+change and the scene settings after the channels, every message through one function that checks the
+finished bytes again. The guard on the `send` of each output also checks the code's own system exclusive
+messages to a guarded model (the JUPITER-X family and the MT-32), and drops one that could write the
+instrument's memory; the one reset the MT-32 entry lists passes. A name shared by several engines has one
+row per engine in the model, and the row is chosen by the engine of the sound in the call.
 
 Instrument controls and the end of a stopped track's notes come from two more pieces.
 `page/midi-controls.js` reads each MIDI track (port, channel, instrument, the controls written in the
@@ -413,7 +475,10 @@ sounds, and `save_midi_model` saves a model drafted from a pasted manual page. I
 draft with the same schema as every model, returns a summary with nothing written, and saves into
 `models/` only a model whose summary was produced earlier in the session, only after the user's
 yes; an existing model needs `overwrite`, a shipped model id is always refused, and no tool writes
-`instruments.json`; the server rewrites three fields of one entry on the user's click from the page.
+`instruments.json`; the server rewrites three fields of one entry on the user's click from the page. The file
+can also name the MIDI inputs a keyboard plays into (`inputs`, up to 4 entries with a port name): the server checks them with
+the same code that reads the rest of the file, a wrong entry is refused with its field and reason, and the names travel to
+the page in `midi-rig` beside the instruments. A settings edit from the page keeps a hand-written `inputs` list as it was.
 
 The server also reads `instruments-state.json` (the instruments the user switched off) at every use,
 and puts `enabled` and `modelChannels` (every channel of the model, with its role) on each instrument of
@@ -441,7 +506,11 @@ a variation, or `rest: true`, with the fit word the grid showed and the notes ou
 name 1 to 200 characters) and a `group` kind (a `name` and the `parent` it sits in) serve a right-click on
 the Song grid; a cell that does not fit also prefills the Ask field with a ready-made request that is
 never sent for the user. The Menu key and Shift+F10 on a focused control of the grid open the same box,
-because the page's one right-click listener leaves a Shift press to the browser.
+because the page's one right-click listener leaves a Shift press to the browser. A `motif` kind (no other field)
+serves the Scratchpad's Send to Claude: that request has no moment and no gesture, and carries a `motif` field
+(`source`, `cycle` when it has a moment, `cycles`, `grid`, `notes` and `phrase`, checked in bounds by the server, the phrase
+against the phrase shape and never trimmed). The request line lists it last, after the gesture. Its facts and a pointer to
+the motif topic of the reference go with the request lines.
 
 Sound catalogs extend a model with more sounds than a model file should hold. `src/catalog.ts` holds
 the catalog file format (`catalogs/<model id>.json` in the data folder), its checks against the

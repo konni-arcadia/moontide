@@ -385,6 +385,16 @@ The clock reads internal fields of the plain Cyclist of the pinned Strudel versi
 that: `npm run check:reference` (the claims `midi-clock-cyclist` and `midi-transport`), a runtime check
 that throws with the missing field's name, and `npm run probe:midi` in the real page.
 
+Heard on real followers (a Roland JUPITER-Xm arpeggiator and a Moog Subharmonicon): a steady tempo for two
+minutes, Start and Stop, and an instrument joining while the music plays, each started on the next downbeat.
+Not verified: a replug while playing, a muted track keeping the clock, code that writes the clock and the
+popover's clock rows. Open and kept open: clock ticks already queued still reach a follower up to about 150 ms
+after a Stop, since a sent tick cannot be called back, and after each Stop a follower jumped to a faster tempo
+for an instant and played a few notes, probably because of those ticks (not proven); the first beat of a Play
+leaves about 30 ms before the clock's Start; the arpeggiator went off the beat at a sudden tempo change. The
+tick spacing on the wire carries about 0.5 ms of jitter on a page that plays only MIDI, from the first seconds
+on; no tick is missing. The user chose to stop the bench there and report anything met in use.
+
 ## MIDI notes leave the page ahead, with the clock's timestamp
 
 The pinned Strudel fires each MIDI send from a Web Audio timer at the note's own instant and gives
@@ -439,6 +449,322 @@ Pins: `npm run check:reference` (the claim `midi-trigger-seam` holds the Strudel
 wrapper relies on, so a Strudel upgrade that moves one fails by name), a loud error when the wrapper
 cannot be installed, and `npm run probe:midi` in the real page. The alternative kept in reserve: running
 Strudel's timers from the page itself instead of moving the target time.
+
+## A played note is placed by its own time stamp
+
+Moontide now reads MIDI input with this rule. The measurement came first: the delay of a played note was
+measured before the input was built, so that the input and a note grid to edit rest on numbers and not on a
+guess.
+
+The rule: the page reads the time stamp the system gives the note, never the time its own code happens
+to run. A busy page ran its code up to 85.8 ms late; the stamp does not move, so reading it removes
+that whole delay. The page puts the stamp on the cycle grid with the same cycle-to-time map that stamps
+Moontide's own MIDI notes and clock ticks: it reads the map's stamps of two cycle lines inside the
+handler and follows the straight line through them backwards. A note with a stamp of 0, a stamp that is
+not a number, a stamp more than 1 ms after the handler's own clock or one more than 1000 ms before it is
+refused with its reason and said. It is never placed at a guess.
+
+The margin: across all 40 measured cells the worst error is 6 ms (the worst measured value, 5.68 ms,
+rounded up to the next half millisecond). That is 9.5 percent of the finest step offered (a sixteenth-note
+triplet, 55.56 ms at 180 BPM), and less at slower tempos. The worst value belongs to a page that makes no
+sound at all: its clock drifts by a few milliseconds after about 25 seconds. On a page that makes any
+sound, even one far below hearing, the worst error is 0.8 ms. Conditions: one Mac, one Chrome version, the
+IAC loopback, 60, 90, 120, 140 and 180 BPM, a silent, a playing and a busy page, headless and headed.
+An independent sender that stamps packets with the operating system's own clock, outside Chrome, gave
+a worst error under half a millisecond at 120 BPM, headless and headed.
+
+No correction is applied. The grid the rule uses is the MIDI-stamp grid, the one Moontide's own MIDI
+output is aligned with. It sits about 5.5 ms after the grid of what the browser plays, which is about
+a tenth of the finest step at 180 BPM; a player who follows the browser's sound is that much early on
+it. The MIDI-stamp grid is defined by the page clock alone and the audio device can move the other one, so
+one constant that could shift it later was kept in reserve and not set. The top bar shows the
+scheduler's own cycle, which runs about 84 ms ahead of the clock's map at the same instant: a note grid
+must follow the map, not the top bar.
+
+Computer keys: the same rule with the key event's stamp. Repeats of a held key are ignored. A tap has
+one fixed velocity, changed later on the note grid. A click is not a trigger. Both ways of making a
+rhythm are wanted: cells placed on the grid and taps on keys. The worst measured error of a tap is
+within 2.5 ms.
+
+Grids: quarter notes, eighth notes, sixteenth notes, eighth-note triplets and sixteenth-note triplets.
+The default is sixteenth notes. On generated straight passages with 15 ms of timing spread, no intended
+note was misplaced on the sixteenth grid, against a share of 0.58 on the eighth and sixteenth-triplet
+grids and 0.78 on the quarter and eighth-triplet grids (the worst passage of each). A coarse grid cannot
+hold a fast rhythm, and a very fine one keeps the spread as a false rhythm. Triplet material needs a
+triplet grid. There is no swing setting: a swung passage landed on the triplet point 27 of 27 times on
+each of the two triplet grids and never on the three straight grids, so a triplet grid carries a swung
+feel.
+
+Every played note is kept, with its velocity, even a weak ghost note. Claude does the cleaning, not a
+filter: no velocity floor and no minimum length. The one exception is two notes of the same pitch in
+the same grid cell: they become one, the stronger. On the default grid the merges were 46 in 844
+played notes (5.45 per 100; 13.95 and 9.52 per 100 on two guitar-like passages), and 106 of 123 ghost
+notes kept a cell of their own.
+
+Velocities are kept as played, scaled to 0 to 1 and written with two decimals. 27 of 127 values
+read back one unit off, none by two or more.
+
+The phrase a played motif is written as: one token per grid step, `~` for a rest and `_` for a held
+step, `note("c4 _ ~ e4").velocity("0.8 _ ~ 0.5")`, where the velocity string mirrors the note string
+token for token. Voices that share step, length and velocity are a chord in square brackets; others get a
+lane each inside `stack`. A motif of several cycles is one sequence in brackets slowed by the cycle
+count, the only form tried that holds a note across a cycle line. Played in the real page, 21 cases (rests,
+holds, chords, overlaps, every grid, a velocity of 0.04, real guitar-like passages) gave back the same
+notes at the same places: the worst position error was 0.3 ms and the worst length error 1.01 ms.
+What the form cannot say, with no workaround invented:
+
+- different velocities for the voices of one chord in one string (the voices multiply);
+- a velocity string that does not mirror the held steps (the extra velocities are lost without an
+  error);
+- a velocity after a colon (it is a sample number);
+- the same pitch twice at one place (it plays twice, so such notes are merged first);
+- a hold across a cycle or beat line in the other forms tried;
+- a note length that is not a whole number of steps, and a gap shorter than a step (the page ends every
+  note 10 ms early);
+- timing inside a step, and swing outside the triplet grids;
+- sixteenths and triplets mixed in one cycle (that needs 48 steps per cycle);
+- a change of velocity inside a held note;
+- pitch bend, pedal and other controllers.
+
+Not verified: a real keyboard's own delay (a loopback adds none, so it cannot show it), a guitar-to-MIDI
+unit (which makes many ghost notes), Windows and Linux time stamps, real key presses (the taps were
+injected key events), and a device that sends no time stamp. The passages used to choose the grid were
+generated with an assumed timing spread (10, 15 and 25 ms), not played by a person, so the default grid
+is a good start and not a verdict on anyone's playing.
+
+## The Scratchpad keeps a motif on the grid, in memory
+
+The Scratchpad is a piano roll where a motif is drawn, tapped, played in and read before it is used for anything. It is a
+view of the page, not a player of the music: it sends a motif to Claude only when the user presses Send to Claude (see "A motif
+goes to Claude as a page request"), it plays a motif on an instrument only when the user presses Listen (see "Making a motif:
+the live view, select by default, Align and Listen"), and it never stores a motif or changes the code.
+
+- Length and grid. A motif is 2 cycles by default and 1 to 8 at most. Positions and lengths are kept in 1/48 of a
+  cycle, the smallest unit that every grid divides into whole steps, so a change of grid is exact and never drifts.
+  The five grids are quarters, eighths, sixteenths (the default), eighth triplets and sixteenth triplets.
+- A change of grid moves every note at once: a start goes to the nearest step (a tie to the earlier step) and a length
+  to the nearest whole step (a tie down, never below one step). A start that rounds to the end of the motif wraps to the
+  beginning. The line says how many notes moved and merged.
+- Notes of one pitch never overlap, because the phrase form of the played-notes section cannot say an overlap. Two notes of one
+  pitch in one cell merge into the stronger one, and a note stops where the next note of its pitch starts. The line says
+  what was cut or merged.
+- Velocities run from 0.01 to 1.00. A new note starts at 0.80 and the last value used is not remembered; a change is made in the
+  velocity lane under the roll.
+- Tap uses the time-stamp rule of the played-notes section, on the page clock's map, with no correction. It needs the music
+  playing and says so when it does not; it turns itself off when the view closes or the music stops. A tap lands where the
+  music is in the motif (the music's cycle modulo the motif's cycles), snapped to the grid, at the cursor's pitch.
+  A refused stamp is said with its reason and nothing is placed.
+- The roll's pitch rows follow the notes. It starts with a window of two octaves and, on every draw, grows to hold every note
+  with two semitones of room, in whole octaves from a C to a B, between C0 and B8 (at most 108 rows). No note is ever hidden,
+  also not after an Undo, and the readout names the range shown (for example C2–B5). Lower and Higher move the starting window
+  only. The range is worked out from the notes and the cursor each time and is never stored, so it cannot go out of step with
+  the motif. When the rows are taller than the box, the box scrolls up and down while the ruler, the piano names and the velocity
+  lane stay in place.
+- The roll takes all the width it has. A beat is at least 4 rem wide and otherwise the room divided by the beats, with no upper
+  cap, so a short motif on a wide window is not a small strip in a large empty box. The box scrolls sideways when the beats do
+  not fit.
+- A right-click on the roll erases a note, while the rest of the page keeps opening the Ask box. A right-click with Ctrl held
+  erases nothing, because on a Mac it is the same press as a Ctrl+click, which adds to the selection.
+- Undo and Redo are the Scratchpad's own, 100 steps deep, and never touch the music's History or the code.
+- The motif stays when the user goes to another view and comes back, and is gone after a reload. Nothing is written to storage
+  or to a file. The output choice, the Start choice, Loop, Draw and the keyboard buffer are reset by a reload as well.
+- A drag on the roll selects, and a note is written by a double-click, by Enter or by Draw; the next section gives the reasons.
+  The only thing that makes a sound is Listen, which the user presses.
+
+Not verified: real key presses for Tap (the taps measured for the rule were injected key events, so a real keyboard's time
+stamps are not yet known to fall inside the rule's window), and Alt with the arrow keys on Windows and Linux, where
+the browser may take the combination for going back a page (only macOS was tried).
+
+## A keyboard fills a rolling buffer, and Record that takes it
+
+A MIDI keyboard is heard by the Scratchpad page, which keeps what was played in a buffer and puts it on the roll
+when asked. The choices and their reasons:
+
+- Inputs are named in the setup file only, as `{ "port": "..." }` entries like the outputs, matched by their exact
+  and full name (an output is matched by a part of its name, but a keyboard name matched loosely could pick the
+  wrong device), at most 4. The models do not change. No product code writes the file: the user writes the line,
+  Claude may propose it in the chat, and a change of an instrument's settings from the page keeps the inputs as
+  they were. A name carried by several connected inputs is refused and said, never guessed.
+- The page asks for MIDI with the same permission as the MIDI output, through the same enable the music uses, so
+  there is one browser prompt and never two. The first prompt comes only from a press of "Allow MIDI to listen",
+  never by itself. A refused permission is said in words and asks nothing more.
+- Only a visible tab that holds the music listens, so there is never a second buffer. A hidden tab, or one that
+  lost the music to another tab, removes its listeners, closes the held notes, keeps its buffer and says why.
+- Nothing played is routed to an instrument. The page listens and never sends what is played, so what is played never
+  sounds an instrument by way of Moontide. Listen sends the motif on the roll, and only when it is pressed.
+- The buffer keeps 8 whole cycles, the roll's longest motif, with its edges on the music's cycle lines: the
+  cycle that is playing and the 7 before it, so 7 to 8 cycles of what was played. Everything is taken: no phrase
+  is guessed and no note is filtered by velocity or length. The cleaning is left to the user or to Claude, as for
+  the taps.
+- An edge cuts a note that began before the window at the edge, and Record that closes a held note at the moment
+  of the press. A disconnect, a hidden tab and a change of setup also close every held note, and the buffer is kept.
+- Velocities are kept as played, in hundredths, from 1 to 100. Notes that the roll cannot show (below C0 or above
+  B8) are left out, counted and said, never moved to another octave. At most 2000 notes are held; past that the
+  newest are not kept and the status says so once.
+- The buffer is in memory only. A reload empties it, and nothing is saved or written to a file.
+- With the music stopped, the page keeps counting cycles by the scheduler's tempo, because a keyboard is played
+  with or without music. The count never goes back: it keeps the clock's own line through a short gap, and on Play
+  it moves forward by whole cycles to the next whole cycle of the music, so the music's downbeats stay downbeats.
+  A tempo change while stopped starts a new line from where the count was. Notes played before a Play have no
+  meaningful place against the new music, and are not corrected. With no cycle lines and no tempo above 0, a note
+  is refused and said, never placed at a guess.
+- Record that replaces the motif in one undoable step. It places the notes on the ring of 8 cycles that the live view
+  draws (the keyboard's cycle count modulo 8), quantized to the roll's grid with the tap's rule, trims the empty cycles
+  before the first note, and makes a motif of 1 to 8 cycles. It does not count from the buffer's first cycle: a take
+  that starts in the third cycle of the ring becomes a motif that starts at its first note's own cycle. It writes nothing
+  to the History or to the code, and the press leaves the music as it was. After the press the keyboard buffer is empty
+  (see the next section for why).
+
+Checked: on a loopback port in real Chrome, the page's own input placed every note within 6 ms of its place on
+the cycle grid at 60, 90, 120, 140 and 180 BPM, with the music playing (the worst error was 0.33 ms) and with it
+stopped (the worst spacing error was 0.14 ms).
+
+Not verified, as in `docs/midi.md`: a real keyboard's own delay and time stamps (the loopback adds none), its plug
+and unplug with a real driver, a guitar-to-MIDI unit, Windows and Linux time stamps, a device that sends no time
+stamp (it is refused and said), and whether a window covered by another window counts as hidden on each system.
+
+## Making a motif: the live view, select by default, Align and Listen
+
+Making a motif on the Scratchpad is meant to feel like the capture and piano-roll tools people already know: what is played
+shows as it is played, a take is kept as shown, a drag selects before anything draws, a motif can be put on the beat, and it can be
+heard on an instrument before it is sent. The choices and their reasons:
+
+- The live view. While an input is listened to, the roll draws what the keyboard plays as it is played: notes in the accent
+  colour (a held note grows to the playhead), held keys lit in the pitch column, and an accent playhead that runs across the
+  buffer's 8 cycles and wraps. The player can see where the bar lines are and land in the bar. The view is visual only: it sends
+  nothing to an output, writes nothing to the History and sends no request. Before the first note the roll shows the now-marker
+  (the roll is armed), so the beat can be felt with no switch to turn on. The ruler numbers the ring's columns 1 to 8, not the
+  music's cycles, because the keyboard's cycle count and the music's differ by a whole number after a Stop and a Play; the beats
+  inside a cycle still line up.
+- The range only grows while the view is live. A pitch played far from the rows adds rows at once, and they settle back to the
+  motif's own range when the buffer is empty. Rows that moved under the player's hand would make the take harder to read.
+- Record that equals what is shown. One layout function places the notes for the live view and for Record that, so the motif holds
+  exactly the notes that were on the screen (a test over all five grids proves it). What can still differ is told in the line:
+  the same-pitch rule (a cut or a merge) and notes outside C0 to B8.
+- Record that empties the buffer. A second press says there is nothing to record. Undo brings the earlier motif back, not the
+  buffer. The reason is that a take is finished when it is kept: the notes left in the buffer would be taken again by the next
+  press and drawn over the new motif. The alternative, a cutoff time after which the notes stay but are not drawn, was kept for
+  later if the emptying feels wrong in use.
+- A take keeps its moment only when it lies in one lap of the ring and one run of the music; any other take is sent with no
+  moment. A take that starts in the last cycle of the ring and goes on into the first is written as it lies on the ring, the later
+  bar first with empty cycles between. Turning such a take so that it stays in the order it was played is left to the user's say.
+- Select by default. A drag on empty space draws a dashed rectangle and selects the notes it touches; a click on a note selects it;
+  Shift, or Ctrl or Cmd, adds to the selection. A note is written by a double-click, by Enter at the cursor, or by a drag while
+  Draw is on. Draw is a visible toggle (its button, or the key d) with its state read out, because a hidden mode makes the same
+  drag do two different things. With selection first, a stray click costs nothing, and a motif can be moved as a group.
+- A selection is one rigid group. Arrows move it a step or a semitone, Alt with the arrows a beat or an octave, Shift with
+  Left or Right changes the lengths, Delete erases it and the velocity lane changes every selected velocity. A move that cannot
+  be made whole (a note would pass the end or the highest or lowest pitch) is refused and said, never squeezed, so the
+  notes keep their spacing. A key held down is one Undo step, not one for each repeat. Ctrl+click adds to the selection on
+  every system and erases nothing.
+- Align moves the whole motif so that its first note starts on the nearest beat, an exact half going to the earlier beat. It keeps
+  the lengths, pitches, velocities, spacing, source and recorded moment. It is refused, and says why, when the last note would
+  pass the end of the motif; it never makes the motif longer by itself. A player is usually a little early or late as a whole, and
+  moving the motif keeps their feel where a quantize would change it. Earlier and Later move the selection, or the whole motif, one
+  grid step.
+- Clear empties the roll with no question, because Undo brings the notes back and the line says so.
+- Listen plays the motif through the page's own MIDI layer, the one that sends the music's notes, and sends note-on and
+  note-off only. It sends no program change and no other message: the sound already on the channel is the one the motif will have
+  in the music, and Listen does not change it.
+- The instrument and channel are chosen from the setup file, in a menu with entries such as `mt32 · channel 3`. The output is found
+  by a part of its port name, like the music's own `.midi()` ports, and found again at every note, so a plug or an unplug is seen. A
+  name that several connected outputs contain is refused and said, never guessed.
+- In the music is the default start: Listen waits for the next cycle line (the one after, when the next is less than 60 ms away) and
+  stamps each note on the page clock, so it falls on the music's beat. At once starts now. In the music with the music stopped is
+  refused and says so, and does not turn into At once by itself. Each note ends 10 ms before its length, as the music's do, so two
+  notes of one pitch back to back both sound.
+- Loop reads the motif again at the end of each pass, so a change made during a loop is heard on the next pass; an emptied motif
+  ends the play and says so.
+- Stop sends a note-off for every note that sounds, and a note-off just after the time stamp of every note already handed to the
+  output for later. It never sends All Notes Off, because a track of the music on the same channel must keep playing.
+- Notes are handed to the output at most 150 ms ahead, because Chrome cannot take back a note once it carries a time stamp. A
+  longer look-ahead would leave notes behind a Stop.
+- A play also ends, and says why in plain words, when the tab is hidden (a hidden tab cannot keep time), when another view
+  opens or the Scratchpad is closed, when the page is left, when the output is unplugged, and, for In the music, when the music
+  stops. The first press asks for MIDI through the one shared enable, says it waits, sends nothing until the answer comes, and a
+  Stop meanwhile cancels the start. Granting MIDI makes the page reset the instrument it has just found, so the first press right
+  after a grant can be answered with "try again in a moment".
+- Listen changes no code, writes nothing to the History and sends no request. The choice, Start, Loop and Draw are not stored.
+- Two Heads up sentences sit in the line under Listen, and neither ever blocks it. One says that a track of the playing code, not
+  muted, uses the chosen instrument and channel, and names the track: both would sound on it. The other says that an instrument whose
+  model says it plays one note at a time was given a chord, which would be heard as one note. That fact is a new optional field
+  of a model, `monophonic`. Absent means unknown and is never read as polyphonic. Claude can write it into a drafted model when the
+  manual says so, and sees it in `get_midi_instruments`. The shipped models do not claim it, so the chord sentence appears for a
+  shipped instrument only once a model in the user's folder says it.
+
+Checked, on the fake keyboard and the fake output of the real-Chrome checks, and by the unit tests: notes played show on the roll as
+they are played and the view sends nothing; Record that writes exactly the notes shown, then empties the buffer, and Undo brings the
+earlier motif back; Align keeps the spacing and the moment, so a take sent before and after an Align carries the same whole cycle
+with a different phrase; Listen sends only note-ons and note-offs on the chosen channel, one cycle apart for notes one cycle
+apart; Stop leaves a note-off for every note-on and nothing else; in the music, the first Listen note was 0.05 ms from the music's own
+note of the same cycle line, and the passes of a two-cycle loop started 2000 ms apart; the stops above say their reasons; and a reload
+leaves nothing of these choices behind and adds nothing to the browser's storage.
+
+Not verified: a motif played on a real keyboard and heard on a real synth, which is for an ear (whether the playhead and the live
+notes make it easy to land in the bar, whether Listen sounds like the motif in the music, and whether the notes that end 10 ms early
+sound in time); Stop on real hardware; the look of the new strips and the live layer in the three layouts; a screen reader on the
+hear strip, the Edit group and the send strip; Ctrl+click on a note on a Mac; Ctrl+Shift+A and Cmd+Shift+A to select none (the
+browser may keep Cmd+Shift+A for itself); and Alt with the arrow keys on Windows and Linux. Also open, to judge by eye: the roll
+grows and shrinks one octave while the cursor walks near its top or bottom rows, and a click in the top or bottom two rows can
+change the rows under the pointer.
+
+## A motif goes to Claude as a page request
+
+A motif made on the Scratchpad reaches Claude as one page request, like the Ask box's, with the motif itself in a field of its
+own. The choices and their reasons:
+
+- Only the user's press sends. The Send to Claude button, or Enter in its words field, sends the motif; nothing else does, and a
+  held key that opened the field sends nothing. The page changes no code and no version, so what Claude does with the motif
+  is Claude's change to make and the user's to keep or undo. The request shows in the Requests panel like any other.
+- The words are the request text. The field is prefilled with a short sentence the user can change, and the page never asks for
+  an addition or a replacement by itself: that is for the user's words to say.
+- The phrase is the form the played-notes section proved: `note("...")` with a `velocity("...")` lane, or a `stack` of them,
+  one token per step. One function writes it, for the screen and for the request, so the phrase under the roll is the phrase
+  sent, and a test compares them. It is never cut. A motif whose request would pass the 8192-byte line limit is refused whole,
+  with what makes it smaller (fewer cycles, a coarser grid, fewer notes sounding together or shorter words), because half a phrase would play as a different motif.
+- The motif rides in its own field (source, cycle, cycles, grid, notes, phrase) with its own context kind, as data about the page
+  and not as part of what the user wrote. A motif request carries no moment of the music and no gesture. Its facts, and a pointer
+  to the motif topic of the reference, go with the request lines; the server instructions stay as they were, because their
+  length is limited.
+- The moment is the cycle of the music where the motif's first cycle stands, so Claude can place the notes where they were meant.
+  - A played motif (Record that) carries the cycle where it was played. It is worked out for each run of the music, because the
+    keyboard's own cycle count runs ahead of the music's after a Stop and a Play.
+  - Any other motif (drawn, tapped or mixed) carries the cycle where the roll's first cycle stands at the press, a whole multiple of
+    its length, because Tap puts notes on the roll that way.
+  - A motif sent while the music is stopped carries no cycle, and neither does a played motif whose notes came from more than one
+    run of the music or from more than one lap of the ring (a take that crosses the ring's right end). No cycle means no moment,
+    and nothing is guessed.
+  - Align moves the notes but keeps the moment, so the same take sent before and after an Align carries the same cycle with a
+    different phrase.
+- One motif request at a time: Send waits until the server has the last one. A refusal (no notes, empty or long words, no
+  connection, a line too long) is said in plain words in the strip under the roll and sends nothing; it never touches the Ask box.
+
+Measured: ten fresh Claude Code sessions, all on one model (claude-opus-5-5), each with only the Moontide tools and one real
+motif request sent from a real page: five of the motifs were drawn on the roll and five were played on a fake MIDI keyboard
+and recorded. The music was a short drum, hat and note line. Success was read from the code that plays, by the strict rule that
+every note of the motif must start at the stated cycle plus its place in the motif. Two kinds of success were counted apart: the
+notes at the stated cycle (A), and an honest answer in words with the code left alone (B). The bar was written down before the
+first session, and the sessions' cost was capped.
+
+- The notes were at the stated cycle in 10 of 10 sessions (A), and in 5 of 5 of the played ones. No session answered in words
+  (B was 0 of 10), and no session missed.
+- Both promises were met: that a motif is worked in (at least 8 sessions, with A plus B at least 8 and A at least 6), and that it
+  is placed at the cycle where it was played (at least 4 played sessions, with at least 3 of them placed). Only these two
+  promises are made.
+- In the five drawn sessions the stated cycle was a whole multiple of the motif's length, so a plain loop of the phrase would
+  have passed there too. The played sessions, whose cycle was not such a multiple, are where the moment was really tested.
+- Observations, not promises: the request line with its fact paragraph reached Claude in all 10 sessions and was enough, as no
+  session read the motif topic before its first change; the quiet one-step notes of the two sessions that had them were kept; the
+  drums and hats were left alone; the line was replaced or changed in the four sessions whose words asked for it.
+
+The limits of this figure: one model, ten sessions. It reads the code and not the sound, so nothing was heard and nothing here says
+that a motif sounds right, or that taste was met. The honest-answer path for a motif that cannot be placed was not exercised. The
+played motifs were made with a fake keyboard on the roll's grid, not with a real one. A different model, or another piece of
+music, may do worse.
+
+Not verified: whether a worked-in motif comes through as played when heard (its pitches, its rhythm and its place in the music;
+this is for an ear), the look of the send strip in the three layouts, a real MIDI keyboard played, recorded and sent, and a
+screen reader on the strip (the phrase reachable and named, the status line spoken once for each send).
 
 ## A drafted model is saved only after the user's yes
 
@@ -667,8 +993,9 @@ over on the next bar or the next phrase.
   ramp at the line. Stop cancels the ramp and the next Play starts at the code's tempo. The ramp lives in the
   page's memory only: a reload or another tab loses it, and Claude is told once. A ramp is refused whole, with
   nothing changed, when nothing plays, when the code sets no tempo or when it sets the tempo that already
-  plays. The top bar has no cancel control (Stop cancels). How a hardware instrument that follows the MIDI
-  clock reacts to a ramp has not been verified; the bench is still to do.
+  plays. The top bar has no cancel control (Stop cancels). On real hardware a ramp down was heard on a
+  JUPITER-Xm arpeggiator and a Subharmonicon, and a ramp up on the Subharmonicon only; a wide ramp and
+  Stop in the middle of a ramp have not been verified.
 
 ## Claude can send only the change
 
@@ -1388,3 +1715,96 @@ lights in the real Mixer against the heard moment and the cost at 40 tracks, and
   and in Claude's replies, never written to a file or a log.
 - **Left out on purpose:** a command that lists every running server. The tab titles are enough; add one
   if the need comes back.
+
+## Synth settings are named once and written in the code
+
+- **Not the editor that was ruled out:** Claude writes tone, part and scene settings in the `.midi()`
+  options the way it writes notes: `tone: { filterCutoff: 600 }`. That does not reverse the earlier
+  exclusion of a patch librarian or a SysEx editor, which was about an editor in the page. The
+  instrument's own tools still edit and store sounds, and the page stores no setting: a setting is a
+  number in the code, and history, restore and hand edits keep it like any other part of the code.
+- **One vocabulary:** the names are camelCase with the number inside (`filterCutoff`, `env1Attack`).
+  The vocabulary says nothing about how a setting reaches an instrument. The level is written as its
+  option key (`tone`, `part`, `scene`) and is never deduced from a name: a name written at the wrong
+  level is refused, and the refusal says where it belongs. Values are in the device's own units, as for
+  controls.
+- **Who does what:** the vocabulary holds the names. The model, in the user's own data folder, says which
+  of them the instrument has and maps each to a Roland data set, an NRPN or a control change, with its
+  range. No shipped model carries settings. A wrong description is refused when read, with the field and
+  the reason, like any other model fault. The sound catalog says which engine each tone belongs to.
+- **The engine:** a tone belongs to one engine of the model, and some settings exist in one engine only.
+  The engine comes from the engine table of the sound catalog (the banks whose tones each engine holds),
+  through the sound the call names, and the code never states it. A setting of another engine is refused
+  naming both engines. When the engine cannot be known, tone settings are refused with that reason and
+  never sent blind: no sound named in the call, a sound the catalog does not place, or a drum kit. Part
+  and scene settings reach every engine, so they are not checked this way. A model that declares no
+  engines has one engine and no engine check.
+- **Known limit:** a catalog saved again from a sound list has no engine table, because the tool that
+  drafts a catalog does not know engines. Its tone settings then read as engine unknown and are refused
+  until the table is back in the file.
+- **Where Claude reads the rules:** the settings rules are in a reference topic and in the
+  `get_midi_instruments` reply, not in the server instructions. Claude Code keeps 2048 characters of the
+  instructions, and they keep a margin for the rules that must come first. No session guide was needed.
+  Fresh sessions turned a delay on the lead and drive on everything into settings at the right level 3
+  times out of 4 each, and a darker bass in only 3 of 8, so that one is not promised; the sessions that
+  read the topic first passed every time.
+- **Sent with every evaluation:** the page sends every setting the code writes, not only what changed.
+  On the instrument this was built for, a program change erases the settings of a tone, while part and
+  scene settings survive it, so sending all of them is safe and simple, and a replug, a reset or switching an instrument on needs no memory of
+  what was sent. A refused setting fails the evaluation, the previous music keeps playing and nothing is
+  sent.
+- **Never stored, never undone:** the value a setting had before the code wrote it is unknown, and reading
+  it back is out of scope. So a setting taken out of the code is simply not sent again, and the instrument
+  keeps its last value until the instrument itself changes it (for a tone setting, until the instrument
+  loads the tone again). Claude and the page say so in words, and only what is true on every instrument:
+  what else undoes a setting is told per instrument.
+- **Temporary only, checked on the bytes:** a setting goes only into an area of the instrument that holds
+  nothing for good: the temporary scene and tones of the JUPITER-Xm, the timbre, patch, system and display
+  areas of the MT-32. The finished bytes are checked just before they are sent, and the same check covers
+  the reset and the system exclusive messages that the code itself asks for, so no path can write the
+  instrument's memory. An instrument whose temporary areas Moontide does not know gets no settings.
+- **Keyed on the message, not on the instrument:** the check looks at the bytes, not at the setup file. A
+  Roland message with the model ID of an instrument whose temporary areas are known (the JUPITER-X family)
+  must be a data set inside them on any port, whether the file is valid or not, and whatever instrument
+  the file names there. The MT-32 (model ID 16) is a second known model, so the code's own MT-32 data sets
+  into patch or timbre memory are dropped on every port from now on; its reset, its display and its
+  temporary areas still pass. Every other system exclusive message passes as before: refusing them all
+  would break the GS messages the code sends to the instruments that take them. The check reads the
+  bytes the way the browser sends them, the whole buffer and the whole address range, and sends on the
+  bytes it checked.
+- **Parts from the model's channels:** the part of a channel is its place among the model's channels, not
+  among the channels the user lists, so a setting always reaches the part the model means.
+- **The part step belongs to the area:** the distance between two parts is not one number for the
+  instrument. The JUPITER-Xm steps by 128 in its scene area and 16384 in each temporary tone; the MT-32 by
+  246 in its timbre area and 16 in its patch area, and by nothing in its system area. The page finds the
+  area that holds the part 1 address, adds the step in base 128, and the result must stay in that area.
+  Keying the step on the level would have been wrong as soon as one level spans two areas, as the MT-32's
+  tone level does.
+- **One row per engine for a shared name:** the JUPITER-X model engine has a filter cutoff and resonance
+  like the first engine's. A second vocabulary name for the same idea would have changed the code Claude
+  writes for each engine, so the model holds one row per engine under the same name, each with its own
+  address and range, and the engine of the sound in the call picks the row. A repeat whose engines
+  overlap, or that names none, is refused when the model is read, and a lookup that cannot choose by
+  engine fails loudly, never taking the first row.
+- **NRPN offsets, for a known family only:** a setting may be an NRPN when the model names a family
+  Moontide knows (today the GS part offsets) and a pair from that family's list. The raw value is sent, as
+  written, with no conversion: the SC-55 offsets are written 14 to 114 with 64 meaning no change, so 0 is
+  never read as closed, and the names end in Offset to say so. They are part settings, they go on the
+  channel of their call, and Moontide never sends a value back to neutral by itself: nothing establishes
+  that 64 undoes a change, and an automatic return would hide that. The NRPN is checked twice, when it
+  is built and again byte by byte against the rig when it is sent. A control change setting stays refused.
+- **The MT-32 guard and its one reset:** the MT-32 is guarded like the JUPITER-X family, with three-byte
+  addresses. Its reset is the one message outside the allowed areas that passes: as the code's own
+  message or the reset of the instrument, never as a setting, so a model row that points at the reset
+  address is refused whatever its value. Patch memory, timbre memory and the write request are never
+  sent.
+- **The MT-32 is treated as a hardware MT-32:** its manual's numeric settings are offered, each marked
+  heard on Munt, sent but not heard, or only documented, because an address in a maker's document says
+  where a value lives, not that it changes the sound. This replaced the earlier rule that its cutoff and
+  resonance wait. What the manual leaves unclear (the direction of the pan, the bit order of the partial
+  mute) and what has no written form yet (a setting per key of the rhythm setup) is open and said so.
+- **The instrument's own facts live in its model's notes:** what undoes a setting on an instrument, the
+  value that changes nothing for its offsets, and the mark of each setting are in the Notes line of that
+  instrument in `get_midi_instruments`, drafted from the bench records and saved only after the user's
+  yes. The shared settings topic holds what is true on every instrument, so it can never say something
+  true on one and false on another, and it never holds a number of an instrument.

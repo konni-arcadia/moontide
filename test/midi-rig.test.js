@@ -6,7 +6,9 @@ import path from 'node:path';
 import { parse } from 'acorn';
 import { RIG_COPY, RIG_LIMITS, checkFailureText, checkSetup, closestSounds, drumMapFor, parseRigMessage, rigFromReadFailure, soundKey, withBuildMismatch } from '../page/midi-rig.js';
 import { BUILT_IN_DRUM_MAPS, MAX_DRUM_MAPS } from '../dist/drum-maps.js';
+import { SETTING_VOCABULARY } from '../dist/vocabulary.js';
 import { DRUM_MAP_CASES, bankDrumsModel, gmDrumsModel } from './drum-fixtures.js';
+import { TINT_WORDS, findWords } from './tint-rules.js';
 import { readMidiSetup } from '../page/midi-plan.js';
 import { MixerRewriteError, writeTrack } from '../page/mixer-rewrite.js';
 import * as instruments from '../dist/instruments.js';
@@ -18,8 +20,11 @@ import {
   MAX_RIG_DRUM_MAPS,
   MAX_RIG_DRUM_NAME,
   MAX_RIG_DRUM_NOTES,
+  MAX_RIG_ENGINES,
+  MAX_RIG_INPUTS,
   MAX_RIG_INSTRUMENTS,
   MAX_RIG_PROBLEMS,
+  MAX_RIG_SETTINGS,
   MAX_RIG_SOUNDS,
 } from '../dist/protocol.js';
 
@@ -113,7 +118,7 @@ test('readMidiSetup reads the plain forms alike and ignores other option keys', 
   assert.equal(short.port, 'Port A');
   assert.equal(short.channel, 1);
   assert.equal(short.sound, null);
-  assert.deepEqual(short.problems, { port: null, channel: null, sound: null, controls: null });
+  assert.deepEqual(short.problems, { port: null, channel: null, sound: null, controls: null, settings: null });
   const forms = [
     `note("c3").midi('Port A', { midichannel: 3, sound: 'Bell 2' })`,
     `note("c3").midi({ port: 'Port A', midichannel: 3, sound: 'Bell 2' })`,
@@ -122,7 +127,7 @@ test('readMidiSetup reads the plain forms alike and ignores other option keys', 
   for (const code of forms) {
     const [call] = read(code);
     assert.deepEqual([call.port, call.channel, call.sound], ['Port A', 3, 'Bell 2'], code);
-    assert.deepEqual(call.problems, { port: null, channel: null, sound: null, controls: null }, code);
+    assert.deepEqual(call.problems, { port: null, channel: null, sound: null, controls: null, settings: null }, code);
   }
 });
 
@@ -216,7 +221,7 @@ test('a .midichan(n) on either side of one .midi() call sets that call channel',
     const calls = read(code);
     assert.equal(calls.length, 1, code);
     assert.equal(calls[0].channel, 3, code);
-    assert.deepEqual(calls[0].problems, { port: null, channel: null, sound: null, controls: null }, code);
+    assert.deepEqual(calls[0].problems, { port: null, channel: null, sound: null, controls: null, settings: null }, code);
   }
   const [override] = read(`note("c3").midichan(4).midi('Port A', { midichannel: 2 })`);
   assert.equal(override.channel, 4, 'midichan overrides midichannel for that call');
@@ -492,7 +497,7 @@ test('an invalid rig refuses any code with a .midi( call, with up to 3 problems 
 
 test('without a setup file nothing is refused and nothing is desired', () => {
   const result = check(`note("c3").midi('Anything', { midichannel: 3, sound: 'nothing' })`, { rig: { setup: 'absent' } });
-  assert.deepEqual(result, { refusal: null, desired: new Map(), controls: new Map() });
+  assert.deepEqual(result, { refusal: null, desired: new Map(), controls: new Map(), settings: new Map(), scenes: new Map() });
 });
 
 test('an unknown rig state is a loud error', () => {
@@ -547,6 +552,7 @@ test('RIG_LIMITS equals the limits of the midi-rig message in src/protocol.ts', 
     { ...RIG_LIMITS },
     {
       instruments: MAX_RIG_INSTRUMENTS,
+      inputs: MAX_RIG_INPUTS,
       sounds: MAX_RIG_SOUNDS,
       controls: MAX_RIG_CONTROLS,
       problems: MAX_RIG_PROBLEMS,
@@ -556,6 +562,8 @@ test('RIG_LIMITS equals the limits of the midi-rig message in src/protocol.ts', 
       drumMaps: MAX_RIG_DRUM_MAPS,
       drumNotes: MAX_RIG_DRUM_NOTES,
       drumName: MAX_RIG_DRUM_NAME,
+      settings: MAX_RIG_SETTINGS,
+      engines: MAX_RIG_ENGINES,
     },
   );
 });
@@ -566,6 +574,42 @@ function realMessage(t) {
   fs.writeFileSync(path.join(dir, 'instruments.json'), JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Port A' }] }));
   return instruments.rigMessage(new instruments.RigStore({ dataDir: dir }).read());
 }
+
+test('parseRigMessage reads the input ports, reads a message without the field as no input, and refuses a list of five', (t) => {
+  const message = realMessage(t);
+  assert.deepEqual(parseRigMessage(message).inputs, [], 'a real message of a file without inputs');
+  const old = structuredClone(message);
+  delete old.inputs;
+  assert.deepEqual(parseRigMessage(old).inputs, [], 'an older server sends no field');
+  const two = { ...structuredClone(message), inputs: ['Keys A', 'Keys B'] };
+  assert.deepEqual(parseRigMessage(two).inputs, ['Keys A', 'Keys B']);
+  const five = { ...structuredClone(message), inputs: ['a', 'b', 'c', 'd', 'e'] };
+  assert.throws(() => parseRigMessage(five), /inputs/);
+  const wrong = { ...structuredClone(message), inputs: ['Keys A', 5] };
+  assert.throws(() => parseRigMessage(wrong), /inputs\[1\]/);
+  const notList = { ...structuredClone(message), inputs: 'Keys A' };
+  assert.throws(() => parseRigMessage(notList), /inputs/);
+  const long = { ...structuredClone(message), inputs: ['x'.repeat(201)] };
+  assert.throws(() => parseRigMessage(long), /inputs\[0\]/);
+});
+
+test('a file with a wrong input reaches the page as an invalid rig whose problem row names the field of the second entry', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moontide-rig-page-test-'));
+  try {
+    fs.writeFileSync(
+      path.join(dir, 'instruments.json'),
+      JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Port A' }], inputs: [{ port: 'Keys' }, { port: 'Keys' }] }),
+    );
+    const rig = parseRigMessage(instruments.rigMessage(new instruments.RigStore({ dataDir: dir }).read()));
+    assert.equal(rig.setup, 'invalid');
+    assert.deepEqual(rig.problems, [{ field: 'inputs[1].port', reason: 'same port as inputs[0]' }]);
+    // The refusal is the one every wrong setup gets: code with .midi( is refused while the file is wrong.
+    const refusal = refusalOf("note('c3').midi('Port A')", { rig, playing: false });
+    assert.ok(refusal.includes('inputs[1].port'), refusal);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('parseRigMessage accepts the message a real RigStore builds, and a wrong type names its field', (t) => {
   const message = realMessage(t);
@@ -595,6 +639,18 @@ test('parseRigMessage accepts the message a real RigStore builds, and a wrong ty
   const wrongRhythmBank = structuredClone(message);
   wrongRhythmBank.instruments[0].rhythmBank = 'x';
   assert.throws(() => parseRigMessage(wrongRhythmBank), /instruments\[0\]\.rhythmBank/);
+
+  // The monophonic flag is required and must be true or false: the page never guesses it, and an older server's message reads unreadable.
+  assert.equal(rig.instruments[0].monophonic, false, 'the shipped MT-32 does not say it plays one note at a time');
+  const noMonophonic = structuredClone(message);
+  delete noMonophonic.instruments[0].monophonic;
+  assert.throws(() => parseRigMessage(noMonophonic), /instruments\[0\]\.monophonic/);
+  const wrongMonophonic = structuredClone(message);
+  wrongMonophonic.instruments[0].monophonic = 'x';
+  assert.throws(() => parseRigMessage(wrongMonophonic), /instruments\[0\]\.monophonic/);
+  const oneNote = structuredClone(message);
+  oneNote.instruments[0].monophonic = true;
+  assert.equal(parseRigMessage(oneNote).instruments[0].monophonic, true);
 
   // The enabled flag is required and must be true or false, so a message from an older server reads unreadable, never silently on.
   assert.equal(rig.instruments[0].enabled, true, 'the real message of the shipped MT-32 reads enabled true');
@@ -1051,4 +1107,429 @@ test('the message of an sc55 entry that declares four channels still offers all 
   assert.equal(sc55.modelChannels.length, 16);
   assert.deepEqual(sc55.modelChannels.map((entry) => entry.channel), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
   assert.deepEqual(sc55.modelChannels.filter((entry) => entry.role === 'rhythm').map((entry) => entry.channel), [10]);
+});
+
+// --- The tone, part and scene settings a call writes are checked at their own level ---
+
+// The first 23 tone names of the vocabulary are the sound-shaping settings of the oscillators, filter, envelopes and LFO.
+const TONE_23 = SETTING_VOCABULARY.tone.slice(0, 23);
+const SETTINGS = {
+  engines: [],
+  tone: TONE_23.map((name) => ({ name, min: 0, max: name === 'filterCutoff' ? 1023 : 127 })),
+  part: [
+    { name: 'level', min: 0, max: 127 },
+    { name: 'pan', min: 0, max: 127 },
+  ],
+  scene: [
+    { name: 'reverbLevel', min: 0, max: 127 },
+    { name: 'chorusSwitch', min: 0, max: 1 },
+  ],
+};
+const SYN = makeInstrument('synth', 'Port S', range(1, 4).map((channel) => ({ channel, role: 'melodic' })), { settings: SETTINGS });
+const SYN_RIG = { setup: 'valid', instruments: [MT32, SYN] };
+const withSettings = (options, port = 'Port S') => `note("c3").midi('${port}', { midichannel: 3, ${options} })`;
+const checkSyn = (code, options = {}) => check(code, { rig: SYN_RIG, ...options });
+const refuseSyn = (code, options = {}) => linesOf(refusalOf(code, { rig: SYN_RIG, ...options }));
+
+test('a tone, part or scene option that is not a plain object of numbers is refused with the shape to write; the last key of a level wins', () => {
+  for (const level of ['tone', 'part', 'scene']) {
+    for (const value of ['someVariable', '{ ...x }', "{ level: 'a' }", '{ [k]: 1 }', '{ level: 1, level: 2 }']) {
+      const [call] = read(withSettings(`${level}: ${value}`));
+      assert.deepEqual(call.problems.settings, { key: 'settingsNotPlain', hints: [], level }, `${level}: ${value}`);
+      assert.equal(call.settings[level].size, 0);
+    }
+    const lines = refuseSyn(withSettings(`${level}: someVariable`));
+    assert.equal(lines[0], `The ${level} option of .midi() must be a plain object of numbers.`);
+    assert.equal(lines[1], `Write each setting as a name and a whole number: .midi('Port S', { midichannel: 3, ${level}: { name: 1 } }).`);
+    assert.equal(lines[2], CLOSING_PLAYING);
+  }
+  // The first bad level in written order is the one named.
+  assert.equal(read(withSettings('scene: x, tone: y'))[0].problems.settings.level, 'scene');
+  // The last key of a level wins, for a good value and for a bad one.
+  const [last] = read(withSettings('tone: { filterCutoff: 1 }, tone: { filterCutoff: 2 }'));
+  assert.equal(last.settings.tone.get('filterCutoff'), 2);
+  assert.equal(last.problems.settings, null);
+  assert.equal(read(withSettings('tone: x, tone: { filterCutoff: 2 }'))[0].problems.settings, null);
+  assert.equal(read(withSettings('tone: { filterCutoff: 2 }, tone: x'))[0].problems.settings.level, 'tone');
+  assert.equal(check(withSettings('tone: { filterCutoff: 1 }, tone: { filterCutoff: 2 }'), { rig: SYN_RIG }).settings.get('synth:3').tone.get('filterCutoff'), 2);
+});
+
+test('an unknown name lists the names of its level, the closest first; a name of another level says where it belongs', () => {
+  const typo = refuseSyn(withSettings('tone: { filterCutof: 5 }'));
+  assert.equal(typo[0], 'Unknown tone setting "filterCutof" for synth.');
+  assert.ok(typo[1].startsWith('Settings in tone for synth: filterCutoff, '), typo[1]);
+  assert.equal(typo.at(-1), CLOSING_PLAYING);
+  const part = refuseSyn(withSettings('part: { pa: 5 }'));
+  assert.equal(part[1], 'Settings in part for synth: pan, level.');
+  // The level is never deduced from the name: pan is a part setting, so it is refused in tone.
+  const other = refuseSyn(withSettings('tone: { pan: 40 }'));
+  assert.equal(other[0], 'Unknown tone setting "pan" for synth.');
+  assert.equal(other[1], '"pan" is a part setting of synth; write it in part.');
+  assert.equal(other[2], CLOSING_PLAYING);
+  // An instrument with no settings, and one level with none.
+  assert.equal(refuseSyn(withSettings('tone: { filterCutoff: 5 }', 'Port A'))[1], 'mt32 has no tone settings.');
+  const noScene = { ...SYN_RIG, instruments: [MT32, makeInstrument('synth', 'Port S', [{ channel: 3, role: 'melodic' }], { settings: { ...SETTINGS, scene: [] } })] };
+  assert.equal(linesOf(refusalOf(withSettings('scene: { reverbLevel: 5 }'), { rig: noScene }))[1], 'synth has no scene settings.');
+  // A written name is cut like any other written name.
+  assert.ok(length(refuseSyn(withSettings(`tone: { ${'x'.repeat(90)}: 1 }`))[0]) < 110);
+});
+
+test('a value that is not a whole number inside the range of its setting is refused with the range', () => {
+  for (const value of ['1.5', '-1', '1024', '100000']) {
+    const lines = refuseSyn(withSettings(`tone: { filterCutoff: ${value} }`));
+    assert.equal(lines[0], 'Setting "filterCutoff" in tone for synth must be a whole number from 0 to 1023.', value);
+    assert.equal(lines[1], CLOSING_PLAYING);
+  }
+  assert.equal(refuseSyn(withSettings('part: { pan: 128 }'))[0], 'Setting "pan" in part for synth must be a whole number from 0 to 127.');
+  assert.equal(refuseSyn(withSettings('scene: { chorusSwitch: 2 }'))[0], 'Setting "chorusSwitch" in scene for synth must be a whole number from 0 to 1.');
+  assert.equal(checkSyn(withSettings('tone: { filterCutoff: 0 }, part: { pan: 127 }, scene: { chorusSwitch: 1 }')).refusal, null);
+});
+
+test('an unknown tone name on an instrument that describes every row of a timbre with four partials lists the closest names and ends with "and N more", inside the budget', () => {
+  // The MT-32 describes about 250 tone settings; the list of names of a refusal must still fit the refusal budget.
+  const names = SETTING_VOCABULARY.tone.slice(0, 300);
+  const big = makeInstrument('big', 'Port B', range(1, 4).map((channel) => ({ channel, role: 'melodic' })), {
+    settings: { engines: [], tone: names.map((name) => ({ name, min: 0, max: 127 })), part: [], scene: [] },
+  });
+  const lines = linesOf(refusalOf(`note("c3").midi('Port B', { midichannel: 3, tone: { partial4Cutof: 5 } })`, { rig: { setup: 'valid', instruments: [big] } }));
+  assert.equal(lines[0], 'Unknown tone setting "partial4Cutof" for big.');
+  assert.ok(length(lines.join('\n')) <= BUDGET, `${length(lines.join('\n'))} code points`);
+  assert.match(lines[1], / and \d+ more\.$/, lines[1]);
+  assert.ok(lines[1].startsWith('Settings in tone for big: partial4Cutoff'), 'the closest name comes first');
+});
+
+test('two different values of one setting are refused naming both; equal values and other channels pass', () => {
+  const twice = (level, a, b, channelB = 3) => [
+    `lead: note("c3").midi('Port S', { midichannel: 3, ${level}: { ${level === 'scene' ? 'reverbLevel' : level === 'part' ? 'pan' : 'filterCutoff'}: ${a} } })`,
+    `pad: note("e3").midi('Port S', { midichannel: ${channelB}, ${level}: { ${level === 'scene' ? 'reverbLevel' : level === 'part' ? 'pan' : 'filterCutoff'}: ${b} } })`,
+  ].join('\n');
+  const tone = refuseSyn(twice('tone', 600, 700));
+  assert.equal(tone[0], 'synth channel 3 is given two different filterCutoff values in tone: 600 and 700.');
+  assert.equal(tone[1], 'Give each setting one value.');
+  assert.equal(tone[2], CLOSING_PLAYING);
+  assert.equal(checkSyn(twice('tone', 600, 600)).refusal, null);
+  assert.equal(checkSyn(twice('tone', 600, 700, 4)).refusal, null, 'another channel is another slot');
+  assert.equal(refuseSyn(twice('part', 10, 20))[0], 'synth channel 3 is given two different pan values in part: 10 and 20.');
+  // A scene setting is one per instrument: two channels of one instrument conflict.
+  const scene = refuseSyn(twice('scene', 80, 90, 4));
+  assert.equal(scene[0], 'synth is given two different reverbLevel values in scene: 80 and 90.');
+  assert.equal(scene[1], 'Give each setting one value.');
+  assert.equal(checkSyn(twice('scene', 80, 80, 4)).refusal, null);
+});
+
+test('the refusal lists every name of a level of 23 when it fits, and shortens the list with the closing wording when it does not', () => {
+  const lines = refuseSyn(withSettings('tone: { filterCutof: 5 }'));
+  const text = lines.join('\n');
+  assert.ok(length(text) <= BUDGET, `${length(text)} code points`);
+  for (const name of TONE_23) assert.ok(lines[1].includes(name), name);
+  // A long id and a second problem: the list is cut by the budget and ends with the usual "and N more".
+  const longId = 'a'.repeat(32);
+  const long = { setup: 'valid', instruments: [makeInstrument(longId, 'Port S', [{ channel: 3, role: 'melodic' }], { settings: SETTINGS })] };
+  const two = [withSettings(`tone: { ${'z'.repeat(50)}: 5 }`), withSettings('tone: { filterCutoff: 9999 }')].join('\n');
+  const cutLines = linesOf(refusalOf(two, { rig: long }));
+  assert.ok(length(cutLines.join('\n')) <= BUDGET);
+  assert.ok(/ and \d+ more\.$/.test(cutLines[1]), cutLines[1]);
+  assert.equal(cutLines.at(-1), CLOSING_PLAYING);
+  assert.ok(cutLines.some((line) => line.startsWith('Also: ')), cutLines.join('\n'));
+});
+
+test('the checked settings and scenes come back for a valid code and are empty on a refusal', () => {
+  const code = [
+    withSettings("tone: { filterCutoff: 600, osc1Wave: 3 }, part: { pan: 20 }, sound: 'Alpha 1'"),
+    `note("e3").midi('Port S', { midichannel: 4, scene: { reverbLevel: 70 } })`,
+  ].join('\n');
+  const result = checkSyn(code);
+  assert.equal(result.refusal, null);
+  assert.deepEqual([...result.settings.keys()], ['synth:3']);
+  const entry = result.settings.get('synth:3');
+  assert.deepEqual([entry.instrument, entry.port, entry.channel, entry.sound, entry.engine], ['synth', 'Port S', 3, 'Alpha 1', null]);
+  assert.deepEqual([...entry.tone], [['filterCutoff', 600], ['osc1Wave', 3]]);
+  assert.deepEqual([...entry.part], [['pan', 20]]);
+  assert.deepEqual([...result.scenes.keys()], ['synth']);
+  assert.deepEqual(result.scenes.get('synth').port, 'Port S');
+  assert.deepEqual([...result.scenes.get('synth').values], [['reverbLevel', 70]]);
+  // A call without settings records none, and an instrument with no settings key reads as having none.
+  assert.equal(checkSyn(withSettings("sound: 'Alpha 1'")).settings.size, 0);
+  const refused = checkSyn(`${code}\n${withSettings('tone: { nope: 1 }')}`);
+  assert.notEqual(refused.refusal, null);
+  assert.equal(refused.settings.size, 0);
+  assert.equal(refused.scenes.size, 0);
+  assert.equal(check(withSettings('tone: { filterCutoff: 5 }', 'Port A')).refusal.split('\n')[1], 'mt32 has no tone settings.');
+});
+
+test('parseRigMessage reads settings strictly and names the field of what it cannot read', (t) => {
+  const message = realMessage(t);
+  const withRows = (change) => {
+    const copy = structuredClone(message);
+    copy.instruments[0].settings = structuredClone({
+      engines: [{ id: 'model', name: 'Model Engine' }],
+      rolandModel: [0, 0, 0, 101],
+      nrpnFamily: null,
+      tone: [{ name: 'filterCutoff', min: 0, max: 1023, engines: ['model'], message: { kind: 'roland-dt1', address: [2, 16, 0, 79], size: 4 } }],
+      part: [{ name: 'pan', min: 0, max: 127, message: { kind: 'roland-dt1', address: [1, 0, 16, 6], size: 1 } }],
+      scene: [],
+    });
+    change(copy.instruments[0].settings);
+    return copy;
+  };
+  assert.equal(parseRigMessage(message).instruments[0].settings, null, 'a shipped model has none');
+  const ok = parseRigMessage(withRows(() => {}));
+  assert.deepEqual(ok.instruments[0].settings.tone, [{ name: 'filterCutoff', min: 0, max: 1023, engines: ['model'], message: { kind: 'roland-dt1', address: [2, 16, 0, 79], size: 4 } }]);
+  assert.deepEqual(ok.instruments[0].settings.engines, [{ id: 'model', name: 'Model Engine' }]);
+  const refuses = (change, field) => assert.throws(() => parseRigMessage(withRows(change)), new RegExp(field.replace(/[[\].]/g, '\\$&')), field);
+  refuses((settings) => void (settings.tone[0].name = 'Bad Name'), 'instruments[0].settings.tone[0].name');
+  refuses((settings) => void (settings.tone[0].name = '1abc'), 'instruments[0].settings.tone[0].name');
+  refuses((settings) => void ((settings.tone[0].min = 600), (settings.tone[0].max = 500)), 'instruments[0].settings.tone[0].max');
+  refuses((settings) => void (settings.tone[0].max = 65536), 'instruments[0].settings.tone[0].max');
+  refuses((settings) => void (settings.tone[0].min = 1.5), 'instruments[0].settings.tone[0].min');
+  refuses((settings) => void settings.tone.push({ name: 'filterCutoff', min: 0, max: 1, engines: ['model'], message: { kind: 'cc', cc: 74 } }), 'instruments[0].settings.tone[1].name');
+  // A level holds up to 512 rows (the MT-32 describes about 250 tone settings) and not 513.
+  assert.equal(RIG_LIMITS.settings, 512);
+  const rowsOf = (count) => Array.from({ length: count }, (_, index) => ({ name: `s${index}`, min: 0, max: 1, engines: ['model'], message: { kind: 'cc', cc: 74 } }));
+  assert.equal(parseRigMessage(withRows((settings) => void (settings.tone = rowsOf(300)))).instruments[0].settings.tone.length, 300);
+  assert.equal(parseRigMessage(withRows((settings) => void (settings.tone = rowsOf(512)))).instruments[0].settings.tone.length, 512);
+  refuses((settings) => void (settings.tone = rowsOf(513)), 'instruments[0].settings.tone');
+  refuses((settings) => void (settings.tone = Array.from({ length: RIG_LIMITS.settings + 1 }, (_, index) => ({ name: `s${index}`, min: 0, max: 1, engines: ['model'], message: { kind: 'cc', cc: 74 } }))), 'instruments[0].settings.tone');
+  refuses((settings) => void (settings.tone[0].engines = ['ghost']), 'instruments[0].settings.tone[0].engines[0]');
+  refuses((settings) => void (settings.part[0].engines = ['model']), 'instruments[0].settings.part[0].engines');
+  refuses((settings) => void settings.engines.push({ id: 'model', name: 'Again' }), 'instruments[0].settings.engines[1].id');
+  refuses((settings) => void settings.engines.push({ id: 'again', name: 'Model Engine' }), 'instruments[0].settings.engines[1].name');
+  refuses((settings) => void (settings.engines = Array.from({ length: RIG_LIMITS.engines + 1 }, (_, index) => ({ id: `e${index}`, name: 'E' }))), 'instruments[0].settings.engines');
+  refuses((settings) => void delete settings.scene, 'instruments[0].settings.scene');
+  const notObject = structuredClone(message);
+  notObject.instruments[0].settings = 'tone';
+  assert.throws(() => parseRigMessage(notObject), /instruments\[0\]\.settings/);
+  const undef = structuredClone(message);
+  delete undef.instruments[0].settings;
+  assert.throws(() => parseRigMessage(undef), /instruments\[0\]\.settings/);
+});
+
+test('parseRigMessage keeps one row per engine for a shared tone name, in the order written, and refuses a repeat the engines do not separate', (t) => {
+  const message = realMessage(t);
+  const row = (engines, address) => ({ name: 'filterCutoff', min: 0, max: 1023, engines, message: { kind: 'roland-dt1', address, size: 4 } });
+  const withRows = (tone, change = () => {}) => {
+    const copy = structuredClone(message);
+    copy.instruments[0].settings = {
+      engines: [{ id: 'model', name: 'Model Engine' }, { id: 'core', name: 'Core Engine' }, { id: 'vintage', name: 'Vintage Engine' }],
+      rolandModel: [0, 0, 0, 101],
+      nrpnFamily: null,
+      tone,
+      part: [],
+      scene: [],
+    };
+    change(copy.instruments[0].settings);
+    return copy;
+  };
+  const both = parseRigMessage(withRows([row(['model'], [2, 16, 0, 79]), row(['vintage'], [2, 80, 1, 66])]));
+  assert.deepEqual(both.instruments[0].settings.tone.map((entry) => [entry.name, entry.engines[0]]), [['filterCutoff', 'model'], ['filterCutoff', 'vintage']]);
+  assert.throws(() => parseRigMessage(withRows([row(['model'], [2, 16, 0, 79]), row(['model', 'core'], [2, 80, 1, 66])])), /settings\.tone\[1\]\.name.*same name as tone\[0\], and both reach engine "model"/);
+  const bare = row(['vintage'], [2, 80, 1, 66]);
+  delete bare.engines;
+  assert.throws(() => parseRigMessage(withRows([row(['model'], [2, 16, 0, 79]), bare])), /settings\.tone\[1\]\.name.*same name as tone\[0\]/);
+  assert.throws(() => parseRigMessage(withRows([bare, row(['model'], [2, 16, 0, 79])])), /settings\.tone\[1\]\.name.*same name as tone\[0\]/);
+  // A part name never repeats, whatever engines say.
+  const level = { name: 'level', min: 0, max: 127, message: { kind: 'roland-dt1', address: [1, 0, 16, 5], size: 1 } };
+  assert.throws(() => parseRigMessage(withRows([], (settings) => void (settings.part = [level, { ...level }]))), /settings\.part\[1\]\.name.*same name as part\[0\]/);
+});
+
+test('parseRigMessage reads the message of each setting and the Roland model ID strictly, naming the field it cannot read', (t) => {
+  const message = realMessage(t);
+  const withSettings = (change) => {
+    const copy = structuredClone(message);
+    copy.instruments[0].settings = {
+      engines: [],
+      rolandModel: [0, 0, 0, 101],
+      nrpnFamily: null,
+      tone: [{ name: 'filterCutoff', min: 0, max: 1023, message: { kind: 'roland-dt1', address: [2, 16, 0, 79], size: 4 } }],
+      part: [{ name: 'level', min: 0, max: 127, message: { kind: 'cc', cc: 7 } }],
+      scene: [{ name: 'reverbLevel', min: 0, max: 127, message: { kind: 'nrpn', msb: 1, lsb: 99 } }],
+    };
+    change(copy.instruments[0].settings);
+    return copy;
+  };
+  const ok = parseRigMessage(withSettings(() => {})).instruments[0].settings;
+  assert.deepEqual(ok.rolandModel, [0, 0, 0, 101]);
+  assert.deepEqual(ok.tone[0].message, { kind: 'roland-dt1', address: [2, 16, 0, 79], size: 4 });
+  assert.deepEqual(ok.part[0].message, { kind: 'cc', cc: 7 });
+  assert.deepEqual(ok.scene[0].message, { kind: 'nrpn', msb: 1, lsb: 99 });
+  const refuses = (change, field) => assert.throws(() => parseRigMessage(withSettings(change)), new RegExp(field.replace(/[[\].]/g, '\\$&')), field);
+  refuses((settings) => void delete settings.tone[0].message, 'instruments[0].settings.tone[0].message');
+  refuses((settings) => void (settings.tone[0].message = 'cc'), 'instruments[0].settings.tone[0].message');
+  refuses((settings) => void (settings.part[0].message.kind = 'raw'), 'instruments[0].settings.part[0].message.kind');
+  refuses((settings) => void (settings.tone[0].message.address = [2, 16, 0, 79, 0]), 'instruments[0].settings.tone[0].message.address');
+  refuses((settings) => void (settings.tone[0].message.address = []), 'instruments[0].settings.tone[0].message.address');
+  for (const short of [[2, 16], [2]]) {
+    assert.throws(() => parseRigMessage(withSettings((settings) => void (settings.tone[0].message.address = short))), /tone\[0\]\.message\.address must have 3 or 4 items/, short.join(' '));
+  }
+  // Three bytes are read; whether the instrument's data sets take them is the guard's to say when the bytes are built.
+  assert.deepEqual(parseRigMessage(withSettings((settings) => void (settings.tone[0].message.address = [2, 16, 0]))).instruments[0].settings.tone[0].message.address, [2, 16, 0]);
+  refuses((settings) => void (settings.tone[0].message.address = [2, 16, 0, 128]), 'instruments[0].settings.tone[0].message.address[3]');
+  refuses((settings) => void (settings.tone[0].message.address = [2, 1.5, 0, 1]), 'instruments[0].settings.tone[0].message.address[1]');
+  refuses((settings) => void (settings.tone[0].message.size = 3), 'instruments[0].settings.tone[0].message.size');
+  refuses((settings) => void (settings.part[0].message.cc = 128), 'instruments[0].settings.part[0].message.cc');
+  refuses((settings) => void delete settings.scene[0].message.lsb, 'instruments[0].settings.scene[0].message.lsb');
+  refuses((settings) => void (settings.scene[0].message.msb = -1), 'instruments[0].settings.scene[0].message.msb');
+  refuses((settings) => void delete settings.rolandModel, 'instruments[0].settings.rolandModel');
+  refuses((settings) => void (settings.rolandModel = [0, 0, 0, 0, 101]), 'instruments[0].settings.rolandModel');
+  refuses((settings) => void (settings.rolandModel = []), 'instruments[0].settings.rolandModel');
+  refuses((settings) => void (settings.rolandModel = [0, 0, 0, 128]), 'instruments[0].settings.rolandModel[3]');
+  // A data set row needs the model ID; a model with control changes only needs none.
+  assert.throws(() => parseRigMessage(withSettings((settings) => void (settings.rolandModel = null))), /instruments\[0\]\.settings\.rolandModel is required by a roland-dt1 setting/);
+  const noRoland = withSettings((settings) => {
+    settings.rolandModel = null;
+    settings.tone[0].message = { kind: 'cc', cc: 74 };
+  });
+  assert.equal(parseRigMessage(noRoland).instruments[0].settings.rolandModel, null);
+});
+
+test('parseRigMessage reads the NRPN family strictly: null or gs, and a missing key is unreadable', (t) => {
+  const message = realMessage(t);
+  const withFamily = (change) => {
+    const copy = structuredClone(message);
+    copy.instruments[0].settings = {
+      engines: [],
+      rolandModel: null,
+      nrpnFamily: null,
+      tone: [],
+      part: [{ name: 'cutoffOffset', min: 14, max: 114, message: { kind: 'nrpn', msb: 1, lsb: 32 } }],
+      scene: [],
+    };
+    change(copy.instruments[0].settings);
+    return copy;
+  };
+  assert.equal(parseRigMessage(withFamily(() => {})).instruments[0].settings.nrpnFamily, null);
+  assert.equal(parseRigMessage(withFamily((settings) => void (settings.nrpnFamily = 'gs'))).instruments[0].settings.nrpnFamily, 'gs');
+  for (const bad of [undefined, 'GS', 'xg', '', 1, false, ['gs']]) {
+    assert.throws(
+      () => parseRigMessage(withFamily((settings) => void (bad === undefined ? delete settings.nrpnFamily : (settings.nrpnFamily = bad)))),
+      /instruments\[0\]\.settings\.nrpnFamily must be null or 'gs'/,
+      String(bad),
+    );
+  }
+});
+
+// --- The engine of a part's tone: from the sound, refused when it cannot be known ---
+
+const ENGINE_SOUNDS = [
+  { name: 'Model Tone', program: 0, bank: { msb: 97, lsb: 64 }, engine: 'model' },
+  { name: 'Core Tone', program: 0, bank: { msb: 87, lsb: 64 }, engine: 'core' },
+  { name: 'Quiet Tone', program: 0, bank: { msb: 77, lsb: 64 }, engine: 'quiet' },
+  { name: 'Loose Tone', program: 0, bank: { msb: 71, lsb: 3 } },
+];
+const ENGINE_SETTINGS = {
+  engines: [
+    { id: 'model', name: 'Model Engine' },
+    { id: 'core', name: 'Core Engine' },
+    { id: 'quiet', name: 'Quiet Engine' },
+  ],
+  tone: [
+    { name: 'filterCutoff', min: 0, max: 1023, engines: ['model'] },
+    { name: 'osc1Wave', min: 0, max: 27, engines: ['core'] },
+    { name: 'env1Attack', min: 0, max: 127, engines: ['model', 'core'] },
+  ],
+  part: [{ name: 'pan', min: 0, max: 127 }],
+  scene: [{ name: 'reverbLevel', min: 0, max: 127 }],
+};
+const ENG = makeInstrument(
+  'engsynth',
+  'Port E',
+  [...range(1, 3).map((channel) => ({ channel, role: 'melodic' })), { channel: 10, role: 'rhythm' }],
+  { settings: ENGINE_SETTINGS, sounds: { melodic: ENGINE_SOUNDS, rhythm: [sound('Kit R', 0, { msb: 97, lsb: 65 })] } },
+);
+const ENG_RIG = { setup: 'valid', instruments: [ENG] };
+const withEngine = (options, channel = 1) => `note("c3").midi('Port E', { midichannel: ${channel}, ${options} })`;
+const refuseEng = (code) => linesOf(refusalOf(code, { rig: ENG_RIG }));
+
+test('engine: a tone setting of the engine of the sound passes and records the sound and its engine; part and scene need no sound', () => {
+  const result = check(withEngine("sound: 'Model Tone', tone: { filterCutoff: 600, env1Attack: 5 }"), { rig: ENG_RIG });
+  assert.equal(result.refusal, null);
+  const entry = result.settings.get('engsynth:1');
+  assert.deepEqual([entry.sound, entry.engine], ['Model Tone', 'model']);
+  assert.equal(check(withEngine("sound: 'Core Tone', tone: { osc1Wave: 3, env1Attack: 5 }"), { rig: ENG_RIG }).refusal, null, 'a row of two engines reaches both');
+  // No engine rule outside the tone level, and the name of the sound is read as the sound option reads it.
+  assert.equal(check(withEngine('part: { pan: 40 }, scene: { reverbLevel: 9 }'), { rig: ENG_RIG }).refusal, null);
+  assert.equal(check(withEngine("sound: 'loose tone', part: { pan: 40 }"), { rig: ENG_RIG }).refusal, null);
+  assert.equal(check(withEngine("sound: 'MODEL tone', tone: { filterCutoff: 1 }"), { rig: ENG_RIG }).settings.get('engsynth:1').engine, 'model');
+});
+
+test('engine: tone settings with no sound in the call are refused once, whatever the number of names', () => {
+  const lines = refuseEng(withEngine('tone: { filterCutoff: 1, osc1Wave: 2, env1Attack: 3 }'));
+  assert.deepEqual(lines, ['Tone settings for engsynth need a sound named in the same .midi() call, so the engine of the tone is known.', CLOSING_PLAYING]);
+  // A name that does not exist is refused for the missing sound first: the engine rule comes before the names.
+  assert.equal(refuseEng(withEngine('tone: { nope: 1 }'))[0], lines[0]);
+});
+
+test('engine: a sound the catalog does not place, and a drum kit, refuse the tone settings with the reason', () => {
+  const loose = refuseEng(withEngine("sound: 'Loose Tone', tone: { filterCutoff: 1, osc1Wave: 2 }"));
+  assert.deepEqual(loose, ['The engine of "Loose Tone" on engsynth is not known, so its tone settings are refused.', 'The sound catalog does not place this sound in an engine.', CLOSING_PLAYING]);
+  const kit = refuseEng(withEngine("sound: 'Kit R', tone: { filterCutoff: 1 }", 10));
+  assert.deepEqual(kit, ['The engine of "Kit R" on engsynth is not known, so its tone settings are refused.', 'The sound catalog does not place this sound in an engine.', CLOSING_PLAYING]);
+  // The same sounds are fine for part settings.
+  assert.equal(check(withEngine("sound: 'Kit R', part: { pan: 1 }", 10), { rig: ENG_RIG }).refusal, null);
+});
+
+test('engine: an unknown tone name lists only the names of the engine of the sound, or says it has none', () => {
+  const model = refuseEng(withEngine("sound: 'Model Tone', tone: { filterCutof: 5 }"));
+  assert.equal(model[0], 'Unknown tone setting "filterCutof" for engsynth.');
+  assert.equal(model[1], 'Settings in tone for engsynth on Model Engine tones: filterCutoff, env1Attack.');
+  const core = refuseEng(withEngine("sound: 'Core Tone', tone: { nope: 5 }"));
+  assert.equal(core[1], 'Settings in tone for engsynth on Core Engine tones: osc1Wave, env1Attack.');
+  const quiet = refuseEng(withEngine("sound: 'Quiet Tone', tone: { nope: 5 }"));
+  assert.equal(quiet[1], 'engsynth has no tone settings for Quiet Engine tones.');
+  // A name that belongs to another level still says where it belongs.
+  assert.equal(refuseEng(withEngine("sound: 'Model Tone', tone: { pan: 5 }"))[1], '"pan" is a part setting of engsynth; write it in part.');
+});
+
+test('engine: a setting of another engine is refused naming both engines and what the sound has; a row of two engines shows both joined', () => {
+  const lines = refuseEng(withEngine("sound: 'Core Tone', tone: { filterCutoff: 5 }"));
+  assert.equal(lines[0], '"filterCutoff" is a setting of Model Engine tones on engsynth, and "Core Tone" is a Core Engine tone.');
+  assert.equal(lines[1], 'Settings in tone for engsynth on Core Engine tones: osc1Wave, env1Attack.');
+  assert.equal(lines[2], CLOSING_PLAYING);
+  const none = refuseEng(withEngine("sound: 'Quiet Tone', tone: { osc1Wave: 5 }"));
+  assert.equal(none[0], '"osc1Wave" is a setting of Core Engine tones on engsynth, and "Quiet Tone" is a Quiet Engine tone.');
+  assert.equal(none[1], 'engsynth has no tone settings for Quiet Engine tones.');
+  // The mismatch comes before the range check; a value out of range on the right engine is the range refusal.
+  assert.equal(refuseEng(withEngine("sound: 'Core Tone', tone: { filterCutoff: 99999 }"))[0].startsWith('"filterCutoff" is a setting of'), true);
+  assert.equal(refuseEng(withEngine("sound: 'Model Tone', tone: { filterCutoff: 99999 }"))[0], 'Setting "filterCutoff" in tone for engsynth must be a whole number from 0 to 1023.');
+  // A row of two engines, written for a third engine, names both of its engines.
+  const wide = { ...ENGINE_SETTINGS, tone: [...ENGINE_SETTINGS.tone] };
+  const rig = { setup: 'valid', instruments: [{ ...ENG, settings: wide }] };
+  const both = linesOf(refusalOf(withEngine("sound: 'Quiet Tone', tone: { env1Attack: 5 }"), { rig }));
+  assert.equal(both[0], '"env1Attack" is a setting of Model Engine or Core Engine tones on engsynth, and "Quiet Tone" is a Quiet Engine tone.');
+});
+
+test('engine: an instrument whose settings declare no engines has no engine rule', () => {
+  const plain = makeInstrument('plainsynth', 'Port P', [{ channel: 1, role: 'melodic' }], { settings: { engines: [], tone: [{ name: 'filterCutoff', min: 0, max: 127 }], part: [], scene: [] } });
+  const rig = { setup: 'valid', instruments: [plain] };
+  const result = check("note('c3').midi('Port P', { midichannel: 1, tone: { filterCutoff: 5 } })", { rig });
+  assert.equal(result.refusal, null);
+  assert.deepEqual([result.settings.get('plainsynth:1').sound, result.settings.get('plainsynth:1').engine], [null, null]);
+});
+
+test('engine: the message keeps the engine of a melodic sound, and fails for a rhythm sound or an engine the settings do not declare', (t) => {
+  const message = realMessage(t);
+  const withSettings = (change) => {
+    const copy = structuredClone(message);
+    copy.instruments[0].settings = { engines: [{ id: 'model', name: 'Model Engine' }], rolandModel: null, nrpnFamily: null, tone: [], part: [{ name: 'pan', min: 0, max: 127, message: { kind: 'cc', cc: 10 } }], scene: [] };
+    change(copy.instruments[0]);
+    return copy;
+  };
+  const ok = parseRigMessage(withSettings((instrument) => void (instrument.sounds.melodic[0].engine = 'model')));
+  assert.equal(ok.instruments[0].sounds.melodic[0].engine, 'model');
+  assert.equal('engine' in ok.instruments[0].sounds.melodic[1], false);
+  const refuses = (change, field) => assert.throws(() => parseRigMessage(withSettings(change)), new RegExp(field.replace(/[[\].]/g, '\\$&')), field);
+  refuses((instrument) => void (instrument.sounds.melodic[0].engine = 'ghost'), 'instruments[0].sounds.melodic[0].engine');
+  refuses((instrument) => void (instrument.sounds.melodic[0].engine = 5), 'instruments[0].sounds.melodic[0].engine');
+  refuses((instrument) => void instrument.sounds.rhythm.push({ name: 'Kit Q', program: 0, engine: 'model' }), 'instruments[0].sounds.rhythm[0].engine');
+  // An instrument with no settings description holds no engine either.
+  const bare = structuredClone(message);
+  bare.instruments[0].sounds.melodic[0].engine = 'model';
+  assert.throws(() => parseRigMessage(bare), /instruments\[0\]\.sounds\.melodic\[0\]\.engine/);
+});
+
+test('engine: the wording of the engine refusals holds no taste word', () => {
+  for (const key of ['engineNoSound', 'engineUnknown', 'engineUnknownWhy', 'engineMismatch', 'engineConflict', 'settingsForEngine', 'noEngineSettings']) {
+    assert.equal(typeof RIG_COPY[key], 'string', key);
+    assert.deepEqual(findWords(RIG_COPY[key], [...TINT_WORDS]), [], key);
+  }
 });

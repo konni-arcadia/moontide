@@ -444,6 +444,17 @@ test('guidance: no Claude-facing text carries a tint word, a steering word, or a
       },
     }),
   });
+  texts.push({
+    where: 'requestLine (motif)',
+    text: askModule.requestLine({
+      id: 'guidance-3',
+      text: 'Add this motif to the music.',
+      context: { kind: 'motif' },
+      chip: 'Motif · drawn · 1 cycle · 2 notes',
+      current: null,
+      motif: { source: 'drawn', cycles: 1, grid: 'quarter', notes: 2, phrase: 'note("c4 ~ e4 _").velocity("0.8 ~ 1 _")' },
+    }),
+  });
   texts.push({ where: 'REQUEST_LINE_FRAMING', text: askModule.REQUEST_LINE_FRAMING });
   texts.push({ where: 'REQUEST_LINE_MOMENT_FACT', text: askModule.REQUEST_LINE_MOMENT_FACT });
   // What the page shows for a linked change and a closed request, and the texts of the tool that closes one.
@@ -540,6 +551,19 @@ test('guidance: no Claude-facing text carries a tint word, a steering word, or a
     assert.ok(!text.toLowerCase().includes('jrpg'), `${where} mentions "jrpg": "${text}"`);
     assert.ok(!/examples[/\\]/i.test(text), `${where} mentions the examples directory: "${text}"`);
   }
+});
+
+// Claude writes the one-note-at-a-time fact into a model it drafts, so the tool says the field exists.
+test('guidance: save_midi_model lists the optional monophonic field, within the characters Claude Code keeps', async (t) => {
+  const { client } = await startMcpClient();
+  t.after(async () => {
+    await client.close();
+  });
+  const { tools } = await client.listTools();
+  const save = tools.find((tool) => tool.name === 'save_midi_model');
+  assert.ok(save !== undefined, 'save_midi_model is listed');
+  assert.ok(save.description.includes('monophonic (optional: true when the instrument plays one note at a time)'), save.description);
+  assert.ok(save.description.length <= mcpModule.CLIENT_INSTRUCTIONS_LIMIT, `${save.description.length} characters`);
 });
 
 // The rule for choosing between the two tools is a fact where Claude chooses.
@@ -651,6 +675,16 @@ test('guidance: edit_code and set_code say when to use which, within the 2048 ch
   assert.equal(byName.restore_version.inputSchema.properties.answering.description, answeringDescription);
   assert.ok(answeringDescription.length <= 200, `the answering description is ${answeringDescription.length} characters`);
   assert.ok(answeringDescription.includes('request line'));
+  // The settings rules live in the settings topic and in the get_midi_instruments reply, because the instructions
+  // keep no room for another sentence; the tool descriptions say where they are.
+  assert.ok(byName.get_midi_instruments.description.includes('settings topic of get_strudel_reference'));
+  assert.ok(byName.get_midi_instruments.description.includes('the engine of each sound'));
+  assert.ok(byName.search_midi_sounds.description.includes('the engine of the sound'));
+  for (const name of ['get_midi_instruments', 'search_midi_sounds']) {
+    assert.deepEqual(findWords(byName[name].description, TINT_WORDS), [], name);
+    assert.deepEqual(findWords(byName[name].description, STEERING_WORDS), [], name);
+  }
+  assert.ok(!(client.getInstructions() ?? '').includes('settings topic'), 'the instructions hold no settings pointer');
   assert.equal(mcpModule.EDIT_CODE_DESCRIPTION.length, 1673, 'the edit_code description is not edited');
   // The ramp length is asked for with one shared description of facts: the bounds are its only digits.
   const glideDescription = byName.set_code.inputSchema.properties.glideBars.description;
@@ -763,6 +797,8 @@ test('guidance: exactly fifteen tools are listed, and resources cover only the r
     'moontide://reference/transitions',
     'moontide://reference/structure',
     'moontide://reference/midi',
+    'moontide://reference/settings',
+    'moontide://reference/motif',
   ].sort();
   assert.deepEqual(uris, expected);
 });

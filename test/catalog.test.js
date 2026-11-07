@@ -8,6 +8,7 @@ import * as catalog from '../dist/catalog.js';
 import { Session } from '../dist/session.js';
 import { STEERING_WORDS, TINT_WORDS, findWords } from './tint-rules.js';
 import { bankDrumsModel } from './drum-fixtures.js';
+import { toneSynthCatalog, toneSynthModel } from './settings-fixtures.js';
 
 // Every problem of a catalog file is a field and a reason, and the search ranks, caps and
 // refuses as stated. Every test works on a temp data folder: never the user's real one. Names are
@@ -225,7 +226,7 @@ test('a category keeps only its sounds, case and spaces ignored, with or without
 });
 
 const many = (count) => catalogFrom(Array.from({ length: count }, (_, index) => [`Tone ${String(index).padStart(3, '0')}`, 'Group A']));
-const replyOf = (value, search) => searchReply({ id: 'sc55', modelName: 'Test Model', catalog: value, result: searchCatalog(value, search) });
+const replyOf = (value, search) => searchReply({ id: 'sc55', modelName: 'Test Model', model: {}, catalog: value, result: searchCatalog(value, search) });
 
 test('30 matches answer 25 match lines then "5 more, refine your search."', () => {
   const lines = replyOf(many(30), { query: 'tone' }).split('\n');
@@ -369,6 +370,76 @@ test('the instruments tool reply carries no taste: its fixed sentences are facts
     assert.deepEqual(findWords(text, TINT_WORDS), [], text);
     assert.deepEqual(findWords(text, STEERING_WORDS), [], text);
   }
+});
+
+// --- The engine of a sound ---
+
+function toneSynthState(t, extraFiles = {}) {
+  const dir = makeDir(t, {
+    'instruments.json': { instruments: [{ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }] },
+    'models/tonesynth.json': toneSynthModel(),
+    'catalogs/tonesynth.json': toneSynthCatalog(),
+    ...extraFiles,
+  });
+  const store = new RigStore({ dataDir: dir });
+  const state = store.read();
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  return { state, options: { connection: () => 'unknown', shipped: store.shippedModelList(), dataDirText: 'the data folder' } };
+}
+
+test('a search match gives the engine of the sound, or says it is in no engine', (t) => {
+  const { state, options } = toneSynthState(t);
+  const text = describeSearch(state, search('tonesynth', 'tone'), options);
+  assert.ok(text.includes('- "Model Tone": program 0, bank 97/64, engine "Model Engine"'), text);
+  assert.ok(text.includes('- "Core Tone": program 0, bank 87/64, engine "Core Engine"'), text);
+  assert.ok(text.includes('- "Loose Tone": program 0, bank 71/3, in no engine'), text);
+  assert.deepEqual(findWords(text, TINT_WORDS), [], text);
+  assert.deepEqual(findWords(text, STEERING_WORDS), [], text);
+});
+
+test('a match puts the engine after the category', (t) => {
+  const withCategory = toneSynthCatalog();
+  withCategory.sounds[0].category = 'Group A';
+  const { state, options } = toneSynthState(t, { 'catalogs/tonesynth.json': withCategory });
+  assert.ok(describeSearch(state, search('tonesynth', 'model'), options).includes('- "Model Tone": program 0, bank 97/64, category "Group A", engine "Model Engine"'));
+});
+
+test('the sound lines of an instrument give the engine inside the parentheses, and a drum kit never carries one', (t) => {
+  const { state, options } = toneSynthState(t);
+  const lines = describeInstrument(state, 'tonesynth', options).split('\n');
+  assert.ok(lines.includes('0 Own Tone (bank 97/64, engine "Model Engine")'), lines.join('\n'));
+  assert.ok(lines.includes('0 Own Kit (bank 97/65)'), lines.join('\n'));
+});
+
+test('a sound with no bank gets its engine in parentheses alone, and a bank in no engine says so', (t) => {
+  const model = toneSynthModel();
+  model.sounds.melodic = [{ name: 'Bare Tone', program: 3 }, { name: 'Loose Own', program: 4, bank: { msb: 71, lsb: 3 } }];
+  const catalogValue = toneSynthCatalog();
+  catalogValue.engines[0].banks.push({ msb: 0, lsb: 0 });
+  const { state, options } = toneSynthState(t, { 'models/tonesynth.json': model, 'catalogs/tonesynth.json': catalogValue });
+  const lines = describeInstrument(state, 'tonesynth', options).split('\n');
+  assert.ok(lines.includes('3 Bare Tone (engine "Model Engine")'), lines.join('\n'));
+  assert.ok(lines.includes('4 Loose Own (bank 71/3, in no engine)'), lines.join('\n'));
+});
+
+test('a model that declares engines says its sounds are in no engine when the catalog has no engine table or there is no catalog', (t) => {
+  const plain = toneSynthCatalog();
+  delete plain.engines;
+  const noTable = toneSynthState(t, { 'catalogs/tonesynth.json': plain });
+  const text = describeSearch(noTable.state, search('tonesynth', 'tone'), noTable.options);
+  assert.ok(text.includes('- "Model Tone": program 0, bank 97/64, in no engine'), text);
+  assert.ok(!text.includes('engine "'), text);
+  assert.ok(describeInstrument(noTable.state, 'tonesynth', noTable.options).includes('0 Own Tone (bank 97/64, in no engine)'));
+  const model = toneSynthModel();
+  assert.equal(catalog.engineClause(undefined, model, { msb: 97, lsb: 64 }), 'in no engine', 'no catalog');
+  assert.equal(catalog.engineClause(null, model, undefined), 'in no engine', 'no catalog, no bank');
+  assert.equal(catalog.engineClause(plain, model, { msb: 97, lsb: 64 }), 'in no engine', 'no engine table');
+});
+
+test('nothing changes for a model that declares no engines', (t) => {
+  const { state, options } = stateWith(t, GROUPED);
+  assert.ok(!describeSearch(state, search('sc55', 'alpha'), options).includes('engine'));
+  assert.ok(!describeInstrument(state, 'sc55', options).includes('engine'));
 });
 
 // The write shared by the import command and the save tool.
@@ -951,4 +1022,185 @@ test('summarizeCatalog: kits are counted in the header and the banks, shown on a
   assert.equal(only[0], 'Catalog for model "bankdrums" (Bank Drum Synth), from "List": 2 drum kits.');
   assert.ok(!only.some((line) => /^(First|Middle|Last): /.test(line)), only.join('\n'));
   assert.ok(only.some((line) => line.startsWith('Kits: 2, from "Pdf Kit One"')));
+});
+
+// --- The engine table of a catalog: which engine of the model each bank of tones belongs to ---
+
+/** The tone synth model (two engines, bank MSB and LSB) as a RigStore resolves it, after `change` on its description. */
+function toneModelOf(t, change = () => {}) {
+  const model = toneSynthModel();
+  change(model);
+  const dir = makeDir(t, { 'instruments.json': { instruments: [{ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }] }, 'models/tonesynth.json': model });
+  const state = new RigStore({ dataDir: dir }).read();
+  assert.equal(state.setup, 'valid', JSON.stringify(state));
+  return state.instruments[0].model;
+}
+
+const withTable = (engines) => ({ ...toneSynthCatalog(), engines });
+const problemsOfTable = (model, engines) => {
+  const result = parseCatalog({ ...withTable(engines), model: model.id }, model);
+  assert.equal(result.ok, false, 'expected the table to be refused');
+  return result.problems;
+};
+
+test('an engine table is valid on a model that declares the engines, and a catalog without one stays valid on any model', (t) => {
+  const model = toneModelOf(t);
+  assert.deepEqual(parseCatalog(toneSynthCatalog(), model), { ok: true, catalog: toneSynthCatalog() });
+  const { engines, ...bare } = toneSynthCatalog();
+  assert.ok(engines.length > 0);
+  assert.deepEqual(parseCatalog(bare, model), { ok: true, catalog: bare });
+  assert.equal(parseCatalog(file(userModel, [sound('Alpha 2')]), modelOf(t, 'synth')).ok, true);
+});
+
+test('an engine table on a model that declares no engines, or has no bank select, is refused at engines with the reason', (t) => {
+  const none = modelOf(t, 'synth');
+  assertProblem(problemsOfTable(none, [{ engine: 'model', banks: [{ msb: 1 }] }]), 'engines', 'the model declares no engines');
+  const noBank = toneModelOf(t, (model) => {
+    model.bankSelect = 'none';
+    delete model.rhythmBank;
+    model.sounds = { melodic: [{ name: 'Own Tone', program: 0 }], rhythm: [{ name: 'Own Kit', program: 0 }] };
+  });
+  const result = parseCatalog({ model: 'tonesynth', source: 'x', engines: [{ engine: 'model', banks: [{ msb: 1 }] }], sounds: [{ name: 'T', program: 0 }] }, noBank);
+  assert.equal(result.ok, false);
+  assertProblem(result.problems, 'engines', 'this model has no bank select');
+});
+
+test('an engine the model does not declare, an engine twice, a bank twice and an LSB on an MSB-only model are refused at their field', (t) => {
+  const model = toneModelOf(t);
+  assertProblem(problemsOfTable(model, [{ engine: 'ghost', banks: [{ msb: 1, lsb: 1 }] }]), 'engines[0].engine', 'unknown engine "ghost", engines of model tonesynth: model, core');
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 1, lsb: 1 }] }, { engine: 'model', banks: [{ msb: 2, lsb: 2 }] }]),
+    'engines[1].engine',
+    'same engine as engines[0]',
+  );
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 97, lsb: 64 }] }, { engine: 'core', banks: [{ msb: 5, lsb: 5 }, { msb: 97, lsb: 64 }] }]),
+    'engines[1].banks[1]',
+    'bank 97/64 is also in engines[0]',
+  );
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 9, lsb: 9 }, { msb: 9, lsb: 9 }] }]),
+    'engines[0].banks[1]',
+    'bank 9/9 is also in engines[0]',
+  );
+  // A missing LSB is an LSB of 0, as the instrument gets it: the same bank written two ways is one bank.
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 9 }] }, { engine: 'core', banks: [{ msb: 9 }] }]),
+    'engines[1].banks[0]',
+    'bank 9 is also in engines[0]',
+  );
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 9 }] }, { engine: 'core', banks: [{ msb: 9, lsb: 0 }] }]),
+    'engines[1].banks[0]',
+    'bank 9/0 is also in engines[0]',
+  );
+  assertProblem(
+    problemsOfTable(model, [{ engine: 'model', banks: [{ msb: 9, lsb: 0 }] }, { engine: 'core', banks: [{ msb: 9 }] }]),
+    'engines[1].banks[0]',
+    'bank 9 is also in engines[0]',
+  );
+  const different = parseCatalog(withTable([{ engine: 'model', banks: [{ msb: 9 }] }, { engine: 'core', banks: [{ msb: 9, lsb: 1 }] }]), model);
+  assert.equal(different.ok, true);
+  const msbOnly = toneModelOf(t, (m) => {
+    m.bankSelect = 'msb';
+    m.sounds = { melodic: [{ name: 'Own Tone', program: 0, bank: { msb: 97 } }], rhythm: [{ name: 'Own Kit', program: 0, bank: { msb: 97 } }] };
+  });
+  const problems = parseCatalog({ model: 'tonesynth', source: 'x', engines: [{ engine: 'model', banks: [{ msb: 1, lsb: 2 }] }], sounds: [{ name: 'T', program: 0, bank: { msb: 1 } }] }, msbOnly);
+  assert.equal(problems.ok, false);
+  assertProblem(problems.problems, 'engines[0].banks[0].lsb', 'this model takes a bank MSB only');
+});
+
+test('the shape of an engine table is strict: no banks, too many banks, an extra key and too many engines are refused', (t) => {
+  const model = toneModelOf(t);
+  const fields = (engines) => problemsOfTable(model, engines).map((problem) => problem.field);
+  assert.ok(fields([{ engine: 'model', banks: [] }]).includes('engines[0].banks'));
+  assert.ok(fields([{ engine: 'model', banks: Array.from({ length: 129 }, (_, index) => ({ msb: index % 128, lsb: Math.floor(index / 128) })) }]).includes('engines[0].banks'));
+  assert.ok(fields([{ engine: 'model', banks: [{ msb: 1, extra: 1 }] }]).some((field) => field.startsWith('engines[0].banks[0]')));
+  assert.ok(fields(Array.from({ length: 17 }, (_, index) => ({ engine: `e${index}`, banks: [{ msb: index, lsb: 0 }] }))).includes('engines'));
+});
+
+test('a wrong engine table makes the rig invalid with the catalog file, the field and the reason; a right one is read', (t) => {
+  const dir = makeDir(t, {
+    'instruments.json': { instruments: [{ id: 'tonesynth', model: 'tonesynth', port: 'Port T' }] },
+    'models/tonesynth.json': toneSynthModel(),
+    'catalogs/tonesynth.json': withTable([{ engine: 'ghost', banks: [{ msb: 1, lsb: 1 }] }]),
+  });
+  const state = new RigStore({ dataDir: dir }).read();
+  assert.equal(state.setup, 'invalid');
+  assertProblem(state.problems, 'catalogs/tonesynth.json:engines[0].engine', 'unknown engine "ghost", engines of model tonesynth: model, core');
+  fs.writeFileSync(path.join(dir, 'catalogs', 'tonesynth.json'), JSON.stringify(toneSynthCatalog()));
+  const good = new RigStore({ dataDir: dir }).read();
+  assert.equal(good.setup, 'valid', JSON.stringify(good));
+  assert.deepEqual(good.instruments[0].catalog.engines, toneSynthCatalog().engines);
+});
+
+test('engineOf finds the engine whose banks hold exactly the MSB and LSB, and says null otherwise', () => {
+  const value = toneSynthCatalog();
+  const { engineOf } = catalog;
+  assert.equal(engineOf(value, { msb: 97, lsb: 64 }), 'model');
+  assert.equal(engineOf(value, { msb: 87, lsb: 64 }), 'core');
+  assert.equal(engineOf(value, { msb: 71, lsb: 3 }), null, 'a bank in no engine');
+  assert.equal(engineOf(value, { msb: 97 }), null, 'an absent LSB is 0, and the engine bank has an LSB of 64');
+  assert.equal(engineOf(value, { msb: 87, lsb: 0 }), null);
+  assert.equal(engineOf(value, undefined), null, 'a sound with no bank is bank 0/0, which no engine of this table holds');
+  assert.equal(engineOf(null, { msb: 97, lsb: 64 }), null, 'no catalog');
+  assert.equal(engineOf({ ...value, engines: undefined }, { msb: 97, lsb: 64 }), null, 'no table');
+  assert.equal(engineOf({ ...value, engines: [{ engine: 'model', banks: [{ msb: 5 }] }] }, { msb: 5 }), 'model');
+});
+
+test('engineOf reads an absent bank as 0/0 and an absent LSB as 0, the way the sender does', () => {
+  const { engineOf } = catalog;
+  const table = (...banks) => ({ ...toneSynthCatalog(), engines: [{ engine: 'model', banks }] });
+  assert.equal(engineOf(table({ msb: 97, lsb: 0 }), { msb: 97 }), 'model', 'a sound without an LSB, an engine bank with LSB 0');
+  assert.equal(engineOf(table({ msb: 97 }), { msb: 97, lsb: 0 }), 'model', 'a sound with LSB 0, an engine bank without an LSB');
+  assert.equal(engineOf(table({ msb: 97 }), { msb: 97 }), 'model');
+  assert.equal(engineOf(table({ msb: 97 }), { msb: 97, lsb: 1 }), null, 'another LSB is another bank');
+  assert.equal(engineOf(table({ msb: 0 }), undefined), 'model', 'a sound with no bank is bank 0');
+  assert.equal(engineOf(table({ msb: 0, lsb: 0 }), undefined), 'model');
+  assert.equal(engineOf(table({ msb: 0, lsb: 0 }), { msb: 0 }), 'model');
+  assert.equal(engineOf(table({ msb: 1 }), undefined), null, 'a sound with no bank, no engine holds bank 0');
+});
+
+test('the file text holds the engine table right after the source, one engine per line, and reads back the same; a catalog without a table keeps its old text', (t) => {
+  const value = toneSynthCatalog();
+  const text = catalog.catalogFileText(value);
+  const lines = text.split('\n');
+  assert.equal(lines[0], '{');
+  assert.equal(lines[1], '  "model": "tonesynth",');
+  assert.equal(lines[2], '  "source": "Test sound list",');
+  assert.equal(lines[3], '  "engines": [');
+  assert.equal(lines[4], '  {"engine":"model","banks":[{"msb":97,"lsb":64}]},');
+  assert.equal(lines[5], '  {"engine":"core","banks":[{"msb":87,"lsb":64}]}');
+  assert.equal(lines[6], '  ],');
+  assert.equal(lines[7], '  "sounds": [');
+  assert.deepEqual(parseCatalog(JSON.parse(text), toneModelOf(t)), { ok: true, catalog: value });
+  const { engines, ...bare } = value;
+  assert.ok(engines.length > 0);
+  assert.equal(
+    catalog.catalogFileText(bare),
+    `{\n  "model": "tonesynth",\n  "source": "Test sound list",\n  "sounds": [\n${bare.sounds.map((item) => `  ${JSON.stringify(item)}`).join(',\n')}\n  ]\n}\n`,
+  );
+  // A table that is present but empty writes nothing.
+  assert.equal(catalog.catalogFileText({ ...bare, engines: [] }), catalog.catalogFileText(bare));
+  // The table survives a write of the file.
+  const dir = makeDir(t);
+  catalog.saveCatalog({ dataDir: dir, catalog: value, replace: false });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'catalogs', 'tonesynth.json'), 'utf8')).engines, value.engines);
+});
+
+test('the catalog summary counts the banks and the sounds of each engine, and the sounds in no engine', (t) => {
+  const model = toneModelOf(t);
+  const line = (value) =>
+    summarizeCatalog({ catalog: value, model, numbering: 'from-0', replaces: false })
+      .split('\n')
+      .filter((text) => text.startsWith('Engines: '));
+  assert.deepEqual(line(toneSynthCatalog()), ['Engines: model (1 bank, 1 sound), core (1 bank, 1 sound); in no engine: 1 sound.']);
+  const { engines, ...bare } = toneSynthCatalog();
+  assert.ok(engines.length > 0);
+  assert.deepEqual(line(bare), [], 'a catalog without a table has no such line');
+  const bigger = {
+    ...toneSynthCatalog(),
+    engines: [{ engine: 'model', banks: [{ msb: 97, lsb: 64 }, { msb: 71, lsb: 3 }] }, { engine: 'core', banks: [{ msb: 87, lsb: 64 }] }],
+  };
+  assert.deepEqual(line(bigger), ['Engines: model (2 banks, 2 sounds), core (1 bank, 1 sound); in no engine: 0 sounds.']);
 });

@@ -25,11 +25,27 @@
 // with its ring on its row and the drums named in the sentence. It runs once before the final verdict of a full run, or alone with
 // `--only timeline`.
 //
+// Settings in the code: the checks of settingsMidiBlocks() prove that the tone, part and scene options of .midi() are read, checked and
+// sent in the real page. Valid settings are sent as exact Roland data sets (the probe builds the expected bytes itself, from the rules
+// of the settings map and the server's checksum, never from the page) in the documented order after each program change, and the reply
+// says a scene setting reaches every part. A setting taken out of the code sends nothing and the reply says the value stays. An unknown
+// name, a value out of range, a setting of another engine, a tone with no sound named, a tone whose engine is not known and a scene
+// setting written under part each fail the evaluation with their first line, while the previous code keeps playing and no setup byte,
+// bank select or system exclusive message goes out; so does a model whose setting points into the instrument's memory. The code's own
+// system exclusive message into memory never reaches the port. A change that waits for its bar line stamps its data sets with one
+// timestamp before the line, a replug sends the settings again after each program change, and the Instruments card shows the Synth
+// settings row. The Settings lines of a real get_midi_instruments reply hold exactly the names and ranges of the model; every listed
+// name is written at its lowest and at its highest value and sent as its data set, and one past the highest is refused with the
+// range. Two values of one setting for one channel, and a level that is not a plain object of number literals, each fail the
+// evaluation while the music keeps playing. A new sound on a channel sends its program change before its part settings and the
+// reply does not say a tone setting stays. The instruments and the sound list come from neutral fixtures written into the probe's own data folder. They run once
+// before the final verdict of a full run, or alone with `--only settings`.
+//
 // Tempo steps: the check of rampMidiBlocks() proves that the page's MIDI clock follows about 20 small tempo steps (100 to 120 BPM
 // while the code holds 120) with no hole, no doubled tick and 96 ticks in every cycle. The steps come from a driver this script
 // injects into its own browser tab (RAMP_DRIVER_SOURCE): a measurement tool, never page code, so nothing about it reaches the
 // user or Claude. It runs once before the final verdict of a full run, or alone with `--only ramp`. These four are the only
-// groups this script can run alone, besides `--only ramp-measure` (the same ramp measured with both drivers at three step spacings,
+// groups this script can run alone, besides `--only settings` (below), besides `--only ramp-measure` (the same ramp measured with both drivers at three step spacings,
 // idle and busy) and `--only ramp-measure-late` (the hook on the query path with each step applied a little after its tick):
 // rampMeasureBlocks() prints one `probe:midi RAMP {...}` line per run, lasts minutes and is never part of a full run.
 //
@@ -59,7 +75,9 @@ import { MIDI_COPY, MIDI_TITLE_PREFIX, fill, listNames, panicMessages } from '..
 import { MIXER_COPY } from '../page/mixer-model.js';
 import { QUEUED_NOTE_OFF_AFTER_MS, RECONNECT_REPEAT_MS, RESET_SETTLE_MS, SETUP_GUARD_MS, SILENCE_REPEAT_MS } from '../page/midi-out.js';
 import { RIG_COPY } from '../page/midi-rig.js';
+import { SETTINGS_COPY } from '../page/midi-settings.js';
 import { bankDrumsModel, gmDrumsModel } from '../test/drum-fixtures.js';
+import { engineSynthCatalog, engineSynthModel, memorySynthModel, offsetSynthModel, timbreSynthModel, toneSynthCatalog, toneSynthModel } from '../test/settings-fixtures.js';
 import { CONNECTION_LABELS, SOUND_LABELS } from '../page/ui-state.js';
 import {
   MIDI_CLOCK_DROPPED_LINE,
@@ -70,12 +88,14 @@ import {
   MIDI_UNREADABLE_LINE,
   MIDI_PERMISSION_WAIT_MESSAGE,
   MIDI_UNSUPPORTED_LINE,
+  midiEventLine,
   midiNoPortLine,
   midiPortAmbiguousLine,
   midiPortBackLine,
   midiPortUnpluggedLine,
 } from '../dist/midi-state.js';
 import { glideLine } from '../dist/mcp.js';
+import { rolandChecksum } from '../dist/instruments.js';
 import {
   PROBE_VIEWPORT,
   ProbeCouldNotRun,
@@ -125,11 +145,11 @@ export const SCENARIO_KEY = 'moontideProbeMidi';
 /**
  * Page JavaScript that runs at document start, before any page script. It reads a scenario from
  * localStorage (JSON: permission 'prompt' | 'granted' | 'denied', answer 'grant' | 'deny' | 'hang',
- * delayMs, webMidi, outputs) and installs a fake Web MIDI.
+ * delayMs, webMidi, outputs, inputs) and installs a fake Web MIDI.
  */
 export const FAKE_MIDI_SOURCE = `(() => {
   if (!location.origin.startsWith('http')) return;
-  const defaults = { permission: 'prompt', answer: 'grant', delayMs: 0, webMidi: true, outputs: ['Fake Synth A', 'Fake Synth B'] };
+  const defaults = { permission: 'prompt', answer: 'grant', delayMs: 0, webMidi: true, outputs: ['Fake Synth A', 'Fake Synth B'], inputs: [] };
   const stored = localStorage.getItem(${JSON.stringify(SCENARIO_KEY)});
   const scenario = stored === null ? defaults : { ...defaults, ...JSON.parse(stored) };
   let permission = scenario.permission;
@@ -159,7 +179,19 @@ export const FAKE_MIDI_SOURCE = `(() => {
     }
   }
 
+  // A fake input has the properties webmidi.js assigns (the handler properties are plain ones here: assigning them does not open the
+  // port, which is stricter than a real port, so a listener that never calls open() hears nothing).
+  class FakeIn extends EventTarget {
+    constructor(id, name) {
+      super();
+      Object.assign(this, { id, name, manufacturer: '', version: '1', type: 'input', state: 'connected', connection: 'closed', onmidimessage: null, onstatechange: null });
+    }
+    async open() { this.connection = 'open'; return this; }
+    async close() { this.connection = 'closed'; return this; }
+  }
+
   const all = scenario.outputs.map((name, index) => new FakeOut('fake-out-' + index, name));
+  const allIn = scenario.inputs.map((name, index) => new FakeIn('fake-in-' + index, name));
   const access = new EventTarget();
   access.outputs = new Map();
   access.inputs = new Map();
@@ -169,7 +201,12 @@ export const FAKE_MIDI_SOURCE = `(() => {
     access.outputs.clear();
     for (const out of all) if (out.state === 'connected') access.outputs.set(out.id, out);
   };
+  const refreshInputs = () => {
+    access.inputs.clear();
+    for (const input of allIn) if (input.state === 'connected') access.inputs.set(input.id, input);
+  };
   refreshOutputs();
+  refreshInputs();
 
   if (!scenario.webMidi) {
     delete Navigator.prototype.requestMIDIAccess;
@@ -203,21 +240,47 @@ export const FAKE_MIDI_SOURCE = `(() => {
     if (typeof access.onstatechange === 'function') access.onstatechange(event);
     access.dispatchEvent(event);
   };
+  // An output or an input by its name; a name carried by several inputs is the first one's.
   const find = (name) => {
-    const out = all.find((candidate) => candidate.name === name);
-    if (!out) throw new Error('no fake output named ' + name);
+    const out = all.find((candidate) => candidate.name === name) || allIn.find((candidate) => candidate.name === name);
+    if (!out) throw new Error('no fake port named ' + name);
     return out;
   };
   const change = (name, state) => {
     const out = find(name);
     out.state = state;
     refreshOutputs();
+    refreshInputs();
     fire(out);
   };
   window.__unplug = (name) => change(name, 'disconnected');
   window.__plug = (name) => change(name, 'connected');
+  // The same for an input: the access object's statechange reaches webmidi's property handler and the added listeners.
+  window.__unplugIn = window.__unplug;
+  window.__plugIn = window.__plug;
   // A statechange event for an output whose state did not change: the noise real drivers make.
   window.__noise = (name) => fire(find(name));
+
+  // Plays MIDI bytes into the fake input called \`name\`, as a message stamped \`stamp\` (the page clock, default now). The stamp is set as an
+  // own property of the event, because the real one is fixed when the event is made. The property handler (webmidi.js) is called, and the
+  // added listeners hear it only while the port is open, as on a real port. Gives the stamp used.
+  window.__playIn = (name, bytes, stamp) => {
+    const port = allIn.find((candidate) => candidate.name === name);
+    if (!port) throw new Error('no fake input named ' + name);
+    const data = Uint8Array.from(bytes);
+    let event;
+    try {
+      event = new MIDIMessageEvent('midimessage', { data });
+    } catch (err) {
+      event = new Event('midimessage');
+      Object.defineProperty(event, 'data', { value: data });
+    }
+    const used = stamp === undefined ? performance.now() : stamp;
+    Object.defineProperty(event, 'timeStamp', { value: used });
+    if (typeof port.onmidimessage === 'function') port.onmidimessage(event);
+    if (port.connection === 'open') port.dispatchEvent(event);
+    return used;
+  };
 })();`;
 
 const SILENT = 's("bd").gain(0)';
@@ -721,6 +784,2562 @@ export async function timelineMidiBlocks(context) {
     await cdp('Emulation.clearDeviceMetricsOverride');
     await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi timeline done' });
     fs.rmSync(rigFile, { force: true });
+  }
+}
+
+/**
+ * The Roland data set of one setting, built here from the rules of the settings map and nothing of the page: F0 41 10, the model ID
+ * (`model`, 00 00 00 65 unless given), 12, the address bytes (any length), the value as data (one byte as it is; a size of 2 or 4 cut into 4-bit pieces, one piece per byte, the biggest
+ * first), the checksum that brings the sum of address and data to a multiple of 128, F7. The checksum comes from the server build. The
+ * caller adds the part itself: a tone setting adds the part minus one to the second address byte, a part setting to the third, a scene
+ * setting uses its address as written.
+ */
+export function settingDataSet({ model = [0x00, 0x00, 0x00, 0x65], address, size, value }) {
+  const data = [];
+  if (size === 1) {
+    data.push(value);
+  } else {
+    for (let piece = size - 1; piece >= 0; piece--) data.push((value >> (4 * piece)) & 15);
+  }
+  const body = [...address, ...data];
+  return [0xf0, 0x41, 0x10, ...model, 0x12, ...body, rolandChecksum(body), 0xf7];
+}
+
+/**
+ * The address of a row of an instrument whose data sets have three-byte addresses, written here from the rule of its map: the
+ * address of part 1 plus the step of the area times the part minus one, counted in base 128.
+ */
+function threeByteAddress(first, step, part) {
+  const number = (first[0] * 128 + first[1]) * 128 + first[2] + step * (part - 1);
+  return [Math.floor(number / 16384), Math.floor(number / 128) % 128, number % 128];
+}
+
+/**
+ * The code and the data sets of the three-byte settings piece: channel 4 (part 3 of a model with melodic channels 2 to 9) sets
+ * the tone partial1Level to 80, the part level to 100 and the scene reverbLevel to 5; channel 9 (part 8) sets partial1Level to 1.
+ * The timbre area steps 246 bytes per part and the patch area 16, which is what makes the two parts different from "part minus one".
+ */
+export function partSpacingPiece(port) {
+  const call = (channel, options) => `part${channel}: note("c3 e3").midi('${port}', { midichannel: ${channel}, sound: 'Own Timbre', ${options} })`;
+  return [call(4, 'tone: { partial1Level: 80 }, part: { level: 100 }, scene: { reverbLevel: 5 }'), call(9, 'tone: { partial1Level: 1 }')].join('\n');
+}
+
+/** The messages `partSpacingPiece` makes the page send: each channel's program change, its data sets, then the scene. */
+export function partSpacingSent() {
+  const model = [0x16];
+  const set = (address, value) => settingDataSet({ model, address, size: 1, value });
+  return [
+    [0xc3, 0x00],
+    set(threeByteAddress([0x04, 0x00, 0x37], 246, 3), 80),
+    set(threeByteAddress([0x03, 0x00, 0x08], 16, 3), 100),
+    [0xc8, 0x00],
+    set(threeByteAddress([0x04, 0x00, 0x37], 246, 8), 1),
+    set([0x10, 0x00, 0x03], 5),
+  ];
+}
+
+/**
+ * The data sets of the timbres piece, built with settingDataSet and the rule of threeByteAddress from the addresses of part 1 that the
+ * map of the timbre synth prints (written here as numbers, not read from the fixture): five tone settings on channel 2 (part 1,
+ * so no step): the wave and the cutoff of partial 1, the cutoff and the volume envelope sustain of partial 4 (58 bytes per partial
+ * further) and the key shift of the patch area; the output level and the panpot on channel 3 (part 2: 16 bytes further in the patch
+ * area); every row of the system area. A value is never 0, so a message that sent nothing could not look like one that did.
+ */
+export const TIMBRE_SETTING_SETS = (() => {
+  const model = [0x16];
+  const set = (address, value) => settingDataSet({ model, address, size: 1, value });
+  return Object.freeze({
+    partial1Wave: set(threeByteAddress([0x04, 0x00, 0x12], 246, 1), 1),
+    partial1Cutoff: set(threeByteAddress([0x04, 0x00, 0x25], 246, 1), 60),
+    partial4Cutoff: set(threeByteAddress([0x04, 0x01, 0x53], 246, 1), 77),
+    partial4AmpEnvSustain: set(threeByteAddress([0x04, 0x01, 0x75], 246, 1), 90),
+    keyShift: set(threeByteAddress([0x03, 0x00, 0x02], 16, 1), 30),
+    level: set(threeByteAddress([0x03, 0x00, 0x08], 16, 2), 90),
+    pan: set(threeByteAddress([0x03, 0x00, 0x09], 16, 2), 3),
+    masterTune: set([0x10, 0x00, 0x00], 64),
+    reverbType: set([0x10, 0x00, 0x01], 2),
+    reverbTime: set([0x10, 0x00, 0x02], 5),
+    reverbLevel: set([0x10, 0x00, 0x03], 6),
+    masterVolume: set([0x10, 0x00, 0x16], 80),
+  });
+})();
+
+/**
+ * The timbres piece on a port: channel 2 (part 1) of the timbre synth with a few tone settings of partials 1 and 4 and of the patch,
+ * channel 3 with its sound, the output level and the panpot, and every scene setting in the call of channel 3. `extra` is appended to
+ * the options of both calls.
+ */
+export function timbreSettingsPiece(port, extra = '') {
+  const lead = `lead: note("c3 e3 g3 c4").midi('${port}', { midichannel: 2, sound: 'Own Timbre', tone: { partial1Wave: 1, partial1Cutoff: 60, partial4Cutoff: 77, partial4AmpEnvSustain: 90, keyShift: 30 }${extra} })`;
+  const pad = `pad: note("e3 g3").midi('${port}', { midichannel: 3, sound: 'Own Timbre', part: { level: 90, pan: 3 }, scene: { masterTune: 64, reverbType: 2, reverbTime: 5, reverbLevel: 6, level: 80 }${extra} })`;
+  return `${lead}\n${pad}`;
+}
+
+/**
+ * The messages the timbres piece sends on top of a piece that plays channel 2 with 'Own Timbre' and nothing else: channel 2's five tone
+ * data sets in the written order, then channel 3's program change and its two part data sets, then the five scene data sets.
+ */
+export function timbreSettingsSent() {
+  const sets = TIMBRE_SETTING_SETS;
+  return [
+    sets.partial1Wave,
+    sets.partial1Cutoff,
+    sets.partial4Cutoff,
+    sets.partial4AmpEnvSustain,
+    sets.keyShift,
+    [0xc2, 0x00],
+    sets.level,
+    sets.pan,
+    sets.masterTune,
+    sets.reverbType,
+    sets.reverbTime,
+    sets.reverbLevel,
+    sets.masterVolume,
+  ];
+}
+
+/**
+ * The data sets of the valid settings piece, built with settingDataSet: the tone cut-off of channel 1 (the value is a parameter, the
+ * piece writes 600), channel 1's pan, channel 2's tone oscillator depth and level, and the scene's reverb level. The tone address
+ * carries the part in its second byte and the part address in its third: channel 1 is part 1 and channel 2 part 2.
+ */
+export const VALID_SETTING_SETS = Object.freeze({
+  cutoff: (value) => settingDataSet({ address: [0x02, 0x10, 0x00, 0x4f], size: 4, value }),
+  pan: settingDataSet({ address: [0x01, 0x00, 0x10, 0x06], size: 1, value: 40 }),
+  lfo: settingDataSet({ address: [0x02, 0x11, 0x00, 0x0b], size: 2, value: 128 }),
+  level: settingDataSet({ address: [0x01, 0x00, 0x11, 0x05], size: 1, value: 100 }),
+  reverb: settingDataSet({ address: [0x01, 0x00, 0x52, 0x02], size: 1, value: 80 }),
+});
+
+/**
+ * The valid settings piece on a port: a lead on channel 1 with a tone, a part and a scene setting (the tone cut-off is left out when
+ * `cutoff` is null) and a pad on channel 2 with a tone and a part setting. `extra` is appended to the options of both calls.
+ */
+export function settingsValidPiece(port, cutoff = 600, extra = '') {
+  const lead = `lead: note("c3 e3 g3 c4").midi('${port}', { midichannel: 1, sound: 'Model Tone', ${cutoff === null ? '' : `tone: { filterCutoff: ${cutoff} }, `}part: { pan: 40 }, scene: { reverbLevel: 80 }${extra} })`;
+  const pad = `pad: note("e3 g3").midi('${port}', { midichannel: 2, sound: 'Model Tone', tone: { lfoOscDepth: 128 }, part: { level: 100 }${extra} })`;
+  return `${lead}\n${pad}`;
+}
+
+/**
+ * The bank selects, program changes and data sets that the valid piece sends on top of a piece that plays channel 1 with 'Model Tone'
+ * and nothing else, in the order the documented rules give: channel 1's settings, then channel 2's sound and its settings, then the scene.
+ */
+export function settingsValidSent() {
+  const sets = VALID_SETTING_SETS;
+  return [sets.cutoff(600), sets.pan, [0xb1, 0x00, 0x61], [0xb1, 0x20, 0x40], [0xc1, 0x00], sets.lfo, sets.level, sets.reverb];
+}
+
+/**
+ * The data sets of the settings on the engines of a multi-engine synth (the engine synth fixture), built with settingDataSet from the
+ * documented addresses. A tone address carries the part in its second byte: channel 1 is part 1, channel 2 part 2, channel 3 part 3.
+ * The model engine's filter cutoff and the third engine's filter cutoff and resonance share their names and sit at their own addresses.
+ */
+export const ENGINE_SETTING_SETS = Object.freeze({
+  modelCutoff: settingDataSet({ address: [0x02, 0x10, 0x00, 0x4f], size: 4, value: 600 }),
+  modelCutoffPart3: settingDataSet({ address: [0x02, 0x12, 0x00, 0x4f], size: 4, value: 600 }),
+  partial1Cutoff: settingDataSet({ address: [0x02, 0x01, 0x20, 0x32], size: 4, value: 300 }),
+  toneCoarseTune: settingDataSet({ address: [0x02, 0x01, 0x00, 0x18], size: 1, value: 40 }),
+  vintageCutoff: settingDataSet({ address: [0x02, 0x52, 0x01, 0x42], size: 4, value: 600 }),
+  vintageResonance: settingDataSet({ address: [0x02, 0x52, 0x01, 0x46], size: 4, value: 100 }),
+});
+
+/** The bank selects and the program change that put the named sound of the engine synth's sound list on a channel. */
+export function engineBankMessages(channel, soundName) {
+  const sound = engineSynthCatalog().sounds.find((candidate) => candidate.name === soundName);
+  return [[0xb0 + channel - 1, 0x00, sound.bank.msb], [0xb0 + channel - 1, 0x20, sound.bank.lsb], [0xc0 + channel - 1, sound.program]];
+}
+
+/** One track of the engines piece: a call on `port` with a sound and tone settings; `extra` is appended to the options. */
+function engineCall(port, channel, sound, tone, extra = '') {
+  return `note("c3 e3").midi('${port}', { midichannel: ${channel}, sound: '${sound}', tone: { ${tone} }${extra} })`;
+}
+
+/**
+ * The engines piece on a port: the model engine's tone on channel 1 with a filter cutoff, a second engine's tone on channel 2 with a
+ * partial 1 cutoff and a coarse tune, and a third engine's tone on channel 3 with a filter cutoff and resonance. `extra` is appended to
+ * the options of the three calls.
+ */
+export function engineSettingsPiece(port, extra = '') {
+  return [
+    `lead: ${engineCall(port, 1, 'Model Tone', 'filterCutoff: 600', extra)}`,
+    `core: ${engineCall(port, 2, 'Core Tone', 'partial1Cutoff: 300, toneCoarseTune: 40', extra)}`,
+    `third: ${engineCall(port, 3, 'Vintage Tone', 'filterCutoff: 600, filterResonance: 100', extra)}`,
+  ].join('\n');
+}
+
+/**
+ * The bank selects, program changes and data sets that the engines piece sends on top of a piece that plays channel 1 with 'Model Tone'
+ * and nothing else: channel 1's data set, then each new channel's sound and data sets, in channel order.
+ */
+export function engineSettingsSent() {
+  const sets = ENGINE_SETTING_SETS;
+  return [
+    sets.modelCutoff,
+    ...engineBankMessages(2, 'Core Tone'),
+    sets.partial1Cutoff,
+    sets.toneCoarseTune,
+    ...engineBankMessages(3, 'Vintage Tone'),
+    sets.vintageCutoff,
+    sets.vintageResonance,
+  ];
+}
+
+/**
+ * The offsets of a GS-style family, written here from the manual's NRPN list and nothing of the page. The control changes of one
+ * offset on a channel (1 to 16) are control 99 the MSB (01), control 98 the LSB, control 6 the value (14 to 114, 64 means no change),
+ * then control 101 and control 100 at 127, five messages of three bytes. There is no control 38.
+ */
+export function nrpnMessages(channel, lsb, value) {
+  const status = 0xb0 + channel - 1;
+  return [[status, 99, 0x01], [status, 98, lsb], [status, 6, value], [status, 101, 127], [status, 100, 127]];
+}
+
+/**
+ * Cuts the sends of the page into the messages they hold: a system exclusive message runs from F0 to F7, any other status byte
+ * starts a message. `sends` is a list of byte lists (one per send); the result lists the messages in order.
+ */
+export function splitSentMessages(sends) {
+  const out = [];
+  for (const bytes of sends) {
+    let inSysex = false;
+    for (const byte of bytes) {
+      if (inSysex || (byte < 0x80 && out.length > 0)) {
+        out.at(-1).push(byte);
+        if (byte === 0xf7) inSysex = false;
+      } else {
+        out.push([byte]);
+        inSysex = byte === 0xf0;
+      }
+    }
+  }
+  return out;
+}
+
+/** The LSB of each offset name of the offset synth (the MSB is 01 for all of them): the manual's tone modify 1 to 8. */
+export const OFFSET_LSBS = Object.freeze({
+  vibratoRateOffset: 0x08,
+  vibratoDepthOffset: 0x09,
+  vibratoDelayOffset: 0x0a,
+  cutoffOffset: 0x20,
+  resonanceOffset: 0x21,
+  attackOffset: 0x63,
+  decayOffset: 0x64,
+  releaseOffset: 0x66,
+});
+
+/**
+ * The messages of the offsets piece, built with nrpnMessages: channel 1's cut-off offset 90 and resonance offset 40, channel 2's attack
+ * offset 100. A value is never 64 (no change), so a message that sent nothing could not look like one that did.
+ */
+export const OFFSET_SETTING_SETS = Object.freeze({
+  cutoff: nrpnMessages(1, OFFSET_LSBS.cutoffOffset, 90),
+  resonance: nrpnMessages(1, OFFSET_LSBS.resonanceOffset, 40),
+  attack: nrpnMessages(2, OFFSET_LSBS.attackOffset, 100),
+});
+
+/** One track of the offsets piece: a call on `port` with a sound and part settings; `extra` is appended to the options. */
+function offsetCall(port, channel, part, extra = '') {
+  return `note("c3 e3").midi('${port}', { midichannel: ${channel}, sound: 'Own Tone', part: { ${part} }${extra} })`;
+}
+
+/**
+ * The offsets piece on a port: channel 1 with a cut-off offset and a resonance offset, channel 2 with an attack offset, both on the
+ * sound 'Own Tone' of the offset synth. `extra` is appended to the options of both calls.
+ */
+export function offsetSettingsPiece(port, extra = '') {
+  return [
+    `lead: ${offsetCall(port, 1, 'cutoffOffset: 90, resonanceOffset: 40', extra)}`,
+    `pad: ${offsetCall(port, 2, 'attackOffset: 100', extra)}`,
+  ].join('\n');
+}
+
+/**
+ * The messages of three bytes (or two, a program change) that the offsets piece sends on top of a piece that plays channel 1 with 'Own Tone'
+ * and nothing else: channel 1's ten offset messages, then channel 2's bank select, program change and five offset messages. The sound
+ * 'Own Tone' is bank MSB 8, program 5.
+ */
+export function offsetSettingsSent() {
+  const sets = OFFSET_SETTING_SETS;
+  return [...sets.cutoff, ...sets.resonance, [0xb1, 0x00, 0x08], [0xc1, 0x05], ...sets.attack];
+}
+
+/**
+ * Keyboard input checks over the fake MIDI device: the setup file names a fake input, a quiet piece with no `.midi(` plays, and notes
+ * played into that input reach the Scratchpad's listening strip. It proves the listening status, a note shown at once, control bytes
+ * ignored, two notes stamped one cycle apart placed one cycle apart within 6 ms, a zero and a stale stamp refused and not counted, the same
+ * listening with the Jam view open, and that nothing the keyboard plays reaches an output. `setScenario` reloads the page with a fresh
+ * fake device, `dataDir` is the server's data folder and `openView` opens a view by its key. The piece is silent and the fake port only records.
+ */
+export async function inputMidiBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir, openView, shotsDir = null, port, pageUrl } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const rigFile = path.join(dataDir, 'instruments.json');
+  const earlier = fs.existsSync(rigFile) ? fs.readFileSync(rigFile) : null;
+  const KEYS = 'Fake Keys';
+  const PIECE = 'setcps(1)\ninput_quiet: s("bd*4").gain(0)';
+  const MARGIN_MS = 6;
+  const read = () =>
+    evaluateExpr(
+      cdp,
+      `(() => {
+        const view = document.getElementById('scratch-view');
+        return {
+          listen: view.dataset.listen ?? null,
+          count: Number(view.dataset.heardCount ?? -1),
+          pitch: view.dataset.heardPitch ?? null,
+          cycle: view.dataset.heardCycle ?? null,
+          source: view.dataset.heardSource ?? null,
+          refused: view.dataset.heardRefused ?? null,
+          state: document.getElementById('scratch-listen-state').textContent,
+          heard: document.getElementById('scratch-heard').textContent,
+        };
+      })()`,
+    );
+  const playIn = (bytes, stamp, name = KEYS) =>
+    evaluateExpr(cdp, `window.__playIn(${JSON.stringify(name)}, ${JSON.stringify(bytes)}, ${stamp === undefined ? 'undefined' : stamp})`);
+  const countIs = (count) => waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.heardCount) === ${count} ? true : null`, 1000);
+  const midiLog = () => evaluateExpr(cdp, 'window.__midiLog');
+  // A picture of the Scratchpad at 1920x1080 in a layout, saved under a fixed name (nothing is saved without a folder outside the repository).
+  const shotNames = [];
+  // `reveal` names an element to scroll to the bottom edge of the window first (layout a puts the hear strip below the fold).
+  const shoot = async (name, layout = 'a', reveal = null) => {
+    if (shotsDir === null) return;
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
+    await sleep(250);
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, layout);
+    await sleep(250);
+    if (reveal !== null) {
+      await evaluateExpr(cdp, `document.getElementById(${JSON.stringify(reveal)}).scrollIntoView({ block: 'end' })`);
+      await sleep(200);
+    }
+    const shot = await cdp('Page.captureScreenshot', { format: 'png' });
+    const file = `${name}-1920x1080-layout-${layout}.png`;
+    fs.writeFileSync(path.join(shotsDir, file), Buffer.from(shot.data, 'base64'));
+    shotNames.push(file);
+    await cdp('Emulation.clearDeviceMetricsOverride');
+  };
+  try {
+    fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth A' }], inputs: [{ port: KEYS }] }));
+    await setScenario({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] });
+    await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi input piece' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the quiet piece of the input checks within 8 seconds');
+    }
+    if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open');
+    // The page clock needs a moment of playing music before it can place a note.
+    await sleep(2500);
+
+    const listening = await waitFor(cdp, `document.getElementById('scratch-view').dataset.listen === 'listening' ? true : null`, 5000);
+    const atStart = await read();
+    report(
+      'input: the Scratchpad says it listens to the input the setup file names',
+      listening === true && atStart.state.includes(KEYS) && !atStart.state.includes('Fake Pads') && atStart.count === 0,
+      JSON.stringify(atStart),
+    );
+
+    const logStart = (await midiLog()).length;
+
+    await playIn([0x90, 60, 100]);
+    const shown = await countIs(1);
+    const first = await read();
+    await playIn([0x80, 60, 0]);
+    report(
+      'input: a note played on the declared input shows in the Scratchpad within a second',
+      shown === true && first.pitch === '60' && first.source === 'music' && first.refused === '' && first.heard.startsWith('Heard C4') && first.cycle !== '',
+      JSON.stringify(first),
+    );
+
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        for (let i = 0; i < 50; i++) window.__playIn(${JSON.stringify(KEYS)}, [0xf8]);
+        window.__playIn(${JSON.stringify(KEYS)}, [0xfe]);
+        window.__playIn(${JSON.stringify(KEYS)}, [0xb0, 64, 127]);
+        window.__playIn(${JSON.stringify(KEYS)}, [0xe0, 0, 64]);
+      })()`,
+    );
+    await sleep(300);
+    const afterControl = await read();
+    report('input: clock, active sensing and controller bytes leave the count as it was', afterControl.count === 1 && afterControl.refused === '', JSON.stringify(afterControl));
+
+    // Two notes stamped exactly one cycle (1000 ms at setcps(1)) apart; the second is played a little after its own stamp.
+    const stamp1 = await evaluateExpr(cdp, `window.__probeStamp1 = window.__playIn(${JSON.stringify(KEYS)}, [0x90, 62, 100], performance.now() - 50)`);
+    const firstCountDone = await countIs(2);
+    const one = await read();
+    await sleep(1020);
+    await playIn([0x90, 64, 100], stamp1 + 1000);
+    const secondCountDone = await countIs(3);
+    const two = await read();
+    const differenceMs = (Number(two.cycle) - Number(one.cycle) - 1) * 1000;
+    report(
+      'input: two notes stamped one cycle apart land one cycle apart within 6 ms',
+      firstCountDone === true && secondCountDone === true && Number.isFinite(differenceMs) && Math.abs(differenceMs) <= MARGIN_MS,
+      JSON.stringify({ firstCycle: one.cycle, secondCycle: two.cycle, offByMs: Math.round(differenceMs * 100) / 100, marginMs: MARGIN_MS }),
+    );
+
+    await playIn([0x90, 65, 100], await evaluateExpr(cdp, 'performance.now() - 2000'));
+    const stale = await waitFor(cdp, `document.getElementById('scratch-view').dataset.heardRefused === 'stale' ? true : null`, 1000);
+    const afterStale = await read();
+    report(
+      'input: a note stamped more than a second ago is refused with its reason and not counted',
+      stale === true && afterStale.count === 3 && afterStale.heard.includes('more than a second old'),
+      JSON.stringify(afterStale),
+    );
+
+    await playIn([0x90, 66, 100], 0);
+    const zero = await waitFor(cdp, `document.getElementById('scratch-view').dataset.heardRefused === 'zero' ? true : null`, 1000);
+    const afterZero = await read();
+    report(
+      'input: a note with a zero time stamp is refused with its reason and not counted',
+      zero === true && afterZero.count === 3 && afterZero.heard.includes('it was zero'),
+      JSON.stringify(afterZero),
+    );
+
+    if ((await openView(5)) !== true) throw new ProbeCouldNotRun('the Jam view did not open');
+    await playIn([0x90, 67, 100]);
+    const inJam = await countIs(4);
+    const jamRead = await read();
+    report('input: a note is still counted with the Jam view open', inJam === true && jamRead.pitch === '67' && jamRead.refused === '', JSON.stringify(jamRead));
+
+    await playIn([0x80, 67, 0]);
+    const toOutputs = noteOnsOnAnyPort(await midiLog(), logStart);
+    report('input: nothing the keyboard plays reaches an output', toOutputs.length === 0, JSON.stringify({ noteOnsOnOutputs: toOutputs }));
+
+    // The live view: notes played on the keyboard appear on the roll as they are played, under a playhead that moves; it only reads.
+    await setScenario({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] });
+    await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi input piece for the live view' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the quiet piece of the live view checks within 8 seconds');
+    }
+    if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open for the live view checks');
+    await sleep(2500);
+    const liveRead = () =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const view = document.getElementById('scratch-view');
+          const pieces = Array.from(document.querySelectorAll('#scratch-live .sp-live')).map((el) => ({ pitch: Number(el.dataset.pitch), start: Number(el.dataset.start), length: Number(el.dataset.length), velocity: Number(el.dataset.velocity), held: el.dataset.held }));
+          return {
+            mode: view.dataset.live ?? null,
+            shownCycles: Number(view.dataset.shownCycles ?? -1),
+            ringCycle: view.dataset.ringCycle ?? null,
+            pieces,
+            playhead: Number(document.getElementById('scratch-playhead').style.getPropertyValue('--sp-playhead') || -1),
+            playheadHidden: document.getElementById('scratch-playhead').hidden,
+          };
+        })()`,
+      );
+    const armedFirst = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'armed' ? true : null`, 3000);
+    // Armed: before the first note the now-marker is shown and moves, so the beat can be felt; there is no switch to turn on.
+    const markerRead = () =>
+      evaluateExpr(cdp, `({ hidden: document.getElementById('scratch-now').hidden, now: Number(document.getElementById('scratch-now').style.getPropertyValue('--sp-now') || -1), rows: Number(document.getElementById('scratch-view').dataset.rows), shown: Number(document.getElementById('scratch-view').dataset.shownCycles), cycles: Number(document.getElementById('scratch-view').dataset.cycles) })`);
+    const armedA = await markerRead();
+    await sleep(250);
+    const armedB = await markerRead();
+    report(
+      'input: Armed (listening, no note played): the now-marker is shown all the time and moves, and the roll shows the motif\'s own cycles',
+      armedFirst === true && armedA.hidden === false && armedB.hidden === false && armedA.now >= 0 && armedB.now !== armedA.now && armedA.shown === armedA.cycles,
+      JSON.stringify({ armedA, armedB }),
+    );
+    const pictureLayouts = async (name) => {
+      for (const layout of ['a', 'b', 'c']) await shoot(name, layout);
+      await shoot(name, 'a');
+    };
+    await pictureLayouts('scratch-live-armed');
+    const logBeforeLive = (await midiLog()).length;
+    const historyBeforeLive = String(await callTool(client, 'list_history', {}));
+    await playIn([0x90, 60, 100]);
+    await sleep(150);
+    await playIn([0x80, 60, 0]);
+    await playIn([0x90, 64, 80]);
+    const isLive = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'live' ? true : null`, 2000);
+    await sleep(150);
+    const liveA = await liveRead();
+    await sleep(200);
+    const liveB = await liveRead();
+    const releasedPiece = liveA.pieces.find((piece) => piece.pitch === 60);
+    const heldPiece = liveA.pieces.find((piece) => piece.pitch === 64);
+    const heldLater = liveB.pieces.find((piece) => piece.pitch === 64);
+    report(
+      'input: notes played on the keyboard appear on the roll as they are played, 8 cycles under a playhead that moves, a held note growing',
+      armedFirst === true &&
+        isLive === true &&
+        liveA.mode === 'live' &&
+        liveA.shownCycles === 8 &&
+        liveA.pieces.length === 2 &&
+        releasedPiece?.held === 'false' &&
+        heldPiece?.held === 'true' &&
+        liveA.playheadHidden === false &&
+        liveA.playhead >= 0 &&
+        liveB.playhead !== liveA.playhead &&
+        heldLater !== undefined &&
+        heldLater.length >= heldPiece.length,
+      JSON.stringify({ liveA, liveB }),
+    );
+    // A key held now lights its key in the pitch column; the key let go clears it.
+    const heldKeys = () =>
+      evaluateExpr(
+        cdp,
+        `(() => { const high = Number(document.getElementById('scratch-view').dataset.rowHigh); return Array.from(document.getElementById('scratch-gutter').children).map((cell, row) => (cell.dataset.held === 'true' ? high - row : null)).filter((pitch) => pitch !== null); })()`,
+      );
+    const heldWhile = await heldKeys();
+    await playIn([0x90, 71, 90]);
+    await waitFor(cdp, `document.querySelectorAll('#scratch-live .sp-live').length === 3 ? true : null`, 1000);
+    await pictureLayouts('scratch-live-held');
+    const heldTwo = await heldKeys();
+    await playIn([0x80, 71, 0]);
+    await playIn([0x80, 64, 0]);
+    const heldCleared = await waitFor(cdp, `Array.from(document.getElementById('scratch-gutter').children).every((cell) => cell.dataset.held !== 'true') ? true : null`, 1000);
+    report(
+      'input: a key held now lights its key in the pitch column and a key let go clears it',
+      JSON.stringify(heldWhile) === JSON.stringify([64]) && JSON.stringify([...heldTwo].sort()) === JSON.stringify([64, 71]) && heldCleared === true,
+      JSON.stringify({ heldWhile, heldTwo, heldCleared }),
+    );
+    const afterLive = String(await callTool(client, 'list_history', {}));
+    const requestLines = (text) => text.split('\n').filter((line) => line.startsWith('Request from the Moontide page: ')).length;
+    report(
+      'input: the live view makes no sound, sends nothing to an output and sends no request to Claude',
+      (await midiLog()).length === logBeforeLive && afterLive === historyBeforeLive && requestLines(afterLive) === requestLines(historyBeforeLive),
+      JSON.stringify({ logBefore: logBeforeLive, logAfter: (await midiLog()).length, sameHistory: afterLive === historyBeforeLive, requests: requestLines(afterLive) }),
+    );
+    await playIn([0x80, 64, 0]);
+
+    // Record that, on a fresh page so the buffer holds only what these checks play.
+    await setScenario({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] });
+    await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi input piece again' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the quiet piece again within 8 seconds');
+    }
+    if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open again');
+    await sleep(2500);
+    const rollNotes = () =>
+      evaluateExpr(
+        cdp,
+        `Array.from(document.querySelectorAll('#scratch-notes .sp-note')).map((el) => ({ pitch: Number(el.dataset.pitch), start: Number(el.dataset.start), length: Number(el.dataset.length), velocity: Number(el.dataset.velocity), label: el.getAttribute('aria-label') }))`,
+      );
+    const roll = () =>
+      evaluateExpr(
+        cdp,
+        `({ notes: Number(document.getElementById('scratch-view').dataset.notes), line: document.getElementById('scratch-note-spoken').textContent, disabled: document.getElementById('scratch-record').getAttribute('aria-disabled') })`,
+      );
+    // One note of the motif first, so Undo has something to bring back.
+    await evaluateExpr(cdp, `document.getElementById('scratch-roll').focus()`);
+    await pressKey(cdp, 'Enter');
+    const motifBefore = await roll();
+    const historyBefore = String(await callTool(client, 'list_history', {}));
+    const codeBefore = String(await callTool(client, 'get_code', {}));
+    const logBeforeRecord = (await midiLog()).length;
+
+    await playIn([0x90, 60, 127]);
+    await sleep(150);
+    await playIn([0x80, 60, 0]);
+    await sleep(150);
+    await playIn([0x90, 64, 64]);
+    await sleep(150);
+    await playIn([0x80, 64, 0]);
+    await sleep(150);
+    await playIn([0x90, 67, 100]);
+    const threeHeard = await countIs(3);
+    await sleep(400);
+    await evaluateExpr(cdp, `document.getElementById('scratch-record').click()`);
+    const recorded = await waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.notes) === 3 ? true : null`, 2000);
+    const afterRecord = await roll();
+    const onRoll = await rollNotes();
+    const byPitch = (pitch) => onRoll.find((note) => note.pitch === pitch);
+    report(
+      'input: Record that puts the 3 notes played on the roll, C4 at 1.00 and E4 at 0.50, and the line says so',
+      threeHeard === true && recorded === true && byPitch(60)?.velocity === 100 && byPitch(64)?.velocity === 50 && afterRecord.line.startsWith('Recorded 3 notes'),
+      JSON.stringify({ afterRecord, onRoll }),
+    );
+    report(
+      'input: a key still held when Record that is pressed is closed and lasts at least one step',
+      byPitch(67) !== undefined && byPitch(67).length >= 3 && (byPitch(67).label ?? '').includes('G4'),
+      JSON.stringify(byPitch(67) ?? null),
+    );
+    const outputsDuring = noteOnsOnAnyPort(await midiLog(), logBeforeRecord);
+    report(
+      "input: a record leaves the music's History and the code as they were and sends no note to an output",
+      String(await callTool(client, 'list_history', {})) === historyBefore && String(await callTool(client, 'get_code', {})) === codeBefore && outputsDuring.length === 0,
+      JSON.stringify({ noteOnsOnOutputs: outputsDuring }),
+    );
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const undone = await waitFor(cdp, `document.getElementById('scratch-note-spoken').textContent === 'Undid: recorded the keyboard.' ? true : null`, 2000);
+    const afterUndo = await roll();
+    report(
+      'input: Ctrl+Z brings back the motif that was there, and the line says what was undone',
+      undone === true && afterUndo.notes === motifBefore.notes,
+      JSON.stringify({ motifBefore, afterUndo }),
+    );
+
+    // The live layer and Record that agree: the motif after the press holds the very notes the live layer showed, and the buffer is empty.
+    const livePieces = () =>
+      evaluateExpr(
+        cdp,
+        `Array.from(document.querySelectorAll('#scratch-live .sp-live')).map((el) => ({ pitch: Number(el.dataset.pitch), start: Number(el.dataset.start), length: Number(el.dataset.length), velocity: Number(el.dataset.velocity) }))`,
+      );
+    const motifBeforeTake = await rollNotes();
+    const bufferEmptyAfterRecord = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'armed' && Number(document.getElementById('scratch-view').dataset.heardCount) === 0 ? true : null`, 3000);
+    // The ring has an origin every 8 cycles: the take is played early in a lap, so that it stays in one lap, and after the first column, so that
+    // there are empty cycles before it to trim.
+    const takeLap = await waitFor(cdp, `(() => { const column = Number(document.getElementById('scratch-view').dataset.ringCycle); return column >= 1 && column <= 3 ? true : null; })()`, 10000);
+    await playIn([0x90, 62, 127]);
+    await sleep(200);
+    await playIn([0x80, 62, 0]);
+    await playIn([0x90, 66, 64]);
+    await sleep(300);
+    await playIn([0x80, 66, 0]);
+    await playIn([0x90, 69, 100]);
+    await sleep(250);
+    await playIn([0x80, 69, 0]);
+    // Three pieces are drawn while the last key is still down; the layer shows the release a frame later, so the wait is for no held piece.
+    const takeLive = await waitFor(
+      cdp,
+      `document.getElementById('scratch-view').dataset.live === 'live' && document.querySelectorAll('#scratch-live .sp-live').length === 3 && document.querySelectorAll('#scratch-live .sp-live[data-held="true"]').length === 0 ? true : null`,
+      2000,
+    );
+    const shownPieces = await livePieces();
+    await evaluateExpr(cdp, `document.getElementById('scratch-record').click()`);
+    const takeRecorded = await waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.notes) === 3 ? true : null`, 2000);
+    const takeNotes = await rollNotes();
+    const trimmed = Math.floor(Math.min(...shownPieces.map((piece) => piece.start)) / 48) * 48;
+    const want = shownPieces.map((piece) => [piece.pitch, piece.velocity, piece.start - trimmed, piece.length]).sort((a, b) => a[0] - b[0]);
+    const got = takeNotes.map((note) => [note.pitch, note.velocity, note.start, note.length]).sort((a, b) => a[0] - b[0]);
+    report(
+      'input: Record that writes exactly the notes the live layer showed: the same pitches, velocities, lengths and places, less the empty cycles before the first',
+      bufferEmptyAfterRecord === true && takeLap === true && takeLive === true && takeRecorded === true && JSON.stringify(got) === JSON.stringify(want),
+      JSON.stringify({ shownPieces, trimmed, got, want }),
+    );
+    const backToMotif = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'armed' && Number(document.getElementById('scratch-view').dataset.heardCount) === 0 ? true : null`, 3000);
+    const afterTake = await evaluateExpr(cdp, `({ live: document.getElementById('scratch-view').dataset.live, shown: Number(document.getElementById('scratch-view').dataset.shownCycles), cycles: Number(document.getElementById('scratch-view').dataset.cycles), pieces: document.querySelectorAll('#scratch-live .sp-live').length })`);
+    await evaluateExpr(cdp, `document.getElementById('scratch-record').click()`);
+    const secondPress = await roll();
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const takeUndone = await waitFor(cdp, `document.getElementById('scratch-note-spoken').textContent === 'Undid: recorded the keyboard.' ? true : null`, 2000);
+    const afterTakeUndo = await rollNotes();
+    report(
+      'input: after the press the buffer is empty and the roll shows the motif\'s own cycles, a second press says there is nothing to record, and Undo brings the earlier motif back',
+      backToMotif === true &&
+        afterTake.live === 'armed' &&
+        afterTake.shown === afterTake.cycles &&
+        afterTake.pieces === 0 &&
+        secondPress.line === 'Nothing to record: the keyboard played nothing in the last 8 cycles.' &&
+        takeUndone === true &&
+        JSON.stringify(afterTakeUndo.map((note) => [note.pitch, note.start, note.length])) === JSON.stringify(motifBeforeTake.map((note) => [note.pitch, note.start, note.length])),
+      JSON.stringify({ afterTake, secondPress, afterTakeUndo, motifBeforeTake }),
+    );
+
+    // The range grows with what is played: a pitch far above the rows adds rows at once, the rows only grow while the view is live, and
+    // they settle to the motif's own when the buffer is empty again. The motif is drawn under the live notes.
+    const rowsRead = () => evaluateExpr(cdp, `Number(document.getElementById('scratch-view').dataset.rows)`);
+    const rowsBefore = await rowsRead();
+    await playIn([0x90, 96, 100]);
+    await sleep(150);
+    await playIn([0x80, 96, 0]);
+    const rowsGrew = await waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.rows) > ${rowsBefore} ? true : null`, 1000);
+    const rowsWith = await rowsRead();
+    await playIn([0x90, 60, 100]);
+    await sleep(150);
+    await playIn([0x80, 60, 0]);
+    await sleep(100);
+    const rowsKept = await rowsRead();
+    const motifStays = (await rollNotes()).length;
+    await pictureLayouts('scratch-live-over-motif');
+    // At eight cycles a second the eight cycles of the buffer pass in one second.
+    await callTool(client, 'set_code', { code: 'setcps(8)\ninput_quiet: s("bd*4").gain(0)', label: 'probe:midi input range piece' });
+    const emptyAgain = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'armed' ? true : null`, 8000);
+    const rowsSettled = await rowsRead();
+    report(
+      'input: a pitch played far above the rows adds rows at once, the rows only grow while live, and they settle to the motif\'s when the buffer is empty again',
+      rowsGrew === true && rowsWith > rowsBefore && rowsKept >= rowsWith && motifStays === 1 && emptyAgain === true && rowsSettled === rowsBefore,
+      JSON.stringify({ rowsBefore, rowsWith, rowsKept, motifStays, rowsSettled }),
+    );
+
+    // Older notes are gone: at 250 ms cycles the window holds about 2 seconds.
+    await playIn([0x80, 67, 0]);
+    await callTool(client, 'set_code', { code: 'setcps(4)\ninput_quiet: s("bd*4").gain(0)', label: 'probe:midi input fast piece' });
+    await sleep(3500);
+    await playIn([0x90, 72, 100]);
+    await sleep(100);
+    await playIn([0x80, 72, 0]);
+    const oneHeard = await countIs(1);
+    const heardAt = Date.now();
+    const gone = await waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.heardCount) === 0 ? true : null`, 5000);
+    const goneAfterMs = Date.now() - heardAt;
+    report(
+      'input: a note older than the 8 cycles is gone from the count (250 ms cycles)',
+      oneHeard === true && gone === true && goneAfterMs >= 1000 && goneAfterMs <= 4000,
+      JSON.stringify({ goneAfterMs }),
+    );
+
+    await setScenario({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] });
+    await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi input piece after reload' });
+    if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open after the reload');
+    await sleep(1000);
+    const afterReload = await roll();
+    await evaluateExpr(cdp, `document.getElementById('scratch-record').click()`);
+    const afterPress = await roll();
+    report(
+      'input: after a reload the buffer is empty: Record that carries aria-disabled and a press says so',
+      afterReload.disabled === 'true' && afterPress.line === 'Nothing to record: the keyboard played nothing in the last 8 cycles.' && afterPress.notes === 0,
+      JSON.stringify({ afterReload, afterPress }),
+    );
+
+    // With the music stopped: the buffer still keeps the beat by the scheduler's tempo. The page was reloaded just above and plays the quiet piece.
+    const heardPitch = (pitch) => waitFor(cdp, `document.getElementById('scratch-view').dataset.heardPitch === '${pitch}' ? true : null`, 1500);
+    const schedulerCps = () => evaluateExpr(cdp, `document.getElementById('repl').editor.repl.scheduler.cps`);
+    await sleep(2500);
+    await callTool(client, 'stop', {});
+    const stoppedOnPage = await waitFor(cdp, `${replState}.started === false ? true : null`, 5000);
+    // The page reads the transport four times a second and the listening tick runs every 50 ms: both have seen the Stop after this.
+    await sleep(700);
+    await playIn([0x90, 60, 100]);
+    const keptStopped = await heardPitch(60);
+    const stoppedRead = await read();
+    report(
+      'input: with the music stopped the page keeps listening and a note played is kept by the tempo',
+      stoppedOnPage === true && keptStopped === true && stoppedRead.listen === 'listening' && stoppedRead.source === 'free' && stoppedRead.refused === '' && stoppedRead.count >= 1,
+      JSON.stringify(stoppedRead),
+    );
+
+    // Two notes stamped exactly 1000 ms apart at setcps(1), the music stopped.
+    const tempoOne = await schedulerCps();
+    const stoppedStamp = await evaluateExpr(cdp, `window.__playIn(${JSON.stringify(KEYS)}, [0x90, 62, 100], performance.now() - 50)`);
+    const firstStopped = await heardPitch(62);
+    const stoppedFirst = await read();
+    await sleep(1020);
+    await playIn([0x90, 64, 100], stoppedStamp + 1000);
+    const secondStopped = await heardPitch(64);
+    const stoppedSecond = await read();
+    const stoppedDiffMs = (Number(stoppedSecond.cycle) - Number(stoppedFirst.cycle) - 1) * 1000;
+    report(
+      'input: with the music stopped at setcps(1), two notes stamped 1000 ms apart land one cycle apart within 6 ms',
+      tempoOne === 1 && firstStopped === true && secondStopped === true && stoppedFirst.source === 'free' && Number.isFinite(stoppedDiffMs) && Math.abs(stoppedDiffMs) <= MARGIN_MS,
+      JSON.stringify({ cps: tempoOne, firstCycle: stoppedFirst.cycle, secondCycle: stoppedSecond.cycle, offByMs: Math.round(stoppedDiffMs * 100) / 100, marginMs: MARGIN_MS }),
+    );
+
+    // Play again: the cycles only go forward and the source is the music's own clock once it is warm.
+    await playMusic(cdp);
+    await sleep(2500);
+    await playIn([0x90, 65, 100]);
+    const afterPlay = await heardPitch(65);
+    const playedRead = await read();
+    report(
+      'input: after Play the cycles of a new note are higher than those before and the source is the music',
+      afterPlay === true && playedRead.source === 'music' && Number(playedRead.cycle) > Number(stoppedSecond.cycle),
+      JSON.stringify({ before: stoppedSecond.cycle, after: playedRead.cycle, source: playedRead.source }),
+    );
+
+    // Stop again and change the tempo through the scheduler: two notes stamped exactly 500 ms apart land one cycle apart at setcps(2).
+    await stopMusic(cdp);
+    await evaluateExpr(cdp, `document.getElementById('repl').editor.repl.scheduler.setCps(2)`);
+    await sleep(700);
+    const tempoTwo = await schedulerCps();
+    const fastStamp = await evaluateExpr(cdp, `window.__playIn(${JSON.stringify(KEYS)}, [0x90, 69, 100], performance.now() - 50)`);
+    const firstFast = await heardPitch(69);
+    const fastFirst = await read();
+    await sleep(520);
+    await playIn([0x90, 71, 100], fastStamp + 500);
+    const secondFast = await heardPitch(71);
+    const fastSecond = await read();
+    const fastDiffMs = (Number(fastSecond.cycle) - Number(fastFirst.cycle) - 1) * 500;
+    report(
+      'input: with the music stopped and the tempo changed to setcps(2), two notes stamped 500 ms apart land one cycle apart within 6 ms',
+      tempoTwo === 2 && firstFast === true && secondFast === true && fastFirst.source === 'free' && Number.isFinite(fastDiffMs) && Math.abs(fastDiffMs) <= MARGIN_MS,
+      JSON.stringify({ cps: tempoTwo, firstCycle: fastFirst.cycle, secondCycle: fastSecond.cycle, offByMs: Math.round(fastDiffMs * 100) / 100, marginMs: MARGIN_MS }),
+    );
+
+    // Record that with the music stopped puts the notes kept on the roll.
+    await evaluateExpr(cdp, `document.getElementById('scratch-record').click()`);
+    const recordedStopped = await waitFor(cdp, `document.getElementById('scratch-note-spoken').textContent.startsWith('Recorded') ? true : null`, 2000);
+    const afterStoppedRecord = await roll();
+    report(
+      'input: Record that works with the music stopped and puts the kept notes on the roll',
+      recordedStopped === true && afterStoppedRecord.notes >= 2 && afterStoppedRecord.line.startsWith('Recorded'),
+      JSON.stringify(afterStoppedRecord),
+    );
+
+    // --- A played motif sent to Claude carries the music's cycle where it was played, not the keyboard axis's cycle. ---
+    // A fresh page holds only what these checks play. Each note is played into the fake input, the motif made by Record that, and the
+    // request taken from the reply of one tool call, as Claude would read it.
+    const PAGE_REQUEST_LINE = 'Request from the Moontide page: ';
+    const freshPage = async (label) => {
+      await setScenario({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] });
+      await callTool(client, 'set_code', { code: PIECE, label });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun(`the page did not start running the quiet piece (${label}) within 8 seconds`);
+      }
+      if ((await openView(7)) !== true) throw new ProbeCouldNotRun(`the Scratchpad did not open (${label})`);
+      await sleep(2500);
+    };
+    const sendRecorded = async () => {
+      const phrase = await evaluateExpr(cdp, "document.getElementById('scratch-phrase').textContent");
+      if ((await waitFor(cdp, "document.getElementById('scratch-send-button').getAttribute('aria-disabled') === 'false' ? true : null", 3000)) !== true) {
+        throw new ProbeCouldNotRun('the Send to Claude button stayed unavailable for 3 seconds');
+      }
+      // Anything waiting from earlier is handed over now, so the reply after the press holds only this request.
+      await callTool(client, 'get_code', {});
+      await evaluateExpr(cdp, "document.getElementById('scratch-send-button').click()");
+      const status = await waitFor(cdp, "document.getElementById('scratch-send-status').textContent.startsWith('Sent to Claude') ? document.getElementById('scratch-send-status').textContent : null", 3000);
+      const handed = String(await callTool(client, 'list_history', {}));
+      const requests = handed
+        .split('\n')
+        .filter((line) => line.startsWith(PAGE_REQUEST_LINE))
+        .map((line) => JSON.parse(line.slice(PAGE_REQUEST_LINE.length)))
+        .filter((request) => request.context.kind === 'motif');
+      return { phrase, status, requests };
+    };
+    const recordTwo = async (first, second, gapMs) => {
+      await playIn([0x90, first, 100]);
+      await sleep(150);
+      await playIn([0x80, first, 0]);
+      await sleep(gapMs);
+      await playIn([0x90, second, 100]);
+      await sleep(150);
+      await playIn([0x80, second, 0]);
+      await sleep(300);
+      await evaluateExpr(cdp, "document.getElementById('scratch-record').click()");
+      return waitFor(cdp, "Number(document.getElementById('scratch-view').dataset.notes) === 2 ? true : null", 2000);
+    };
+
+    await freshPage('probe:midi input piece for a played motif');
+    await callTool(client, 'stop', {});
+    const stoppedForSend = await waitFor(cdp, `${replState}.started === false ? true : null`, 5000);
+    await sleep(1500);
+    await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi input piece after a stop' });
+    const runningAgain = await waitFor(cdp, `${replState}.started === true && ${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000);
+    // A note outside the roll's range tells when the page places notes on the music again; Record that leaves it out.
+    const onMusic = await waitFor(
+      cdp,
+      `(async () => {
+        await window.__playIn(${JSON.stringify(KEYS)}, [0x90, 125, 100]);
+        await window.__playIn(${JSON.stringify(KEYS)}, [0x80, 125, 0]);
+        return document.getElementById('scratch-view').dataset.heardSource === 'music' ? true : null;
+      })()`,
+      8000,
+    );
+    // The scheduler's cycle is read from cycle 1 on, with a fractional part from 0.3 to 0.6, so the first note falls well inside one cycle
+    // and a cycle of 0 cannot be right by accident.
+    // The ring has an origin every 8 cycles: a take across it belongs to two laps and carries no moment, so the first note is played early in a
+    // lap as well, in the same instant (a wait in between would move the music's cycle).
+    const musicCycle = await waitFor(
+      cdp,
+      `(() => { const now = document.getElementById('repl').editor.repl.scheduler.now(); const part = now - Math.floor(now); const column = Number(document.getElementById('scratch-view').dataset.ringCycle); return now >= 1 && part >= 0.3 && part <= 0.6 && column <= 3 ? now : null; })()`,
+      12000,
+    );
+    const earlyInLap = Number.isFinite(musicCycle);
+    await playIn([0x90, 60, 100]);
+    await sleep(150);
+    const firstHeard = await read();
+    await playIn([0x80, 60, 0]);
+    await sleep(850);
+    await playIn([0x90, 64, 100]);
+    await sleep(150);
+    await playIn([0x80, 64, 0]);
+    await sleep(300);
+    await evaluateExpr(cdp, "document.getElementById('scratch-record').click()");
+    const recordedAfterStop = await waitFor(cdp, "Number(document.getElementById('scratch-view').dataset.notes) === 2 ? true : null", 2000);
+    const afterStop = await sendRecorded();
+    const afterStopMotif = afterStop.requests[0]?.motif;
+    report(
+      "input: a played motif sent to Claude carries the music's cycle where it was played, after a Stop and a Play",
+      stoppedForSend === true &&
+        runningAgain === true &&
+        onMusic === true &&
+        earlyInLap &&
+        Number.isFinite(musicCycle) &&
+        firstHeard.source === 'music' &&
+        recordedAfterStop === true &&
+        afterStop.requests.length === 1 &&
+        afterStopMotif.source === 'played' &&
+        afterStopMotif.cycle === Math.floor(musicCycle) &&
+        Number(firstHeard.cycle) - afterStopMotif.cycle >= 1 &&
+        afterStopMotif.phrase === afterStop.phrase &&
+        afterStop.status.startsWith('Sent to Claude at cycle '),
+      JSON.stringify({ musicCycle, firstHeard, afterStop }),
+    );
+
+    // With the music stopped nothing places the motif against music, so the request carries no moment.
+    await freshPage('probe:midi input piece for a played motif with the music stopped');
+    await callTool(client, 'stop', {});
+    const stoppedAgain = await waitFor(cdp, `${replState}.started === false ? true : null`, 5000);
+    await sleep(700);
+    const recordedStopped2 = await recordTwo(60, 64, 450);
+    const whileStopped = await sendRecorded();
+    const stoppedMotif = whileStopped.requests[0]?.motif;
+    report(
+      'input: a motif played with the music stopped is sent with no moment',
+      stoppedAgain === true &&
+        recordedStopped2 === true &&
+        whileStopped.requests.length === 1 &&
+        stoppedMotif.source === 'played' &&
+        !Object.hasOwn(stoppedMotif, 'cycle') &&
+        stoppedMotif.phrase === whileStopped.phrase &&
+        whileStopped.status.startsWith('Sent to Claude with no moment.'),
+      JSON.stringify({ whileStopped }),
+    );
+
+    // --- The status says why it is not listening, asks for MIDI only from its button, and follows a plug or an unplug. ---
+    // Each scenario below reloads the page with the setup file naming the given inputs and the quiet piece playing.
+    const load = async (scenario, names, label) => {
+      fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth A' }], inputs: names.map((name) => ({ port: name })) }));
+      await setScenario(scenario);
+      await callTool(client, 'set_code', { code: PIECE, label });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun(`the page did not start running the quiet piece (${label}) within 8 seconds`);
+      }
+      if ((await openView(7)) !== true) throw new ProbeCouldNotRun(`the Scratchpad did not open (${label})`);
+      await sleep(2500);
+    };
+    const listenIs = (word, ms = 3000) => waitFor(cdp, `document.getElementById('scratch-view').dataset.listen === ${JSON.stringify(word)} ? true : null`, ms);
+    const requests = () => evaluateExpr(cdp, 'window.__midiRequests');
+    const allowShown = () => evaluateExpr(cdp, `(() => { const el = document.getElementById('scratch-allow'); return el !== null && !el.hidden && el.getClientRects().length > 0; })()`);
+
+    // A name that is not connected: said plainly with the inputs that exist; the right name listens.
+    await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, ['Fake Keyz'], 'probe:midi input wrong name');
+    const wrongName = await listenIs('missing');
+    const wrongRead = await read();
+    report(
+      'input: a name that is not connected is said as missing, with the inputs that exist',
+      wrongName === true && wrongRead.state.includes('Fake Keyz') && wrongRead.state.includes(KEYS) && wrongRead.state.includes('Fake Pads') && !(await allowShown()),
+      JSON.stringify(wrongRead),
+    );
+    await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi input right name');
+    const rightName = await listenIs('listening');
+    report('input: after the name is written right, the page listens', rightName === true, JSON.stringify(await read()));
+
+    // An unplug and a plug are noticed with no reload.
+    await evaluateExpr(cdp, 'window.__probeSamePage = true');
+    await playIn([0x90, 60, 100]);
+    await countIs(1);
+    const unplugAt = Date.now();
+    await evaluateExpr(cdp, `window.__unplugIn(${JSON.stringify(KEYS)})`);
+    const unplugged = await listenIs('unplugged', 1000);
+    const unpluggedMs = Date.now() - unplugAt;
+    const unpluggedRead = await read();
+    report(
+      'input: an unplug is noticed within a second with no reload, and the status lists the input that exists',
+      unplugged === true && unpluggedMs <= 1500 && (await evaluateExpr(cdp, 'window.__probeSamePage === true')) && unpluggedRead.state.includes('unplugged') && unpluggedRead.state.includes('Fake Pads') && unpluggedRead.state.includes(KEYS),
+      JSON.stringify({ unpluggedMs, read: unpluggedRead }),
+    );
+    await evaluateExpr(cdp, `window.__plugIn(${JSON.stringify(KEYS)})`);
+    const replugged = await listenIs('listening', 1000);
+    await playIn([0x90, 62, 100]);
+    const afterReplug = await waitFor(cdp, `document.getElementById('scratch-view').dataset.heardPitch === '62' ? true : null`, 1500);
+    report(
+      'input: a plug is noticed with no reload, and a note played after it is counted',
+      replugged === true && afterReplug === true && (await evaluateExpr(cdp, 'window.__probeSamePage === true')) && (await read()).count >= 2,
+      JSON.stringify(await read()),
+    );
+
+    // Strudel's own port handling still follows the outputs while the page listens: the Instruments view shows the output unplugged and back.
+    if ((await openView(6)) !== true) throw new ProbeCouldNotRun('the Instruments view did not open');
+    const cardState = () => evaluateExpr(cdp, `(() => { const el = document.querySelector('#instruments-list .instrument-card .instrument-state'); return el === null ? null : el.textContent; })()`);
+    const cardIs = (word) => waitFor(cdp, `(() => { const el = document.querySelector('#instruments-list .instrument-card .instrument-state'); return el !== null && el.textContent === ${JSON.stringify(word)} ? true : null; })()`, 3000);
+    const outputBefore = await cardIs('connected');
+    await evaluateExpr(cdp, `window.__unplug('Fake Synth A')`);
+    const outputGone = await cardIs('unplugged');
+    await evaluateExpr(cdp, `window.__plug('Fake Synth A')`);
+    const outputBack = await cardIs('connected');
+    report(
+      'input: while the page listens, an output unplugged and plugged back is followed in the page MIDI facts',
+      outputBefore === true && outputGone === true && outputBack === true && (await read()).listen === 'listening',
+      JSON.stringify({ outputBefore, outputGone, outputBack, now: await cardState() }),
+    );
+    if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open again');
+
+    // Two connected inputs with one exact name: refused, neither listened to.
+    await load({ permission: 'granted', inputs: [KEYS, KEYS] }, [KEYS], 'probe:midi input same name twice');
+    const doubled = await listenIs('ambiguous');
+    await playIn([0x90, 60, 100]);
+    await sleep(400);
+    const doubledRead = await read();
+    report(
+      'input: two inputs with the same exact name are refused in the status and a note played is not counted',
+      doubled === true && doubledRead.count === 0 && doubledRead.state.includes('2 inputs are named exactly') && doubledRead.state.includes(KEYS),
+      JSON.stringify(doubledRead),
+    );
+
+    // The permission: asked only from the button, once.
+    await load({ permission: 'prompt', answer: 'grant', inputs: [KEYS] }, [KEYS], 'probe:midi input no permission yet');
+    const needs = await listenIs('needs-permission');
+    const requestsBefore = await requests();
+    const shownBefore = await allowShown();
+    report(
+      'input: with the input declared and no permission yet, the page asks nothing and offers the Allow MIDI to listen button',
+      needs === true && requestsBefore === 0 && shownBefore === true && (await read()).state.includes(KEYS),
+      JSON.stringify({ requests: requestsBefore, buttonShown: shownBefore, read: await read() }),
+    );
+    await evaluateExpr(cdp, `document.getElementById('scratch-allow').click()`);
+    const afterAllow = await listenIs('listening', 5000);
+    const requestsAfter = await requests();
+    report(
+      'input: the Allow MIDI to listen press makes exactly one request and the page then listens',
+      afterAllow === true && requestsAfter === 1 && !(await allowShown()),
+      JSON.stringify({ requests: requestsAfter, read: await read() }),
+    );
+
+    // A refused permission is said, with no request.
+    await load({ permission: 'denied', inputs: [KEYS] }, [KEYS], 'probe:midi input denied');
+    const deniedNeeds = await listenIs('needs-permission');
+    await evaluateExpr(cdp, `document.getElementById('scratch-allow').click()`);
+    const deniedSaid = await listenIs('denied', 3000);
+    const deniedRead = await read();
+    report(
+      'input: a refused permission is said in the status, with no request to the browser and no button left',
+      deniedNeeds === true && deniedSaid === true && (await requests()) === 0 && deniedRead.state.includes('refused') && !(await allowShown()),
+      JSON.stringify({ requests: await requests(), read: deniedRead }),
+    );
+
+    // --- Only a visible tab that holds the music listens, and a paused tab says why. ---
+    const setVisibility = (hidden) =>
+      evaluateExpr(
+        cdp,
+        hidden
+          ? `(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); return true; })()`
+          : `(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')); return true; })()`,
+      );
+
+    // A hidden page (the simulated one of the page probe): paused with its reason, nothing kept, and listening again once shown.
+    await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi input hidden tab');
+    const beforeHide = await listenIs('listening');
+    await setVisibility(true);
+    const hiddenSaid = await listenIs('hidden', 1000);
+    await playIn([0x90, 60, 100]);
+    await sleep(400);
+    const hiddenRead = await read();
+    report(
+      'input: a hidden tab says listening is paused and why, and a note played is not counted',
+      beforeHide === true && hiddenSaid === true && hiddenRead.count === 0 && hiddenRead.state.includes('paused') && hiddenRead.state.includes('hidden'),
+      JSON.stringify(hiddenRead),
+    );
+    await shoot('input-paused-hidden');
+    await setVisibility(false);
+    const shownAgain = await listenIs('listening', 1000);
+    await playIn([0x90, 62, 100]);
+    const countedAgain = await countIs(1);
+    report('input: showing the tab again listens again with no reload and a note is counted', shownAgain === true && countedAgain === true, JSON.stringify(await read()));
+
+    // A second Moontide tab takes the music: the first tab says so and keeps nothing. The second tab has no fake device of its own.
+    await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi input other tab');
+    const beforeOther = await listenIs('listening');
+    const second = { id: null, ws: null };
+    let otherSaid = null;
+    let otherRead = null;
+    try {
+      const created = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
+      if (!created.ok) throw new ProbeCouldNotRun(`/json/new answered ${created.status}`);
+      const info = await created.json();
+      second.id = info.id;
+      second.ws = new WebSocket(info.webSocketDebuggerUrl);
+      await waitSocketOpen(second.ws);
+      const secondCdp = makeCdp(second.ws);
+      await secondCdp('Runtime.enable');
+      await secondCdp('Page.enable');
+      await secondCdp('Page.navigate', { url: pageUrl });
+      await waitConnected(secondCdp, 15000);
+      otherSaid = await listenIs('other-tab', 8000);
+      await playIn([0x90, 60, 100]);
+      await sleep(400);
+      otherRead = await read();
+    } finally {
+      if (second.ws !== null) {
+        try {
+          second.ws.close();
+        } catch {
+          // already closed
+        }
+      }
+      if (second.id !== null) await fetch(`http://127.0.0.1:${port}/json/close/${second.id}`).catch(() => {});
+    }
+    report(
+      'input: a tab that lost the music to a second tab says another tab has it and keeps no note',
+      beforeOther === true && otherSaid === true && otherRead.count === 0 && otherRead.state.includes('another Moontide tab has the music'),
+      JSON.stringify(otherRead),
+    );
+    // The second tab is closed and the first one still has no music: it takes it back with its own button, and listens again with no reload.
+    await evaluateExpr(cdp, 'window.__probeSamePage = true');
+    const offered = await waitFor(cdp, `document.getElementById('midi-takeover').hidden ? null : true`, 8000);
+    await evaluateExpr(cdp, `document.getElementById('take-back').click()`);
+    const tookBack = await listenIs('listening', 8000);
+    await sleep(2500);
+    await playIn([0x90, 64, 100]);
+    const heardBack = await countIs(1);
+    report(
+      'input: taking the music back listens again with no reload and a note is counted',
+      offered === true && tookBack === true && heardBack === true && (await evaluateExpr(cdp, 'window.__probeSamePage === true')),
+      JSON.stringify(await read()),
+    );
+
+    // The strip is the one place that says why nothing is heard, so it must be in sight: at 1920x1080, in each layout, fully inside the window
+    // and under the information line, never hidden below the edge or over the line above it.
+    const fitLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+    const fits = [];
+    try {
+      await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
+      for (const layout of ['a', 'b', 'c']) {
+        await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+        await pressKey(cdp, layout);
+        await sleep(300);
+        fits.push({
+          layout,
+          ...(await evaluateExpr(
+            cdp,
+            `(() => { const strip = document.getElementById('scratch-listen').getBoundingClientRect(); const note = document.getElementById('scratch-note').getBoundingClientRect(); return { inner: window.innerHeight, stripTop: Math.round(strip.top), stripBottom: Math.round(strip.bottom), noteBottom: Math.round(note.bottom) }; })()`,
+          )),
+        });
+      }
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+      if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`)) !== fitLayout) await pressKey(cdp, fitLayout);
+    }
+    report(
+      'input: at 1920x1080 the listening strip lies fully inside the window and under the information line in all three layouts',
+      fits.length === 3 && fits.every((fit) => fit.stripBottom <= fit.inner && fit.stripTop >= fit.noteBottom),
+      JSON.stringify(fits),
+    );
+
+    // --- Listen: the motif played once on a chosen instrument and channel, by the page's own MIDI layer; Stop leaves nothing sounding. ---
+    {
+      // A fresh page with the quiet piece, a two-note motif written with the keys (C4 then E4, a sixteenth each), 'mt32 · channel 3' chosen, At once.
+      const writeMotif = async () => {
+        await evaluateExpr(cdp, `document.getElementById('scratch-roll').focus()`);
+        await pressKey(cdp, 'Enter');
+        await pressKey(cdp, 'ArrowRight');
+        for (let step = 0; step < 4; step++) await pressKey(cdp, 'ArrowUp');
+        await pressKey(cdp, 'Enter');
+      };
+      await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi listen at once');
+      await writeMotif();
+      const choose = (value) =>
+        evaluateExpr(cdp, `(() => { const select = document.getElementById('scratch-play-output'); const there = Array.from(select.options).some((option) => option.value === ${JSON.stringify(value)}); select.value = ${JSON.stringify(value)}; select.dispatchEvent(new Event('change')); return there; })()`);
+      const hearRead = () =>
+        evaluateExpr(
+          cdp,
+          `({ hear: document.getElementById('scratch-view').dataset.hear, note: document.getElementById('scratch-play-note').textContent, listen: document.getElementById('scratch-play-listen').getAttribute('aria-disabled'), stop: document.getElementById('scratch-play-stop').getAttribute('aria-disabled'), notes: Number(document.getElementById('scratch-view').dataset.notes), options: Array.from(document.getElementById('scratch-play-output').options).map((option) => option.textContent) })`,
+        );
+      const hearIs = (word, ms = 5000) => waitFor(cdp, `document.getElementById('scratch-view').dataset.hear === ${JSON.stringify(word)} ? true : null`, ms);
+      const press = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+      const requestLinesIn = (text) => text.split('\n').filter((line) => line.startsWith('Request from the Moontide page: ')).length;
+      // The strip's line holds the state sentence and then any Heads up sentences: the state sentence alone is what these checks read.
+      const stateOf = (note) => note.split(' Heads up: ')[0];
+      const synthEntries = async (from) => (await midiLog()).slice(from).filter((entry) => entry.port === 'Fake Synth A');
+      const listenBefore = await hearRead();
+      const optionThere = await choose('mt32|3');
+      const historyBeforeListen = String(await callTool(client, 'list_history', {}));
+      const codeBeforeListen = String(await callTool(client, 'get_code', {}));
+      const logBeforeListen = (await midiLog()).length;
+      await press('scratch-play-now');
+      await press('scratch-play-listen');
+      const ended = await hearIs('ended');
+      const afterListen = await hearRead();
+      const sent = await synthEntries(logBeforeListen);
+      const statuses = sent.map((entry) => entry.bytes[0]);
+      const ons = sent.filter((entry) => entry.bytes[0] === 0x92);
+      const offs = sent.filter((entry) => entry.bytes[0] === 0x82);
+      report(
+        "input: Listen plays the motif once on the chosen instrument and channel, as exactly its note-ons and note-offs, and the line says so",
+        listenBefore.options.includes('mt32 · channel 3') &&
+          optionThere === true &&
+          ended === true &&
+          afterListen.note === 'Played once on mt32, channel 3.' &&
+          sent.length === 4 &&
+          statuses.every((status) => status === 0x92 || status === 0x82) &&
+          JSON.stringify(ons.map((entry) => [entry.bytes[1], entry.bytes[2]])) === JSON.stringify([[60, 102], [64, 102]]) &&
+          JSON.stringify(offs.map((entry) => entry.bytes[1])) === JSON.stringify([60, 64]) &&
+          sent.every((entry) => entry.bytes.length === 3 && entry.ts !== null && entry.ts > 0),
+        JSON.stringify({ before: listenBefore, after: afterListen, sent: sent.map((entry) => entry.bytes) }),
+      );
+      const stopAt = (await midiLog()).length;
+      await press('scratch-play-listen');
+      await press('scratch-play-stop');
+      const stopped = await hearIs('stopped', 2000);
+      await sleep(500);
+      const afterStop = await hearRead();
+      const stopSent = await synthEntries(stopAt);
+      const onsSent = stopSent.filter((entry) => entry.bytes[0] === 0x92);
+      const offsSent = stopSent.filter((entry) => entry.bytes[0] === 0x82);
+      const onFor = (pitch) => onsSent.find((entry) => entry.bytes[1] === pitch);
+      report(
+        'input: Stop silences every note Listen handed over, each by a note-off of its own at or after its note-on, and never by anything else',
+        stopped === true &&
+          afterStop.note === 'Stopped. Held notes are silent.' &&
+          afterStop.stop === 'true' &&
+          onsSent.length >= 1 &&
+          stopSent.every((entry) => entry.bytes.length === 3 && (entry.bytes[0] === 0x92 || entry.bytes[0] === 0x82)) &&
+          onsSent.every((on) => offsSent.some((off) => off.bytes[1] === on.bytes[1] && (off.ts ?? Infinity) >= on.ts)),
+        JSON.stringify({ afterStop, sent: stopSent.map((entry) => ({ bytes: entry.bytes, ts: entry.ts })), first: onFor(60) ?? null }),
+      );
+      const afterAll = String(await callTool(client, 'list_history', {}));
+      report(
+        'input: Listen changes no code and no History and sends no request to Claude',
+        afterAll === historyBeforeListen && String(await callTool(client, 'get_code', {})) === codeBeforeListen && requestLinesIn(afterAll) === requestLinesIn(historyBeforeListen),
+        JSON.stringify({ sameHistory: afterAll === historyBeforeListen, requests: requestLinesIn(afterAll) }),
+      );
+
+      // Heads up: a track of the playing code on the chosen channel is named, another channel is not, the sentence follows the playing code, and
+      // Listen plays anyway. The motif holds no chord and the shipped MT-32 model says nothing about one note at a time, so only the channel sentence shows.
+      const TAKEN = 'setcps(1)\nlead: note("c3").midi(\'Fake Synth A\', { midichannel: 3 })';
+      await callTool(client, 'set_code', { code: TAKEN, label: 'probe:midi listen heads up' });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(TAKEN)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun('the page did not start running the code of the Heads up check within 8 seconds');
+      }
+      await sleep(1500);
+      await choose('mt32|3');
+      const takenRead = await hearRead();
+      await choose('mt32|4');
+      const freeRead = await hearRead();
+      await choose('mt32|3');
+      const headsUpMark = (await midiLog()).length;
+      await press('scratch-play-listen');
+      const headsUpEnded = await hearIs('ended');
+      const headsUpSent = (await synthEntries(headsUpMark)).filter((entry) => entry.bytes[0] === 0x92 && (entry.bytes[1] === 60 || entry.bytes[1] === 64));
+      const MUTED = 'setcps(1)\n_lead: note("c3").midi(\'Fake Synth A\', { midichannel: 3 })';
+      await callTool(client, 'set_code', { code: MUTED, label: 'probe:midi listen heads up muted' });
+      const mutedGone = await waitFor(cdp, `document.getElementById('scratch-play-note').textContent === 'Played once on mt32, channel 3.' ? true : null`, 8000);
+      report(
+        'input: Listen says a playing track uses the chosen channel and still plays, says nothing for another channel, and stops saying it when the track is muted',
+        takenRead.note === 'Heads up: channel 3 on mt32 is used by the track lead, which is playing. Both would sound on it.' &&
+          takenRead.listen === 'false' &&
+          freeRead.note === '' &&
+          headsUpEnded === true &&
+          headsUpSent.length === 2 &&
+          mutedGone === true,
+        JSON.stringify({ taken: takenRead, free: freeRead.note, sent: headsUpSent.map((entry) => entry.bytes), mutedGone }),
+      );
+
+      // In the music, with the music playing a note on every cycle line of the same instrument: Listen waits for a line and its first note
+      // lands where the music's own notes land (the one page clock). The motif's pitches (60, 64) differ from the music's (48).
+      const MUSIC = 'setcps(1)\nbeat: note("c3").midi(\'Fake Synth A\', { midichannel: 3 })';
+      await callTool(client, 'set_code', { code: MUSIC, label: 'probe:midi listen in the music' });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(MUSIC)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun('the page did not start running the music of the Listen checks within 8 seconds');
+      }
+      await sleep(2500);
+      await choose('mt32|3');
+      // A picture in layout a on a short window: the strip scrolls with the view and nothing is clipped.
+      const shootShort = async (name) => {
+        if (shotsDir === null) return;
+        await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 640, deviceScaleFactor: 1, mobile: false });
+        await sleep(250);
+        await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+        await pressKey(cdp, 'a');
+        await sleep(250);
+        await evaluateExpr(cdp, `document.getElementById('scratch-play').scrollIntoView({ block: 'center' })`);
+        await sleep(150);
+        const shot = await cdp('Page.captureScreenshot', { format: 'png' });
+        const file = `${name}-1920x640-layout-a.png`;
+        fs.writeFileSync(path.join(shotsDir, file), Buffer.from(shot.data, 'base64'));
+        shotNames.push(file);
+        await cdp('Emulation.clearDeviceMetricsOverride');
+      };
+      for (const layout of ['a', 'b', 'c']) await shoot('scratch-hear-idle', layout);
+      await shoot('scratch-hear-idle', 'a');
+      await shootShort('scratch-hear-idle-short');
+      const musicLogMark = (await midiLog()).length;
+      await press('scratch-play-music');
+      await press('scratch-play-listen');
+      const waiting = await hearIs('waiting', 2000);
+      const waitingRead = await hearRead();
+      const endedInMusic = await hearIs('ended', 8000);
+      const entries = (await synthEntries(musicLogMark)).filter((entry) => entry.bytes[0] === 0x92);
+      const musicOns = entries.filter((entry) => entry.bytes[1] === 48);
+      const listenOns = entries.filter((entry) => entry.bytes[1] === 60 || entry.bytes[1] === 64);
+      const offBy = listenOns.length === 0 || musicOns.length === 0 ? null : Math.min(...musicOns.map((entry) => Math.abs(entry.ts - listenOns[0].ts)));
+      const waitedCycle = Number((stateOf(waitingRead.note).match(/^Waiting for cycle (\d+) of the music, then playing on mt32, channel 3\. Stop cancels\.$/) ?? [])[1]);
+      report(
+        "input: Listen In the music says the cycle it waits for and plays its first note on a cycle line of the music, where the music's own note of that line lands",
+        waiting === true && Number.isInteger(waitedCycle) && endedInMusic === true && listenOns.length === 2 && offBy !== null && offBy <= 3,
+        JSON.stringify({ waitingRead: waitingRead.note, waitedCycle, offByMs: offBy, listen: listenOns.map((entry) => entry.ts), music: musicOns.map((entry) => entry.ts) }),
+      );
+
+      // Loop: the motif plays again on the next lines; Stop ends it and leaves every note-on with a note-off of its own.
+      const loopMark = (await midiLog()).length;
+      await press('scratch-play-loop');
+      await press('scratch-play-listen');
+      const twoPasses = await waitFor(
+        cdp,
+        `window.__midiLog.slice(${loopMark}).filter((entry) => entry.port === 'Fake Synth A' && entry.bytes[0] === 0x92 && (entry.bytes[1] === 60 || entry.bytes[1] === 64)).length >= 4 ? true : null`,
+        12000,
+      );
+      const loopingRead = await hearRead();
+      await press('scratch-play-stop');
+      const loopStopped = await hearIs('stopped', 2000);
+      await sleep(500);
+      const loopEntries = (await synthEntries(loopMark)).filter((entry) => entry.bytes[1] === 60 || entry.bytes[1] === 64);
+      const loopOns = loopEntries.filter((entry) => entry.bytes[0] === 0x92);
+      const loopOffs = loopEntries.filter((entry) => entry.bytes[0] === 0x82);
+      const offTime = (entry) => entry.ts ?? entry.t;
+      const matched = loopOns.every((on) => loopOffs.some((off) => off.bytes[1] === on.bytes[1] && offTime(off) >= on.ts));
+      const lapStarts = loopOns.filter((entry) => entry.bytes[1] === 60).map((entry) => entry.ts);
+      await press('scratch-play-loop');
+      report(
+        'input: Listen with Loop plays a second pass on the next lines of the music, and Stop ends it with a note-off for every note-on',
+        twoPasses === true && stateOf(loopingRead.note).endsWith('in a loop.') && loopStopped === true && loopOns.length >= 4 && matched && lapStarts.length >= 2 && Math.abs(lapStarts[1] - lapStarts[0] - 2000) <= 3,
+        JSON.stringify({ loopingRead: loopingRead.note, lapStarts, ons: loopOns.length, offs: loopOffs.length, matched }),
+      );
+
+      // With the music stopped, In the music has no cycle line to wait for: it says so, sends nothing and does not fall back to At once.
+      await stopMusic(cdp);
+      const musicStopped = await waitFor(cdp, `${replState}.started === false ? true : null`, 5000);
+      await sleep(900);
+      const refuseMark = (await midiLog()).length;
+      await press('scratch-play-listen');
+      const refusedSaid = await hearIs('refused', 2000);
+      const refusedRead = await hearRead();
+      await sleep(500);
+      const refusedSent = (await synthEntries(refuseMark)).filter((entry) => entry.bytes[0] === 0x92 || entry.bytes[0] === 0x82);
+      report(
+        'input: Listen In the music with the music stopped says there is no cycle line to wait for, sends nothing and does not start At once',
+        musicStopped === true &&
+          refusedSaid === true &&
+          refusedRead.note === 'The music is not playing, so there is no cycle line to wait for. Press Play, or choose At once.' &&
+          refusedSent.length === 0,
+        JSON.stringify({ refusedRead: refusedRead.note, sent: refusedSent.length }),
+      );
+      await shoot('scratch-hear-error', 'a');
+      await playMusic(cdp);
+
+      // The stops: another view opening and the tab being hidden each silence a play and say why, in plain words.
+      await sleep(2500);
+      await press('scratch-play-now');
+      await press('scratch-play-loop');
+      if (shotsDir !== null) {
+        await press('scratch-play-listen');
+        await waitFor(cdp, `document.getElementById('scratch-view').dataset.hear === 'playing' ? true : null`, 2000);
+        for (const layout of ['a', 'b', 'c']) await shoot('scratch-hear-playing', layout);
+        await shoot('scratch-hear-playing', 'a');
+        await shootShort('scratch-hear-playing-short');
+        await press('scratch-play-stop');
+        await hearIs('stopped', 2000);
+      }
+      const stopAfter = async (name, doIt) => {
+        const mark = (await midiLog()).length;
+        await press('scratch-play-listen');
+        await waitFor(cdp, `document.getElementById('scratch-view').dataset.hear === 'playing' ? true : null`, 2000);
+        await sleep(400);
+        await doIt();
+        await sleep(400);
+        const read = await evaluateExpr(cdp, `({ hear: document.getElementById('scratch-view').dataset.hear, note: document.getElementById('scratch-play-note').textContent })`);
+        const motifNotes = (list) => list.filter((entry) => entry.bytes[1] === 60 || entry.bytes[1] === 64);
+        const sentNow = motifNotes(await synthEntries(mark));
+        const ons = sentNow.filter((entry) => entry.bytes[0] === 0x92);
+        const offs = sentNow.filter((entry) => entry.bytes[0] === 0x82);
+        await sleep(600);
+        const later = motifNotes(await synthEntries(mark)).length;
+        return { name, read, ons: ons.length, offs: offs.length, quiet: later === sentNow.length };
+      };
+      const closed = await stopAfter('another view opens', async () => {
+        await openView(5);
+      });
+      await openView(7);
+      await sleep(300);
+      const reopened = await evaluateExpr(cdp, `document.getElementById('scratch-play-note').textContent`);
+      const hiddenStop = await stopAfter('the tab is hidden', async () => {
+        await evaluateExpr(cdp, `(() => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); })()`);
+      });
+      await evaluateExpr(cdp, `(() => { delete document.visibilityState; document.dispatchEvent(new Event('visibilitychange')); })()`);
+      report(
+        'input: another view opening silences a Listen play and says so (the sentence is still there when the Scratchpad opens again), and a hidden tab does the same',
+        closed.read.hear === 'stopped' &&
+          stateOf(closed.read.note) === 'Stopped: the Scratchpad was closed.' &&
+          closed.quiet &&
+          closed.offs >= closed.ons &&
+          stateOf(reopened) === 'Stopped: the Scratchpad was closed.' &&
+          hiddenStop.read.hear === 'stopped' &&
+          stateOf(hiddenStop.read.note) === 'Stopped: this tab was hidden, and a hidden tab cannot keep time.' &&
+          hiddenStop.quiet &&
+          hiddenStop.offs >= hiddenStop.ons,
+        JSON.stringify({ closed, reopened, hiddenStop }),
+      );
+      await press('scratch-play-loop');
+
+      // The permission: with MIDI not asked yet, the first press asks the browser once and says it waits, sends nothing, and Stop cancels the start.
+      await load({ permission: 'prompt', answer: 'hang', inputs: [KEYS] }, [KEYS], 'probe:midi listen permission pending');
+      await writeMotif();
+      await choose('mt32|3');
+      await press('scratch-play-now');
+      const requestsBeforeAsk = await requests();
+      const askMark = (await midiLog()).length;
+      await press('scratch-play-listen');
+      const asking = await hearIs('asking', 2000);
+      const askingRead = await hearRead();
+      await press('scratch-play-listen');
+      await sleep(300);
+      const requestsWhileAsking = await requests();
+      await press('scratch-play-stop');
+      const askCancelled = await hearIs('stopped', 2000);
+      const cancelledRead = await hearRead();
+      await sleep(400);
+      const askSent = (await synthEntries(askMark)).filter((entry) => entry.bytes[0] === 0x92 || entry.bytes[0] === 0x82);
+      report(
+        'input: with the MIDI permission unanswered, the first Listen press asks once, says it waits and sends nothing, and Stop cancels the start',
+        asking === true &&
+          askingRead.note === 'Waiting for the answer to the MIDI permission.' &&
+          askingRead.stop === 'false' &&
+          requestsWhileAsking - requestsBeforeAsk === 1 &&
+          askCancelled === true &&
+          cancelledRead.note === 'Stopped. Held notes are silent.' &&
+          askSent.length === 0,
+        JSON.stringify({ askingRead: askingRead.note, asked: requestsWhileAsking - requestsBeforeAsk, cancelledRead: cancelledRead.note, sent: askSent.length }),
+      );
+      await load({ permission: 'prompt', answer: 'grant', inputs: [KEYS] }, [KEYS], 'probe:midi listen permission granted');
+      await writeMotif();
+      await choose('mt32|3');
+      await press('scratch-play-now');
+      const grantMark = (await midiLog()).length;
+      await press('scratch-play-listen');
+      // Granting MIDI makes the page reset the instrument it has just found, and a note sent during the reset would be dropped by the device: the
+      // press that met the reset says so, and the next one plays.
+      await waitFor(cdp, `['ended', 'refused'].includes(document.getElementById('scratch-view').dataset.hear) ? true : null`, 6000);
+      const firstAnswer = await hearRead();
+      let grantedEnded = firstAnswer.hear === 'ended';
+      if (firstAnswer.hear === 'refused') {
+        await sleep(1500);
+        await press('scratch-play-listen');
+        grantedEnded = (await hearIs('ended', 6000)) === true;
+      }
+      const grantedSent = (await synthEntries(grantMark)).filter((entry) => entry.bytes[0] === 0x92 || entry.bytes[0] === 0x82);
+      report(
+        'input: the first Listen press asks for MIDI, and the motif plays once it is granted',
+        grantedEnded && (await requests()) === 1 && grantedSent.filter((entry) => entry.bytes[0] === 0x92).length === 2 && grantedSent.every((entry) => entry.bytes.length === 3),
+        JSON.stringify({ requests: await requests(), firstAnswer: firstAnswer.note, sent: grantedSent.map((entry) => entry.bytes) }),
+      );
+    }
+
+    // --- The whole workflow in the real page: played notes show live, Record that takes them, Align puts the first note on a beat, Listen plays
+    // the aligned motif on the chosen output and Send to Claude carries the same moment before and after the Align. ---
+    {
+      // Music with a note on every cycle line, on a channel nothing else uses: its note stamps are the cycle lines of the page clock, so the
+      // keyboard notes can be stamped a sixteenth after a line exactly as the page counts it.
+      const WORK_MUSIC = 'setcps(1)\ncal: note("c2").midi(\'Fake Synth A\', { midichannel: 9 })';
+      const REQUEST_PREFIX = 'Request from the Moontide page: ';
+      const press = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+      const choose = (value) =>
+        evaluateExpr(cdp, `(() => { const select = document.getElementById('scratch-play-output'); const there = Array.from(select.options).some((option) => option.value === ${JSON.stringify(value)}); select.value = ${JSON.stringify(value)}; select.dispatchEvent(new Event('change')); return there; })()`);
+      const hearIs = (word, ms = 5000) => waitFor(cdp, `document.getElementById('scratch-view').dataset.hear === ${JSON.stringify(word)} ? true : null`, ms);
+      const notesOnRoll = () =>
+        evaluateExpr(cdp, `Array.from(document.querySelectorAll('#scratch-notes .sp-note')).map((el) => ({ pitch: Number(el.dataset.pitch), start: Number(el.dataset.start), length: Number(el.dataset.length), velocity: Number(el.dataset.velocity) })).sort((a, b) => a.start - b.start)`);
+      const nonRequestLines = (text) => text.split('\n').filter((line) => !line.startsWith(REQUEST_PREFIX)).join('\n');
+      // Sends the motif and takes the request from the reply of a tool call, as Claude would read it.
+      const takeRequest = async () => {
+        if ((await waitFor(cdp, "document.getElementById('scratch-send-button').getAttribute('aria-disabled') === 'false' ? true : null", 5000)) !== true) {
+          throw new ProbeCouldNotRun('the Send to Claude button stayed unavailable for 5 seconds');
+        }
+        const phrase = await evaluateExpr(cdp, "document.getElementById('scratch-phrase').textContent");
+        await callTool(client, 'get_code', {});
+        await press('scratch-send-button');
+        const deadline = Date.now() + 5000;
+        let requests = [];
+        while (requests.length === 0 && Date.now() < deadline) {
+          await sleep(150);
+          requests = String(await callTool(client, 'list_history', {}))
+            .split('\n')
+            .filter((line) => line.startsWith(REQUEST_PREFIX))
+            .map((line) => JSON.parse(line.slice(REQUEST_PREFIX.length)))
+            .filter((request) => request.context.kind === 'motif');
+        }
+        const status = await evaluateExpr(cdp, "document.getElementById('scratch-send-status').textContent");
+        return { phrase, status, requests };
+      };
+
+      await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi workflow');
+      await callTool(client, 'set_code', { code: WORK_MUSIC, label: 'probe:midi workflow music' });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(WORK_MUSIC)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun('the page did not start running the music of the workflow check within 8 seconds');
+      }
+      await sleep(2500);
+      const historyAtStart = String(await callTool(client, 'list_history', {}));
+      const codeAtStart = String(await callTool(client, 'get_code', {}));
+
+      // A take of two cycles, every note a sixteenth after a cycle line, early in a ring lap so that it stays in one lap. The line is worked out
+      // from the music's own last note on the fake synth (the page clock's stamp of a cycle line); the notes are played 250 to 450 ms after it.
+      const lineWindow = await waitFor(
+        cdp,
+        `(() => {
+          const log = window.__midiLog;
+          let t0 = null;
+          for (let i = log.length - 1; i >= 0; i--) {
+            const entry = log[i];
+            if (entry.port === 'Fake Synth A' && entry.bytes[0] === 0x98 && entry.bytes[2] > 0 && typeof entry.ts === 'number') { t0 = entry.ts; break; }
+          }
+          if (t0 === null) return null;
+          const now = performance.now();
+          const phase = (((now - t0) % 1000) + 1000) % 1000;
+          const column = Number(document.getElementById('scratch-view').dataset.ringCycle);
+          return phase >= 250 && phase <= 450 && column >= 1 && column <= 3 ? { line: now - phase, column } : null;
+        })()`,
+        20000,
+      );
+      if (lineWindow === null || lineWindow === undefined) throw new ProbeCouldNotRun('the music never gave a cycle line early in a ring lap within 20 seconds');
+      const SIXTEENTH_MS = 62.5;
+      const first = lineWindow.line + SIXTEENTH_MS;
+      await playIn([0x90, 62, 100], first);
+      await playIn([0x80, 62, 0], first + 2 * SIXTEENTH_MS);
+      await sleep(1000);
+      await playIn([0x90, 66, 100], first + 1000);
+      await playIn([0x80, 66, 0], first + 1000 + 2 * SIXTEENTH_MS);
+      const isLive = await waitFor(cdp, `document.getElementById('scratch-view').dataset.live === 'live' && document.querySelectorAll('#scratch-live .sp-live').length === 2 ? true : null`, 2000);
+      const livePieces = await evaluateExpr(
+        cdp,
+        `Array.from(document.querySelectorAll('#scratch-live .sp-live')).map((el) => ({ pitch: Number(el.dataset.pitch), start: Number(el.dataset.start), length: Number(el.dataset.length) })).sort((a, b) => a.start - b.start)`,
+      );
+      await press('scratch-record');
+      const recorded = await waitFor(cdp, `Number(document.getElementById('scratch-view').dataset.notes) === 2 ? true : null`, 2000);
+      const recordedNotes = await notesOnRoll();
+      const firstRequest = await takeRequest();
+      const cycleOne = firstRequest.requests[0]?.motif?.cycle;
+      const phraseOne = firstRequest.requests[0]?.motif?.phrase;
+
+      await press('scratch-align');
+      const aligned = await waitFor(cdp, `document.getElementById('scratch-note-spoken').textContent.startsWith('Aligned:') ? true : null`, 2000);
+      const alignedNotes = await notesOnRoll();
+      const secondRequest = await takeRequest();
+      const cycleTwo = secondRequest.requests[0]?.motif?.cycle;
+      const phraseTwo = secondRequest.requests[0]?.motif?.phrase;
+      report(
+        'input: the whole workflow in the real page: played notes show live, Record that takes them, Align puts the first note on a beat and keeps the spacing, and the request carries the same whole cycle with a different phrase',
+        isLive === true &&
+          livePieces.length === 2 &&
+          livePieces[0].start % 12 === 3 &&
+          livePieces[1].start - livePieces[0].start === 48 &&
+          recorded === true &&
+          recordedNotes.length === 2 &&
+          recordedNotes[0].start % 12 === 3 &&
+          recordedNotes[1].start - recordedNotes[0].start === 48 &&
+          firstRequest.requests.length === 1 &&
+          secondRequest.requests.length === 1 &&
+          firstRequest.requests[0].motif.source === 'played' &&
+          secondRequest.requests[0].motif.source === 'played' &&
+          Number.isInteger(cycleOne) &&
+          cycleTwo === cycleOne &&
+          typeof phraseOne === 'string' &&
+          phraseOne === firstRequest.phrase &&
+          phraseTwo === secondRequest.phrase &&
+          phraseTwo !== phraseOne &&
+          aligned === true &&
+          alignedNotes.length === 2 &&
+          alignedNotes[0].start % 12 === 0 &&
+          alignedNotes[1].start - alignedNotes[0].start === 48 &&
+          alignedNotes[0].start === recordedNotes[0].start - 3 &&
+          alignedNotes.every((note, index) => note.length === recordedNotes[index].length && note.pitch === recordedNotes[index].pitch && note.velocity === recordedNotes[index].velocity),
+        JSON.stringify({ lineWindow, livePieces, recordedNotes, alignedNotes, cycleOne, cycleTwo, phraseOne, phraseTwo, statuses: [firstRequest.status, secondRequest.status] }),
+      );
+
+      // Listen plays the aligned motif on the chosen output: only its note-ons and note-offs reach channel 3, one cycle apart.
+      const optionThere = await choose('mt32|3');
+      await press('scratch-play-now');
+      const logMark = (await midiLog()).length;
+      await press('scratch-play-listen');
+      const listenEnded = await hearIs('ended', 8000);
+      await sleep(200);
+      const onChannel = (await midiLog()).slice(logMark).filter((entry) => entry.port === 'Fake Synth A' && (entry.bytes[0] & 0x0f) === 2);
+      const listenOns = onChannel.filter((entry) => entry.bytes[0] === 0x92);
+      const historyAtEnd = String(await callTool(client, 'list_history', {}));
+      report(
+        'input: the workflow ends in Listen: the aligned motif reaches the chosen output as only note-ons and note-offs, one cycle apart, and the code and the History are as they were',
+        optionThere === true &&
+          listenEnded === true &&
+          onChannel.every((entry) => entry.bytes[0] === 0x92 || entry.bytes[0] === 0x82) &&
+          JSON.stringify(listenOns.map((entry) => entry.bytes[1])) === JSON.stringify([62, 66]) &&
+          onChannel.filter((entry) => entry.bytes[0] === 0x82).length === 2 &&
+          Math.abs(listenOns[1].ts - listenOns[0].ts - 1000) <= 3 &&
+          String(await callTool(client, 'get_code', {})) === codeAtStart &&
+          nonRequestLines(historyAtEnd) === nonRequestLines(historyAtStart),
+        JSON.stringify({ sent: onChannel.map((entry) => ({ bytes: entry.bytes, ts: entry.ts })), sameCode: String(await callTool(client, 'get_code', {})) === codeAtStart, historyAtStart, historyAtEnd }),
+      );
+    }
+
+    // --- A reload keeps nothing of the Scratchpad: the output choice, Loop, the Start choice, Draw and the keyboard buffer are reset, and no
+    // key was added to the browser's storage. ---
+    {
+      const storageKeys = () => evaluateExpr(cdp, `JSON.stringify({ local: Object.keys(localStorage).sort(), session: Object.keys(sessionStorage).sort() })`);
+      const press = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+      await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi reload keeps nothing');
+      await listenIs('listening');
+      const keysBefore = await storageKeys();
+      await press('scratch-draw');
+      await press('scratch-play-loop');
+      await evaluateExpr(
+        cdp,
+        `(() => { const select = document.getElementById('scratch-play-output'); select.value = 'mt32|3'; select.dispatchEvent(new Event('change')); })()`,
+      );
+      await press('scratch-play-now');
+      await playIn([0x90, 60, 100]);
+      await countIs(1);
+      const changed = await evaluateExpr(
+        cdp,
+        `({ draw: document.getElementById('scratch-view').dataset.draw, loop: document.getElementById('scratch-play-loop').getAttribute('aria-pressed'), chosen: document.getElementById('scratch-play-output').value, now: document.getElementById('scratch-play-now').getAttribute('aria-pressed'), heard: Number(document.getElementById('scratch-view').dataset.heardCount) })`,
+      );
+      const keysChanged = await storageKeys();
+      await reloadPage(cdp);
+      await callTool(client, 'set_code', { code: PIECE, label: 'probe:midi reload keeps nothing again' });
+      if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(PIECE)} ? true : null`, 8000)) !== true) {
+        throw new ProbeCouldNotRun('the page did not start running the quiet piece after the reload within 8 seconds');
+      }
+      if ((await openView(7)) !== true) throw new ProbeCouldNotRun('the Scratchpad did not open after the reload');
+      await sleep(1000);
+      const afterReload = await evaluateExpr(
+        cdp,
+        `({ draw: document.getElementById('scratch-view').dataset.draw, loop: document.getElementById('scratch-play-loop').getAttribute('aria-pressed'), chosen: document.getElementById('scratch-play-output').value, chosenIndex: document.getElementById('scratch-play-output').selectedIndex, now: document.getElementById('scratch-play-now').getAttribute('aria-pressed'), music: document.getElementById('scratch-play-music').getAttribute('aria-pressed'), heard: Number(document.getElementById('scratch-view').dataset.heardCount) })`,
+      );
+      const keysAfter = await storageKeys();
+      report(
+        'input: after a reload the output choice, Loop, the Start choice, Draw and the keyboard buffer are reset and nothing was written to the browser storage',
+        changed.draw === 'on' &&
+          changed.loop === 'true' &&
+          changed.chosen === 'mt32|3' &&
+          changed.now === 'true' &&
+          changed.heard === 1 &&
+          afterReload.draw === 'off' &&
+          afterReload.loop === 'false' &&
+          afterReload.chosen === '' &&
+          afterReload.chosenIndex === 0 &&
+          afterReload.music === 'true' &&
+          afterReload.now === 'false' &&
+          afterReload.heard === 0 &&
+          keysChanged === keysBefore &&
+          keysAfter === keysBefore,
+        JSON.stringify({ changed, afterReload, keysBefore, keysChanged, keysAfter }),
+      );
+    }
+
+    // --- Pictures of the status strip, for the look: only with MOONTIDE_PROBE_SHOTS naming a folder outside the repository. ---
+    if (shotsDir !== null) {
+      const startLayout = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`);
+      try {
+        await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi input pictures listening');
+        await listenIs('listening');
+        for (const pitch of [60, 64, 67]) {
+          await playIn([0x90, pitch, 100]);
+          await sleep(120);
+          await playIn([0x80, pitch, 0]);
+        }
+        await countIs(3);
+        for (const layout of ['a', 'b', 'c']) await shoot('input-listening-heard', layout);
+        await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, ['Fake Keyz'], 'probe:midi input pictures missing');
+        await listenIs('missing');
+        await shoot('input-missing');
+        await load({ permission: 'prompt', answer: 'grant', inputs: [KEYS] }, [KEYS], 'probe:midi input pictures permission');
+        await listenIs('needs-permission');
+        await shoot('input-needs-permission');
+        await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi input pictures unplugged');
+        await listenIs('listening');
+        await evaluateExpr(cdp, `window.__unplugIn(${JSON.stringify(KEYS)})`);
+        await listenIs('unplugged', 1000);
+        await shoot('input-unplugged');
+
+      // The views the status strip pictures above do not cover: the hear strip with each Heads up sentence, a selection with its rectangle
+      // in progress, Draw on, and the keyboard focus ring on the new controls. A made-up model that says it plays one note at a time, on the
+      // fake synth, and music with a track on channel 3 of it.
+      const modelDir = path.join(dataDir, 'models');
+      const modelFile = path.join(modelDir, 'monosynth.json');
+      try {
+        fs.mkdirSync(modelDir, { recursive: true });
+        fs.writeFileSync(
+          modelFile,
+          JSON.stringify({
+            id: 'monosynth',
+            name: 'Mono Synth',
+            channels: { melodic: [1, 2, 3, 4, 5, 6, 7, 8], rhythm: [10] },
+            bankSelect: 'none',
+            defaultVolume: 100,
+            monophonic: true,
+            controls: [],
+            sounds: { melodic: [{ name: 'Probe Tone', program: 0 }], rhythm: [] },
+            notes: [],
+          }),
+        );
+        const TAKEN_PIECE = 'setcps(1)\nlead: note("c3").midi(\'Fake Synth A\', { midichannel: 3 })';
+        await load({ permission: 'granted', inputs: [KEYS, 'Fake Pads'] }, [KEYS], 'probe:midi pictures views');
+        fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'monosynth', port: 'Fake Synth A' }], inputs: [{ port: KEYS }] }));
+        await callTool(client, 'set_code', { code: TAKEN_PIECE, label: 'probe:midi pictures views music' });
+        await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(TAKEN_PIECE)} ? true : null`, 8000);
+        await sleep(2000);
+        const pressId = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+        const chooseOutput = (value) =>
+          evaluateExpr(cdp, `(() => { const select = document.getElementById('scratch-play-output'); select.value = ${JSON.stringify(value)}; select.dispatchEvent(new Event('change')); return Array.from(select.options).some((option) => option.value === ${JSON.stringify(value)}); })()`);
+        // A picture of the page as it stands (no key, no blur), at 1920x1080.
+        const shootAsIs = async (name, layout) => {
+          await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
+          await sleep(300);
+          const shot = await cdp('Page.captureScreenshot', { format: 'png' });
+          const file = `${name}-1920x1080-layout-${layout}.png`;
+          fs.writeFileSync(path.join(shotsDir, file), Buffer.from(shot.data, 'base64'));
+          shotNames.push(file);
+        };
+        const writeNotes = async () => {
+          // Three single notes: C-ish at the start, one beat later and one beat after that (the cursor starts on the first row of the window).
+          await evaluateExpr(cdp, `document.getElementById('scratch-roll').focus()`);
+          await pressKey(cdp, 'Home');
+          await pressKey(cdp, 'Enter');
+          for (let n = 0; n < 4; n++) await pressKey(cdp, 'ArrowRight');
+          await pressKey(cdp, 'ArrowUp');
+          await pressKey(cdp, 'ArrowUp');
+          await pressKey(cdp, 'Enter');
+          for (let n = 0; n < 4; n++) await pressKey(cdp, 'ArrowRight');
+          await pressKey(cdp, 'ArrowUp');
+          await pressKey(cdp, 'ArrowUp');
+          await pressKey(cdp, 'Enter');
+        };
+        await writeNotes();
+        // The channel sentence alone: a track of the playing music uses channel 3, and the motif holds no chord.
+        await chooseOutput('mt32|3');
+        await sleep(300);
+        for (const layout of ['a', 'b', 'c']) await shoot('scratch-hear-warn-channel', layout, layout === 'a' ? 'scratch-play' : null);
+        // Then a chord: a second note at the start of the first. Both sentences, and then the chord sentence alone on a free channel.
+        await evaluateExpr(cdp, `document.getElementById('scratch-roll').focus()`);
+        await pressKey(cdp, 'Home');
+        await pressKey(cdp, 'Enter');
+        await sleep(300);
+        for (const layout of ['a', 'b', 'c']) await shoot('scratch-hear-warn-both', layout, layout === 'a' ? 'scratch-play' : null);
+        await chooseOutput('mt32|4');
+        await sleep(300);
+        await shoot('scratch-hear-warn-chord', 'a', 'scratch-play');
+        // A selection with its rectangle in progress: the drag starts on empty space to the right of the notes and is held while the picture is
+        // taken, then let go (the notes the rectangle touched are selected).
+        const geometry = () =>
+          evaluateExpr(
+            cdp,
+            `(() => {
+              const notes = Array.from(document.querySelectorAll('#scratch-notes .sp-note')).map((el) => el.getBoundingClientRect());
+              const grid = document.getElementById('scratch-grid').getBoundingClientRect();
+              return { left: Math.min(...notes.map((r) => r.left)), top: Math.min(...notes.map((r) => r.top)), right: Math.max(...notes.map((r) => r.right)), bottom: Math.max(...notes.map((r) => r.bottom)), gridRight: grid.right, gridBottom: grid.bottom };
+            })()`,
+          );
+        const mouse = (type, x, y, extra = {}) => cdp('Input.dispatchMouseEvent', { type, x, y, button: 'left', buttons: type === 'mouseReleased' ? 0 : 1, clickCount: type === 'mouseMoved' ? 0 : 1, ...extra });
+        for (const layout of ['a', 'b', 'c']) {
+          await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 1080, deviceScaleFactor: 1, mobile: false });
+          await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+          await pressKey(cdp, layout);
+          await sleep(400);
+          await evaluateExpr(cdp, `document.getElementById('scratch-roll').scrollIntoView({ block: 'start' })`);
+          const box = await geometry();
+          const startX = Math.min(box.right + 40, box.gridRight - 4);
+          const startY = Math.min(box.bottom + 10, box.gridBottom - 4);
+          await mouse('mousePressed', startX, startY);
+          await mouse('mouseMoved', (startX + box.left) / 2, (startY + box.top) / 2, { clickCount: 0 });
+          await mouse('mouseMoved', box.left + 2, box.top - 8, { clickCount: 0 });
+          await sleep(200);
+          const rectShown = await evaluateExpr(cdp, `document.getElementById('scratch-select-rect').hidden === false`);
+          const midDrag = await cdp('Page.captureScreenshot', { format: 'png' });
+          const dragFile = `scratch-select-rectangle-1920x1080-layout-${layout}.png`;
+          fs.writeFileSync(path.join(shotsDir, dragFile), Buffer.from(midDrag.data, 'base64'));
+          shotNames.push(dragFile);
+          await mouse('mouseReleased', box.left + 2, box.top - 8, { clickCount: 1 });
+          await sleep(200);
+          const selected = await evaluateExpr(cdp, `Number(document.getElementById('scratch-view').dataset.selectedCount)`);
+          if (layout === 'a') {
+            const heldFile = 'scratch-select-selected-1920x1080-layout-a.png';
+            const selectedShot = await cdp('Page.captureScreenshot', { format: 'png' });
+            fs.writeFileSync(path.join(shotsDir, heldFile), Buffer.from(selectedShot.data, 'base64'));
+            shotNames.push(heldFile);
+          }
+          if (rectShown !== true || selected < 2) console.error(`probe:midi input pictures: the selection rectangle picture in layout ${layout} is wrong (rectangle shown ${rectShown}, ${selected} notes selected)`);
+          await pressKey(cdp, 'a', { ctrl: true, shift: true, plain: true });
+          await cdp('Emulation.clearDeviceMetricsOverride');
+        }
+        // Draw on, in each layout.
+        await pressId('scratch-draw');
+        for (const layout of ['a', 'b', 'c']) await shoot('scratch-draw-on', layout);
+        await pressId('scratch-draw');
+        // The keyboard focus ring on the new controls (layout a): the Draw toggle, Align and Listen.
+        await pressKey(cdp, 'a');
+        for (const [name, id] of [['scratch-focus-draw', 'scratch-draw'], ['scratch-focus-align', 'scratch-align'], ['scratch-focus-listen', 'scratch-play-listen'], ['scratch-focus-menu', 'scratch-play-output']]) {
+          await evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).focus()`);
+          await shootAsIs(name, 'a');
+          await cdp('Emulation.clearDeviceMetricsOverride');
+        }
+      } finally {
+        await cdp('Emulation.clearDeviceMetricsOverride');
+        fs.rmSync(modelDir, { recursive: true, force: true });
+        fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: 'mt32', model: 'mt32', port: 'Fake Synth A' }], inputs: [{ port: KEYS }] }));
+      }
+      } finally {
+        await cdp('Emulation.clearDeviceMetricsOverride');
+        if ((await evaluateExpr(cdp, `document.getElementById('workspace').dataset.layout`)) !== startLayout) await pressKey(cdp, startLayout);
+      }
+      console.log(`probe:midi input pictures saved: ${shotNames.length} (${shotNames.join(', ')})`);
+    }
+  } finally {
+    // A failure here must not hide the one that brought the checks down.
+    try {
+      await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi input done' });
+    } catch (err) {
+      console.error(`probe:midi input: the quiet code could not be set at the end: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`);
+    }
+    if (earlier === null) fs.rmSync(rigFile, { force: true });
+    else fs.writeFileSync(rigFile, earlier);
+  }
+}
+
+/**
+ * Settings checks over the fake MIDI device: the tone, part and scene options of `.midi()` are checked and sent in the real page against
+ * a made-up instrument (a model with settings and a sound list with an engine table, written into the probe's own data folder). Valid
+ * settings play and reach the port as exact data sets in the documented order; every refusal keeps the previous music and sends
+ * nothing. `setScenario` reloads the page with a fresh fake device, `dataDir` is the server's data folder. The pieces are not heard: the
+ * fake port only records.
+ */
+export async function settingsMidiBlocks(context) {
+  const { cdp, client, report, setScenario, dataDir } = context;
+  const replState = `document.getElementById('repl').editor.repl.state`;
+  const modelFile = path.join(dataDir, 'models', 'tonesynth.json');
+  const catalogFile = path.join(dataDir, 'catalogs', 'tonesynth.json');
+  const memoryModelFile = path.join(dataDir, 'models', 'memorysynth.json');
+  const engineModelFile = path.join(dataDir, 'models', 'enginesynth.json');
+  const engineCatalogFile = path.join(dataDir, 'catalogs', 'enginesynth.json');
+  const offsetModelFile = path.join(dataDir, 'models', 'offsetsynth.json');
+  const timbreModelFile = path.join(dataDir, 'models', 'timbresynth.json');
+  const rigFile = path.join(dataDir, 'instruments.json');
+  const logLength = () => evaluateExpr(cdp, 'window.__midiLog.length');
+  const logSince = (mark) => evaluateExpr(cdp, `window.__midiLog.slice(${mark})`);
+  const refusedWith = async (code, label) => {
+    try {
+      await callTool(client, 'set_code', { code, label });
+      return null;
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  };
+  const firstLine = (text) => (text ?? '').split('\n')[0];
+  const piece = (options) => `lead: note("c3 e3 g3 c4").midi('Fake Synth A', { midichannel: 1, ${options} })`;
+  const base = piece("sound: 'Model Tone'");
+  // The bank selects, program changes and messages starting with F0 that reached Fake Synth A, with their log entries, in the order the port got them.
+  const setupEntries = (entries) =>
+    entries.filter(
+      (entry) =>
+        entry.port === 'Fake Synth A' &&
+        (entry.bytes[0] === 0xf0 ||
+          (entry.bytes.length === 2 && (entry.bytes[0] & 0xf0) === 0xc0) ||
+          (entry.bytes.length === 3 && (entry.bytes[0] & 0xf0) === 0xb0 && (entry.bytes[1] === 0 || entry.bytes[1] === 32)) ||
+          // The fifteen bytes of an NRPN set start with control 99.
+          (entry.bytes.length === 15 && (entry.bytes[0] & 0xf0) === 0xb0 && entry.bytes[1] === 99)),
+    );
+  const setupMessages = (entries) => setupEntries(entries).map((entry) => entry.bytes);
+  // The same, with every send cut into its messages.
+  const splitMessages = splitSentMessages;
+  const setupBytes = (entries) => setupEntries(entries).length;
+  const sameMessages = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const hex = (bytes) => bytes.map((byte) => byte.toString(16).toUpperCase().padStart(2, '0')).join(' ');
+  const id = 'tonesynth';
+  const engineId = 'enginesynth';
+  const offsetId = 'offsetsynth';
+  const timbreId = 'timbresynth';
+  try {
+    await setScenario({ permission: 'granted' });
+    fs.mkdirSync(path.dirname(modelFile), { recursive: true });
+    fs.mkdirSync(path.dirname(catalogFile), { recursive: true });
+    fs.writeFileSync(modelFile, JSON.stringify(toneSynthModel()));
+    fs.writeFileSync(catalogFile, JSON.stringify(toneSynthCatalog()));
+    fs.writeFileSync(memoryModelFile, JSON.stringify(memorySynthModel()));
+    fs.writeFileSync(
+      rigFile,
+      JSON.stringify({
+        instruments: [
+          { id: 'tonesynth', model: 'tonesynth', port: 'Fake Synth A' },
+          { id: 'memorysynth', model: 'memorysynth', port: 'Fake Synth B' },
+        ],
+      }),
+    );
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi settings rig' });
+    await callTool(client, 'get_midi_instruments', {});
+    await sleep(1500);
+
+    // The base piece names a sound and no setting; it plays before every refusal below.
+    await callTool(client, 'set_code', { code: base, label: 'probe:midi settings base' });
+    if ((await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(base)} ? true : null`, 8000)) !== true) {
+      throw new ProbeCouldNotRun('the page did not start running the base piece of the settings check within 8 seconds');
+    }
+    const heardAfter = (mark, ms) =>
+      waitFor(cdp, `window.__midiLog.slice(${mark}).some((e) => e.port === 'Fake Synth A' && e.bytes.length === 3 && e.bytes[0] === 0x90 && e.bytes[2] > 0) ? true : null`, ms);
+    if ((await heardAfter(await logLength(), 8000)) !== true) throw new ProbeCouldNotRun('the base piece of the settings check sent no note to the fake port within 8 seconds');
+
+    // (1) Two channels with settings at the three levels: the page puts exactly the documented messages on the port, in order, each
+    // channel's data sets after its program change, the scene last; the reply says the scene setting reaches every part. Channel 1's
+    // sound is the base piece's, so only channel 2 sends bank selects and a program change.
+    const validCode = (cutoff) => settingsValidPiece('Fake Synth A', cutoff);
+    const valid = validCode(600);
+    const cutoffSet = VALID_SETTING_SETS.cutoff;
+    const { pan: panSet, lfo: lfoSet, level: levelSet, reverb: reverbSet } = VALID_SETTING_SETS;
+    const expectedSent = settingsValidSent();
+    const sceneLine = midiEventLine({ kind: 'settings-scene', instrument: id, names: ['reverbLevel'] });
+    const validMark = await logLength();
+    let validRefusal = null;
+    let validReply = '';
+    try {
+      validReply = await callTool(client, 'set_code', { code: valid, label: 'probe:midi settings valid' });
+    } catch (err) {
+      validRefusal = err instanceof Error ? err.message : String(err);
+    }
+    const active = await waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(valid)} ? true : null`, 8000);
+    await sleep(600);
+    const validSent = setupMessages(await logSince(validMark));
+    report(
+      'settings: tone, part and scene settings on two channels reach the port as the documented data sets in the documented order, after the program change of their channel',
+      validRefusal === null && active === true && JSON.stringify(validSent) === JSON.stringify(expectedSent),
+      JSON.stringify({ refusal: firstLine(validRefusal), active: active === true, sent: validSent, expected: expectedSent }),
+    );
+    report(
+      'settings: the reply says a scene setting reaches every part, and the code keeps playing its notes',
+      validReply.includes(sceneLine) && (await heardAfter(await logLength(), 4000)) === true,
+      JSON.stringify({ expectedLine: sceneLine, reply: validReply.slice(0, 600) }),
+    );
+
+    // A refusal fails the evaluation with its first line, the valid code stays the code and the active code, the notes keep coming,
+    // and no setup byte, bank select or system exclusive message goes out after it.
+    const refusal = async (name, code, expectedLine, label, extra = () => true, stays = valid) => {
+      const mark = await logLength();
+      const text = await refusedWith(code, label);
+      const codeAfter = await callTool(client, 'get_code', {});
+      const activeAfter = await evaluateExpr(cdp, `${replState}.activeCode`);
+      const noteMark = await logLength();
+      const stillPlays = await heardAfter(noteMark, 6000);
+      const entries = await logSince(mark);
+      const sent = setupBytes(entries);
+      report(
+        name,
+        firstLine(text) === `Evaluation failed: ${expectedLine}` && extra(text ?? '', entries) && codeAfter.includes(stays) && activeAfter === stays && stillPlays === true && sent === 0,
+        JSON.stringify({ errorStart: firstLine(text), expected: expectedLine, codeUnchanged: codeAfter.includes(stays), activeUnchanged: activeAfter === stays, stillPlays: stillPlays === true, setupBytesSent: sent }),
+      );
+    };
+    await refusal(
+      'settings: an unknown tone setting name fails the evaluation with the names that exist, the music keeps playing and nothing is sent',
+      piece("sound: 'Model Tone', tone: { filterCutof: 600 }"),
+      fill(RIG_COPY.unknownSetting, { level: 'tone', setting: 'filterCutof', id }),
+      'probe:midi settings unknown name',
+      (text) => text.includes('filterCutoff'),
+    );
+    await refusal(
+      'settings: a value out of range fails the evaluation with the range, the music keeps playing and nothing is sent',
+      piece("sound: 'Model Tone', tone: { filterCutoff: 5000 }"),
+      fill(RIG_COPY.settingRange, { setting: 'filterCutoff', level: 'tone', id, min: 0, max: 1023 }),
+      'probe:midi settings range',
+    );
+    await refusal(
+      'settings: a tone setting of another engine fails the evaluation naming both engines, the music keeps playing and nothing is sent',
+      piece("sound: 'Core Tone', tone: { filterCutoff: 600 }"),
+      fill(RIG_COPY.engineMismatch, { setting: 'filterCutoff', settingEngines: 'Model Engine', id, sound: 'Core Tone', engine: 'Core Engine' }),
+      'probe:midi settings engine mismatch',
+      (text) => text.includes('Core Engine') && text.includes('Model Engine'),
+    );
+    await refusal(
+      'settings: tone settings with no sound in the call fail the evaluation with the reason, the music keeps playing and nothing is sent',
+      piece('tone: { filterCutoff: 600 }'),
+      fill(RIG_COPY.engineNoSound, { id }),
+      'probe:midi settings no sound',
+    );
+    await refusal(
+      'settings: tone settings on a sound the catalog does not place fail the evaluation with the reason, the music keeps playing and nothing is sent',
+      piece("sound: 'Loose Tone', tone: { filterCutoff: 600 }"),
+      fill(RIG_COPY.engineUnknown, { sound: 'Loose Tone', id }),
+      'probe:midi settings engine unknown',
+      (text) => text.includes(RIG_COPY.engineUnknownWhy),
+    );
+
+    // A scene name written under part is refused with the level it belongs to, and nothing is sent.
+    await refusal(
+      'settings: a scene setting written under part fails the evaluation naming the level it belongs to, the music keeps playing and nothing is sent',
+      piece("sound: 'Model Tone', part: { reverbLevel: 80 }"),
+      fill(RIG_COPY.unknownSetting, { level: 'part', setting: 'reverbLevel', id }),
+      'probe:midi settings scene under part',
+      (text) => text.includes(fill(RIG_COPY.otherLevel, { setting: 'reverbLevel', other: 'scene', id })),
+    );
+
+    // A model whose setting points into the instrument's memory is refused with the address, and no system exclusive message
+    // reaches either port.
+    const memoryId = 'memorysynth';
+    await refusal(
+      "settings: a setting that points into the instrument's memory fails the evaluation with its address, the music keeps playing and no system exclusive message is sent",
+      `${valid}\nmemory: note("c5").midi('Fake Synth B', { midichannel: 1, part: { level: 100 } })`,
+      fill(SETTINGS_COPY.memoryWrite, { setting: 'level', level: 'part', id: memoryId, address: '50 00 10 05' }),
+      'probe:midi settings memory model',
+      (text, entries) => text.includes(SETTINGS_COPY.temporaryOnly) && !entries.some((entry) => entry.bytes[0] === 0xf0),
+    );
+
+    // Replies after a code change: the reply of the call and the one that follows, since a fact the page tells waits for the next reply
+    // when it was told after the call answered.
+    const repliesOf = async (code, label, extraArgs = {}) => {
+      const first = await callTool(client, 'set_code', { code, label, ...extraArgs });
+      await sleep(800);
+      return `${first}\n${await callTool(client, 'get_code', {})}`;
+    };
+    const activeIs = (code, ms = 8000) => waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} ? true : null`, ms);
+    const playValid = async (label) => {
+      await callTool(client, 'set_code', { code: valid, label });
+      if ((await activeIs(valid)) !== true) throw new ProbeCouldNotRun('the page did not go back to the valid piece of the settings check within 8 seconds');
+      await sleep(600);
+    };
+    const noteOnAfter = (mark, port, status, pitch, ms) =>
+      waitFor(
+        cdp,
+        `window.__midiLog.slice(${mark}).some((e) => e.port === ${JSON.stringify(port)} && e.bytes.length === 3 && e.bytes[0] === ${status} && e.bytes[1] === ${pitch} && e.bytes[2] > 0) ? true : null`,
+        ms,
+      );
+
+    // (1) A setting taken out of the code sends nothing for it, and the reply says the value stays on the instrument.
+    const leftMark = await logLength();
+    const leftReplies = await repliesOf(validCode(null), 'probe:midi settings left the code');
+    await activeIs(validCode(null));
+    await sleep(600);
+    const leftSent = setupMessages(await logSince(leftMark));
+    const leftLine = midiEventLine({ kind: 'settings-left', instrument: id, level: 'tone', channel: 1, names: ['filterCutoff'] });
+    report(
+      'settings: a setting taken out of the code sends nothing for it, the other data sets go out again, and the reply says the value stays on the instrument',
+      sameMessages(leftSent, [panSet, lfoSet, levelSet, reverbSet]) && !leftSent.some((bytes) => bytes.length > 12 && hex(bytes.slice(8, 12)) === '02 10 00 4F') && leftReplies.includes(leftLine),
+      JSON.stringify({ sent: leftSent.map(hex), expectedLine: leftLine, replyHasLine: leftReplies.includes(leftLine) }),
+    );
+    await playValid('probe:midi settings back to valid');
+
+    // (2) The code's own system exclusive message: Strudel's sysexid and sysexdata make .midi() send one. A data set into the user
+    // area never reaches the port; a data set into a temporary tone does; the reply tells once that nothing that could write memory is sent.
+    const sysexBody = (data) => data.slice(2, -1);
+    const memoryMessage = settingDataSet({ address: [0x50, 0x00, 0x00, 0x00], size: 1, value: 1 });
+    const temporaryMessage = settingDataSet({ address: [0x02, 0x10, 0x00, 0x4f], size: 4, value: 0 });
+    const ownSysex = (name, message, channel) =>
+      `${name}: note("c5").sysexid(0x41).sysexdata(${JSON.stringify(sysexBody(message))}).midi('Fake Synth A', { midichannel: ${channel} })`;
+    const ownCode = `${valid}\n${ownSysex('into_memory', memoryMessage, 3)}\n${ownSysex('into_temporary', temporaryMessage, 4)}`;
+    const ownMark = await logLength();
+    const ownFirst = await callTool(client, 'set_code', { code: ownCode, label: 'probe:midi settings own system exclusive' });
+    await activeIs(ownCode);
+    // The drop happens when the new notes play, a cycle after the call; the reply that tells it comes after that.
+    const temporaryJson = JSON.stringify(temporaryMessage);
+    await waitFor(cdp, `window.__midiLog.slice(${ownMark}).some((e) => e.port === 'Fake Synth A' && JSON.stringify(e.bytes) === ${JSON.stringify(temporaryJson)}) ? true : null`, 15000);
+    await sleep(2500);
+    const ownReplies = `${ownFirst}\n${await callTool(client, 'get_code', {})}`;
+    const ownEntries = await logSince(ownMark);
+    const reached = (message) => ownEntries.filter((entry) => entry.port === 'Fake Synth A' && sameMessages(entry.bytes, message)).length;
+    const refusedLine = midiEventLine({ kind: 'sysex-refused', instrument: id, source: 'code', reason: 'outside' });
+    report(
+      "settings: the code's own system exclusive message into the instrument's memory never reaches the port, one into a temporary tone does, and the reply says nothing that could write memory is sent",
+      reached(memoryMessage) === 0 && reached(temporaryMessage) >= 1 && ownReplies.includes(refusedLine),
+      JSON.stringify({ memoryMessageReached: reached(memoryMessage), temporaryMessageReached: reached(temporaryMessage), expectedLine: refusedLine, replyHasLine: ownReplies.includes(refusedLine) }),
+    );
+    await playValid('probe:midi settings back to valid after own sysex');
+
+    // (3) A change that waits for its bar line stamps the sound and the data sets of its setup with one timestamp, sent ahead of it
+    // and before the first note of the new code. A third channel is new, so the change carries bank selects and a program change.
+    const barCode = `${validCode(400)}\nthird: note("c5 c5").midi('Fake Synth A', { midichannel: 3, sound: 'Model Tone', tone: { filterResonance: 100 } })`;
+    const barExpected = [
+      cutoffSet(400),
+      panSet,
+      lfoSet,
+      levelSet,
+      [0xb2, 0x00, 0x61],
+      [0xb2, 0x20, 0x40],
+      [0xc2, 0x00],
+      settingDataSet({ address: [0x02, 0x12, 0x00, 0x53], size: 4, value: 100 }),
+      reverbSet,
+    ];
+    const barMark = await logLength();
+    await callTool(client, 'set_code', { code: barCode, label: 'probe:midi settings at the bar line', at: 'bar' });
+    const thirdHeard = await noteOnAfter(barMark, 'Fake Synth A', 0x92, 72, 30000);
+    await sleep(300);
+    const barEntries = await logSince(barMark);
+    const barSetup = setupEntries(barEntries);
+    const stamps = [...new Set(barSetup.map((entry) => entry.ts))];
+    const firstThird = barEntries.filter((entry) => entry.port === 'Fake Synth A' && entry.bytes[0] === 0x92 && entry.bytes[2] > 0 && typeof entry.ts === 'number').map((entry) => entry.ts);
+    report(
+      'settings: a change that waits for its bar line stamps its data sets, bank selects and program change with one timestamp, sent ahead of it and before the first note of the new code',
+      thirdHeard === true &&
+        stamps.length === 1 &&
+        typeof stamps[0] === 'number' &&
+        barSetup.every((entry) => entry.t < entry.ts) &&
+        firstThird.length > 0 &&
+        stamps[0] <= Math.min(...firstThird) &&
+        sameMessages(barSetup.map((entry) => entry.bytes), barExpected),
+      JSON.stringify({ thirdHeard: thirdHeard === true, stamps, sent: barSetup.map((entry) => hex(entry.bytes)), sentAheadMs: barSetup.map((entry) => Math.round(entry.ts - entry.t)), firstThirdNoteTs: Math.min(...firstThird) }),
+    );
+    await playValid('probe:midi settings back to valid after the bar change');
+
+    // (4) A replug sends the settings again after each program change: the reconnect sets the instrument up twice, and each setup carries
+    // every data set of the playing code, a channel's after its program change and the scene after the program changes of the channels.
+    await evaluateExpr(cdp, `window.__unplug('Fake Synth A')`);
+    await sleep(500);
+    const replugMark = await logLength();
+    await evaluateExpr(cdp, `window.__plug('Fake Synth A')`);
+    const replugNotes = await noteOnAfter(replugMark, 'Fake Synth A', 0x90, 48, 20000);
+    await sleep(RESET_SETTLE_MS + RECONNECT_REPEAT_MS + 1500);
+    const replugSent = setupMessages(await logSince(replugMark));
+    const half = replugSent.length / 2;
+    const setups = [replugSent.slice(0, half), replugSent.slice(half)];
+    const indexIn = (list, message) => list.findIndex((bytes) => sameMessages(bytes, message));
+    const settingsAfterSound = (list) => {
+      const program1 = list.findIndex((bytes) => sameMessages(bytes, [0xc0, 0x00]));
+      const program2 = list.findIndex((bytes) => sameMessages(bytes, [0xc1, 0x00]));
+      const lastProgram = Math.max(program1, program2);
+      return (
+        program1 >= 0 &&
+        program2 >= 0 &&
+        indexIn(list, cutoffSet(600)) > program1 &&
+        indexIn(list, panSet) > program1 &&
+        indexIn(list, lfoSet) > program2 &&
+        indexIn(list, levelSet) > program2 &&
+        indexIn(list, reverbSet) > lastProgram &&
+        [cutoffSet(600), panSet, lfoSet, levelSet, reverbSet].every((message) => list.filter((bytes) => sameMessages(bytes, message)).length === 1)
+      );
+    };
+    report(
+      'settings: a replug sends the settings of the playing code again after the program change of their channel, in both setups of the reconnect',
+      replugNotes === true && Number.isInteger(half) && half > 0 && sameMessages(setups[0], setups[1]) && setups.every(settingsAfterSound),
+      JSON.stringify({ notesAgain: replugNotes === true, setups: setups.map((list) => list.map(hex)) }),
+    );
+
+    // (4b) The listing equals what the page takes: the Settings lines of a real get_midi_instruments reply give the names and ranges, they
+    // hold exactly the rows of the model, every listed name is written at its lowest and at its highest value and reaches the port as
+    // its data set, and one past the highest is refused with the range. Each extreme is a piece of its own, since one setting takes one
+    // value in an evaluation: tone at the top with part and scene at the bottom, then the other way round.
+    const listing = await callTool(client, 'get_midi_instruments', {});
+    const listingLines = listing.split('\n');
+    const sectionStart = listingLines.findIndex((line) => line.startsWith(`- ${id}:`));
+    const section = [];
+    for (let at = sectionStart + 1; sectionStart >= 0 && at < listingLines.length && !listingLines[at].startsWith('- '); at++) section.push(listingLines[at]);
+    const listedRows = (text) =>
+      text === 'none.' ? [] : text.replace(/\.$/, '').split(', ').map((entry) => {
+        const found = /^(\w+) (\d+)-(\d+)$/.exec(entry);
+        return found === null ? null : { name: found[1], min: Number(found[2]), max: Number(found[3]) };
+      });
+    const listedAfter = (prefix) => {
+      const line = section.find((candidate) => candidate.startsWith(prefix));
+      return line === undefined ? null : listedRows(line.slice(prefix.length));
+    };
+    const listed = {
+      tone: listedAfter('    Tone, for a sound of engine "Model Engine": '),
+      toneCore: listedAfter('    Tone, for a sound of engine "Core Engine": '),
+      toneNone: listedAfter('    Tone, for a sound in no engine: '),
+      part: section.find((line) => line.startsWith('    Part, ')),
+      scene: section.find((line) => line.startsWith('    Scene, ')),
+    };
+    listed.part = listed.part === undefined ? null : listedRows(listed.part.slice(listed.part.indexOf(': ') + 2));
+    listed.scene = listed.scene === undefined ? null : listedRows(listed.scene.slice(listed.scene.indexOf(': ') + 2));
+    const modelSettings = toneSynthModel().settings;
+    const rowsOf = (rows) => rows.map((row) => ({ name: row.name, min: row.min, max: row.max }));
+    const listingMatchesModel =
+      listed.tone !== null &&
+      listed.part !== null &&
+      listed.scene !== null &&
+      JSON.stringify(listed.tone) === JSON.stringify(rowsOf(modelSettings.tone.filter((row) => row.engines.includes('model')))) &&
+      JSON.stringify(listed.toneCore) === '[]' &&
+      JSON.stringify(listed.toneNone) === '[]' &&
+      JSON.stringify(listed.part) === JSON.stringify(rowsOf(modelSettings.part)) &&
+      JSON.stringify(listed.scene) === JSON.stringify(rowsOf(modelSettings.scene));
+    const modelRow = (level, name) => modelSettings[level].find((row) => row.name === name);
+    const addressOf = (row) => row.message.address.split(' ').map((byte) => parseInt(byte, 16));
+    // The data set of a listed name at a value, as the rules of the settings map give it for channel 1, which is part 1.
+    const dataSetOf = (level, name, value) => {
+      const row = modelRow(level, name);
+      return settingDataSet({ address: addressOf(row), size: row.message.size, value });
+    };
+    const optionText = (level, rows, pick) => `${level}: { ${rows.map((row) => `${row.name}: ${pick(row)}`).join(', ')} }`;
+    const extremeRun = async (toneSide, label) => {
+      const pickFor = (side) => (row) => (side === 'high' ? row.max : row.min);
+      const otherSide = toneSide === 'high' ? 'low' : 'high';
+      const code = piece(
+        `sound: 'Model Tone', ${optionText('tone', listed.tone, pickFor(toneSide))}, ${optionText('part', listed.part, pickFor(otherSide))}, ${optionText('scene', listed.scene, pickFor(toneSide))}`,
+      );
+      const mark = await logLength();
+      const refused = await refusedWith(code, label);
+      const isActive = await activeIs(code);
+      await sleep(600);
+      const sets = (await logSince(mark)).filter((entry) => entry.port === 'Fake Synth A' && entry.bytes[0] === 0xf0).map((entry) => entry.bytes);
+      const expectedGroups = [
+        listed.tone.map((row) => dataSetOf('tone', row.name, pickFor(toneSide)(row))),
+        listed.part.map((row) => dataSetOf('part', row.name, pickFor(otherSide)(row))),
+        listed.scene.map((row) => dataSetOf('scene', row.name, pickFor(toneSide)(row))),
+      ];
+      // Each level's data sets are compared as a set: the order inside a level is not a documented fact.
+      const sortedJson = (messages) => messages.map((bytes) => JSON.stringify(bytes)).sort();
+      let from = 0;
+      const gotGroups = expectedGroups.map((group) => {
+        const taken = sets.slice(from, from + group.length);
+        from += group.length;
+        return taken;
+      });
+      const same = expectedGroups.every((group, index) => JSON.stringify(sortedJson(group)) === JSON.stringify(sortedJson(gotGroups[index]))) && from === sets.length;
+      return { ok: refused === null && isActive === true && same, refusal: firstLine(refused), active: isActive === true, sent: sets.map(hex), expected: expectedGroups.flat().map(hex) };
+    };
+    let extremes = [];
+    if (listingMatchesModel) {
+      extremes = [await extremeRun('high', 'probe:midi settings highest values'), await extremeRun('low', 'probe:midi settings lowest values')];
+    }
+    await playValid('probe:midi settings back to valid after the extremes');
+    const pastHighest = [];
+    if (listingMatchesModel) {
+      for (const level of ['tone', 'part', 'scene']) {
+        const row = listed[level][0];
+        const mark = await logLength();
+        const text = await refusedWith(piece(`sound: 'Model Tone', ${level}: { ${row.name}: ${row.max + 1} }`), `probe:midi settings one past the highest ${level}`);
+        const sentAfter = setupBytes(await logSince(mark));
+        pastHighest.push({ level, name: row.name, got: firstLine(text), expected: `Evaluation failed: ${fill(RIG_COPY.settingRange, { setting: row.name, level, id, min: row.min, max: row.max })}`, sentAfter });
+      }
+    }
+    const activeAfterPast = await evaluateExpr(cdp, `${replState}.activeCode`);
+    report(
+      'settings: every name and range get_midi_instruments lists for the instrument is taken at its lowest and highest value and sent, and one past the highest is refused with the range',
+      listingMatchesModel &&
+        extremes.length === 2 &&
+        extremes.every((run) => run.ok) &&
+        pastHighest.length === 3 &&
+        pastHighest.every((entry) => entry.got === entry.expected && entry.sentAfter === 0) &&
+        activeAfterPast === valid,
+      JSON.stringify({ listingMatchesModel, listed, extremes, pastHighest, validStillActive: activeAfterPast === valid }),
+    );
+
+    // (4c) Two values of one setting for one channel are refused naming both, in the order the tracks are written.
+    await refusal(
+      'settings: two values of one setting for one channel fail the evaluation naming both values, the music keeps playing and nothing is sent',
+      `first: note("c3").midi('Fake Synth A', { midichannel: 1, sound: 'Model Tone', tone: { filterCutoff: 300 } })\nsecond: note("e3").midi('Fake Synth A', { midichannel: 1, sound: 'Model Tone', tone: { filterCutoff: 600 } })`,
+      fill(RIG_COPY.settingConflict, { id, channel: 1, setting: 'filterCutoff', level: 'tone', a: 300, b: 600 }),
+      'probe:midi settings two values',
+      (text) => text.includes('300') && text.includes('600'),
+    );
+
+    // (4d) A level that is not a plain object of number literals is refused, here a value worked out in the call.
+    await refusal(
+      'settings: a level that is not a plain object of number literals fails the evaluation, the music keeps playing and nothing is sent',
+      piece("sound: 'Model Tone', tone: { filterCutoff: 100 + 200 }"),
+      fill(RIG_COPY.settingsNotPlain, { level: 'tone' }),
+      'probe:midi settings not plain',
+    );
+
+    // (4e) A new sound on a channel: its bank selects and program change go first, then its part settings, then the other channel's data
+    // sets and the scene; the tone settings the code no longer writes are not reported as staying, since the new sound loaded that tone.
+    await callTool(client, 'get_code', {});
+    const coreBank = toneSynthCatalog().sounds.find((sound) => sound.name === 'Core Tone').bank;
+    const coreCode = validCode(null).replace("sound: 'Model Tone'", "sound: 'Core Tone'");
+    const coreMark = await logLength();
+    const coreReplies = await repliesOf(coreCode, 'probe:midi settings new sound on a channel');
+    const coreActive = await activeIs(coreCode);
+    await sleep(600);
+    const coreSent = setupMessages(await logSince(coreMark));
+    const coreExpected = [[0xb0, 0x00, coreBank.msb], [0xb0, 0x20, coreBank.lsb], [0xc0, 0x00], panSet, lfoSet, levelSet, reverbSet];
+    report(
+      'settings: a new sound on a channel sends its program change before its part settings, and no line says a tone setting taken out with it stays',
+      coreActive === true && sameMessages(coreSent, coreExpected) && coreReplies.includes('Core Tone') && !coreReplies.includes(leftLine),
+      JSON.stringify({ active: coreActive === true, sent: coreSent.map(hex), expected: coreExpected.map(hex), replyHasLeftLine: coreReplies.includes(leftLine) }),
+    );
+    await playValid('probe:midi settings back to valid after the new sound');
+
+    // (5) The Instruments view (key 6): the tonesynth card has a Synth settings row with what the playing code writes, the scene
+    // line says it reaches every part, and the standing rule about a setting taken out of the code is there. The view is closed again.
+    const viewBefore = await evaluateExpr(cdp, `document.getElementById('workspace').dataset.view`);
+    await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+    await pressKey(cdp, 'Escape');
+    await pressKey(cdp, '6');
+    const viewOpen = await waitFor(cdp, `document.getElementById('workspace').dataset.view === 'instruments' ? true : null`, 3000);
+    const settingsRow = await waitFor(
+      cdp,
+      `(() => {
+        const card = document.querySelector('#instruments-list .instrument-card[data-instrument="tonesynth"]');
+        if (card === null) return null;
+        const label = ${JSON.stringify(INSTRUMENTS_COPY.labelSynthSettings)};
+        const row = Array.from(card.querySelectorAll('.instrument-row')).find((candidate) => candidate.querySelector('.instrument-label').textContent.startsWith(label));
+        return row === undefined ? null : Array.from(row.querySelectorAll('.instrument-inuse-line')).map((line) => line.textContent);
+      })()`,
+      5000,
+    );
+    const otherCard = await evaluateExpr(
+      cdp,
+      `(() => {
+        const card = document.querySelector('#instruments-list .instrument-card[data-instrument="memorysynth"]');
+        const label = ${JSON.stringify(INSTRUMENTS_COPY.labelSynthSettings)};
+        return card === null ? null : Array.from(card.querySelectorAll('.instrument-row')).some((candidate) => candidate.querySelector('.instrument-label').textContent.startsWith(label));
+      })()`,
+    );
+    await pressKey(cdp, 'Escape');
+    const viewKeys = { history: '1', timeline: '2', mixer: '3', parts: '4', jam: '5' };
+    if (viewKeys[viewBefore] !== undefined) await pressKey(cdp, viewKeys[viewBefore]);
+    const sceneRow = fill(INSTRUMENTS_COPY.synthScene, { values: 'reverbLevel 80' });
+    const toneRow = fill(INSTRUMENTS_COPY.synthTone, { channel: 1, values: 'filterCutoff 600' });
+    report(
+      'settings: the Instruments card shows the Synth settings row with the tone and part settings of the playing code, the scene line that says it reaches every part, and the rule that a setting taken out of the code stays',
+      viewOpen === true && Array.isArray(settingsRow) && settingsRow.includes(sceneRow) && settingsRow.includes(toneRow) && settingsRow.includes(INSTRUMENTS_COPY.synthStays) && sceneRow.includes('reaches every part'),
+      JSON.stringify({ viewOpen: viewOpen === true, settingsRow, expectedScene: sceneRow, expectedTone: toneRow, otherCardHasRow: otherCard }),
+    );
+
+    // (6) The other engines of a multi-engine synth: its rig replaces the tone synth's on the same fake port, with a sound in each of
+    // three engines. A tone setting of a second or third engine's sound goes out as that engine's documented data set, at the part of its channel.
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi settings engines silent' });
+    fs.writeFileSync(engineModelFile, JSON.stringify(engineSynthModel()));
+    fs.writeFileSync(engineCatalogFile, JSON.stringify(engineSynthCatalog()));
+    fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: engineId, model: 'enginesynth', port: 'Fake Synth A' }] }));
+    await callTool(client, 'get_midi_instruments', {});
+    await sleep(1500);
+    await callTool(client, 'set_code', { code: base, label: 'probe:midi settings engines base' });
+    if ((await activeIs(base)) !== true || (await heardAfter(await logLength(), 8000)) !== true) {
+      throw new ProbeCouldNotRun('the base piece of the engine settings check did not play on the fake port within 8 seconds');
+    }
+    const enginesCode = engineSettingsPiece('Fake Synth A');
+    const enginesExpected = engineSettingsSent();
+    const enginesMark = await logLength();
+    const enginesRefusal = await refusedWith(enginesCode, 'probe:midi settings engines');
+    const enginesActive = await activeIs(enginesCode);
+    await sleep(600);
+    const enginesSent = setupMessages(await logSince(enginesMark));
+    report(
+      "settings: a tone setting on a sound of a second or third engine reaches the port as that engine's documented data set, at the part of its channel",
+      enginesRefusal === null && enginesActive === true && sameMessages(enginesSent, enginesExpected),
+      JSON.stringify({ refusal: firstLine(enginesRefusal), active: enginesActive === true, sent: enginesSent.map(hex), expected: enginesExpected.map(hex) }),
+    );
+
+    // (7) One name described for two engines: the same line of code, with only the sound of channel 3 changed, goes to the address of the
+    // engine of that sound; a sound of an engine that lacks the name fails the evaluation naming the engines of every row of the name.
+    const sharedLead = `lead: ${engineCall('Fake Synth A', 1, 'Model Tone', 'filterCutoff: 600')}`;
+    const sharedCode = (sound) => `${sharedLead}\nthird: ${engineCall('Fake Synth A', 3, sound, 'filterCutoff: 600')}`;
+    const sharedRuns = [];
+    for (const [sound, set] of [['Model Tone', ENGINE_SETTING_SETS.modelCutoffPart3], ['Vintage Tone', ENGINE_SETTING_SETS.vintageCutoff]]) {
+      const mark = await logLength();
+      const refused = await refusedWith(sharedCode(sound), `probe:midi settings shared name ${sound}`);
+      const isActive = await activeIs(sharedCode(sound));
+      await sleep(600);
+      const sent = setupMessages(await logSince(mark));
+      const expected = [ENGINE_SETTING_SETS.modelCutoff, ...engineBankMessages(3, sound), set];
+      sharedRuns.push({ sound, ok: refused === null && isActive === true && sameMessages(sent, expected), refusal: firstLine(refused), sent: sent.map(hex), expected: expected.map(hex) });
+    }
+    await refusal(
+      "settings: one name described for two engines goes to the address of the sound's engine, and on a sound whose engine lacks it the evaluation fails naming the engines",
+      `${sharedCode('Vintage Tone')}\nsecond: ${engineCall('Fake Synth A', 2, 'Core Tone', 'filterCutoff: 600')}`,
+      fill(RIG_COPY.engineMismatch, { setting: 'filterCutoff', settingEngines: 'Model Engine or Vintage Engine', id: engineId, sound: 'Core Tone', engine: 'Core Engine' }),
+      'probe:midi settings shared name on a third engine sound',
+      (text) => sharedRuns.length === 2 && sharedRuns.every((run) => run.ok) && text.includes('Core Engine') && text.includes('partial1Cutoff'),
+      sharedCode('Vintage Tone'),
+    );
+    // (8) The offsets of a GS-style family: the offset synth replaces the engine synth on the same fake port. An offset in the part
+    // options goes out as the five documented control changes on the channel of its call, right after the program change of that channel
+    // and before the next channel, one send of fifteen bytes whose messages are compared one by one.
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi settings offsets silent' });
+    fs.writeFileSync(offsetModelFile, JSON.stringify(offsetSynthModel()));
+    fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: offsetId, model: 'offsetsynth', port: 'Fake Synth A' }] }));
+    await callTool(client, 'get_midi_instruments', {});
+    await sleep(1500);
+    const offsetBase = `lead: note("c3 e3 g3 c4").midi('Fake Synth A', { midichannel: 1, sound: 'Own Tone' })`;
+    await callTool(client, 'set_code', { code: offsetBase, label: 'probe:midi settings offsets base' });
+    if ((await activeIs(offsetBase)) !== true || (await heardAfter(await logLength(), 8000)) !== true) {
+      throw new ProbeCouldNotRun('the base piece of the offset settings check did not play on the fake port within 8 seconds');
+    }
+    const offsetCode = offsetSettingsPiece('Fake Synth A');
+    const offsetExpected = offsetSettingsSent();
+    const offsetMark = await logLength();
+    const offsetRefusal = await refusedWith(offsetCode, 'probe:midi settings offsets');
+    const offsetActive = await activeIs(offsetCode);
+    await sleep(600);
+    const offsetSent = splitMessages(setupMessages(await logSince(offsetMark)));
+    report(
+      'settings: an offset setting reaches the port as the documented NRPN on the channel of its call, after the program change of that channel and before the next channel',
+      offsetRefusal === null && offsetActive === true && sameMessages(offsetSent, offsetExpected),
+      JSON.stringify({ refusal: firstLine(offsetRefusal), active: offsetActive === true, sent: offsetSent.map(hex), expected: offsetExpected.map(hex) }),
+    );
+    // (9) The refusals of an offset: a model whose ninth part row maps `level` to a pair the family does not list (01 24), a model that
+    // names no NRPN family (refused when it loads, so the evaluation fails naming the missing family), and an offset on the rhythm
+    // channel of the model each fail the evaluation with their own reason; the valid offsets piece keeps playing and nothing is sent.
+    // The model file is written for each variant and put back at the end.
+    const writeOffsetModel = async (change) => {
+      const model = offsetSynthModel();
+      change(model);
+      fs.writeFileSync(offsetModelFile, JSON.stringify(model));
+      await callTool(client, 'get_midi_instruments', {});
+      await sleep(1500);
+    };
+    const offsetStays = offsetSettingsPiece('Fake Synth A');
+    const offsetRefusalRun = async (model, code, expectedLine, label, needsMemoryLine, neededLine = null) => {
+      await writeOffsetModel(model);
+      const mark = await logLength();
+      const text = await refusedWith(code, label);
+      const codeAfter = await callTool(client, 'get_code', {});
+      const activeAfter = await evaluateExpr(cdp, `${replState}.activeCode`);
+      const stillPlays = await heardAfter(await logLength(), 6000);
+      const sent = setupBytes(await logSince(mark));
+      const memoryLine = (text ?? '').split('\n').includes(SETTINGS_COPY.temporaryOnly);
+      const reasonLine = neededLine === null || (text ?? '').split('\n').some((line) => line.endsWith(neededLine));
+      return {
+        ok: firstLine(text) === `Evaluation failed: ${expectedLine}` && memoryLine === needsMemoryLine && reasonLine && codeAfter.includes(offsetStays) && activeAfter === offsetStays && stillPlays === true && sent === 0,
+        errorStart: firstLine(text),
+        expected: expectedLine,
+        memoryLine,
+        reasonLine,
+        codeUnchanged: codeAfter.includes(offsetStays),
+        activeUnchanged: activeAfter === offsetStays,
+        stillPlays: stillPlays === true,
+        setupBytesSent: sent,
+      };
+    };
+    const offsetRuns = [
+      await offsetRefusalRun(
+        (model) => void model.settings.part.push({ name: 'level', min: 14, max: 114, message: { kind: 'nrpn', msb: 1, lsb: 0x24 } }),
+        `${offsetStays}\nlevelrow: note("c3").midi('Fake Synth A', { midichannel: 3, sound: 'Own Tone', part: { level: 64 } })`,
+        fill(SETTINGS_COPY.nrpnNotListed, { setting: 'level', id: offsetId, pair: '01 24', family: 'gs' }),
+        'probe:midi settings offsets pair not listed',
+        true,
+      ),
+      await offsetRefusalRun(
+        (model) => void delete model.settings.nrpnFamily,
+        `${offsetStays}\nextra: note("c3").midi('Fake Synth A', { midichannel: 3, sound: 'Own Tone', part: { cutoffOffset: 90 } })`,
+        RIG_COPY.invalidFile,
+        'probe:midi settings offsets no family',
+        false,
+        'settings.nrpnFamily: required: an nrpn setting needs the NRPN family',
+      ),
+      await offsetRefusalRun(
+        () => {},
+        `${offsetStays}\ndrums: note("c3").midi('Fake Synth A', { midichannel: 10, sound: 'Own Kit', part: { cutoffOffset: 90 } })`,
+        fill(SETTINGS_COPY.nrpnRhythm, { setting: 'cutoffOffset', id: offsetId, channel: 10 }),
+        'probe:midi settings offsets rhythm',
+        false,
+      ),
+    ];
+    report(
+      'settings: an NRPN the family does not list, an instrument with no NRPN family and an offset on a rhythm channel each fail the evaluation with their reason, the music keeps playing and nothing is sent',
+      offsetRuns.every((run) => run.ok),
+      JSON.stringify(offsetRuns),
+    );
+
+    // (10) An instrument whose data sets have a one-byte model ID and three-byte addresses (the timbre synth replaces the offset synth on
+    // the same fake port): a tone, a part and a scene setting reach the port as the documented data sets, the tone at the 246-byte
+    // step of the timbre area and the part at the 16-byte step of the patch area, each channel's program change first.
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi settings timbre silent' });
+    fs.writeFileSync(timbreModelFile, JSON.stringify(timbreSynthModel()));
+    fs.writeFileSync(rigFile, JSON.stringify({ instruments: [{ id: timbreId, model: 'timbresynth', port: 'Fake Synth A' }] }));
+    await callTool(client, 'get_midi_instruments', {});
+    await sleep(1500);
+    const timbreBase = `lead: note("c3 e3 g3 c4").midi('Fake Synth A', { midichannel: 2, sound: 'Own Timbre' })`;
+    await callTool(client, 'set_code', { code: timbreBase, label: 'probe:midi settings timbre base' });
+    // The base piece plays on channel 2, the first melodic channel of the model (heardAfter listens for channel 1).
+    const heardOnChannel2 = (mark, ms) =>
+      waitFor(cdp, `window.__midiLog.slice(${mark}).some((e) => e.port === 'Fake Synth A' && e.bytes.length === 3 && e.bytes[0] === 0x91 && e.bytes[2] > 0) ? true : null`, ms);
+    if ((await activeIs(timbreBase)) !== true || (await heardOnChannel2(await logLength(), 8000)) !== true) {
+      throw new ProbeCouldNotRun('the base piece of the three-byte settings check did not play on the fake port within 8 seconds');
+    }
+    const timbreCode = partSpacingPiece('Fake Synth A');
+    const timbreExpected = partSpacingSent();
+    const timbreMark = await logLength();
+    const timbreRefusal = await refusedWith(timbreCode, 'probe:midi settings timbre');
+    const timbreActive = await activeIs(timbreCode);
+    await sleep(600);
+    const timbreSent = setupMessages(await logSince(timbreMark));
+    report(
+      'settings: a tone, a part and a scene setting of an instrument with three-byte addresses reach the port as the documented data sets, at the part spacing of their area',
+      timbreRefusal === null && timbreActive === true && sameMessages(timbreSent, timbreExpected),
+      JSON.stringify({ refusal: firstLine(timbreRefusal), active: timbreActive === true, sent: timbreSent.map(hex), expected: timbreExpected.map(hex) }),
+    );
+
+    // (11) The code's own system exclusive message to the same three-byte instrument: a data set into its timbre memory (08 00 00) never
+    // reaches the port, one into the timbre temporary area of part 1 does, and the reply says nothing that could write memory is sent.
+    const timbreMemory = settingDataSet({ model: [0x16], address: [0x08, 0x00, 0x00], size: 1, value: 15 });
+    const timbreTemporary = settingDataSet({ model: [0x16], address: [0x04, 0x00, 0x0c], size: 1, value: 15 });
+    const timbreOwnCode = `${timbreCode}\n${ownSysex('into_memory', timbreMemory, 5)}\n${ownSysex('into_temporary', timbreTemporary, 6)}`;
+    const timbreOwnMark = await logLength();
+    const timbreOwnFirst = await callTool(client, 'set_code', { code: timbreOwnCode, label: 'probe:midi settings timbre own system exclusive' });
+    await activeIs(timbreOwnCode);
+    const timbreTemporaryJson = JSON.stringify(timbreTemporary);
+    await waitFor(cdp, `window.__midiLog.slice(${timbreOwnMark}).some((e) => e.port === 'Fake Synth A' && JSON.stringify(e.bytes) === ${JSON.stringify(timbreTemporaryJson)}) ? true : null`, 15000);
+    await sleep(2500);
+    const timbreOwnReplies = `${timbreOwnFirst}\n${await callTool(client, 'get_code', {})}`;
+    const timbreOwnEntries = await logSince(timbreOwnMark);
+    const timbreReached = (message) => timbreOwnEntries.filter((entry) => entry.port === 'Fake Synth A' && sameMessages(entry.bytes, message)).length;
+    const timbreRefusedLine = midiEventLine({ kind: 'sysex-refused', instrument: timbreId, source: 'code', reason: 'outside' });
+    report(
+      "settings: the code's own data set into a timbre memory of an instrument with three-byte addresses never reaches the port, one into its timbre temporary area does, and the reply says nothing that could write memory is sent",
+      timbreReached(timbreMemory) === 0 && timbreReached(timbreTemporary) >= 1 && timbreOwnReplies.includes(timbreRefusedLine),
+      JSON.stringify({ memoryMessageReached: timbreReached(timbreMemory), temporaryMessageReached: timbreReached(timbreTemporary), expectedLine: timbreRefusedLine, replyHasLine: timbreOwnReplies.includes(timbreRefusedLine) }),
+    );
+
+    // (12) The listing equals what the page takes, for the instrument with three-byte addresses and every row of its map: the Settings
+    // lines of a real get_midi_instruments reply hold exactly the rows of the fixture, every listed name is written at its lowest and at its
+    // highest value on channel 2 (part 1) and reaches the port as its data set built from the map, once more at the highest value on
+    // channel 9 (part 8), where the step of each area shows, and one past the highest is refused with the range. As in the first
+    // engine's check, each extreme is a piece of its own and the order inside a level is not compared.
+    await callTool(client, 'set_code', { code: timbreBase, label: 'probe:midi settings timbre listing base' });
+    if ((await activeIs(timbreBase)) !== true || (await heardOnChannel2(await logLength(), 8000)) !== true) {
+      throw new ProbeCouldNotRun('the base piece of the full three-byte listing check did not play on the fake port within 8 seconds');
+    }
+    const timbreListing = await callTool(client, 'get_midi_instruments', {});
+    const timbreListed = {};
+    for (const [level, prefix] of [['tone', '    Tone: '], ['part', '    Part, '], ['scene', '    Scene, ']]) {
+      const line = timbreListing.split('\n').find((candidate) => candidate.startsWith(prefix));
+      const text = line === undefined ? null : line.slice(line.indexOf(': ') + 2);
+      timbreListed[level] =
+        text === null
+          ? null
+          : text.replace(/\.$/, '').split(', ').map((entry) => {
+              const found = /^(\w+) (\d+)-(\d+)$/.exec(entry);
+              return found === null ? null : { name: found[1], min: Number(found[2]), max: Number(found[3]) };
+            });
+    }
+    const timbreFixture = timbreSynthModel().settings;
+    const fixtureRows = (rows) => rows.map((row) => ({ name: row.name, min: row.min, max: row.max }));
+    const timbreListingMatches = ['tone', 'part', 'scene'].every((level) => timbreListed[level] !== null && JSON.stringify(timbreListed[level]) === JSON.stringify(fixtureRows(timbreFixture[level])));
+    // The data set of a row at a value, from the address of the fixture row, the step of the area it lies in (246 in the timbre area 04, 16 in
+    // the patch area 03, none in the system area) and the part, counted in base 128.
+    const timbreDataSet = (level, name, value, part) => {
+      const row = timbreFixture[level].find((entry) => entry.name === name);
+      const first = row.message.address.split(' ').map((byte) => parseInt(byte, 16));
+      const step = first[0] === 0x04 ? 246 : first[0] === 0x03 ? 16 : 0;
+      return settingDataSet({ model: [0x16], address: threeByteAddress(first, step, part), size: 1, value });
+    };
+    const timbreOptionText = (level, pick) => `${level}: { ${timbreListed[level].map((row) => `${row.name}: ${pick(row)}`).join(', ')} }`;
+    const timbreExtremeRun = async (channel, sides, label) => {
+      const part = channel - 1;
+      const pickFor = (side) => (row) => (side === 'high' ? row.max : row.min);
+      const code = `lead: note("c3 e3 g3 c4").midi('Fake Synth A', { midichannel: ${channel}, sound: 'Own Timbre', ${['tone', 'part', 'scene'].map((level, at) => timbreOptionText(level, pickFor(sides[at]))).join(', ')} })`;
+      const expectedGroups = ['tone', 'part', 'scene'].map((level, at) => timbreListed[level].map((row) => timbreDataSet(level, row.name, pickFor(sides[at])(row), level === 'scene' ? 1 : part)));
+      const total = expectedGroups.flat().length;
+      const mark = await logLength();
+      const refused = await refusedWith(code, label);
+      const isActive = await activeIs(code);
+      await waitFor(cdp, `window.__midiLog.slice(${mark}).filter((e) => e.port === 'Fake Synth A' && e.bytes[0] === 0xf0).length >= ${total} ? true : null`, 20000);
+      await sleep(400);
+      const sets = (await logSince(mark)).filter((entry) => entry.port === 'Fake Synth A' && entry.bytes[0] === 0xf0).map((entry) => entry.bytes);
+      const sortedJson = (messages) => messages.map((bytes) => JSON.stringify(bytes)).sort();
+      let from = 0;
+      const gotGroups = expectedGroups.map((group) => {
+        const taken = sets.slice(from, from + group.length);
+        from += group.length;
+        return taken;
+      });
+      const same = expectedGroups.every((group, at) => JSON.stringify(sortedJson(group)) === JSON.stringify(sortedJson(gotGroups[at]))) && from === sets.length;
+      const missing = sortedJson(expectedGroups.flat()).filter((text) => !sortedJson(sets).includes(text)).slice(0, 3);
+      return { ok: refused === null && isActive === true && same, channel, sides, refusal: firstLine(refused), active: isActive === true, sentCount: sets.length, expectedCount: total, firstMissing: missing };
+    };
+    let timbreExtremes = [];
+    if (timbreListingMatches) {
+      timbreExtremes = [
+        await timbreExtremeRun(2, ['high', 'low', 'high'], 'probe:midi settings timbre highest values'),
+        await timbreExtremeRun(2, ['low', 'high', 'low'], 'probe:midi settings timbre lowest values'),
+        await timbreExtremeRun(9, ['high', 'high', 'high'], 'probe:midi settings timbre highest values on the last part'),
+      ];
+    }
+    await callTool(client, 'set_code', { code: timbreBase, label: 'probe:midi settings timbre back to the base after the extremes' });
+    await activeIs(timbreBase);
+    const timbrePastHighest = [];
+    if (timbreListingMatches) {
+      for (const level of ['tone', 'part', 'scene']) {
+        const row = timbreListed[level][0];
+        const mark = await logLength();
+        const text = await refusedWith(
+          `lead: note("c3 e3 g3 c4").midi('Fake Synth A', { midichannel: 2, sound: 'Own Timbre', ${level}: { ${row.name}: ${row.max + 1} } })`,
+          `probe:midi settings timbre one past the highest ${level}`,
+        );
+        const sentAfter = setupBytes(await logSince(mark));
+        timbrePastHighest.push({ level, name: row.name, got: firstLine(text), expected: `Evaluation failed: ${fill(RIG_COPY.settingRange, { setting: row.name, level, id: timbreId, min: row.min, max: row.max })}`, sentAfter });
+      }
+    }
+    const timbreActiveAfterPast = await evaluateExpr(cdp, `${replState}.activeCode`);
+    report(
+      'settings: every name and range get_midi_instruments lists for an instrument with three-byte addresses is taken at its lowest and highest value and sent as its data set, and one past the highest is refused with the range',
+      timbreListingMatches &&
+        timbreExtremes.length === 3 &&
+        timbreExtremes.every((run) => run.ok) &&
+        timbrePastHighest.length === 3 &&
+        timbrePastHighest.every((entry) => entry.got === entry.expected && entry.sentAfter === 0) &&
+        timbreActiveAfterPast === timbreBase,
+      JSON.stringify({ listingMatchesFixture: timbreListingMatches, counts: ['tone', 'part', 'scene'].map((level) => timbreListed[level]?.length ?? null), timbreExtremes, timbrePastHighest, baseStillActive: timbreActiveAfterPast === timbreBase }),
+    );
+  } finally {
+    await callTool(client, 'set_code', { code: SILENT, label: 'probe:midi settings done' });
+    for (const file of [modelFile, catalogFile, memoryModelFile, engineModelFile, engineCatalogFile, offsetModelFile, timbreModelFile, rigFile]) fs.rmSync(file, { force: true });
+    for (const folder of [path.dirname(modelFile), path.dirname(catalogFile)]) {
+      if (fs.existsSync(folder) && fs.readdirSync(folder).length === 0) fs.rmdirSync(folder);
+    }
   }
 }
 
@@ -1825,7 +4444,7 @@ export async function rampGestureBlocks(context) {
 
 
 /** The groups of checks this script can run alone with `--only`. */
-export const MIDI_GROUPS = Object.freeze(['song', 'mixer', 'timeline', 'ramp', 'ramp-measure', 'ramp-measure-late', 'ramp-gestures']);
+export const MIDI_GROUPS = Object.freeze(['song', 'mixer', 'timeline', 'ramp', 'settings', 'ramp-measure', 'ramp-measure-late', 'ramp-gestures', 'input']);
 
 async function main() {
   let args;
@@ -1905,7 +4524,7 @@ async function main() {
     };
 
     // Helpers the instrument-control blocks share. A reload drops the page's own state, so a block calls installEvalCounter again.
-    const VIEW_NAMES = { 1: 'history', 2: 'timeline', 3: 'mixer', 4: 'parts', 5: 'jam', 6: 'instruments' };
+    const VIEW_NAMES = { 1: 'history', 2: 'timeline', 3: 'mixer', 4: 'parts', 5: 'jam', 6: 'instruments', 7: 'scratchpad' };
     /** Opens a view by its key: leaves the editor, closes any open view, presses the key and waits for the view. */
     async function openView(key) {
       await evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
@@ -1973,6 +4592,11 @@ async function main() {
       summarize();
       return;
     }
+    if (args.only === 'settings') {
+      await settingsMidiBlocks({ cdp, client, report, setScenario, dataDir });
+      summarize();
+      return;
+    }
     if (args.only === 'ramp-measure') {
       await rampMeasureBlocks({ cdp, client, report, setScenario, dataDir });
       summarize();
@@ -1985,6 +4609,11 @@ async function main() {
     }
     if (args.only === 'ramp-measure-late') {
       await rampMeasureBlocks({ cdp, client, report, setScenario, dataDir }, RAMP_LATE_RUNS);
+      summarize();
+      return;
+    }
+    if (args.only === 'input') {
+      await inputMidiBlocks({ cdp, client, report, setScenario, dataDir, openView, shotsDir, port, pageUrl });
       summarize();
       return;
     }
@@ -7299,6 +9928,8 @@ async function main() {
     await mixerMidiBlocks({ cdp, client, report, setScenario, dataDir });
     await timelineMidiBlocks({ cdp, client, report, setScenario, dataDir });
     await rampMidiBlocks({ cdp, client, report, setScenario, dataDir });
+    await settingsMidiBlocks({ cdp, client, report, setScenario, dataDir });
+    await inputMidiBlocks({ cdp, client, report, setScenario, dataDir, openView, shotsDir, port, pageUrl });
 
     summarize();
   } catch (err) {

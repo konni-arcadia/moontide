@@ -13,6 +13,8 @@ import {
   ASK_COPY,
   BOX_GAP_REM,
   MAX_ASK_TEXT_LENGTH,
+  MAX_MOTIF_PHRASE_LENGTH,
+  MAX_REQUEST_LINE_BYTES,
   PAGE_REQUESTS_COPY,
   pageRequestsText,
   askMessage,
@@ -21,11 +23,13 @@ import {
   describeContext,
   fitGestureToLine,
   fitMomentToLine,
+  motifChip,
   newAskId,
   partsAskState,
   placeBox,
   refusalText,
   requestFitsLine,
+  requestLineBytes,
 } from './ask.js';
 
 /**
@@ -34,9 +38,11 @@ import {
  * sends one JSON-able message to the server; `reportError` and `clearError` write and clear the
  * top-bar error line; `setTimer`, `clearTimer` and `now` are the page's clock. `requests` is the per-request tracker
  * of page/request-status.js: every request sent is handed to it, and so is every server answer to one. The tracker
- * tells the page (main.js) when a request was never confirmed; the page then calls `notConfirmed(id)` here.
+ * tells the page (main.js) when a request was never confirmed; the page then calls `notConfirmed(id)` here. `onMotifResult` is
+ * called with what became of the Scratchpad's motif request (`{ status: 'received' }` once Claude has it, `{ status: 'waiting' }` once the
+ * server holds it for Claude's next call); the motif request has its own pending id, so nothing it meets ever reaches the Ask box or its draft.
  */
-export function createAskView({ document, send, reportError, clearError, setTimer, clearTimer, now, requests }) {
+export function createAskView({ document, send, reportError, clearError, setTimer, clearTimer, now, requests, onMotifResult = () => {} }) {
   const askBox = document.getElementById('ask-box');
   const askContextChip = document.getElementById('ask-context-chip');
   const askCurrentChip = document.getElementById('ask-current-chip');
@@ -136,6 +142,8 @@ export function createAskView({ document, send, reportError, clearError, setTime
   // request while it waits for Claude to take it.
   let partsAvailable = false;
   let partsPendingId = null;
+  // The Scratchpad's motif request, the same way: the id of the one on its way, so its refusal never arms the Ask box.
+  let motifPendingId = null;
 
   /** The fields of the request the box would send for `text` (trimmed), the id measured with the next one's shape. */
   function requestFields(text) {
@@ -430,6 +438,46 @@ export function createAskView({ document, send, reportError, clearError, setTime
     renderPartsAsk();
   });
 
+  /**
+   * Sends the Scratchpad's motif as a page request: `words` are the user's own (trimmed) and `motif` is the motif field of
+   * page/scratch-model.js's motifRequest. The request has its own pending id, goes to the tracker like any other and never
+   * touches the Ask box. Returns `{ id }` once it is sent, or `{ refused: word, ...numbers }` and sends nothing: 'disconnected',
+   * 'pending' (the last motif request has not reached the server: the server has not answered it yet), 'empty-words', 'words-too-long' (`length`, `max`) or 'too-big'
+   * (`bytes` and `max`, measured on the exact frame, id included; a phrase over MAX_MOTIF_PHRASE_LENGTH characters is refused the same way). The
+   * phrase is never cut: a motif that does not fit is refused whole.
+   */
+  function sendMotif({ words, motif }) {
+    if (!connected) return { refused: 'disconnected' };
+    if (motifPendingId !== null) return { refused: 'pending' };
+    const text = words.trim();
+    if (text === '') return { refused: 'empty-words' };
+    if (text.length > MAX_ASK_TEXT_LENGTH) return { refused: 'words-too-long', length: text.length, max: MAX_ASK_TEXT_LENGTH };
+    const id = newAskId(counter + 1, now());
+    // A phrase longer than the server takes is refused like any motif too big for the line, before describeContext (which throws on it)
+    // checks the motif. The bytes are those of the line it would make; the rest of the request always puts that line over its bound.
+    if (motif !== null && typeof motif === 'object' && typeof motif.phrase === 'string' && motif.phrase.length > MAX_MOTIF_PHRASE_LENGTH) {
+      const bytes = requestLineBytes({ id, text, context: { kind: 'motif' }, chip: motifChip(motif), current: currentVersion, motif });
+      return { refused: 'too-big', bytes, max: MAX_REQUEST_LINE_BYTES };
+    }
+    const described = describeContext({ kind: 'motif', motif });
+    const frame = { type: 'ask', id, text, context: described.context, chip: described.chip, current: currentVersion, motif: described.motif };
+    const bytes = requestLineBytes(frame);
+    if (bytes > MAX_REQUEST_LINE_BYTES) return { refused: 'too-big', bytes, max: MAX_REQUEST_LINE_BYTES };
+    counter += 1;
+    send(frame);
+    // While the token is refused the line stays: the server's 'token' refusal writes it again, so it never blinks off.
+    if (!authRefused) clearError();
+    requests.sent(frame.id, { text, chip: described.chip });
+    motifPendingId = frame.id;
+    return { id: frame.id };
+  }
+
+  /** The server has the motif request: it is no longer on its way, and the page is told. */
+  function arrivedMotif() {
+    motifPendingId = null;
+    onMotifResult({ status: 'received' });
+  }
+
   /** The server's answers: token result, one result per request, and hand-overs of waiting requests. */
   function onServerMessage(msg) {
     if (msg.type === 'ask-auth') {
@@ -455,11 +503,26 @@ export function createAskView({ document, send, reportError, clearError, setTime
     if (msg.type === 'ask-received') {
       requests.serverMessage(msg);
       if (partsPendingId !== null && msg.ids.includes(partsPendingId)) partsPendingId = null;
+      if (motifPendingId !== null && msg.ids.includes(motifPendingId)) arrivedMotif();
       renderPartsAsk();
       return;
     }
     if (msg.type !== 'ask-result') return;
     requests.serverMessage(msg);
+    if (msg.id === motifPendingId) {
+      // The Scratchpad's request is answered in its own strip: nothing of it reaches the Ask box, its draft or its not-sent message.
+      if (msg.status === 'received') {
+        arrivedMotif();
+      } else if (msg.status === 'waiting') {
+        // The server holds it until Claude's next Moontide call: it is no longer on its way, so the next motif may go, and the strip says it waits.
+        motifPendingId = null;
+        onMotifResult({ status: 'waiting' });
+      } else if (msg.status === 'refused') {
+        motifPendingId = null;
+        onMotifResult({ status: 'refused', text: refusalText(msg.reason, msg.detail) });
+      }
+      return;
+    }
     const fromParts = msg.id === partsPendingId;
     if (msg.status === 'refused') {
       reportError(refusalText(msg.reason, msg.detail));
@@ -485,6 +548,12 @@ export function createAskView({ document, send, reportError, clearError, setTime
    * says so, and the draft comes back (or, for the Parts button's canned request, the button is released).
    */
   function notConfirmed(id) {
+    if (id === motifPendingId) {
+      // The Scratchpad's strip says it; the Ask box and its draft are not involved.
+      motifPendingId = null;
+      onMotifResult({ status: 'not-confirmed' });
+      return;
+    }
     reportError(ASK_COPY.didNotConfirm);
     if (id === partsPendingId) {
       // The canned request needs no draft: the button just comes back.
@@ -500,6 +569,7 @@ export function createAskView({ document, send, reportError, clearError, setTime
     connected = state === 'connected';
     if (state === 'disconnected') {
       partsPendingId = null;
+      motifPendingId = null;
       // The state is unknown once the socket is gone (the page does not reconnect by itself).
       pageRequests.hidden = true;
       closeHelp();
@@ -531,6 +601,11 @@ export function createAskView({ document, send, reportError, clearError, setTime
     contains: (node) => askBox.contains(node),
     setConnected,
     setCurrentVersion,
+    sendMotif,
+    /** True while a motif request is on its way to the server. */
+    motifPending: () => motifPendingId !== null,
+    /** True while the page is connected to the server. */
+    isConnected: () => connected,
     setPartsAvailable,
     onServerMessage,
     notConfirmed,

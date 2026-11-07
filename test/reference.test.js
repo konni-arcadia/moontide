@@ -53,9 +53,25 @@ import {
 } from '../scripts/check-reference.mjs';
 import { VCSL_SAMPLE_BASE } from '../page/ui-state.js';
 import { parse } from 'acorn';
+import { SETTING_VOCABULARY } from '../dist/vocabulary.js';
+import { shippedModelsDir } from '../dist/instruments.js';
 import { extractTracks } from '../page/tracks.js';
 import { HELPER_TEXT, readStructure } from '../page/structure.js';
 import { TINT_WORDS, STEERING_WORDS, ALLOWED_DEMO_SOUNDS, findWords, fencedBlocks, stripNamesBlocks, fenceTags, demoSoundTokens } from './tint-rules.js';
+import { askMotifShape, MOTIF_GRIDS, MOTIF_SOURCES, MIN_MOTIF_CYCLES, MAX_MOTIF_CYCLES } from '../dist/protocol.js';
+import { BEATS_PER_CYCLE } from '../page/change-timing.js';
+import {
+  GRIDS,
+  MIN_CYCLES,
+  MAX_CYCLES,
+  emptyMotif,
+  placeNote,
+  motifPhrase,
+  motifMoment,
+  motifRequest,
+  gridOf,
+  SCRATCH_COPY,
+} from '../page/scratch-model.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -65,7 +81,7 @@ test('reference module: REFERENCE_TOPIC_IDS equals the table ids, in table order
   assert.deepEqual(REFERENCE_TOPIC_IDS, REFERENCE_TOPICS.map((topic) => topic.id));
 });
 
-test('reference module: all nine topics are present, in table order with midi last, and referenceIndexText has eleven lines', () => {
+test('reference module: all eleven topics are present, in table order with motif last, and referenceIndexText has thirteen lines', () => {
   assert.deepEqual(REFERENCE_TOPIC_IDS, [
     'tidal-differences',
     'mini-notation',
@@ -76,8 +92,10 @@ test('reference module: all nine topics are present, in table order with midi la
     'transitions',
     'structure',
     'midi',
+    'settings',
+    'motif',
   ]);
-  assert.equal(referenceIndexText().split('\n').length, 11);
+  assert.equal(referenceIndexText().split('\n').length, 13);
 });
 
 test('structure topic: the template get_code shows is a structure the page reads, with a canonical helper', () => {
@@ -2040,6 +2058,264 @@ test('content rule (fixture): a demo naming a GM instrument or a drum bank is fl
   assert.equal(violatesInstrumentRule('s("bd").bank("RolandTR909")'), true);
   assert.equal(violatesInstrumentRule('s("sine sawtooth")'), false);
   assert.equal(violatesInstrumentRule('s("bd*2 sd")'), false);
+});
+
+// --- The settings topic ---
+
+test('settings topic: nine sections in order, the names blocks equal the vocabulary, no standalone number, no shipped model named, no tint or steering word', () => {
+  const text = readReferenceTopic('settings');
+  assert.ok(text.startsWith('# Synth settings\n'), 'the title comes first');
+  const headings = [...text.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+  assert.deepEqual(headings, [
+    'Where the names come from',
+    'Writing them',
+    'What each level reaches',
+    'What is refused',
+    'When they are sent',
+    'Nothing is stored',
+    'What the instrument undoes',
+    'System exclusive messages from the code',
+  ]);
+
+  const blocks = fencedBlocks(text, 'names').map((block) => block.split(/\s+/).filter((name) => name !== ''));
+  assert.deepEqual(blocks, [SETTING_VOCABULARY.tone, SETTING_VOCABULARY.part, SETTING_VOCABULARY.scene].map((names) => [...names]));
+
+  // The applies-to line holds the only numbers; a value, a part or a channel number would be an example.
+  const withoutAppliesTo = text.replace(REFERENCE_APPLIES_TO, '');
+  assert.deepEqual(stripNamesBlocks(withoutAppliesTo).match(/\b\d+\b/g), null, 'a standalone number outside the applies-to line');
+
+  assert.ok(text.includes('get_midi_instruments'));
+  assert.ok(text.includes('search_midi_sounds'));
+
+  const lower = text.toLowerCase();
+  for (const file of fs.readdirSync(shippedModelsDir()).filter((name) => name.endsWith('.json'))) {
+    const model = JSON.parse(fs.readFileSync(path.join(shippedModelsDir(), file), 'utf8'));
+    assert.ok(!lower.includes(String(model.id).toLowerCase()), `the topic names the shipped model ${model.id}`);
+    assert.ok(!lower.includes(String(model.name).toLowerCase()), `the topic names the shipped model ${model.name}`);
+  }
+
+  const prose = stripNamesBlocks(text);
+  assert.deepEqual(findWords(prose, TINT_WORDS), []);
+  assert.deepEqual(findWords(prose, STEERING_WORDS), []);
+});
+
+// --- The motif topic ---
+
+/** A motif on `gridId` with `cycles` cycles and the given cells (step, steps, velocity in hundredths), made with the model's own command. */
+function motifFrom(gridId, cycles, cells) {
+  const unit = gridOf(gridId).unit;
+  let motif = { ...emptyMotif(), grid: gridId, cycles };
+  for (const cell of cells) {
+    motif = placeNote(motif, { pitch: cell.pitch, start: cell.step * unit, length: (cell.steps ?? 1) * unit, velocity: cell.velocity ?? 80 }).motif;
+  }
+  return motif;
+}
+
+/** The two strings of a one-lane phrase: the text inside note("...") and inside velocity("..."). */
+function laneStringsOf(phrase) {
+  const match = /^note\("([^"]*)"\)\.velocity\("([^"]*)"\)$/.exec(phrase);
+  assert.ok(match, `not a one-lane phrase: ${phrase}`);
+  return { notes: match[1], velocities: match[2] };
+}
+
+/** The entries of a lane string: the outer square brackets and the slash with the cycles are taken off, the rest split on spaces. */
+function entriesOf(text, cycles) {
+  const inner = cycles === 1 ? text : text.replace(new RegExp(`^\\[(.*)\\]/${cycles}$`), '$1');
+  return inner.split(' ');
+}
+
+const MOTIF_NUMBER_RE = /(?<![A-Za-z0-9.#])\d+(?:\.\d+)?(?![A-Za-z0-9])/g;
+
+test('motif topic: eight sections in order, and the names blocks equal the field names, the grid ids and the source words of the code', () => {
+  const text = readReferenceTopic('motif');
+  assert.ok(text.startsWith('# Motif requests\n'), 'the title comes first');
+  const headings = [...text.matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+  assert.deepEqual(headings, [
+    'What a motif request holds',
+    'The moment',
+    'The grid',
+    'The phrase',
+    'Velocities',
+    'How the notes got there',
+    'What the words can ask',
+    'What the page did',
+  ]);
+  const blocks = fencedBlocks(text, 'names').map((block) => block.split(/\s+/).filter((name) => name !== ''));
+  assert.deepEqual(blocks, [Object.keys(askMotifShape), GRIDS.map((grid) => grid.id), [...MOTIF_SOURCES]]);
+  assert.deepEqual(GRIDS.map((grid) => grid.id), [...MOTIF_GRIDS], 'the page and the server name the same grids');
+  assert.deepEqual([...MOTIF_SOURCES], ['played', 'drawn', 'tapped', 'mixed']);
+  assert.deepEqual(fenceTags(text), ['names', 'names', 'names'], 'no js fence in this topic');
+});
+
+test('motif topic: the cycles bounds, the beats of a cycle and the default words are the code\'s', () => {
+  const text = readReferenceTopic('motif');
+  assert.equal(MIN_CYCLES, MIN_MOTIF_CYCLES);
+  assert.equal(MAX_CYCLES, MAX_MOTIF_CYCLES);
+  assert.ok(text.includes(`the length of the motif in cycles, from ${MIN_CYCLES} to ${MAX_CYCLES}.`));
+  assert.ok(text.includes(`A cycle holds ${BEATS_PER_CYCLE} beats.`));
+  // The request text is prefilled with a short default sentence the user can change.
+  assert.ok(SCRATCH_COPY.defaultWords.length > 0 && SCRATCH_COPY.defaultWords.length < 60);
+  assert.ok(text.includes('prefilled with a short default sentence they can change'));
+  assert.ok(text.includes('as a page request whose context has kind motif'));
+});
+
+test('motif topic: the grid list gives each of the five grids the steps per cycle the model gives it, and no other grid', () => {
+  const text = readReferenceTopic('motif');
+  const lines = [...text.matchAll(/^- `([a-z-]+)`: (\d+) steps per cycle$/gm)].map((match) => [match[1], Number(match[2])]);
+  assert.deepEqual(lines, GRIDS.map((grid) => [grid.id, grid.steps]));
+  assert.equal(lines.length, 5);
+  assert.ok(text.includes('Every note starts on a step and lasts a whole number of steps.'));
+  // Every note of a motif on each grid starts on a step and lasts whole steps, and the phrase holds exactly the steps the list says.
+  for (const grid of GRIDS) {
+    const { notes } = laneStringsOf(motifPhrase(motifFrom(grid.id, 1, [{ pitch: 60, step: 0, steps: 2 }])));
+    assert.equal(entriesOf(notes, 1).length, grid.steps, grid.id);
+  }
+});
+
+test('motif topic: outside the applies-to line and the names blocks every number is a constant of the code, and the topic holds no example phrase', () => {
+  const text = readReferenceTopic('motif');
+  const prose = stripNamesBlocks(text.replace(REFERENCE_APPLIES_TO, ''));
+  const allowed = new Set([...GRIDS.map((grid) => String(grid.steps)), String(MIN_CYCLES), String(MAX_CYCLES), String(BEATS_PER_CYCLE), '0.01', '1', '60']);
+  for (const number of prose.match(MOTIF_NUMBER_RE) ?? []) {
+    assert.ok(allowed.has(number), `the topic holds the number ${number}, which no check ties to the code`);
+  }
+  // 0.01 and 1 are the lowest and the highest velocity the writer gives; 60 is the MIDI note it spells c4.
+  const lowest = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0, velocity: 1 }])));
+  const highest = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0, velocity: 100 }])));
+  assert.equal(entriesOf(lowest.velocities, 1)[0], '0.01');
+  assert.equal(entriesOf(highest.velocities, 1)[0], '1');
+  assert.ok(text.includes('A velocity runs from 0.01 to 1, written with at most two decimals.'));
+  const spelling = entriesOf(laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0 }]))).notes, 1)[0];
+  assert.equal(spelling, 'c4');
+  assert.ok(text.includes(`MIDI note 60 is written ${spelling}.`));
+  // No quoted string but the placeholder, and no pitch name but the spelling of MIDI note 60.
+  assert.deepEqual([...prose.matchAll(/"([^"]*)"/g)].map((match) => match[1]).filter((quoted) => quoted !== '…'), []);
+  assert.deepEqual(prose.match(/\b[a-g]#?\d\b/g), [spelling]);
+});
+
+test('motif topic: the moment sentences are true of motifMoment and motifRequest', () => {
+  const text = readReferenceTopic('motif');
+  for (const piece of [
+    "For a played motif, cycle is the cycle of the music where the motif's first cycle was played.",
+    "For any other motif, cycle is the cycle where the first cycle of the roll stood when the user pressed the button, a whole multiple of the cycles of the motif.",
+    'An absent cycle means the motif has no moment: the music was stopped, or the notes of a played motif came from more than one run of the music.',
+    'A pattern repeats from the start of the count, so a phrase that spans its cycles starts again at every multiple of them.',
+    'the functions topic of get_strudel_reference',
+  ]) {
+    assert.ok(text.includes(piece), piece);
+  }
+  // A played motif keeps the cycle where it was played, whatever the music does now; no moment when it has none.
+  const base = motifFrom('quarter', 2, [{ pitch: 60, step: 0 }]);
+  assert.equal(motifMoment({ ...base, source: 'played', recorded: { cycle: 5 } }, 40.5), 5);
+  assert.equal(motifMoment({ ...base, source: 'played', recorded: { cycle: null } }, 40.5), null);
+  // Any other motif: the music's cycle at the press, a whole multiple of the motif's cycles, and none while the music is stopped. A mixed motif
+  // that began as a recording is one of them: what it was played at no longer counts.
+  for (const cycles of [1, 2, 3, 8]) {
+    const base = motifFrom('quarter', cycles, [{ pitch: 60, step: 0 }]);
+    for (const motif of [{ ...base, source: 'drawn' }, { ...base, source: 'tapped' }, { ...base, source: 'mixed' }, { ...base, source: 'mixed', recorded: { cycle: 5 } }]) {
+      for (const musicCycle of [0, 0.4, cycles, cycles + 0.6, 13.6, 100.9]) {
+        const moment = motifMoment(motif, musicCycle);
+        assert.equal(moment % cycles, 0, `${motif.source} of ${cycles} cycles at ${musicCycle}`);
+        assert.ok(moment <= musicCycle && musicCycle < moment + cycles);
+      }
+      assert.equal(motifMoment(motif, null), null);
+      assert.equal(Object.hasOwn(motifRequest(motif, null), 'cycle'), false, 'no moment means no cycle key');
+    }
+  }
+});
+
+test('motif topic: each sentence about the phrase form is true of what motifPhrase writes', () => {
+  const text = readReferenceTopic('motif');
+  for (const piece of [
+    'One lane is `note("…").velocity("…")`, and several lanes are `stack(…)` of lanes.',
+    'A string holds one entry per step of the whole motif, from its first step to its last.',
+    '`~` is a step where no note of that lane starts.',
+    '`_` is a step the note before still holds.',
+    'Voices that start together with the same length and velocity are one entry in square brackets with commas between the pitch names.',
+    'Voices that differ go in separate lanes.',
+    'A motif of more than one cycle is one sequence in square brackets followed by a slash and the value of cycles, so a note can be held across the line between two cycles.',
+    'The velocity string mirrors the note string entry for entry: a note or a chord has its velocity at the same place, and ~ and _ stay the same.',
+    'Pitch names are lowercase letters from a to g, with # for a sharp and the octave number after them',
+    'The mini-notation topic of get_strudel_reference lists every symbol of the strings.',
+  ]) {
+    assert.ok(text.includes(piece), piece);
+  }
+
+  // One lane, one entry per step of the whole motif, on every grid and for one and two cycles.
+  for (const grid of GRIDS) {
+    for (const cycles of [1, 2]) {
+      const phrase = motifPhrase(motifFrom(grid.id, cycles, [{ pitch: 60, step: 1 }]));
+      const { notes, velocities } = laneStringsOf(phrase);
+      assert.equal(entriesOf(notes, cycles).length, grid.steps * cycles, `${grid.id} ${cycles}`);
+      // The velocity string mirrors the note string entry for entry.
+      assert.equal(entriesOf(velocities, cycles).length, grid.steps * cycles);
+    }
+  }
+
+  // A rest is ~ where no note starts, and the note itself is its pitch name.
+  const rest = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 1 }])));
+  assert.deepEqual(entriesOf(rest.notes, 1), ['~', 'c4', '~', '~']);
+  assert.deepEqual(entriesOf(rest.velocities, 1), ['~', '0.8', '~', '~']);
+
+  // A note held for several steps is followed by _ for each held step, in both strings.
+  const held = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0, steps: 3, velocity: 50 }])));
+  assert.deepEqual(entriesOf(held.notes, 1), ['c4', '_', '_', '~']);
+  assert.deepEqual(entriesOf(held.velocities, 1), ['0.5', '_', '_', '~']);
+
+  // Voices that start together with the same length and velocity are one entry in square brackets with commas, and keep one lane.
+  const chord = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0 }, { pitch: 64, step: 0 }, { pitch: 67, step: 0 }])));
+  assert.deepEqual(entriesOf(chord.notes, 1), ['[c4,e4,g4]', '~', '~', '~']);
+  assert.deepEqual(entriesOf(chord.velocities, 1), ['0.8', '~', '~', '~']);
+
+  // Voices that differ go in separate lanes of a stack, whatever differs: the velocity, or the length.
+  for (const second of [{ pitch: 64, step: 0, velocity: 30 }, { pitch: 64, step: 0, steps: 2 }]) {
+    const stacked = motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0 }, second]));
+    assert.ok(stacked.startsWith('stack(note("') && stacked.endsWith('"))'), stacked);
+    assert.equal(stacked.match(/note\("/g).length, 2);
+    assert.equal(stacked.match(/\.velocity\("/g).length, 2);
+  }
+
+  // More than one cycle is one sequence in square brackets and a slash and the cycles; a note held across the line between two cycles
+  // has its _ right after the line.
+  const twice = laneStringsOf(motifPhrase(motifFrom('quarter', 2, [{ pitch: 60, step: 3, steps: 2 }])));
+  assert.equal(twice.notes, '[~ ~ ~ c4 _ ~ ~ ~]/2');
+  assert.equal(twice.velocities, '[~ ~ ~ 0.8 _ ~ ~ ~]/2');
+  const eight = laneStringsOf(motifPhrase(motifFrom('quarter', MAX_CYCLES, [{ pitch: 60, step: 0 }])));
+  assert.ok(eight.notes.endsWith(`]/${MAX_CYCLES}`));
+
+  // Pitch names: lowercase letters, # for a sharp, the octave number after them.
+  const names = laneStringsOf(motifPhrase(motifFrom('quarter', 1, [{ pitch: 60, step: 0 }, { pitch: 61, step: 1 }, { pitch: 71, step: 2 }, { pitch: 72, step: 3 }])));
+  assert.deepEqual(entriesOf(names.notes, 1), ['c4', 'c#4', 'b4', 'c5']);
+
+  // The phrase is the text the page showed: the request carries it as it is.
+  const motif = { ...motifFrom('quarter', 1, [{ pitch: 60, step: 0 }]), source: 'drawn' };
+  assert.equal(motifRequest(motif, null).phrase, motifPhrase(motif));
+});
+
+test('motif topic: the source words, the tools and the topics it names exist, and it has no tint or steering word', () => {
+  const text = readReferenceTopic('motif');
+  for (const piece of [
+    '- played: the notes were played on a MIDI keyboard and put on the roll.',
+    '- drawn: the notes were placed on the roll by the user.',
+    '- tapped: the notes were tapped in time with the music.',
+    '- mixed: the notes got there in more than one of these ways.',
+    'Played notes can include very short, very quiet notes that the player may not have meant.',
+    'The motif can become a new labeled track, a change to a track that plays, or a replacement of what plays, or the answer can be in words.',
+    'The page asks for none of these by itself.',
+    'The page changed no code and no version.',
+    'The music plays as it did until a change is written with set_code or edit_code.',
+    'A change that passes the id of the request as answering links to it, and answer_request closes the request in words.',
+    'the midi topic of get_strudel_reference',
+  ]) {
+    assert.ok(text.includes(piece), piece);
+  }
+  for (const id of ['mini-notation', 'functions', 'midi']) assert.ok(REFERENCE_TOPIC_IDS.includes(id), id);
+  // The request-line facts point to this topic by its id.
+  assert.ok(REFERENCE_TOPIC_IDS.includes('motif'));
+  const prose = stripNamesBlocks(text);
+  assert.deepEqual(findWords(prose, TINT_WORDS), []);
+  assert.deepEqual(findWords(prose, STEERING_WORDS), []);
+  for (const word of ['you should', 'we recommend', 'try']) assert.ok(!new RegExp(`\\b${word}\\b`, 'i').test(prose), word);
 });
 
 // --- Content rules over every REFERENCE_TOPICS file ---

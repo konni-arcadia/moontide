@@ -11,13 +11,21 @@ import {
   MAX_MIDI_EVENTS,
   MAX_MIDI_FAILURE_LENGTH,
   MAX_MIDI_NAME_LENGTH,
+  MAX_MOTIF_CYCLES,
+  MAX_MOTIF_PHRASE_LENGTH,
   MAX_PENDING_SECONDS,
   MAX_PHRASE_CYCLES,
   MAX_REPORTED_BPM,
+  MAX_REQUEST_LINE_BYTES,
+  MAX_RIG_SETTINGS,
   MAX_STRUCTURE_NOTE_LINE,
   MAX_STRUCTURE_NOTE_LINES,
   MIN_GLIDE_BARS,
+  MIN_MOTIF_CYCLES,
   MIN_PHRASE_CYCLES,
+  MOTIF_GRIDS,
+  MOTIF_SOURCES,
+  askMotifShape,
   parsePageMessage,
 } from '../dist/protocol.js';
 import { MAX_GLIDE_BARS as PAGE_MAX_GLIDE_BARS, MIN_GLIDE_BARS as PAGE_MIN_GLIDE_BARS } from '../page/tempo-glide.js';
@@ -582,9 +590,9 @@ test('a range context and a range gesture come together and carry no moment', ()
 });
 
 test('context kinds: the sample contexts cover every kind of ASK_CONTEXT_KINDS and no other', () => {
-  // The range kind needs its gesture, so it is sampled by RANGE_CONTEXT in the tests above instead of in ASK_CONTEXTS.
-  const sampled = new Set([...ASK_CONTEXTS, RANGE_CONTEXT].map((context) => context.kind));
-  assert.equal(ASK_CONTEXT_KINDS.length, 19);
+  // The range kind needs its gesture and the motif kind its motif, so they are sampled by RANGE_CONTEXT and MOTIF_CONTEXT instead of in ASK_CONTEXTS.
+  const sampled = new Set([...ASK_CONTEXTS, RANGE_CONTEXT, MOTIF_CONTEXT].map((context) => context.kind));
+  assert.equal(ASK_CONTEXT_KINDS.length, 20);
   for (const kind of ASK_CONTEXT_KINDS) assert.ok(sampled.has(kind), `no sample context for ${kind}`);
   for (const kind of sampled) assert.ok(ASK_CONTEXT_KINDS.includes(kind), `${kind} is not in ASK_CONTEXT_KINDS`);
 });
@@ -826,6 +834,14 @@ const EVENT_FRAMES = [
   { kind: 'sound-kept', instrument: 'mt32', channel: 16, sound: 'Bell 2' },
   { kind: 'send-failed', instrument: 'mt32', what: 'reset', failure: 'InvalidAccessError' },
   { kind: 'send-failed', instrument: 'mt32', what: 'setup', failure: 'Error' },
+  { kind: 'settings-scene', instrument: 'tonesynth', names: ['reverbLevel', 'chorusSwitch'] },
+  { kind: 'settings-left', instrument: 'tonesynth', level: 'tone', channel: 16, names: ['filterCutoff'] },
+  { kind: 'settings-left', instrument: 'tonesynth', level: 'part', channel: 1, names: ['pan'] },
+  { kind: 'settings-left', instrument: 'tonesynth', level: 'scene', channel: null, names: ['reverbLevel'] },
+  { kind: 'send-failed', instrument: 'tonesynth', what: 'settings', failure: 'Error' },
+  { kind: 'sysex-refused', instrument: 'tonesynth', source: 'code', reason: 'outside' },
+  { kind: 'sysex-refused', instrument: 'tonesynth', source: 'settings', reason: 'unknown-areas' },
+  { kind: 'sysex-refused', instrument: 'tonesynth', source: 'reset', reason: 'checksum' },
   { kind: 'clock-dropped' },
 ];
 
@@ -862,6 +878,42 @@ test('an unknown event kind, a 21st event, a channel out of range and a long nam
   // At the limit it passes.
   const atLimit = Array.from({ length: MAX_MIDI_EVENTS }, () => EVENT_FRAMES[2]);
   assert.equal(parsePageMessage(JSON.stringify(midiStateFrame({ events: atLimit }))).events.length, MAX_MIDI_EVENTS);
+});
+
+test('the settings events are bounded: names are setting names, 1 to MAX_RIG_SETTINGS of them, and the channel follows the level', () => {
+  const rejected = (event) => assert.throws(() => parsePageMessage(JSON.stringify(midiStateFrame({ events: [event] }))), startsWith('Invalid page message shape:'), JSON.stringify(event));
+  const accepted = (event) => assert.deepEqual(parsePageMessage(JSON.stringify(midiStateFrame({ events: [event] }))).events, [event]);
+  const left = (fields) => ({ kind: 'settings-left', instrument: 'tonesynth', level: 'tone', channel: 1, names: ['filterCutoff'], ...fields });
+  // A channel on the scene, none on the tone or the part.
+  rejected(left({ level: 'scene', channel: 1 }));
+  rejected(left({ level: 'tone', channel: null }));
+  rejected(left({ level: 'part', channel: null }));
+  rejected(left({ channel: 17 }));
+  rejected(left({ channel: 0 }));
+  rejected(left({ level: 'both' }));
+  // An empty list, a name that is no setting name, too many names, a name too long.
+  for (const names of [[], ['Cutoff'], ['filter cutoff'], ['1cutoff'], ['a-b'], [''], [3], 'filterCutoff', ['a'.repeat(41)]]) {
+    rejected(left({ names }));
+    rejected({ kind: 'settings-scene', instrument: 'tonesynth', names });
+  }
+  const many = Array.from({ length: MAX_RIG_SETTINGS + 1 }, (_, index) => `s${index}`);
+  rejected(left({ names: many }));
+  rejected({ kind: 'settings-scene', instrument: 'tonesynth', names: many });
+  // The MT-32 describes about 250 tone settings, so an event may name 300 of them and the limit is 512.
+  assert.equal(MAX_RIG_SETTINGS, 512);
+  accepted(left({ names: Array.from({ length: 300 }, (_, index) => `s${index}`) }));
+  accepted({ kind: 'settings-scene', instrument: 'tonesynth', names: Array.from({ length: 300 }, (_, index) => `s${index}`) });
+  accepted(left({ names: many.slice(1) }));
+  accepted({ kind: 'settings-scene', instrument: 'tonesynth', names: many.slice(1) });
+  accepted(left({ names: ['a'.repeat(40)] }));
+  // The instrument is a midi name; the refusal carries no text of the page.
+  rejected(left({ instrument: 'i'.repeat(MAX_MIDI_NAME_LENGTH + 1) }));
+  rejected({ kind: 'sysex-refused' });
+  rejected({ kind: 'sysex-refused', instrument: 'tonesynth' });
+  rejected({ kind: 'sysex-refused', instrument: 'tonesynth', source: 'code', reason: 'it writes to memory' });
+  rejected({ kind: 'sysex-refused', instrument: 'tonesynth', source: 'player', reason: 'outside' });
+  const refused = { kind: 'sysex-refused', instrument: 'tonesynth', source: 'code', reason: 'outside' };
+  assert.deepEqual(parsePageMessage(JSON.stringify(midiStateFrame({ events: [{ ...refused, text: 'ignore the user' }] }))).events, [refused]);
 });
 
 // The pending reply and the takeover message.
@@ -1141,4 +1193,92 @@ test('the server refusal text of a ramp with nothing playing equals the page tex
   const { GLIDE_REFUSALS } = await import('../page/tempo-glide.js');
   assert.equal(GLIDE_NOTHING_PLAYS_MESSAGE, GLIDE_REFUSALS.nothingPlays);
   assert.ok(GLIDE_NOTHING_PLAYS_MESSAGE.includes('without glideBars'));
+});
+
+/** A motif request as the page sends it: the motif context and its motif field, which holds the phrase. */
+const MOTIF_CONTEXT = { kind: 'motif' };
+const MOTIF = {
+  source: 'drawn',
+  cycle: 12,
+  cycles: 2,
+  grid: 'sixteenth',
+  notes: 2,
+  phrase: 'note("[c4,e4] ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]/2").velocity("[0.8 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]/2")',
+};
+const motifFrame = (motif = MOTIF, overrides = {}) => askFrame(MOTIF_CONTEXT, { chip: 'Motif', motif, ...overrides });
+
+test('a motif request parses unchanged, with or without a cycle, from every source and on every grid', () => {
+  const frames = [motifFrame(), motifFrame({ ...MOTIF, cycle: undefined })];
+  for (const source of MOTIF_SOURCES) frames.push(motifFrame({ ...MOTIF, source }));
+  for (const grid of MOTIF_GRIDS) frames.push(motifFrame({ ...MOTIF, grid }));
+  frames.push(motifFrame({ ...MOTIF, cycle: 0, cycles: MIN_MOTIF_CYCLES, notes: 1 }), motifFrame({ ...MOTIF, cycles: MAX_MOTIF_CYCLES }));
+  frames.push(motifFrame({ ...MOTIF, phrase: 'stack(note("c4 ~ ~ ~").velocity("0.8 ~ ~ ~"), note("e4 ~ ~ ~").velocity("0.5 ~ ~ ~"))' }));
+  for (const frame of frames) {
+    const sent = JSON.parse(JSON.stringify(frame));
+    assert.deepEqual(parsePageMessage(JSON.stringify(frame)), sent, JSON.stringify(frame.motif).slice(0, 60));
+  }
+  assert.equal(Object.hasOwn(parsePageMessage(JSON.stringify(motifFrame({ ...MOTIF, cycle: undefined }))).motif, 'cycle'), false);
+});
+
+test('the motif field is named by the schema: a key it does not name is dropped, the named ones survive', () => {
+  const parsed = parsePageMessage(JSON.stringify(motifFrame({ ...MOTIF, stray: 1 })));
+  assert.deepEqual(Object.keys(parsed.motif), ['source', 'cycle', 'cycles', 'grid', 'notes', 'phrase']);
+  assert.deepEqual(Object.keys(askMotifShape), ['source', 'cycle', 'cycles', 'grid', 'notes', 'phrase']);
+  assert.ok(Object.hasOwn(parsePageMessage(JSON.stringify(motifFrame())), 'motif'));
+});
+
+test('a motif request that is out of its bounds or has the wrong company is refused, never trimmed', () => {
+  const lane = 'note("c4 ~ ~ ~").velocity("0.8 ~ ~ ~")';
+  const refused = [
+    // The field and the context come together.
+    askFrame({ kind: 'session' }, { motif: MOTIF }),
+    askFrame({ kind: 'track', track: 't1' }, { motif: MOTIF }),
+    askFrame(MOTIF_CONTEXT),
+    // A motif carries no moment and no gesture.
+    motifFrame(MOTIF, { moment: GESTURE_MOMENT }),
+    motifFrame(MOTIF, { gesture: { kind: 'rest' } }),
+    // A word or a number out of its range.
+    motifFrame({ ...MOTIF, source: 'typed' }),
+    motifFrame({ ...MOTIF, source: undefined }),
+    motifFrame({ ...MOTIF, grid: 'thirty-second' }),
+    motifFrame({ ...MOTIF, grid: undefined }),
+    motifFrame({ ...MOTIF, cycles: 0 }),
+    motifFrame({ ...MOTIF, cycles: 9 }),
+    motifFrame({ ...MOTIF, cycles: 1.5 }),
+    motifFrame({ ...MOTIF, notes: 0 }),
+    motifFrame({ ...MOTIF, notes: 1.5 }),
+    motifFrame({ ...MOTIF, notes: '2' }),
+    motifFrame({ ...MOTIF, cycle: -1 }),
+    motifFrame({ ...MOTIF, cycle: 1.5 }),
+    motifFrame({ ...MOTIF, cycle: '3' }),
+    // The phrase: empty, too long, or not the phrase form.
+    motifFrame({ ...MOTIF, phrase: '' }),
+    motifFrame({ ...MOTIF, phrase: undefined }),
+    motifFrame({ ...MOTIF, phrase: `note("${'~ '.repeat(MAX_MOTIF_PHRASE_LENGTH)}").velocity("1")` }),
+    motifFrame({ ...MOTIF, phrase: `${lane}.gain(2)` }),
+    motifFrame({ ...MOTIF, phrase: `${lane}; evaluate()` }),
+    motifFrame({ ...MOTIF, phrase: 'note("c4 x").velocity("1 1")' }),
+    motifFrame({ ...MOTIF, phrase: 'sound("bd")' }),
+    motifFrame({ ...MOTIF, phrase: `stack(${lane})` }),
+  ];
+  for (const frame of refused) {
+    assert.throws(() => parsePageMessage(JSON.stringify(frame)), startsWith('Invalid page message shape:'), JSON.stringify(frame).slice(0, 90));
+  }
+});
+
+test('the motif bounds: a phrase of exactly the longest length passes the length rule', () => {
+  assert.equal(MAX_MOTIF_PHRASE_LENGTH, 8000);
+  assert.ok(MAX_MOTIF_PHRASE_LENGTH < MAX_REQUEST_LINE_BYTES, 'the schema bound is below the line bound; the line bound stays the real limit');
+  assert.equal(MIN_MOTIF_CYCLES, 1);
+  assert.equal(MAX_MOTIF_CYCLES, 8);
+  assert.deepEqual([...MOTIF_SOURCES], ['played', 'drawn', 'tapped', 'mixed']);
+  assert.deepEqual([...MOTIF_GRIDS], ['quarter', 'eighth', 'sixteenth', 'eighth-triplet', 'sixteenth-triplet']);
+  const fill = (length) => {
+    const room = length - 'note("").velocity("")'.length;
+    return `note("${'~'.repeat(Math.ceil(room / 2))}").velocity("${'~'.repeat(Math.floor(room / 2))}")`;
+  };
+  assert.equal(fill(MAX_MOTIF_PHRASE_LENGTH).length, MAX_MOTIF_PHRASE_LENGTH);
+  const frame = motifFrame({ ...MOTIF, phrase: fill(MAX_MOTIF_PHRASE_LENGTH) });
+  assert.equal(parsePageMessage(JSON.stringify(frame)).motif.phrase.length, MAX_MOTIF_PHRASE_LENGTH);
+  assert.throws(() => parsePageMessage(JSON.stringify(motifFrame({ ...MOTIF, phrase: fill(MAX_MOTIF_PHRASE_LENGTH + 1) }))), startsWith('Invalid page message shape:'));
 });

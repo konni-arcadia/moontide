@@ -5,7 +5,7 @@
 // CONNECTION_LABELS (read at use time, so the popover, the top bar and this view never disagree). The DOM
 // side is page/instruments-view.js; page/main.js feeds the inputs.
 
-import { ACCESS_STATES, MIDI_COPY, fill, listNames, readMidiCalls } from './midi-plan.js';
+import { ACCESS_STATES, MIDI_COPY, fill, listNames, readMidiCalls, readMidiSetup } from './midi-plan.js';
 import { BUILD_MISMATCH_COPY, CONNECTION_LABELS } from './ui-state.js';
 import { midiTag, readMidiTracks } from './midi-controls.js';
 import { drumMapFor, soundKey } from './midi-rig.js';
@@ -59,6 +59,15 @@ export const INSTRUMENTS_COPY = Object.freeze({
   labelControlsHint: 'default values',
   labelCatalog: 'Catalog',
   labelInUse: 'In use',
+  // The Synth settings row of an instrument whose model describes settings: what the playing code writes, never stored.
+  labelSynthSettings: 'Synth settings',
+  synthTone: 'tone, ch {channel}: {values}',
+  synthPart: 'part, ch {channel}: {values}',
+  synthScene: 'scene: {values}, reaches every part',
+  synthValue: '{name} {value}',
+  synthValuesJoin: ', ',
+  synthNone: 'none in the code',
+  synthStays: 'A setting taken out of the code is not sent again: the instrument keeps its value until the instrument itself changes it, and a tone setting until the instrument loads the tone again. Moontide stores no setting.',
   clockFollows: 'follows the clock',
   controlsNone: 'none',
   catalogOne: '1 sound',
@@ -303,8 +312,9 @@ function readUse(code, parse, rig) {
   if (typeof parse !== 'function') return { kind: 'unreadable' };
   const tracks = readMidiTracks(code, { parse, rig });
   const calls = readMidiCalls(code, { parse });
-  if (!tracks.ok || !calls.ok) return { kind: 'unreadable' };
-  return { kind: 'read', tracks: [...tracks.tracks.values()], calls: calls.calls };
+  const setup = readMidiSetup(code, { parse });
+  if (!tracks.ok || !calls.ok || !setup.ok) return { kind: 'unreadable' };
+  return { kind: 'read', tracks: [...tracks.tracks.values()], calls: calls.calls, setups: setup.calls };
 }
 
 /**
@@ -335,6 +345,40 @@ function inUseOf(instrument, use) {
     return `${names}${midiTag(tracks[0]).channel}`;
   });
   return { lead: instrument.enabled === false ? INSTRUMENTS_COPY.silentWhileOff : null, lines, muted: false };
+}
+
+/**
+ * The Synth settings row of one instrument: null when its model describes no settings, else `{ lines: [{ text, muted }] }`
+ * read from the playing code. The lines are the tone and part settings per channel ascending (tone first), then the scene
+ * settings, taken from the calls whose port is exactly the instrument's port; the values stay in the order written and a
+ * later equal value merges. Without any, or without readable code, one muted line says so. The standing rule about a
+ * setting taken out of the code comes last. Nothing is stored: the row is the code.
+ */
+function synthSettingsOf(instrument, use) {
+  if (instrument.settings === null || instrument.settings === undefined) return null;
+  const staying = { text: INSTRUMENTS_COPY.synthStays, muted: true };
+  if (use.kind === 'unreadable') return { lines: [{ text: INSTRUMENTS_COPY.unreadableCode, muted: true }, staying] };
+  if (use.kind === 'empty') return { lines: [{ text: MIDI_COPY.rowNotUsed, muted: true }, staying] };
+  const channels = new Map();
+  const scene = new Map();
+  for (const call of use.setups) {
+    if (call.port !== instrument.port) continue;
+    if (!channels.has(call.channel)) channels.set(call.channel, { tone: new Map(), part: new Map() });
+    const level = channels.get(call.channel);
+    for (const [name, value] of call.settings.tone) level.tone.set(name, value);
+    for (const [name, value] of call.settings.part) level.part.set(name, value);
+    for (const [name, value] of call.settings.scene) scene.set(name, value);
+  }
+  const valuesOf = (map) => Array.from(map, ([name, value]) => fill(INSTRUMENTS_COPY.synthValue, { name, value: String(value) })).join(INSTRUMENTS_COPY.synthValuesJoin);
+  const lines = [];
+  for (const channel of [...channels.keys()].sort((a, b) => a - b)) {
+    const { tone, part } = channels.get(channel);
+    if (tone.size > 0) lines.push({ text: fill(INSTRUMENTS_COPY.synthTone, { channel: String(channel), values: valuesOf(tone) }), muted: false });
+    if (part.size > 0) lines.push({ text: fill(INSTRUMENTS_COPY.synthPart, { channel: String(channel), values: valuesOf(part) }), muted: false });
+  }
+  if (scene.size > 0) lines.push({ text: fill(INSTRUMENTS_COPY.synthScene, { values: valuesOf(scene) }), muted: false });
+  if (lines.length === 0) lines.push({ text: INSTRUMENTS_COPY.synthNone, muted: true });
+  return { lines: [...lines, staying] };
 }
 
 /** True when the instrument declares at least one channel with the rhythm role (the Drum kit row and Drum map line only exist then). */
@@ -558,6 +602,7 @@ function cardOf(instrument, liveInstruments, use) {
     modelChannels: modelChannelsOf(instrument),
     usedChannels: usedChannelsOf(instrument, use),
     inUse: inUseOf(instrument, use),
+    synthSettings: synthSettingsOf(instrument, use),
     drumKit: drumKitOf(instrument, use),
     drumMaps: drumMapsOf(instrument, use),
     drumDeclared: drumDeclaredOf(instrument),
@@ -717,6 +762,8 @@ function declaredFacts(card) {
     drumDeclared: card.drumDeclared,
     settings: card.settings,
     modelChannels: card.modelChannels,
+    // Whether the model describes settings decides whether the Synth settings row exists; its lines are live.
+    hasSynthSettings: card.synthSettings !== null,
   });
 }
 

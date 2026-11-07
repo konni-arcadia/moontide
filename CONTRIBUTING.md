@@ -28,6 +28,10 @@ npm run smoke:npx
 Moontide before you run it. `npm run smoke:npx` packs the package and starts it through npx the
 way a user does.
 
+`npm run build:site -- --out <empty folder>` builds the user manual from `site/` into HTML to look at locally.
+
+The images of the manual are in `site/images/`. `node scripts/capture-manual-images.mjs --out <empty folder>` retakes them from a silent page (it needs `npm run build`, a Chromium-based browser and ffmpeg). Look at each new image before it replaces an old one.
+
 ## Checking for tint
 
 Run `npm run tint:report -- --last 10` to see the sounds, scales, tempo, flute use and reused

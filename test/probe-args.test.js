@@ -65,7 +65,7 @@ test('parseArgs: every group of the page probe is accepted by --only and another
 
 test('parseArgs: the MIDI probe reads its own groups and refuses the others by name', () => {
   const options = { groups: MIDI_GROUPS, checks: [] };
-  assert.deepEqual([...MIDI_GROUPS], ['song', 'mixer', 'timeline', 'ramp', 'ramp-measure', 'ramp-measure-late', 'ramp-gestures']);
+  assert.deepEqual([...MIDI_GROUPS], ['song', 'mixer', 'timeline', 'ramp', 'settings', 'ramp-measure', 'ramp-measure-late', 'ramp-gestures', 'input']);
   assert.equal(parseArgs(['--only', 'mixer'], options).only, 'mixer');
   assert.throws(
     () => parseArgs(['--only', 'bar'], options),

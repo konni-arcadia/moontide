@@ -87,6 +87,20 @@ export const REFERENCE_TOPICS = [
     summary:
       'sending a track to a MIDI port with .midi(): port names, channels, notes, control and program changes, the MIDI clock Moontide sends, and what Stop sends',
   },
+  {
+    id: 'settings',
+    file: 'settings.md',
+    title: 'Synth settings',
+    summary:
+      'the tone, part and scene settings of a MIDI instrument written in .midi(): what each level reaches, the setting names, what is refused, when they are sent and what undoes them',
+  },
+  {
+    id: 'motif',
+    file: 'motif.md',
+    title: 'Motif requests',
+    summary:
+      'how to read a motif sent from the Scratchpad: its fields, the moment, the grid, the phrase form, the velocities, the source words, what the words can ask and what the page did',
+  },
 ] as const satisfies readonly ReferenceTopic[];
 
 export type ReferenceTopicId = (typeof REFERENCE_TOPICS)[number]['id'];

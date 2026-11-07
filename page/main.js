@@ -108,6 +108,11 @@ import { createSongGridView, isAskKey } from './song-grid-view.js';
 import { SONG_FOLDS_COPY, isRememberable, readSongFolds, writeSongFolds } from './song-prefs.js';
 import { JAM_COPY, buildJamModel, jamStuckFor, jamIsStuck } from './jam-model.js';
 import { createJamView } from './jam-view.js';
+import { createScratchView } from './scratch-view.js';
+import { createMidiIn } from './midi-in.js';
+import { createPlayedBuffer } from './played-buffer.js';
+import { cycleAtStamp, listenOptions, unitInMotif } from './scratch-model.js';
+import { createScratchListen } from './scratch-listen.js';
 import { createInstrumentsView } from './instruments-view.js';
 import { instrumentsModel, readDataFolder, readInstrumentResult } from './instruments-model.js';
 import { createMidiOut, installNoMidiShim, isKnownMidiRejection } from './midi-out.js';
@@ -201,6 +206,9 @@ let pageSocket = 'connecting';
 let pageDataFolder = null;
 // The one place the page asks whether this browser has Web MIDI; midi-out and the Instruments view share it.
 const supportsMidi = () => typeof navigator.requestMIDIAccess === 'function';
+// The listener for the MIDI inputs the setup file names (made below, next to the Scratchpad it feeds). Declared here so the MIDI facts'
+// callback can tell it that the port list or the access just changed.
+let midiIn = null;
 const midiOut = createMidiOut({
   getWebMidi: () => globalThis.WebMidi ?? null,
   enableWebMidi: () => {
@@ -235,6 +243,8 @@ const midiOut = createMidiOut({
   onClockState: () => renderMidiIndicator(),
   now: () => Date.now(),
   publish: (facts) => {
+    // The access may just have come up, or a port may have come or gone: the input listener reads the ports again.
+    midiIn?.refresh();
     // The indicator shows the same facts the server hears, so the page and Claude never disagree; it
     // renders even while the socket is closed, so it can hide.
     renderMidiIndicator(facts);
@@ -694,6 +704,17 @@ function drawTopBar() {
 }
 
 /**
+ * The music's cycle now, as the top bar reads it (the same condition that it plays here, the same clamp), or null while it does not
+ * play: the Scratchpad's Send to Claude takes the moment of a motif from it. It reads the scheduler and nothing else.
+ */
+function musicCycleNow() {
+  const plays = currentSoundState === 'playing' && !pageSuperseded && hasEvaluatedSuccessfully;
+  if (!plays) return null;
+  const raw = scheduler.now();
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+/**
  * Hands the queued section header of the Song grid its countdown for this poll: the rest of the top bar's text
  * (`in 3 bars`, `in 2 beats`, `in 1 beat`) from the same record and the same cycle `now` the bar just drew, so the two
  * never disagree. `now` is null while nothing plays. The grid is written in the same turn when the text changed.
@@ -1087,6 +1108,7 @@ const timelineEditUi = createTimelineEditView({
 window.addEventListener('blur', () => timelineEditUi.cancelGesture());
 const jamViewEl = document.getElementById('jam-view');
 const instrumentsViewEl = document.getElementById('instruments-view');
+const scratchViewEl = document.getElementById('scratch-view');
 const editorArea = document.getElementById('editor-area');
 const viewButtonsEl = document.getElementById('view-buttons');
 const layoutButtonsEl = document.getElementById('layout-buttons');
@@ -1139,6 +1161,258 @@ const jamUi = createJamView({
   },
   onScaleChoice: (choice) => chooseJamScale(choice),
 });
+
+// The Scratchpad view's DOM and its motif, which lives in memory only: nothing it holds is stored or played, and the motif is sent only
+// when the user presses Send to Claude (the view hands the request to onSend; the page sends it, as any other request to Claude). Created
+// here, before any code path that can call into it.
+const scratchUi = createScratchView({
+  document,
+  rootFontPx: () => parseFloat(getComputedStyle(document.documentElement).fontSize),
+  // Send to Claude: the motif request goes through the Ask channel like any other request, so the Requests panel shows it. askUi is
+  // created further down and looked up when the user presses.
+  onSend: (request) => {
+    const result = askUi.sendMotif(request);
+    syncScratchSend();
+    return result;
+  },
+  musicCycle: () => musicCycleNow(),
+  // The marker loop runs only while Tap is on: the view tells the page whenever Tap turns on or off.
+  onTapChange: (on) => (on ? startTapMarker() : stopTapMarker()),
+  // Record that: the keyboard's last cycles become the motif; the snapshot stays in memory and nothing is sent or written.
+  onRecord: () => {
+    // The live layer showed exactly the notes Record that writes (one layout), so once they are the motif the buffer is empty again and the
+    // live view hands over to it. A press that took nothing leaves the buffer alone.
+    if (scratchUi.record(midiIn.snapshot())) midiIn.clearBuffer();
+  },
+  // The Allow MIDI to listen press: the only moment the keyboard input asks the browser for MIDI, and it does so through the music's own enable.
+  onAllow: () => void midiIn.allow(),
+  // Listen, Stop and Loop: the view asks, the page's Listen player plays on the page's own MIDI layer (see startListen).
+  onListen: (request) => startListen(request),
+  onStop: () => stopListen('stop'),
+  onLoop: (on) => scratchListen.setLoop(on),
+  // The Heads up line: the unmuted tracks of the playing code on the chosen instrument and channel, read by the MIDI layer.
+  playingTracks: (instrumentId, channel) => midiOut.playingTracksOn(instrumentId, channel),
+});
+// A drag on the roll ends with nothing committed when the window loses focus.
+window.addEventListener('blur', () => scratchUi.cancelGesture());
+
+// Tap and the MIDI keyboard read the music's cycle-to-time map through the one page clock (midiOut.stampOfCycle), never a second clock and never the top
+// bar's cycle. The two anchors are the stamps of the cycle lines on both sides of the music's now; null when the music is not running,
+// the clock is still warming up or the scheduler cannot be read (the view then says so and places nothing).
+let cycleLinesErrorLogged = false;
+function readCycleLines() {
+  let raw;
+  try {
+    raw = scheduler.now();
+  } catch (err) {
+    // The listening tick reads this every 50 ms: say it once.
+    if (!cycleLinesErrorLogged) console.error('Moontide: the scheduler could not be read for the Scratchpad:', err);
+    cycleLinesErrorLogged = true;
+    return null;
+  }
+  if (!Number.isFinite(raw)) return null;
+  const c0 = Math.floor(Math.max(raw, 0));
+  const ta = midiOut.stampOfCycle(c0);
+  const tb = midiOut.stampOfCycle(c0 + 1);
+  if (ta === null || tb === null || ta === tb) return null;
+  return { a: { c: c0, t: ta }, b: { c: c0 + 1, t: tb } };
+}
+
+// The notes a MIDI keyboard plays, in memory only. The listener reads the Web MIDI access Strudel's shared enable already holds, whatever view
+// is open, and asks for it only from the Allow MIDI to listen press, through that same enable (one request, never a second prompt). It places
+// each note by its own time stamp on the music's cycle lines. Nothing it hears is sent to an instrument. Its state goes to the Scratchpad's
+// listening strip.
+const playedBuffer = createPlayedBuffer();
+midiIn = createMidiIn({
+  getAccess: () => {
+    const webMidi = globalThis.WebMidi;
+    return webMidi && webMidi.enabled === true && webMidi.interface ? webMidi.interface : null;
+  },
+  accessState: () => midiOut.accessState(),
+  accessFailure: () => midiOut.accessFailure(),
+  enable: () => midiOut.enable(),
+  // Only a visible tab that holds the music listens, so there are never two buffers.
+  isVisible: () => document.visibilityState === 'visible',
+  holdsMusic: () => !pageSuperseded,
+  readCycleLines,
+  // The scheduler keeps its tempo while stopped, which is what keeps the buffer on the beat then.
+  readCps: () => scheduler.cps,
+  isPlaying: () => transportPlaying,
+  perfNow: () => performance.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  buffer: playedBuffer,
+  onChange: () => {
+    const state = midiIn.state();
+    scratchUi.setListening(state);
+    syncLive(state);
+  },
+  onError: (message) => console.error(message),
+});
+
+// Listen: the motif played on the output the user chose, by the page's own MIDI layer (the same access, queue and refusals as the music's
+// controls). The player holds the clock, the timer and the output it is given and nothing else; it changes no code and no History, sends nothing to
+// Claude and never starts by itself. What became of a play goes to the hear strip.
+const scratchListen = createScratchListen({
+  perfNow: () => performance.now(),
+  setTimer: (fn, ms) => setTimeout(fn, ms),
+  clearTimer: (timer) => clearTimeout(timer),
+  emit: (note) => midiOut.sendListenNote(note),
+  stampOfCycle: (cycle) => midiOut.stampOfCycle(cycle),
+  musicCycle: () => musicCycleNow(),
+  readCps: () => scheduler.cps,
+  onState: (state) => {
+    // The frame loop also runs while a play waits or plays, to hand the view the playhead's place.
+    listenBusy = state.kind === 'waiting' || state.kind === 'playing';
+    scratchUi.setHear(state);
+    syncLive();
+  },
+});
+// The menu of the hear strip lists the setup file's instruments; it is given again whenever the rig changes (see applyRig).
+scratchUi.setOutputs(listenOptions(pageRig), pageRig.setup);
+
+let listenBusy = false;
+// The press that is waiting for the MIDI permission, or null, and a number that a Stop, a new press or a stop of the view moves on, so an answer that
+// comes late finds it is no longer wanted.
+let listenAsking = null;
+let listenTicket = 0;
+
+// A press of Listen. MIDI is asked for only here, through the one shared enable, and only when the page has not asked yet; the play starts
+// when it is granted, unless Stop came meanwhile. Whatever cannot start is said in one sentence and nothing falls back to anything else.
+function startListen(request) {
+  listenTicket += 1;
+  const word = midiOut.accessState();
+  if (word === 'enabled') {
+    playListen(request);
+    return;
+  }
+  const { instrumentId, channel } = request;
+  if (word === 'denied' || word === 'unsupported' || word === 'failed') {
+    refuseListen({ kind: 'refused', refused: word, failure: midiOut.accessFailure() ?? 'Error', instrumentId, channel, mid: false });
+    return;
+  }
+  // 'idle' (not asked yet) or 'pending' (the browser's prompt is open): the same enable answers both.
+  const ticket = listenTicket;
+  listenAsking = { instrumentId, channel };
+  scratchUi.setHear({ kind: 'asking' });
+  void midiOut.enable().then(() => {
+    if (ticket !== listenTicket) return;
+    listenAsking = null;
+    const answer = midiOut.accessState();
+    if (answer === 'enabled') playListen(request);
+    else refuseListen({ kind: 'refused', refused: answer === 'denied' || answer === 'unsupported' ? answer : 'failed', failure: midiOut.accessFailure() ?? 'Error', instrumentId, channel, mid: false });
+  });
+}
+
+// The output must be one the page could play on right now, else the reason is said and nothing starts.
+function playListen({ instrumentId, channel, start, loop }) {
+  const target = midiOut.listenTarget(instrumentId);
+  if (target.refused !== undefined) {
+    refuseListen({ kind: 'refused', ...target, instrumentId, channel, mid: false });
+    return;
+  }
+  scratchListen.play({ readMotif: () => scratchUi.motif(), instrumentId, channel, start, loop });
+}
+
+// A refused press still replaces the play before it: the old play is silenced first, then the refusal is said. Its 'stopped' state comes
+// first, so the refusal is the sentence that stays, and Stop is never greyed out over a play that goes on.
+function refuseListen(state) {
+  scratchListen.stop('stop');
+  scratchUi.setHear(state);
+}
+
+// Stop, the view closing, the tab hidden and the page left all end here: a wait for the permission is cancelled, and a play is silenced.
+function stopListen(reason) {
+  listenTicket += 1;
+  const asking = listenAsking;
+  listenAsking = null;
+  if (asking !== null) scratchUi.setHear({ kind: 'stopped', reason, ...asking });
+  scratchListen.stop(reason);
+}
+
+// One document keydown listener in the capture phase, because focus may be on the Play button or anywhere outside a text field: a
+// listener on the view would never hear it. It acts only with the Scratchpad open and Tap on, never in a text field or the code
+// editor, and never for a Ctrl, Cmd or Alt chord. The handler's clock is read first, then the event's own stamp: the stamp, not the
+// time this code runs, decides where the note lands. A held key's repeats are swallowed and place nothing.
+let tapSpaceHandled = false;
+document.addEventListener('keydown', (event) => {
+  if (event.key !== ' ' || viewState.view !== 'scratchpad' || !scratchUi.tapOn()) return;
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  if (isTextEntryFocused() || editorArea.contains(document.activeElement)) return;
+  const h = performance.now();
+  const ts = event.timeStamp;
+  event.preventDefault();
+  tapSpaceHandled = true;
+  if (event.repeat) return;
+  scratchUi.tap({ ts, h, anchors: readCycleLines() });
+}, true);
+// The Space keyup of a handled tap never clicks a focused button.
+document.addEventListener('keyup', (event) => {
+  if (event.key !== ' ' || !tapSpaceHandled) return;
+  tapSpaceHandled = false;
+  event.preventDefault();
+}, true);
+// A window that loses focus between the key down and the key up never hears the key up; without this the next Space release, which may
+// be the click of a focused button, would be swallowed.
+window.addEventListener('blur', () => {
+  tapSpaceHandled = false;
+});
+
+// The now-marker: while Tap is on, each frame reads the same anchors at the present moment and hands the motif position to the view.
+// The loop also keeps the page clock warm on a page with no MIDI instrument, so a first tap right after Tap turns on can still meet a
+// clock that gives nothing yet, and says so.
+let tapMarkerFrame = null;
+function tapMarkerStep() {
+  tapMarkerFrame = null;
+  if (!scratchUi.tapOn()) return;
+  const anchors = readCycleLines();
+  scratchUi.setNowUnit(anchors === null ? null : unitInMotif(cycleAtStamp(performance.now(), anchors.a, anchors.b), scratchUi.motifCycles()));
+  tapMarkerFrame = requestAnimationFrame(tapMarkerStep);
+}
+function startTapMarker() {
+  if (tapMarkerFrame === null) tapMarkerFrame = requestAnimationFrame(tapMarkerStep);
+}
+function stopTapMarker() {
+  if (tapMarkerFrame !== null) cancelAnimationFrame(tapMarkerFrame);
+  tapMarkerFrame = null;
+}
+
+// The live view: while the Scratchpad is open and an input is listened to, every animation frame hands the view the cycle axis now and the
+// keyboard buffer's snapshot (read again only when the buffer changed, else the same object, so the view knows nothing was rebuilt). The loop only
+// reads: it makes no sound and sends no message and no request. It stops when the view closes or the listening ends, and then the view is
+// told there is nothing live (Off). The frame time is the view's only clock.
+let scratchOpen = false;
+let liveFrame = null;
+let liveRevision = null;
+let liveSnapshot = null;
+function liveStep() {
+  liveFrame = null;
+  const live = midiIn.live();
+  if (live === null) {
+    scratchUi.setLive(null);
+  } else {
+    if (live.revision !== liveRevision) {
+      liveRevision = live.revision;
+      liveSnapshot = midiIn.snapshot();
+    }
+    scratchUi.setLive({ now: live.now, snapshot: liveSnapshot, frameMs: performance.now() });
+  }
+  // The Listen playhead's place in the motif (null while the play waits).
+  if (listenBusy) scratchUi.setHearPosition(scratchListen.position(), performance.now());
+  liveFrame = requestAnimationFrame(liveStep);
+}
+// Starts or stops the loop for the state of the view and of the listener (`state` is midiIn.state(), read here when left out).
+function syncLive(state = midiIn.state()) {
+  if (scratchOpen && (state.listen === 'listening' || listenBusy)) {
+    if (liveFrame === null) liveFrame = requestAnimationFrame(liveStep);
+    return;
+  }
+  if (liveFrame !== null) cancelAnimationFrame(liveFrame);
+  liveFrame = null;
+  liveRevision = null;
+  liveSnapshot = null;
+  scratchUi.setLive(null);
+}
 
 // The Instruments view's DOM. Created here, before any code path that can call into it (its redraw
 // hooks stay shut while instrumentsOpen is false, which it is until renderViews() has run). The view
@@ -1288,7 +1562,23 @@ const askUi = createAskView({
   setTimer: (fn, ms) => setTimeout(fn, ms),
   clearTimer: (timer) => clearTimeout(timer),
   now: () => Date.now(),
+  // What became of the Scratchpad's motif request is said in its own strip.
+  onMotifResult: (result) => {
+    scratchUi.motifResult(result);
+    syncScratchSend();
+  },
 });
+
+// The Scratchpad's Send button follows the connection and the last motif request: the page tells the view whenever either changes.
+function syncScratchSend() {
+  scratchUi.setSendState({ connected: askUi.isConnected(), pending: askUi.motifPending() });
+}
+
+/** The connection state of the Ask channel ('connecting', 'connected' or 'disconnected'), told to the Ask box and to the Scratchpad's Send button. */
+function setAskConnected(state) {
+  askUi.setConnected(state);
+  syncScratchSend();
+}
 
 // The segment a superseded tab shows, with its "Play in this tab" button. takeBackTimer is the
 // 5 s wait for the server's hello after a click; it is null while no take-over is pending.
@@ -1383,7 +1673,13 @@ function refreshMidiHidden() {
   midiOut.publishFacts();
 }
 
-document.addEventListener('visibilitychange', () => refreshMidiHidden());
+document.addEventListener('visibilitychange', () => {
+  // A hidden tab throttles its timers, so a play could not keep time and would hold notes: it is stopped.
+  if (document.visibilityState === 'hidden') stopListen('hidden');
+  refreshMidiHidden();
+  // Showing or hiding the tab starts or stops the keyboard listening.
+  midiIn.refresh();
+});
 
 /**
  * Draws the top-bar MIDI indicator from the MIDI facts. midiPublishReady is true exactly while the
@@ -1817,6 +2113,10 @@ function applyRig(rig) {
   const drumsBefore = jamOpen && timelineTracks !== null ? drumTrackIndexes(timelineTracks, laneTags().drums) : null;
   pageRig = withBuildMismatch(rig, pageBuildMismatch);
   midiOut.setRig(pageRig);
+  // The input ports the setup file names (a valid rig its inputs, an absent or invalid one none) and the file's own word, so the page can say which.
+  midiIn.setInputs(pageRig.setup === 'valid' ? pageRig.inputs ?? [] : [], pageRig.setup);
+  midiIn.refresh();
+  scratchUi.setOutputs(listenOptions(pageRig), pageRig.setup);
   renderMidiIndicator();
   // The Mixer reads its MIDI tracks against the rig: draw it again when the file changes while it is open.
   if (viewState.view === 'mixer') renderMixer();
@@ -1866,6 +2166,7 @@ function renderVersionIndicator() {
 // result changed. One writer for both: the sound-state event, the superseded and hello handlers, trackEvalSuccess and
 // the 250 ms poll all end here (a second writer of "playing" would let the button and the word disagree).
 let shownTransport = null;
+let transportPlaying = false;
 
 /** The transport model for the page as it is now. The editor's text is trimmed: a blank editor has nothing to play. */
 function currentTransport() {
@@ -1879,6 +2180,8 @@ function currentTransport() {
 
 function renderTransport() {
   const model = currentTransport();
+  // The keyboard buffer's cycle axis reads this: the music plays, as the transport says it does.
+  transportPlaying = model.playing;
   const key = JSON.stringify(model);
   if (key === shownTransport) return;
   shownTransport = key;
@@ -1894,6 +2197,10 @@ function renderTransport() {
   soundStateEl.setAttribute('aria-label', `${model.word}${model.here ? BAR_COPY.stateHere : ''}`);
   // The accent means live now: the model's playing, not the sound state alone (a lost tab or an unevaluated page is not live).
   soundStateEl.dataset.accent = String(model.playing);
+  // Tap needs the music playing: the Scratchpad turns Tap off by itself when it stops.
+  scratchUi.setMusicPlaying(model.playing);
+  // The Heads up line names only tracks that play now, so it follows the playing state.
+  scratchUi.refreshHear();
   // The word, its ' here' part and the button's word change the bar's width: the fit step runs again.
   topBarUi.fit();
 }
@@ -1935,6 +2242,7 @@ function trackEvalSuccess(e) {
         // The setup prepared at the lead is committed first, so the facts and the clock follow the code that plays.
         waiting.midiPlan?.commit();
         midiOut.recordSuccess(waiting.code);
+        scratchUi.refreshHear();
         refreshMidiHidden();
         onVersionPlaying();
       });
@@ -1945,6 +2253,7 @@ function trackEvalSuccess(e) {
       // The MIDI facts of the code that plays now. This runs inside repl.evaluate, before
       // handleEvaluate sends `evaluated` on the same socket, so the server has them first.
       midiOut.recordSuccess(editor.repl.state.activeCode);
+      scratchUi.refreshHear();
       refreshMidiHidden();
       onVersionPlaying();
     }
@@ -2401,7 +2710,7 @@ ws.addEventListener('open', () => {
   midiOut.publishFacts({ force: true });
   historyUi.setConnected('connected');
   mixerUi.setConnected('connected');
-  askUi.setConnected('connected');
+  setAskConnected('connected');
   // The requests of a page that went away (a reload) come back from the server; an empty answer changes nothing.
   sendIfOpen(JSON.stringify({ type: 'ask-board-request' }));
   // Always ask, whether or not the view is open, so live additions accumulate.
@@ -2425,7 +2734,7 @@ ws.addEventListener('close', () => {
   historyUi.setConnected('disconnected');
   mixerUi.setConnected('disconnected');
   requestTracker.connectionLost();
-  askUi.setConnected('disconnected');
+  setAskConnected('disconnected');
 });
 ws.addEventListener('error', () => {
   pageSocket = 'closed';
@@ -2440,7 +2749,7 @@ ws.addEventListener('error', () => {
   historyUi.setConnected('disconnected');
   mixerUi.setConnected('disconnected');
   requestTracker.connectionLost();
-  askUi.setConnected('disconnected');
+  setAskConnected('disconnected');
 });
 
 // Evaluate requests are processed strictly one at a time through this promise chain — never
@@ -2496,10 +2805,12 @@ const mixerUi = createMixerView({
   onGroupFold: (key) => toggleSongFold(key),
 });
 mixerUi.setConnected(ws.readyState === ws.OPEN ? 'connected' : 'connecting');
-askUi.setConnected(ws.readyState === ws.OPEN ? 'connected' : 'connecting');
+setAskConnected(ws.readyState === ws.OPEN ? 'connected' : 'connecting');
 
 // pagehide: record a pending gesture while the socket is still open.
 window.addEventListener('pagehide', () => mixerGesture.flushNow());
+// Listen first, so its notes are ended before the page's own MIDI silence goes out; its own listener, so a throw in one never skips the other.
+window.addEventListener('pagehide', () => stopListen('page'));
 // A separate listener, so a throw in one never skips the other: MIDI silence on close or reload.
 window.addEventListener('pagehide', () => midiOut.onPageHide());
 // Its own listener too: a closing page drops its waiting change without a message (the server handles detach).
@@ -2507,6 +2818,7 @@ window.addEventListener('pagehide', () => takeover.cancel('unload'));
 // A resize or a layout change moves the lines: the selected-strip light follows (ignored while the Mixer is closed).
 window.addEventListener('resize', () => {
   if (viewState.view === 'mixer') syncMixerLit();
+  if (viewState.view === 'scratchpad') scratchUi.resize();
 });
 
 ws.addEventListener('message', (event) => {
@@ -2533,6 +2845,8 @@ ws.addEventListener('message', (event) => {
     sessionUi.setTakeBackPending(false);
     renderMidiIndicator();
     refreshMidiHidden();
+    // A tab that lost the music stops listening to the keyboard, so there is never a second buffer.
+    midiIn.refresh();
     drawTopBar();
     // Said again when a tab plays again after none did: this tab is already stopped, only its text changes.
     // No second panic: it could cut the notes of the tab that plays now.
@@ -2617,6 +2931,8 @@ ws.addEventListener('message', (event) => {
       // The shadows are cleared with no reset (another tab may have changed the sounds); the replay sends them again.
       midiOut.setActive(true);
       refreshMidiHidden();
+      // The tab holds the music again, so it listens to the keyboard again.
+      midiIn.refresh();
     }
     renderInstrumentsIfOpen();
     chain = chain
@@ -3490,7 +3806,7 @@ function markNarrowSpans() {
 }
 
 /** The things that listen only to the window follow a new size: the Mixer's lit strip once per animation
- * frame while a drag moves and on release, the Timeline's narrow-span marks on release. CodeMirror needs nothing: it
+ * frame while a drag moves and on release, the Timeline's narrow-span marks on release, the Scratchpad's beat and row sizes. CodeMirror needs nothing: it
  * measures itself (its own ResizeObserver), and no manual measure call is made here. */
 function refreshAfterSize({ final }) {
   if (final) {
@@ -3498,12 +3814,14 @@ function refreshAfterSize({ final }) {
     splitFrame = 0;
     if (viewState.view === 'mixer') syncMixerLit();
     if (viewState.view === 'timeline') markNarrowSpans();
+    if (viewState.view === 'scratchpad') scratchUi.resize();
     return;
   }
   if (splitFrame !== 0) return;
   splitFrame = requestAnimationFrame(() => {
     splitFrame = 0;
     if (viewState.view === 'mixer') syncMixerLit();
+    if (viewState.view === 'scratchpad') scratchUi.resize();
   });
 }
 
@@ -3998,7 +4316,8 @@ document.addEventListener('keyup', (event) => {
 // The one contextmenu listener of the page; no view module has its own. Shift + right-click keeps
 // the browser's own menu, and so does a right-click inside the box (the user can paste) or while the
 // audio-unlock overlay shows (it is a gate to start sound, not part of the page's work). The right-click
-// never evaluates, records or changes the editor's text, selection or scroll.
+// never evaluates, records or changes the editor's text, selection or scroll. The Scratchpad's roll takes
+// its own right-click to erase a note, so it opens no Ask box there; the rest of that view asks as any other.
 document.addEventListener('contextmenu', (event) => {
   // The key press already opened the box: only keep the browser's menu away.
   if (keyAsk !== null && !keyAsk.openBefore && askUi.isOpen()) {
@@ -4010,6 +4329,12 @@ document.addEventListener('contextmenu', (event) => {
   // A right-click on the failed-change banner (or on its own popover) offers the banner's actions.
   if (event.target instanceof Node && (problemUi.contains(event.target) || problemUi.menuContains(event.target))) {
     problemUi.openMenu({ x: event.clientX, y: event.clientY });
+    return;
+  }
+  if (scratchUi.rollContains(event.target)) {
+    // A Menu key press raises the same event with no pointer behind it, and its coordinates are the browser's pick: erasing the note
+    // under them would lose a note the user never pointed at. Only the browser's menu is kept away.
+    if (keyAsk === null) scratchUi.handleContextMenu(event);
     return;
   }
   openAskFor(() => resolveAskTarget(event), { x: event.clientX, y: event.clientY });
@@ -4082,6 +4407,9 @@ function renderViews() {
   const isMixerOpen = viewState.view === 'mixer';
   const wasJamOpen = previousViewState !== null && previousViewState.view === 'jam';
   const isJamOpen = viewState.view === 'jam';
+  const isScratchOpen = viewState.view === 'scratchpad';
+  // Read before the view hides: focus inside a view that closes goes to that view's own top-bar button, never to the page body.
+  const scratchLostFocus = previousViewState !== null && previousViewState.view === 'scratchpad' && !isScratchOpen && scratchViewEl.contains(document.activeElement);
 
   if ((wasTimelineOpen || wasJamOpen) && !isTimelineOpen && !isJamOpen) {
     // The Timeline or the Jam view just closed and neither is open now (without a new version
@@ -4114,6 +4442,17 @@ function renderViews() {
   const isInstrumentsOpen = viewState.view === 'instruments';
   instrumentsViewEl.hidden = !isInstrumentsOpen;
   instrumentsOpen = isInstrumentsOpen;
+  scratchViewEl.hidden = !isScratchOpen;
+  if (isScratchOpen) scratchUi.render();
+  else scratchUi.closed();
+  scratchOpen = isScratchOpen;
+  // Listen does not outlast the view: another view opening, or the Scratchpad closing, silences it.
+  if (!isScratchOpen) stopListen('closed');
+  syncLive();
+  if (scratchLostFocus) {
+    const scratchButton = document.querySelector('#view-buttons button[data-key="7"]');
+    if (scratchButton !== null) scratchButton.focus();
+  }
   jamUi.setPreferences({ instrument: viewState.jamInstrument, chordTones: viewState.jamChordTones });
   historyUi.setViewContext({ open: isHistoryOpen, layout: viewState.layout, mode: viewState.historyMode });
 
@@ -4144,6 +4483,8 @@ function renderViews() {
   }
   previousViewState = viewState;
   if (splitSizeChanged) refreshAfterSize({ final: true });
+  // The panel is laid out by now, so the Scratchpad can read its room: on opening, and on a layout change while it stays open.
+  if (isScratchOpen) scratchUi.resize();
 
   // The animation loop runs while
   // either the Timeline or the Parts view is open: a fresh Timeline open (including the very

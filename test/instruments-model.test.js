@@ -47,6 +47,8 @@ const instrument = (overrides = {}) => ({
   drumMap: null,
   drumMaps: [],
   catalogKits: 0,
+  // What the model states about the instrument; a rig instrument always carries it.
+  monophonic: false,
   ...overrides,
   // Every channel of the model; by default the instrument declares all of them.
   modelChannels: overrides.modelChannels ?? overrides.channels ?? MT32_CHANNELS,
@@ -1226,4 +1228,102 @@ test('the editor copy keys exist, and each placeholder is filled by the code tha
   assert.throws(() => fill(copy.portNotDetected, {}), /port/);
   for (const key of ['labelPort', 'labelChannels', 'labelClock']) assert.ok(copy[key].length > 0);
   for (const key of ['outputsNone', 'rowSeparator', 'rowsMore', 'takeBackFailed']) assert.ok(MIDI_COPY[key].length > 0);
+});
+
+// --- The Synth settings row: what the playing code writes at each level, read from the code, stored nowhere ---
+
+const DESCRIBED = { engines: [], rolandModel: null, tone: [], part: [], scene: [] };
+const TONE_SYNTH = instrument({ id: 'tonesynth', model: 'tonesynth', modelName: 'Tone Synth', port: 'Port T', settings: DESCRIBED });
+const synthRow = (code, rig = validRig(TONE_SYNTH), overrides = {}) =>
+  model.instrumentsModel(inputs({ rig, code, ...overrides })).cards.find((card) => card.id === 'tonesynth').synthSettings;
+const STAYS = 'A setting taken out of the code is not sent again: the instrument keeps its value until the instrument itself changes it, and a tone setting until the instrument loads the tone again. Moontide stores no setting.';
+
+test('the Synth settings copy holds the exact words', () => {
+  assert.equal(model.INSTRUMENTS_COPY.labelSynthSettings, 'Synth settings');
+  assert.equal(model.INSTRUMENTS_COPY.synthTone, 'tone, ch {channel}: {values}');
+  assert.equal(model.INSTRUMENTS_COPY.synthPart, 'part, ch {channel}: {values}');
+  assert.equal(model.INSTRUMENTS_COPY.synthScene, 'scene: {values}, reaches every part');
+  assert.equal(model.INSTRUMENTS_COPY.synthValue, '{name} {value}');
+  assert.equal(model.INSTRUMENTS_COPY.synthValuesJoin, ', ');
+  assert.equal(model.INSTRUMENTS_COPY.synthNone, 'none in the code');
+  assert.equal(model.INSTRUMENTS_COPY.synthStays, STAYS);
+});
+
+test('a card of an instrument whose model describes no settings has no Synth settings row', () => {
+  const result = model.instrumentsModel(inputs({ rig: validRig(ALPHA), code: `a: note("c3").midi('Port A', { midichannel: 3, tone: { filterCutoff: 600 } })` }));
+  assert.equal(result.cards[0].synthSettings, null);
+  const nulled = model.instrumentsModel(inputs({ rig: validRig(instrument({ settings: null })) }));
+  assert.equal(nulled.cards[0].synthSettings, null);
+});
+
+test('the Synth settings lines read the tone and part settings per channel and the scene settings, then the standing rule', () => {
+  const code = [
+    `a: note("c3").midi('Port T', { midichannel: 2, sound: 'Model Tone', tone: { filterCutoff: 600 }, part: { pan: 40 } })`,
+    `b: note("c3").midi('Port T', { midichannel: 3, scene: { reverbLevel: 80 } })`,
+  ].join('\n');
+  assert.deepEqual(synthRow(code), {
+    lines: [
+      { text: 'tone, ch 2: filterCutoff 600', muted: false },
+      { text: 'part, ch 2: pan 40', muted: false },
+      { text: 'scene: reverbLevel 80, reaches every part', muted: false },
+      { text: STAYS, muted: true },
+    ],
+  });
+});
+
+test('channels go in ascending order, values in written order, and a later equal value merges', () => {
+  const code = [
+    `a: note("c3").midi('Port T', { midichannel: 5, tone: { filterResonance: 300, filterCutoff: 600 } })`,
+    `b: note("c3").midi('Port T', { midichannel: 1, part: { pan: 40, level: 100 } })`,
+    `c: note("e3").midi('Port T', { midichannel: 5, tone: { filterCutoff: 600 } })`,
+    `d: note("c3").midi('Port T', { midichannel: 1, part: { pan: 40 } })`,
+    `e: note("c3").midi('Port T', { midichannel: 2, scene: { reverbLevel: 80, chorusSwitch: 1 } })`,
+  ].join('\n');
+  assert.deepEqual(synthRow(code).lines.map((line) => line.text), [
+    'part, ch 1: pan 40, level 100',
+    'tone, ch 5: filterResonance 300, filterCutoff 600',
+    'scene: reverbLevel 80, chorusSwitch 1, reaches every part',
+    STAYS,
+  ]);
+});
+
+test('a channel with both levels lists its tone line before its part line', () => {
+  const code = `a: note("c3").midi('Port T', { midichannel: 4, part: { pan: 40 }, tone: { filterCutoff: 600 } })`;
+  assert.deepEqual(synthRow(code).lines.map((line) => line.text), ['tone, ch 4: filterCutoff 600', 'part, ch 4: pan 40', STAYS]);
+});
+
+test('no setting in the code says none in the code, muted, and keeps the standing rule', () => {
+  const code = `a: note("c3").midi('Port T', { midichannel: 3, sound: 'Model Tone' })`;
+  assert.deepEqual(synthRow(code), { lines: [{ text: 'none in the code', muted: true }, { text: STAYS, muted: true }] });
+});
+
+test('empty code gives the not-used line and unreadable code the unreadable line, each muted, with the standing rule last', () => {
+  assert.deepEqual(synthRow(''), { lines: [{ text: 'not used by the code', muted: true }, { text: STAYS, muted: true }] });
+  assert.deepEqual(synthRow('a: note("c3").midi('), { lines: [{ text: "can't read the code", muted: true }, { text: STAYS, muted: true }] });
+  assert.deepEqual(synthRow(`a: note("c3").midi('Port T')`, validRig(TONE_SYNTH), { parse: null }).lines[0], { text: "can't read the code", muted: true });
+});
+
+test('a call on another port, or on a port that only contains the instrument\'s port, adds nothing', () => {
+  const code = [
+    `a: note("c3").midi('Port A', { midichannel: 3, tone: { filterCutoff: 600 } })`,
+    `b: note("c3").midi('Port T2', { midichannel: 3, tone: { filterCutoff: 100 }, scene: { reverbLevel: 10 } })`,
+    `c: note("c3").midi('Port', { midichannel: 3, part: { pan: 1 } })`,
+  ].join('\n');
+  assert.deepEqual(synthRow(code).lines.map((line) => line.text), ['none in the code', STAYS]);
+});
+
+test('the call can name its port and options in the options object, and the channel defaults to 1', () => {
+  const code = `a: note("c3").midi({ port: 'Port T', tone: { filterCutoff: 600 } })`;
+  assert.deepEqual(synthRow(code).lines.map((line) => line.text), ['tone, ch 1: filterCutoff 600', STAYS]);
+});
+
+test('the card keeps the editor\'s settings key as it was, and a row that appears is a declared change', () => {
+  const described = model.instrumentsModel(inputs({ rig: validRig(TONE_SYNTH) })).cards[0];
+  assert.deepEqual(described.settings, { port: 'Port T', channels: MT32_CHANNELS.map((entry) => entry.channel).sort((a, b) => a - b), clock: false });
+  const plain = model.instrumentsModel(inputs({ rig: validRig(instrument({ id: 'tonesynth', model: 'tonesynth', modelName: 'Tone Synth', port: 'Port T' })) }));
+  assert.deepEqual(model.cardsToReplace(plain, model.instrumentsModel(inputs({ rig: validRig(TONE_SYNTH) }))), [0]);
+  // A change of the lines alone is a live redraw.
+  const withCode = model.instrumentsModel(inputs({ rig: validRig(TONE_SYNTH), code: `a: note("c3").midi('Port T', { tone: { filterCutoff: 600 } })` }));
+  const first = model.instrumentsModel(inputs({ rig: validRig(TONE_SYNTH) }));
+  assert.equal(model.redrawPlan(first, withCode), 'live');
 });

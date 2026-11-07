@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import os from 'node:os';
 import path from 'node:path';
 import * as askModule from '../dist/ask.js';
+import { REFERENCE_TOPIC_IDS } from '../dist/reference.js';
 import {
   AskChannel,
   ASK_QUEUE_MAX,
@@ -34,7 +35,15 @@ import {
   MAX_GESTURE_SEMITONES,
   MOMENT_BEATS,
   askMomentNoteShape,
+  askMotifShape,
   askRangeNoteShape,
+  MAX_MOTIF_CYCLES,
+  MAX_MOTIF_PHRASE_LENGTH,
+  MIN_MOTIF_CYCLES,
+  MOTIF_GRIDS,
+  MOTIF_PHRASE_SHAPE,
+  MOTIF_SOURCES,
+  parsePageMessage,
 } from '../dist/protocol.js';
 import { PAGE_TOKEN_PLACEHOLDER } from '../dist/web-server.js';
 import {
@@ -42,6 +51,7 @@ import {
   MAX_GESTURE_SEMITONES as PAGE_MAX_GESTURE_SEMITONES,
   MAX_ASK_CONTEXT_LENGTH as PAGE_MAX_CONTEXT,
   MAX_ASK_TEXT_LENGTH as PAGE_MAX_TEXT,
+  MAX_MOTIF_PHRASE_LENGTH as PAGE_MAX_MOTIF_PHRASE_LENGTH,
   MAX_REQUEST_LINE_BYTES as PAGE_MAX_LINE_BYTES,
   REQUEST_LINE_PREFIX as PAGE_LINE_PREFIX,
   askTextProblem,
@@ -55,6 +65,7 @@ import {
   PAGE_TOKEN_PLACEHOLDER as PAGE_PLACEHOLDER,
 } from '../page/ask.js';
 import { BEATS_PER_CYCLE } from '../page/change-timing.js';
+import * as scratchModel from '../page/scratch-model.js';
 import { MAX_MOMENT_NOTES as PAGE_MAX_MOMENT_NOTES, MAX_RANGE_CYCLES as PAGE_MAX_RANGE_CYCLES } from '../page/timeline.js';
 
 const SCRIPT_PATH = path.join(os.tmpdir(), 'moontide test', 'listen.js');
@@ -1216,6 +1227,44 @@ test('the gesture reaches Claude through the channel: an ask with a lane, a mome
   assert.deepEqual(Object.keys(body), ['id', 'text', 'context', 'chip', 'current', 'moment', 'gesture']);
 });
 
+test('the moment fact ends with the motif paragraph, which points to the motif topic of get_strudel_reference', () => {
+  const fact = askModule.REQUEST_LINE_MOMENT_FACT;
+  const start = fact.indexOf('About the motif field of a page request:');
+  assert.ok(start > 0, 'the motif paragraph is in the fact, after the range paragraph');
+  assert.ok(fact.endsWith('The motif topic of get_strudel_reference says how to read the phrase and the moment.'));
+  assert.ok(fact.indexOf('About a request whose context has kind range') < start);
+  const paragraph = fact.slice(start);
+  // It names every field of a motif and every source word of the code, so a field or a word added there fails here.
+  for (const key of Object.keys(askMotifShape)) {
+    assert.ok(new RegExp(`\\b${key}\\b`).test(paragraph), `the paragraph names the field ${key}`);
+  }
+  for (const word of MOTIF_SOURCES) {
+    assert.ok(new RegExp(`\\b${word}\\b`).test(paragraph), `the paragraph names the source word ${word}`);
+  }
+  for (const piece of [
+    'it comes only with a context of kind motif',
+    "sent from the page's Scratchpad when the user pressed its send button",
+    'data about the page, not part of what the user wrote',
+    'Such a request has no moment and no gesture.',
+    'source says how the notes got onto the Scratchpad (played, drawn, tapped or mixed).',
+    "cycle, when present, is the cycle of the music where the motif's first cycle sits, on the count the code's patterns are queried at;",
+    'an absent cycle means the motif has no moment.',
+    'cycles is its length in cycles, grid the grid of its steps, notes how many notes it holds, and phrase the motif written in mini-notation exactly as the page showed it.',
+    'The page changed no code.',
+  ]) {
+    assert.ok(paragraph.includes(piece), piece);
+  }
+  // The words the other fact paragraphs keep out.
+  assert.doesNotMatch(paragraph, /listen|could not|couldn't/i);
+  assert.ok(!paragraph.includes(REQUEST_LINE_PREFIX), 'the paragraph is not itself a request line');
+  // The topic it points to exists.
+  assert.ok(REFERENCE_TOPIC_IDS.includes('motif'));
+  // It reaches Claude in the arming line and in the page-requests-on text.
+  const token = newToken();
+  assert.ok(armingLine({ scriptPath: SCRIPT_PATH, port: PORT, token }).includes(paragraph));
+  assert.ok(askModule.pageRequestsOnText({ scriptPath: SCRIPT_PATH, port: PORT, token }).includes(paragraph));
+});
+
 test('the facts for Claude name the gesture field and each of its kinds, as facts and not instructions', () => {
   const fact = askModule.REQUEST_LINE_MOMENT_FACT;
   // A probe looks for the words 'could not' in a whole tool reply to find a replay failure the page reports; the fact is in that reply, so it must not use them.
@@ -1383,4 +1432,65 @@ test('page/timeline.js mirrors the moment limits by hand, and the beats of a bar
 test('page/ask.js mirrors the two page-requests prompt names by hand, as Claude Code shows them', () => {
   assert.equal(PAGE_REQUESTS_COPY.onCommand, `/mcp__moontide__${askModule.PAGE_REQUESTS_ON_PROMPT}`);
   assert.equal(PAGE_REQUESTS_COPY.offCommand, `/mcp__moontide__${askModule.PAGE_REQUESTS_OFF_PROMPT}`);
+});
+
+// --- the motif field of a request ---
+
+const MOTIF_PHRASE = 'note("c4 ~ e4 _").velocity("0.8 ~ 1 _")';
+
+/** The fields of a request about a motif from the Scratchpad. */
+function motifFields(text, motif = { source: 'drawn', cycle: 12, cycles: 1, grid: 'quarter', notes: 2, phrase: MOTIF_PHRASE }) {
+  return { id: 'motif-1', text, context: { kind: 'motif' }, chip: 'Motif \u00b7 drawn \u00b7 1 cycle \u00b7 2 notes \u00b7 at cycle 12', current: 12, motif };
+}
+
+test('a motif request line ends with the motif object, after the version, in the order the page measures', () => {
+  const fields = motifFields('Add this motif to the music.');
+  const line = requestLine(fields);
+  assert.equal(line, `${REQUEST_LINE_PREFIX} ${JSON.stringify(fields)}`);
+  const parsed = JSON.parse(line.slice(REQUEST_LINE_PREFIX.length + 1));
+  assert.deepEqual(Object.keys(parsed), ['id', 'text', 'context', 'chip', 'current', 'motif']);
+  assert.deepEqual(Object.keys(parsed.motif), ['source', 'cycle', 'cycles', 'grid', 'notes', 'phrase']);
+  assert.deepEqual(parsed.context, { kind: 'motif' });
+  const without = motifFields('hello', { source: 'tapped', cycles: 2, grid: 'eighth', notes: 1, phrase: MOTIF_PHRASE });
+  assert.deepEqual(Object.keys(JSON.parse(requestLine(without).slice(REQUEST_LINE_PREFIX.length + 1)).motif), ['source', 'cycles', 'grid', 'notes', 'phrase']);
+  // A request without a motif is as it always was.
+  assert.equal(Object.hasOwn(JSON.parse(requestLine(lineFields('x')).slice(REQUEST_LINE_PREFIX.length + 1)), 'motif'), false);
+});
+
+test('requestLineBytes counts a motif request byte for byte, with a cycle and without, and with multi-byte words', () => {
+  for (const text of ['Add this motif to the music.', '\u4f60\u597d'.repeat(50), 'a\u2028b\u2029c', 'line\nbreak "quoted"', '\ud83c\udfb5 music']) {
+    for (const motif of [
+      { source: 'drawn', cycle: 12, cycles: 1, grid: 'quarter', notes: 2, phrase: MOTIF_PHRASE },
+      { source: 'played', cycles: 8, grid: 'sixteenth-triplet', notes: 192, phrase: MOTIF_PHRASE },
+    ]) {
+      const fields = motifFields(text, motif);
+      assert.equal(requestLineBytes(fields), Buffer.byteLength(requestLine(fields), 'utf8'), JSON.stringify(text));
+    }
+  }
+});
+
+test('the mirrored motif bounds, sources, grids and phrase shape are equal on the page and on the server', () => {
+  assert.equal(PAGE_MAX_MOTIF_PHRASE_LENGTH, MAX_MOTIF_PHRASE_LENGTH);
+  assert.equal(PAGE_MAX_MOTIF_PHRASE_LENGTH, 8000);
+  assert.deepEqual([...scratchModel.MOTIF_SOURCES], [...MOTIF_SOURCES]);
+  assert.deepEqual(scratchModel.GRIDS.map((grid) => grid.id), [...MOTIF_GRIDS]);
+  assert.equal(scratchModel.MIN_CYCLES, MIN_MOTIF_CYCLES);
+  assert.equal(scratchModel.MAX_CYCLES, MAX_MOTIF_CYCLES);
+  assert.equal(scratchModel.PHRASE_SHAPE.source, MOTIF_PHRASE_SHAPE.source);
+  assert.equal(scratchModel.PHRASE_SHAPE.flags, MOTIF_PHRASE_SHAPE.flags);
+});
+
+test('the keys of the server motif shape equal the keys the page can give a motif request', () => {
+  const motif = scratchModel.placeNote(scratchModel.emptyMotif(), { pitch: 60, start: 0, length: 3 }).motif;
+  assert.deepEqual(Object.keys(scratchModel.motifRequest(motif, 4)), Object.keys(askMotifShape));
+  const keys = new Set([...Object.keys(scratchModel.motifRequest(motif, 4)), ...Object.keys(scratchModel.motifRequest(motif, null))]);
+  assert.deepEqual([...keys].sort(), Object.keys(askMotifShape).sort());
+});
+
+test('a motif request made by the page passes the server schema and reaches the request line unchanged', () => {
+  const motif = scratchModel.placeNote(scratchModel.emptyMotif(), { pitch: 64, start: 6, length: 6 }).motif;
+  const request = scratchModel.motifRequest(motif, 9);
+  const frame = { type: 'ask', id: 'ask-1', text: 'Add this motif to the music.', context: { kind: 'motif' }, chip: 'Motif', current: null, motif: request };
+  assert.deepEqual(parsePageMessage(JSON.stringify(frame)), frame);
+  assert.deepEqual(JSON.parse(requestLine(parsePageMessage(JSON.stringify(frame))).slice(REQUEST_LINE_PREFIX.length + 1)).motif, request);
 });

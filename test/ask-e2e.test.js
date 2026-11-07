@@ -14,7 +14,7 @@ import {
   withoutPageLine,
   withoutStructureTemplate,
 } from './helpers.js';
-import { REQUEST_LINE_PREFIX, requestLine } from '../dist/ask.js';
+import { ARMING_PAUSED_LOG, REQUEST_LINE_PREFIX, requestLine } from '../dist/ask.js';
 import { MAX_REQUEST_LINE_BYTES } from '../dist/protocol.js';
 
 const ARMING_PREFIX = 'Page requests: no listener is connected.';
@@ -507,4 +507,100 @@ test('ask e2e: an error request whose text holds 201 characters is refused inval
   assert.equal(typeof refusal.detail, 'string');
   assert.ok(refusal.detail.length > 0);
   await expectNothingPrintedBefore(trusted, listener, 0, 'error-follow-up');
+});
+
+/** A motif request as the page's model gives it for a short drawn motif. */
+function goodMotif() {
+  return { source: 'drawn', cycle: 12, cycles: 2, grid: 'sixteenth', notes: 1, phrase: 'note("[c4 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]/2").velocity("[0.8 ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~]/2")' };
+}
+
+test('ask e2e: a motif request reaches the listener exactly as the page sent it, the motif last in the line', async (t) => {
+  const scenario = await startScenario(t);
+  const trusted = await trustedPage(scenario);
+  const listener = startListenerFrom(await scenario.getCode(), scenario);
+  await listenerLive(trusted);
+  const motif = goodMotif();
+  ask(trusted.page, 'motif-1', 'Add this motif to the music.', {
+    context: { kind: 'motif' },
+    chip: 'Motif · drawn · 2 cycles · 1 note · at cycle 12',
+    current: 12,
+    motif,
+  });
+  await listener.waitForLines(1, 'the motif request line');
+  const request = JSON.parse(listener.lines()[0].slice(REQUEST_LINE_PREFIX.length + 1));
+  assert.deepEqual(request.motif, motif);
+  assert.deepEqual(Object.keys(request), ['id', 'text', 'context', 'chip', 'current', 'motif']);
+  assert.deepEqual(request.context, { kind: 'motif' });
+  assert.equal(request.text, 'Add this motif to the music.');
+  await trusted.waitFor((m) => m.type === 'ask-result' && m.id === 'motif-1' && m.status === 'received', 'received');
+});
+
+test('ask e2e: a motif request handed over in a tool reply comes after the fact lines, and those lines hold the motif paragraph with its pointer', async (t) => {
+  const scenario = await startScenario(t);
+  const trusted = await trustedPage(scenario);
+  // Page requests off: no arming line, so the facts go in front of the request line. Nobody listens, so the request waits.
+  const off = await scenario.client.getPrompt({ name: 'page-requests-off' });
+  assert.equal(off.messages.length, 1, JSON.stringify(off));
+  await waitForStderr(scenario, ARMING_PAUSED_LOG);
+  ask(trusted.page, 'motif-wait', 'Add this motif to the music.', {
+    context: { kind: 'motif' },
+    chip: 'Motif · drawn · 2 cycles · 1 note · at cycle 12',
+    current: 12,
+    motif: goodMotif(),
+  });
+  await trusted.waitFor((m) => m.type === 'ask-result' && m.id === 'motif-wait' && m.status === 'waiting', 'ask-result waiting');
+  const handedOver = await scenario.getCode();
+  const lines = handedOver.split('\n');
+  const requestAt = lines.findIndex((line) => line.startsWith(REQUEST_LINE_PREFIX));
+  assert.ok(requestAt > 0, handedOver);
+  const factLines = lines.slice(0, requestAt);
+  const paragraphAt = factLines.findIndex((line) => line.includes('About the motif field of a page request:'));
+  assert.ok(paragraphAt >= 0, 'a fact line before the request holds the motif paragraph');
+  assert.ok(
+    factLines[paragraphAt].endsWith('The motif topic of get_strudel_reference says how to read the phrase and the moment.'),
+    'the paragraph ends with the pointer',
+  );
+  assert.equal(JSON.parse(lines[requestAt].slice(REQUEST_LINE_PREFIX.length + 1)).motif.source, 'drawn');
+});
+
+test('ask e2e: the arming line of a page with no listener carries the motif paragraph with its pointer', async (t) => {
+  const scenario = await startScenario(t);
+  await trustedPage(scenario);
+  const armed = await scenario.getCode();
+  const armingLine = armed.split('\n').find((line) => line.startsWith(ARMING_PREFIX));
+  assert.ok(armingLine !== undefined, armed);
+  assert.ok(armingLine.includes('About the motif field of a page request:'));
+  assert.ok(armingLine.includes('The motif topic of get_strudel_reference says how to read the phrase and the moment.'));
+});
+
+test('ask e2e: get_strudel_reference with the motif topic returns the topic text through a real MCP client', async (t) => {
+  const scenario = await startScenario(t);
+  const topic = await scenario.client.callTool({ name: 'get_strudel_reference', arguments: { topic: 'motif' } });
+  assert.ok(!topic.isError, JSON.stringify(topic.content));
+  assert.ok(topic.content[0].text.startsWith('# Motif requests'), topic.content[0].text.slice(0, 80));
+});
+
+test('ask e2e: a motif request with a bad phrase is refused invalid with a detail and never printed or queued', async (t) => {
+  const scenario = await startScenario(t);
+  const trusted = await trustedPage(scenario);
+  const motif = goodMotif();
+  const bad = [
+    ['code after the lane', { ...motif, phrase: `${motif.phrase}.gain(2)` }],
+    ['a second statement', { ...motif, phrase: `${motif.phrase}; evaluate()` }],
+    ['a sound instead of notes', { ...motif, phrase: 'sound("bd")' }],
+    ['an empty phrase', { ...motif, phrase: '' }],
+    ['a motif with a moment', motif],
+  ];
+  for (const [index, [what, value]] of bad.entries()) {
+    const id = `bad-motif-${index}`;
+    const extra = what === 'a motif with a moment' ? { moment: goodMoment() } : {};
+    ask(trusted.page, id, 'Add this motif to the music.', { context: { kind: 'motif' }, chip: 'Motif', motif: value, ...extra });
+    const refusal = await trusted.waitFor((m) => m.type === 'ask-result' && m.id === id, `the refusal for ${what}`);
+    assert.equal(refusal.status, 'refused', what);
+    assert.equal(refusal.reason, 'invalid', what);
+    assert.ok(refusal.detail.length > 0, what);
+    await sleep(250);
+  }
+  const reply = await scenario.getCode();
+  assert.ok(!reply.includes(REQUEST_LINE_PREFIX), 'no refused request is queued');
 });

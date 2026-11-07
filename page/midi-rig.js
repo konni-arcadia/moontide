@@ -8,12 +8,13 @@ import { controlKeyText, fill } from './midi-plan.js';
 import { cutText } from './ask.js';
 
 /**
- * The limits of the midi-rig message. src/protocol.ts holds the same numbers (MAX_RIG_INSTRUMENTS,
+ * The limits of the midi-rig message. src/protocol.ts holds the same numbers (MAX_RIG_INSTRUMENTS, MAX_RIG_INPUTS,
  * MAX_RIG_SOUNDS, MAX_RIG_CONTROLS, MAX_RIG_PROBLEMS, MAX_RIG_CATALOG_SOUNDS, MAX_RIG_CATALOG_KITS, MAX_RIG_DRUM_MAPS, MAX_RIG_DRUM_NOTES and
- * MAX_RIG_DRUM_NAME, and MAX_MIDI_NAME_LENGTH for names); test/midi-rig.test.js checks both sides.
+ * MAX_RIG_DRUM_NAME, MAX_RIG_SETTINGS, MAX_RIG_ENGINES, and MAX_MIDI_NAME_LENGTH for names); test/midi-rig.test.js checks both sides.
  */
 export const RIG_LIMITS = Object.freeze({
   instruments: 16,
+  inputs: 4,
   sounds: 512,
   controls: 32,
   problems: 20,
@@ -23,6 +24,8 @@ export const RIG_LIMITS = Object.freeze({
   drumMaps: 16,
   drumNotes: 128,
   drumName: 40,
+  settings: 512,
+  engines: 16,
 });
 
 /**
@@ -79,6 +82,23 @@ export const RIG_COPY = Object.freeze({
   offInstrumentsOn: 'Instruments that are on: {ids}.',
   offNoneOn: 'No instrument is switched on.',
   offHow: 'The user switches it on in the Instruments view (key 6).',
+  unknownSetting: 'Unknown {level} setting "{setting}" for {id}.',
+  settingsList: 'Settings in {level} for {id}: {names}.',
+  settingsNotPlain: 'The {level} option of .midi() must be a plain object of numbers.',
+  settingsNotPlainHint: "Write each setting as a name and a whole number: .midi('{port}', { midichannel: 3, {level}: { name: 1 } }).",
+  noLevelSettings: '{id} has no {level} settings.',
+  otherLevel: '"{setting}" is a {other} setting of {id}; write it in {other}.',
+  settingRange: 'Setting "{setting}" in {level} for {id} must be a whole number from {min} to {max}.',
+  settingConflict: '{id} channel {channel} is given two different {setting} values in {level}: {a} and {b}.',
+  sceneConflict: '{id} is given two different {setting} values in scene: {a} and {b}.',
+  oneValuePerSetting: 'Give each setting one value.',
+  engineNoSound: 'Tone settings for {id} need a sound named in the same .midi() call, so the engine of the tone is known.',
+  engineUnknown: 'The engine of "{sound}" on {id} is not known, so its tone settings are refused.',
+  engineUnknownWhy: 'The sound catalog does not place this sound in an engine.',
+  engineMismatch: '"{setting}" is a setting of {settingEngines} tones on {id}, and "{sound}" is a {engine} tone.',
+  engineConflict: '{id} channel {channel} is given tone settings for a {a} tone and for a {b} tone.',
+  settingsForEngine: 'Settings in tone for {id} on {engine} tones: {names}.',
+  noEngineSettings: '{id} has no tone settings for {engine} tones.',
   closingPlaying: 'The previous music keeps playing.',
   closingStopped: 'Nothing changed in the music.',
 });
@@ -133,6 +153,12 @@ function readSound(value, path, role) {
     readObject(value.bank, `${path}.bank`);
     sound.bank = { msb: readInt(value.bank.msb, `${path}.bank.msb`, 0, 127) };
     if (value.bank.lsb !== undefined) sound.bank.lsb = readInt(value.bank.lsb, `${path}.bank.lsb`, 0, 127);
+  }
+  // A melodic sound may name the engine its bank is placed in; the instrument check below makes sure the settings declare it.
+  if (value.engine !== undefined) {
+    if (role !== 'melodic') fail(`${path}.engine`, 'is only for melodic sounds');
+    if (typeof value.engine !== 'string' || !CONTROL_ID.test(value.engine)) fail(`${path}.engine`, 'must be an engine id');
+    sound.engine = value.engine;
   }
   // A rhythm sound may name its kit's drum map (an id) or say null, no map is known; absent stays absent.
   if (value.noteMap !== undefined) {
@@ -203,12 +229,115 @@ function readControls(value, path) {
   });
 }
 
+// The setting names of the vocabulary (src/vocabulary.ts): a letter, then letters and digits.
+const SETTING_NAME = /^[a-z][A-Za-z0-9]{0,39}$/;
+const SETTING_LEVELS = ['tone', 'part', 'scene'];
+
+/** The model ID of the Roland data sets: null, or 1 to 4 whole numbers from 0 to 127. */
+function readRolandModel(value, path) {
+  if (value === null) return null;
+  const bytes = readList(value, path, 4).map((byte, index) => readInt(byte, `${path}[${index}]`, 0, 127));
+  if (bytes.length < 1) fail(path, 'must have at least 1 item');
+  return bytes;
+}
+
+/** The NRPN family of the model: null, or 'gs'. A missing key is unreadable, so a message from an older server is noticed. */
+function readNrpnFamily(value, path) {
+  if (value === null || value === 'gs') return value;
+  return fail(path, "must be null or 'gs'");
+}
+
+/** The message a setting becomes: a Roland data set, an NRPN or a control change. Anything else fails with its path. */
+function readSettingMessage(value, path, rolandModel, rolandPath) {
+  readObject(value, path);
+  if (value.kind === 'roland-dt1') {
+    // The page cannot build a data set without the model ID.
+    if (rolandModel === null) fail(rolandPath, 'is required by a roland-dt1 setting');
+    const address = readList(value.address, `${path}.address`, 4).map((byte, index) => readInt(byte, `${path}.address[${index}]`, 0, 127));
+    // 3 or 4: a shorter address would make the instrument read data bytes as address bytes. Which of the two the instrument
+    // takes is the guard's to check when the bytes are built.
+    if (address.length < 3) fail(`${path}.address`, 'must have 3 or 4 items');
+    if (value.size !== 1 && value.size !== 2 && value.size !== 4) fail(`${path}.size`, 'must be 1, 2 or 4');
+    return { kind: 'roland-dt1', address, size: value.size };
+  }
+  if (value.kind === 'nrpn') return { kind: 'nrpn', msb: readInt(value.msb, `${path}.msb`, 0, 127), lsb: readInt(value.lsb, `${path}.lsb`, 0, 127) };
+  if (value.kind === 'cc') return { kind: 'cc', cc: readInt(value.cc, `${path}.cc`, 0, 127) };
+  return fail(`${path}.kind`, "must be 'roland-dt1', 'nrpn' or 'cc'");
+}
+
+/** The settings an instrument describes, or null: rows of a name, a range in the device's own units and the message, per level. */
+function readSettings(value, path) {
+  if (value === null) return null;
+  readObject(value, path);
+  const engines = readEngines(value.engines, `${path}.engines`);
+  const rolandModel = readRolandModel(value.rolandModel, `${path}.rolandModel`);
+  const nrpnFamily = readNrpnFamily(value.nrpnFamily, `${path}.nrpnFamily`);
+  const levels = {};
+  for (const level of SETTING_LEVELS) {
+    // The rows read so far by name: a tone name may repeat once per engine, no other name may.
+    const seen = new Map();
+    levels[level] = readList(value[level], `${path}.${level}`, RIG_LIMITS.settings).map((entry, index) => {
+      const at = `${path}.${level}[${index}]`;
+      readObject(entry, `${at}`);
+      const name = readString(entry.name, `${at}.name`);
+      if (!SETTING_NAME.test(name)) fail(`${at}.name`, 'must be a setting name (a letter, then letters and digits)');
+      const earlier = seen.get(name) ?? [];
+      // A repeat is only possible between tone rows that both name engines; everything else is refused here.
+      if (earlier.length > 0 && (level !== 'tone' || entry.engines === undefined)) fail(`${at}.name`, `same name as ${level}[${earlier[0].index}]`);
+      const row = { name, min: readInt(entry.min, `${at}.min`, 0, 65535), max: readInt(entry.max, `${at}.max`, 0, 65535) };
+      if (row.max < row.min) fail(`${at}.max`, 'must not be below min');
+      row.message = readSettingMessage(entry.message, `${at}.message`, rolandModel, `${path}.rolandModel`);
+      // Only a tone row may name engines, and only declared ones; part and scene settings reach every engine.
+      if (entry.engines !== undefined) {
+        if (level !== 'tone') fail(`${at}.engines`, `is only for tone settings: ${level} settings reach every engine`);
+        row.engines = readList(entry.engines, `${at}.engines`, RIG_LIMITS.engines).map((id, position) => {
+          if (typeof id !== 'string' || !engines.some((engine) => engine.id === id)) fail(`${at}.engines[${position}]`, 'must be the id of a declared engine');
+          return id;
+        });
+      }
+      for (const other of earlier) {
+        if (other.engines === undefined) fail(`${at}.name`, `same name as ${level}[${other.index}]`);
+        const shared = row.engines.find((id) => other.engines.includes(id));
+        if (shared !== undefined) fail(`${at}.name`, `same name as ${level}[${other.index}], and both reach engine "${shared}"`);
+      }
+      seen.set(name, [...earlier, { index, engines: row.engines }]);
+      return row;
+    });
+  }
+  return { engines, rolandModel, nrpnFamily, ...levels };
+}
+
+/** The engines a model declares: ids unique, names unique and 1 to 40 code points. */
+function readEngines(value, path) {
+  const seen = new Map();
+  const seenNames = new Map();
+  return readList(value, path, RIG_LIMITS.engines).map((entry, index) => {
+    const at = `${path}[${index}]`;
+    readObject(entry, at);
+    const id = readString(entry.id, `${at}.id`);
+    if (!CONTROL_ID.test(id)) fail(`${at}.id`, 'must be an id (lowercase letters, digits, - and _)');
+    if (seen.has(id)) fail(`${at}.id`, `same id as engines[${seen.get(id)}]`);
+    seen.set(id, index);
+    const name = readString(entry.name, `${at}.name`);
+    const length = Array.from(name).length;
+    if (length < 1 || length > 40) fail(`${at}.name`, 'must be 1 to 40 characters');
+    if (seenNames.has(name)) fail(`${at}.name`, `same name as engines[${seenNames.get(name)}]`);
+    seenNames.set(name, index);
+    return { id, name };
+  });
+}
+
 function readInstrument(value, path) {
   readObject(value, path);
   const instrument = readInstrumentFields(value, path);
   // Every map id the instrument names must be a map of the message, or the whole rig reads unreadable.
   const hasMap = (id) => instrument.drumMaps.some((map) => map.id === id);
   if (instrument.drumMap !== null && !hasMap(instrument.drumMap)) fail(`${path}.drumMap`, `names drum map "${instrument.drumMap}", which the message does not hold`);
+  instrument.sounds.melodic.forEach((sound, index) => {
+    if (sound.engine !== undefined && !(instrument.settings?.engines ?? []).some((engine) => engine.id === sound.engine)) {
+      fail(`${path}.sounds.melodic[${index}].engine`, `names engine "${sound.engine}", which the message does not hold`);
+    }
+  });
   instrument.sounds.rhythm.forEach((sound, index) => {
     // Same rule as src/instruments.ts and src/catalog.ts: a kit with no bank on an opted-in model would go out as bank 0/0.
     if (instrument.rhythmBank && sound.bank === undefined) {
@@ -267,12 +396,16 @@ function readInstrumentFields(value, path) {
     // Instruments from the page: the fields the Instruments view's switch and settings editor read.
     // Required, so a message from an older server reads unreadable instead of silently on.
     enabled: readBoolean(value.enabled, `${path}.enabled`),
+    // Whether the model states that the instrument plays one note at a time; required like enabled, so the page never guesses it and an older server's message reads unreadable.
+    monophonic: readBoolean(value.monophonic, `${path}.monophonic`),
     // Every channel of the model, so the editor can offer them all; required like enabled.
     modelChannels: readList(value.modelChannels, `${path}.modelChannels`, 16).map((entry, index) => {
       readObject(entry, `${path}.modelChannels[${index}]`);
       if (!ROLES.includes(entry.role)) fail(`${path}.modelChannels[${index}].role`, `must be one of ${ROLES.join(', ')}`);
       return { channel: readInt(entry.channel, `${path}.modelChannels[${index}].channel`, 1, 16), role: entry.role };
     }),
+    // The settings the model describes (names and ranges), or null; required, so a message from an older server reads unreadable.
+    settings: readSettings(value.settings, `${path}.settings`),
   };
 }
 
@@ -322,7 +455,9 @@ export function parseRigMessage(msg) {
     const instruments = readList(msg.instruments, 'instruments', RIG_LIMITS.instruments).map((instrument, index) =>
       readInstrument(instrument, `instruments[${index}]`),
     );
-    return { setup: 'valid', instruments };
+    // The input ports the page listens to. A message without the field (an older server) reads as no input.
+    const inputs = msg.inputs === undefined ? [] : readList(msg.inputs, 'inputs', RIG_LIMITS.inputs).map((name, index) => readString(name, `inputs[${index}]`));
+    return { setup: 'valid', instruments, inputs };
   }
   fail('setup', "must be 'absent', 'invalid' or 'valid'");
   return null;
@@ -428,7 +563,7 @@ export function closestSounds(query, sounds) {
  * The lines of one problem, as a function of how many list entries it may show: line 1 is one
  * self-contained sentence, the lines after it are the valid values.
  */
-function problemLines(call, rig, outputs, desired, written, controls, playingPorts) {
+function problemLines(call, rig, outputs, desired, written, controls, settings, scenes, playingPorts) {
   const issues = call.problems;
   if (issues.port !== null) {
     return () => [RIG_COPY[issues.port.key], ...issues.port.hints.map((hint) => RIG_COPY[hint])];
@@ -464,7 +599,7 @@ function problemLines(call, rig, outputs, desired, written, controls, playingPor
       fill(RIG_COPY.declaredChannels, { id: instrument.id, channels: channelRanges(instrument.channels.map((entry) => entry.channel)) }),
     ];
   }
-  return soundLines(call, instrument, declared, desired, written) ?? controlLines(call, instrument, declared, controls);
+  return soundLines(call, instrument, declared, desired, written) ?? controlLines(call, instrument, declared, controls) ?? settingLines(call, instrument, declared, settings, scenes);
 }
 
 /**
@@ -568,6 +703,139 @@ function controlLines(call, instrument, declared, controls) {
   return null;
 }
 
+/** Every name of `names`, the ones that contain the query (or are contained in it) first in list order, then by edit distance. */
+function closestNames(query, names) {
+  const queryKey = query.toLowerCase();
+  const near = [];
+  const rest = [];
+  names.forEach((name, index) => {
+    const key = name.toLowerCase();
+    if (queryKey !== '' && (key.includes(queryKey) || queryKey.includes(key))) near.push(name);
+    else rest.push({ name, index, distance: editDistance(queryKey, key) });
+  });
+  rest.sort((a, b) => a.distance - b.distance || a.index - b.index);
+  return [...near, ...rest.map((entry) => entry.name)];
+}
+
+/**
+ * How many names a list of settings shows at each list limit of composeRefusal: every name at the first try,
+ * fewer only when the whole refusal would pass the budget.
+ */
+const NAMES_SHOWN = Object.freeze({ 5: Infinity, 4: 16, 3: 10, 2: 6, 1: 3 });
+
+/**
+ * The settings part of one call's problems, after the controls: the lines of the first problem, or null when
+ * the settings are fine or absent. A level that is not a plain object comes first; then, for the levels in the
+ * order tone, part, scene and each written name in written order: a name the instrument lacks at that level (the
+ * level it belongs to, or the names it has, the closest first), a value that is not a whole number inside the
+ * setting's min to max, and a different value for a setting a call already wrote (tone and part per slot
+ * `<instrument id>:<channel>`, scene per instrument). A valid value is recorded under its level.
+ */
+function settingLines(call, instrument, declared, settings, scenes) {
+  if (call.problems.settings !== null) {
+    const level = call.problems.settings.level;
+    return () => [fill(RIG_COPY[call.problems.settings.key], { level }), fill(RIG_COPY.settingsNotPlainHint, { port: cut(call.port), level })];
+  }
+  const described = instrument.settings ?? null;
+  const slot = `${instrument.id}:${call.channel}`;
+  // The engine rule: the engine of the tone comes from the sound catalog through the sound the call names, never from the code.
+  let sound = null;
+  let engine = null;
+  const engineRule = described !== null && described.engines.length > 0 && call.settings.tone.size > 0;
+  if (engineRule) {
+    if (call.sound === null) return () => [fill(RIG_COPY.engineNoSound, { id: instrument.id })];
+    const key = soundKey(call.sound);
+    sound = instrument.sounds[declared.role].find((candidate) => soundKey(candidate.name) === key) ?? null;
+    if (sound === null || sound.engine === undefined) {
+      return () => [fill(RIG_COPY.engineUnknown, { sound: cut(sound === null ? call.sound : sound.name), id: instrument.id }), RIG_COPY.engineUnknownWhy];
+    }
+    engine = sound.engine;
+  }
+  const engineName = (id) => described.engines.find((candidate) => candidate.id === id).name;
+  const reaches = (row) => row.engines === undefined || row.engines.includes(engine);
+  for (const level of SETTING_LEVELS) {
+    const written = call.settings[level];
+    if (written.size === 0) continue;
+    const allRows = described === null ? [] : described[level];
+    // A tone name list shows only the names of the sound's engine.
+    const rows = level === 'tone' && engine !== null ? allRows.filter(reaches) : allRows;
+    for (const [name, value] of written) {
+      // A name may have one row per engine: the row is the one that reaches the sound's engine, else the first of the name.
+      const sameName = allRows.filter((candidate) => candidate.name === name);
+      const row = level === 'tone' && engine !== null ? (sameName.find(reaches) ?? sameName[0]) : sameName[0];
+      if (row === undefined) {
+        const other = described === null ? undefined : SETTING_LEVELS.find((candidate) => candidate !== level && described[candidate].some((entry) => entry.name === name));
+        return (limit) => {
+          const lines = [fill(RIG_COPY.unknownSetting, { level, setting: cut(name), id: instrument.id })];
+          if (other !== undefined) lines.push(fill(RIG_COPY.otherLevel, { setting: cut(name), other, id: instrument.id }));
+          else if (allRows.length === 0) lines.push(fill(RIG_COPY.noLevelSettings, { id: instrument.id, level }));
+          else if (rows.length === 0) lines.push(fill(RIG_COPY.noEngineSettings, { id: instrument.id, engine: engineName(engine) }));
+          else if (rows !== allRows) lines.push(fill(RIG_COPY.settingsForEngine, { id: instrument.id, engine: engineName(engine), names: listItems(closestNames(name, rows.map((entry) => entry.name)), NAMES_SHOWN[limit]) }));
+          else lines.push(fill(RIG_COPY.settingsList, { level, id: instrument.id, names: listItems(closestNames(name, rows.map((entry) => entry.name)), NAMES_SHOWN[limit]) }));
+          return lines;
+        };
+      }
+      if (level === 'tone' && engine !== null && !reaches(row)) {
+        return (limit) => [
+          fill(RIG_COPY.engineMismatch, {
+            setting: name,
+            settingEngines: [...new Set(sameName.flatMap((candidate) => candidate.engines))].map(engineName).join(' or '),
+            id: instrument.id,
+            sound: cut(sound.name),
+            engine: engineName(engine),
+          }),
+          rows.length === 0
+            ? fill(RIG_COPY.noEngineSettings, { id: instrument.id, engine: engineName(engine) })
+            : fill(RIG_COPY.settingsForEngine, { id: instrument.id, engine: engineName(engine), names: listItems(closestNames(name, rows.map((entry) => entry.name)), NAMES_SHOWN[limit]) }),
+        ];
+      }
+      if (!Number.isInteger(value) || value < row.min || value > row.max) {
+        return () => [fill(RIG_COPY.settingRange, { setting: name, level, id: instrument.id, min: row.min, max: row.max })];
+      }
+      let entry;
+      let earlier;
+      if (level === 'scene') {
+        entry = scenes.get(instrument.id);
+        earlier = entry === undefined ? undefined : entry.values.get(name);
+      } else {
+        entry = settings.get(slot);
+        earlier = entry === undefined ? undefined : entry[level].get(name);
+      }
+      if (earlier !== undefined && earlier !== value) {
+        return () => [
+          level === 'scene'
+            ? fill(RIG_COPY.sceneConflict, { id: instrument.id, setting: name, a: earlier, b: value })
+            : fill(RIG_COPY.settingConflict, { id: instrument.id, channel: call.channel, setting: name, level, a: earlier, b: value }),
+          RIG_COPY.oneValuePerSetting,
+        ];
+      }
+      if (level === 'scene') {
+        if (entry === undefined) {
+          entry = { instrument: instrument.id, port: instrument.port, values: new Map() };
+          scenes.set(instrument.id, entry);
+        }
+        entry.values.set(name, value);
+      } else {
+        if (entry === undefined) {
+          entry = { instrument: instrument.id, port: instrument.port, channel: call.channel, sound: sound === null ? call.sound : sound.name, engine, tone: new Map(), part: new Map() };
+          settings.set(slot, entry);
+        }
+        // Two calls on one channel share its slot: the first may have written part settings only (no engine), so the engine
+        // of the tone is the one of the call that writes tone settings, and two calls whose sounds are in different engines are refused.
+        if (level === 'tone' && engine !== null) {
+          if (entry.engine === null) entry.engine = engine;
+          else if (entry.engine !== engine) {
+            const first = entry.engine;
+            return () => [fill(RIG_COPY.engineConflict, { id: instrument.id, channel: call.channel, a: engineName(first), b: engineName(engine) }), RIG_COPY.oneSoundPerChannel];
+          }
+        }
+        entry[level].set(name, value);
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Composes the refusal from the problems in code order: the first problem's lines (its lists shrink
  * until the text fits), then 'Also:' lines with line 1 of the next problems while they fit, then one
@@ -620,11 +888,14 @@ function composeInvalid(rig, closing) {
  * Checks the `.midi(` calls of a piece of code against the rig. `read` is the result of
  * readMidiSetup, `rig` the object parseRigMessage returned, `outputs` the connected output names (they
  * only decide the wording of a port that is missing from the file) and `playing` whether the page plays
- * now. Returns { refusal, desired, controls }: `refusal` is the whole text of the failed evaluation (null
+ * now. Returns { refusal, desired, controls, settings, scenes }: `refusal` is the whole text of the failed evaluation (null
  * when the code may run), `desired` the sound each used instrument channel must have, keyed
  * `<instrument id>:<channel>`: { instrument, port, channel, role, sound, program, bank }, and `controls`
  * the controls the code writes, keyed the same way: { instrument, port, channel, values: Map<cc, { id, value }> }.
- * `desired` and `controls` are empty Maps on every refusal and for an absent or invalid setup.
+ * `settings` the tone and part settings the code writes, keyed the same way: { instrument, port, channel, sound, engine,
+ * tone: Map<name, value>, part: Map<name, value> } (`sound` is the name the call wrote or null), and `scenes` the scene
+ * settings keyed by instrument id: { instrument, port, values: Map<name, value> }.
+ * `desired`, `controls`, `settings` and `scenes` are empty Maps on every refusal and for an absent or invalid setup.
  * Every call is checked in source order and, within one call, port, channel, sound, then controls; a port
  * equals a file port only by exact string equality.
  * `playingPorts` is the set of ports the playing code already names with .midi(): a call to the port of an
@@ -635,10 +906,12 @@ export function checkSetup({ read, rig, outputs = [], playing, playingPorts = ne
   const closing = playing === true ? RIG_COPY.closingPlaying : RIG_COPY.closingStopped;
   const desired = new Map();
   const controls = new Map();
-  if (rig.setup === 'absent') return { refusal: null, desired, controls };
+  const settings = new Map();
+  const scenes = new Map();
+  if (rig.setup === 'absent') return { refusal: null, desired, controls, settings, scenes };
   if (rig.setup === 'invalid') {
-    if (read.calls.length === 0) return { refusal: null, desired, controls };
-    return { refusal: composeInvalid(rig, closing), desired, controls };
+    if (read.calls.length === 0) return { refusal: null, desired, controls, settings, scenes };
+    return { refusal: composeInvalid(rig, closing), desired, controls, settings, scenes };
   }
   if (rig.setup !== 'valid') {
     throw new Error(`Moontide: the rig setup must be absent, invalid or valid, got ${JSON.stringify(rig.setup)}.`);
@@ -647,9 +920,9 @@ export function checkSetup({ read, rig, outputs = [], playing, playingPorts = ne
   // The sound as the code wrote it for each slot: a conflict names both spellings.
   const written = new Map();
   for (const call of read.calls) {
-    const lines = problemLines(call, rig, outputs, desired, written, controls, playingPorts);
+    const lines = problemLines(call, rig, outputs, desired, written, controls, settings, scenes, playingPorts);
     if (lines !== null) problems.push(lines);
   }
-  if (problems.length === 0) return { refusal: null, desired, controls };
-  return { refusal: composeRefusal(problems, closing), desired: new Map(), controls: new Map() };
+  if (problems.length === 0) return { refusal: null, desired, controls, settings, scenes };
+  return { refusal: composeRefusal(problems, closing), desired: new Map(), controls: new Map(), settings: new Map(), scenes: new Map() };
 }

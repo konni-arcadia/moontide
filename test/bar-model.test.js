@@ -96,6 +96,8 @@ test('BAR_COPY holds the exact Session words', () => {
   assert.equal(BAR_COPY.session, 'Session');
   assert.equal(BAR_COPY.noChange, 'No change yet.');
   assert.equal(BAR_COPY.rightClickHint, 'Right-click anything to ask Claude.');
+  assert.equal(BAR_COPY.earlyNote, 'Early: Moontide is young and has known bugs.');
+  assert.ok(BAR_COPY.earlyNote.startsWith('Early: '));
   assert.equal(BAR_COPY.midiHint, 'Instruments view: key 6.');
   assert.equal(BAR_COPY.settingsLabel, 'Your edits take over');
   assert.equal(BAR_COPY.timingNote, "Claude's changes say their own timing.");

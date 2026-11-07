@@ -92,7 +92,7 @@ export const ACCENT_EXEMPT_TODAY = Object.freeze([]);
  * A change that adds a button adds it to a family (or a family with its rule) in the same change. */
 export const SIZED_FAMILIES = Object.freeze([
   { rule: '#transport-button', controls: ['#transport-button'] },
-  { rule: '#view-buttons button', controls: ['1', '2', '3', '4', '5', '6'].map((key) => `#view-buttons button[data-key="${key}"]`) },
+  { rule: '#view-buttons button', controls: ['1', '2', '3', '4', '5', '6', '7'].map((key) => `#view-buttons button[data-key="${key}"]`) },
   { rule: '#layout-buttons button', controls: ['a', 'b', 'c'].map((key) => `#layout-buttons button[data-key="${key}"]`) },
   { rule: '#change-timing button', controls: ['now', 'bar', 'phrase'].map((value) => `#change-timing button[data-value="${value}"]`) },
   { rule: '#requests-toggle', controls: ['#requests-toggle'] },

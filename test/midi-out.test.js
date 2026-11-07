@@ -577,6 +577,64 @@ test('the port watcher is skipped when the native interface has no event API', a
   assert.deepEqual(rig.errors, []);
 });
 
+test('enable() is the shared enable: accessState goes from idle to enabled', async () => {
+  const { out, calls } = makeAccessRig();
+  assert.equal(out.accessState(), 'idle');
+  await out.enable();
+  assert.equal(out.accessState(), 'enabled');
+  assert.equal(calls.enable, 1);
+  await out.enable();
+  assert.equal(calls.enable, 1, 'an enabled page does not ask again');
+});
+
+test('two enable() calls while one is pending make one enableWebMidi call, and the evaluation shares it', async () => {
+  const gate = deferred();
+  const { out, calls } = makeAccessRig({
+    permission: 'prompt',
+    enable: ({ turnOn }) => gate.promise.then(turnOn),
+  });
+  const first = out.enable();
+  const second = out.enable();
+  const evaluation = out.beforeEvaluate(MIDI_CODE);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(out.accessState(), 'pending');
+  gate.resolve();
+  await Promise.all([first, second, evaluation]);
+  assert.equal(calls.enable, 1);
+  assert.equal(out.accessState(), 'enabled');
+});
+
+test('enable() on a denied permission stays denied and never calls enableWebMidi, nor does it ask again afterwards', async () => {
+  const { out, calls } = makeAccessRig({ permission: 'denied' });
+  await out.enable();
+  assert.equal(out.accessState(), 'denied');
+  assert.equal(calls.enable, 0);
+  const queries = calls.query;
+  await out.enable();
+  assert.equal(calls.query, queries, 'a denial stays for the page session');
+});
+
+test('enable() on a browser without Web MIDI says unsupported, and a failed start names the failure and can be tried again', async () => {
+  const none = makeAccessRig({ supports: false });
+  await none.out.enable();
+  assert.equal(none.out.accessState(), 'unsupported');
+  let attempts = 0;
+  const flaky = makeAccessRig({
+    enable: ({ turnOn }) => {
+      attempts += 1;
+      if (attempts === 1) return Promise.reject(Object.assign(new Error('no'), { name: 'InvalidStateError' }));
+      turnOn();
+      return Promise.resolve();
+    },
+  });
+  await flaky.out.enable();
+  assert.equal(flaky.out.accessState(), 'failed');
+  assert.equal(flaky.out.accessFailure(), 'InvalidStateError');
+  await flaky.out.enable();
+  assert.equal(flaky.out.accessState(), 'enabled');
+});
+
 /** A promise the test settles by hand. */
 function deferred() {
   let resolve;
@@ -3253,13 +3311,13 @@ test('the hold drops note-ons only: velocity 0, other messages, malformed data a
   out.send([0xe2, 0, 64]);
   out.send(new Uint8Array([0x93, 61, 100]));
   out.send({ 0: 0x94, 1: 62, 2: 100, length: 3 });
-  out.send([0x92, 60, '100']);
+  out.send([0x95, 60, '100']);
   out.send([0x92, 60]);
   const passed = a.sent.map((entry) => entry.data[0]);
   assert.ok(passed.includes(0xfe) && passed.includes(0xe2), 'active sensing and pitch bend messages pass');
   assert.equal(a.sent.filter((entry) => entry.data[0] === 0x92 && entry.data[2] === 0).length, 1, 'a note-on with velocity 0 is a note-off and passes');
   assert.equal(a.sent.filter((entry) => entry.data[0] === 0x93 || entry.data[0] === 0x94).length, 0, 'typed and array-like note-ons are dropped');
-  assert.equal(a.sent.filter((entry) => entry.data[0] === 0x92 && entry.data[2] === '100').length, 1, 'a velocity that is not a number is not read as a note-on');
+  assert.equal(a.sent.filter((entry) => entry.data[0] === 0x95).length, 0, 'a velocity written as text is read as Web MIDI reads it: a note-on, held too');
   outputNamedIn(r, 'Port C').send(NOTE_ON);
   assert.equal(noteOnsOf(c).length, 1, 'a port that follows no clock is never held');
   assert.deepEqual(r.errors, []);
@@ -3749,6 +3807,23 @@ test('noteStampOf gives the timestamp the port got for a stamped note, and null 
   const coldHap = { note: 60 };
   fire(coldStrudel, 'Port C', {}, coldHap, cold.ctx.currentTime + 0.25);
   assert.equal(cold.out.noteStampOf(coldHap), null);
+});
+
+test('stampOfCycle gives the page clock\'s stamp of a cycle line, growing with the cycle, and null with no clock or no running music', async () => {
+  const r = await makeClockRig();
+  assert.equal(r.out.stampOfCycle(4), null, 'the music has not started');
+  r.play(NAMES_A);
+  assert.ok(await r.waitUntil(() => Number.isFinite(r.out.stampOfCycle(4))), 'once the clock runs it gives a finite stamp');
+  const first = r.out.stampOfCycle(4);
+  const second = r.out.stampOfCycle(5);
+  assert.ok(second > first, 'a later cycle line has a later stamp');
+  assert.ok(Math.abs(second - first - 1000 / CLOCK_CPS) < 1, 'one cycle apart is one cycle long');
+  assert.equal(r.out.stampOfCycle(NaN), null);
+  assert.equal(r.out.stampOfCycle('4'), null);
+  const bare = await makeClockRig({ options: { getScheduler: undefined } });
+  bare.play(NAMES_A);
+  await bare.wait(3500);
+  assert.equal(bare.out.stampOfCycle(4), null, 'a page with no scheduler has no clock');
 });
 
 test('WebMidi.outputs that is not a list, and a stamp that throws, leave the trigger unchanged and say so once each', async () => {
@@ -4289,8 +4364,8 @@ const soundOn = (channel, name, controls = '') => `note("c3").midi('Port C', { m
 const AFTER = () => midiOutModule.SETUP_AFTER_QUEUED_MS;
 
 /** A stamp rig over SOUND_CLOCK_RIG whose Port C plays `first` (Alpha 1 on channel 3, plus `extra` lines) with its setup sent. */
-async function makeSoundStampRig(extra = '', sends, options) {
-  const s = await makeStampRig({ rig: SOUND_CLOCK_RIG, sends, options });
+async function makeSoundStampRig(extra = '', sends, options, rig = SOUND_CLOCK_RIG) {
+  const s = await makeStampRig({ rig, sends, options });
   const first = `${NAMES_B}${soundOn(3, 'Alpha 1')}\n${extra}`;
   const plan = s.r.out.prepareSetup(first);
   assert.equal(plan.refusal, null, plan.refusal ?? '');
@@ -4883,8 +4958,8 @@ test('drop after a timed plan sent its bytes puts the playing code\'s sound and 
  * plan `immediate` that was prepared and sent after it and is not committed yet: the moment its setPattern replaces the
  * waiting change, which drops the timed plan. Returns what went to Port C after each step.
  */
-async function immediateAfterTimed({ extra = '', timed, immediate }) {
-  const s = await makeSoundStampRig(extra);
+async function immediateAfterTimed({ extra = '', timed, immediate, rig }) {
+  const s = await makeSoundStampRig(extra, undefined, undefined, rig);
   const { r } = s;
   const c = r.native('Port C');
   const line = lineAhead(r, 400);
@@ -5602,4 +5677,845 @@ test('after Stop, code naming a switched-off instrument is refused again, even i
   r.out.setReplayBase(null);
   r.state.playing = true;
   assert.equal(r.out.checkSetup(code), null, 'playing again with the same code in place passes');
+});
+
+// --- Settings follow the sound and the controls: at the line, after a replug, on switching on ---
+
+const hexBytes = (text) => text.split(' ').map((part) => Number.parseInt(part, 16));
+const settingRow = (name, address, size, min, max) => ({ name, min, max, message: { kind: 'roland-dt1', address, size } });
+// A page-shaped instrument that describes settings as Roland data sets (model ID 00 00 00 65). Channels 3 and 4 are
+// parts 1 and 2 of the model, the rhythm channel 10 is part 3.
+const SETTINGS_OF_MODEL = {
+  engines: [],
+  rolandModel: [0, 0, 0, 0x65],
+  nrpnFamily: null,
+  tone: [settingRow('filterCutoff', [2, 16, 0, 0x4f], 4, 0, 1023), settingRow('lfoOscDepth', [2, 16, 0, 0x0b], 2, 28, 228)],
+  part: [settingRow('level', [1, 0, 16, 5], 1, 0, 127), settingRow('pan', [1, 0, 16, 6], 1, 0, 127)],
+  scene: [settingRow('reverbLevel', [1, 0, 0x52, 2], 1, 0, 127)],
+};
+const withSettings = (rest = {}) => ({
+  settings: SETTINGS_OF_MODEL,
+  modelChannels: [{ channel: 3, role: 'melodic' }, { channel: 4, role: 'melodic' }, { channel: 10, role: 'rhythm' }],
+  ...rest,
+});
+const SETTINGS_STAMP_RIG = {
+  setup: 'valid',
+  instruments: [SOUND_CLOCK_RIG.instruments[0], SOUND_CLOCK_RIG.instruments[1], instrumentOf('wide', 'Port C', 'msb-lsb', withSettings())],
+};
+
+// The data sets, written byte by byte: filterCutoff 600 on part 1 (0x258 in four 4-bit pieces after 02 10 00 4F), pan 40 on
+// part 1 (01 00 10 06), level 100 on part 2 (01 00 11 05) and the scene reverbLevel 80 (01 00 52 02, the same for every part).
+const CUTOFF_600 = hexBytes('F0 41 10 00 00 00 65 12 02 10 00 4F 00 02 05 08 10 F7');
+const PAN_40 = hexBytes('F0 41 10 00 00 00 65 12 01 00 10 06 28 41 F7');
+const LEVEL_100 = hexBytes('F0 41 10 00 00 00 65 12 01 00 11 05 64 05 F7');
+const REVERB_80 = hexBytes('F0 41 10 00 00 00 65 12 01 00 52 02 50 5B F7');
+const dataSet = (address, data) => [0xf0, 0x41, 0x10, 0x00, 0x00, 0x00, 0x65, 0x12, ...address, ...data, instruments.rolandChecksum([...address, ...data]), 0xf7];
+const TEMPORARY_TONE = dataSet([2, 16, 0, 0x4f], [0, 0, 0, 1]);
+const BELL_SETTINGS = ', tone: { filterCutoff: 600 }, part: { pan: 40 }, scene: { reverbLevel: 80 }';
+
+test('the literal data sets of the settings tests agree with the server checksum', () => {
+  for (const set of [CUTOFF_600, PAN_40, LEVEL_100, REVERB_80, TEMPORARY_TONE]) {
+    assert.equal(instruments.rolandChecksum(set.slice(8, -2)), set.at(-2));
+  }
+});
+
+test('a timed setup stamps its settings like its sound: the line minus SETUP_BEFORE_LINE_MS, after the sound of their channel, the scene after the channels', async () => {
+  const s = await makeSoundStampRig(soundOn(4, 'Bell 1'), undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const c = r.native('Port C');
+  const old = queueNote(s, 'Port C', 3, 60);
+  const line = lineAhead(r, 400);
+  const next = `${NAMES_B}${soundOn(3, 'Alpha 2', BELL_SETTINGS)}\n${soundOn(4, 'Bell 1', ', part: { level: 100 }')}`;
+  const mark = c.sent.length;
+  r.out.prepareTakeover(next);
+  const plan = r.out.prepareSetup(next, { atCycle: line.cycle });
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  await plan.send();
+  const sent = c.sent.slice(mark);
+  assert.deepEqual(
+    sent.map((entry) => entry.data),
+    [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 1], CUTOFF_600, PAN_40, LEVEL_100, REVERB_80],
+    'channel 3: sound, tone, part; channel 4 (its sound stays): part; then the scene',
+  );
+  for (const entry of sent) {
+    assert.equal(entry.argc, 2);
+    assert.ok(Math.abs(entry.ts - (line.ts - BEFORE_LINE())) < 0.5, `ts ${entry.ts} against the line ${line.ts}`);
+    assert.ok(entry.ts >= old.ts, 'after the last old note-on');
+  }
+  plan.commit();
+  assert.deepEqual(r.errors, []);
+});
+
+test('a stamped scene setting holds back a later setup on any channel of the port until after the line', async () => {
+  const s = await makeSoundStampRig(soundOn(4, 'Bell 1'), undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const c = r.native('Port C');
+  // The port was replugged just now: the page knows nothing of it yet (its reset is still in the settle delay), so
+  // the code that names channel 3 only leaves channel 4 with no mark of its own.
+  r.unplug('Port C');
+  r.plug('Port C');
+  const line = lineAhead(r, 400);
+  const timed = r.out.prepareSetup(`${NAMES_B}${soundOn(3, 'Alpha 1', ', scene: { reverbLevel: 80 }')}`, { atCycle: line.cycle });
+  assert.equal(timed.refusal, null, timed.refusal ?? '');
+  const markTimed = c.sent.length;
+  await timed.send();
+  const stamped = c.sent.slice(markTimed);
+  assert.deepEqual(stamped.map((entry) => entry.data), [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 0], REVERB_80]);
+  assert.ok(stamped.every((entry) => entry.argc === 2 && Math.abs(entry.ts - (line.ts - BEFORE_LINE())) < 0.5));
+  const mark = c.sent.length;
+  const later = r.out.prepareSetup(`${NAMES_B}${soundOn(4, 'Bell 2')}`);
+  assert.equal(later.refusal, null, later.refusal ?? '');
+  const sending = later.send();
+  await r.wait(100);
+  await sending;
+  const sent = c.sent.slice(mark);
+  assert.deepEqual(sent.map((entry) => entry.data), [[0xb3, 0, 0], [0xb3, 32, 0], [0xc3, 3]]);
+  for (const entry of sent) {
+    assert.equal(entry.argc, 2);
+    assert.ok(entry.ts >= line.ts - 0.5 + AFTER() - 1e-6, `ts ${entry.ts} against the line ${line.ts}`);
+  }
+  assert.deepEqual(r.errors, []);
+});
+
+test('a sound change while old code plays gives the channel\'s settings the stamp of its program change; a channel whose sound stays has none', async () => {
+  const s = await makeSoundStampRig(soundOn(4, 'Bell 1'), undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const on = queueNote(s, 'Port C', 3, 60);
+  const change = await sendSetup(r, `${NAMES_B}${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }, part: { pan: 40 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 100 }')}`);
+  const sent = change.sent();
+  assert.deepEqual(sent.map((entry) => entry.data), [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 1], CUTOFF_600, PAN_40, LEVEL_100]);
+  for (const entry of sent.slice(0, 5)) {
+    assert.equal(entry.argc, 2);
+    assert.ok(Math.abs(entry.ts - (on.ts + AFTER())) < 1e-6, `ts ${entry.ts}`);
+  }
+  assert.equal(sent[5].argc, 1, 'channel 4 keeps its sound: its data set goes out at once');
+  await r.wait(100);
+  await change.sending;
+  assert.deepEqual(r.errors, []);
+});
+
+test('a timed setup that cannot get a stamp waits for the line and sends its settings without a timestamp, in the same order', async () => {
+  let cyclist = null;
+  const s = await makeSoundStampRig('', undefined, { clock: () => ({ now: cyclist.now(), cps: cyclist.cps }) }, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  cyclist = r.cyclist;
+  const c = r.native('Port C');
+  const line = lineAhead(r, 400);
+  r.ctx.suspend();
+  const mark = c.sent.length;
+  const plan = r.out.prepareSetup(`${NAMES_B}${soundOn(3, 'Alpha 2', BELL_SETTINGS)}`, { atCycle: line.cycle });
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const sending = plan.send();
+  await r.wait(200);
+  assert.deepEqual(c.sent.slice(mark), [], 'nothing goes out before the line');
+  await r.wait(400);
+  await sending;
+  const sent = c.sent.slice(mark);
+  assert.deepEqual(sent.map((entry) => entry.data), [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 1], CUTOFF_600, PAN_40, REVERB_80]);
+  assert.ok(sent.every((entry) => entry.argc === 1), 'untimed');
+});
+
+// --- A reset, a replug, switching on, taking the role back ---
+
+const SETTINGS_RESET_RIG = {
+  setup: 'valid',
+  instruments: [
+    instrumentOf('plain', 'Port A', 'none', withSettings({ reset: { messages: [TEMPORARY_TONE], waitMs: 100 } })),
+    instrumentOf('bank', 'Port B', 'msb', { reset: { messages: RESET_B, waitMs: 50 } }),
+  ],
+};
+const settingsCode = (sound, settings = BELL_SETTINGS) => `note("c3").midi('Port A', { midichannel: 3, sound: '${sound}'${settings} })`;
+// What a setup after a reset sends for settingsCode('Alpha 2'): the sound, its tone and part settings, the volume of
+// every declared channel, then the scene settings after the channels.
+const SETUP_OF_SETTINGS = [[0xc2, 1], CUTOFF_600, PAN_40, ...VOLUMES, REVERB_80];
+
+test('a reset at page start sends, after the sound of each channel, the settings of the evaluation being prepared, the scene after the channels', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  const plan = r.out.prepareSetup(settingsCode('Alpha 2'));
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const sending = plan.send();
+  await r.wait(100);
+  await r.wait(1000);
+  await sending;
+  assert.deepEqual(
+    bytesOf(r.native('Port A')),
+    [TEMPORARY_TONE, ...SETUP_OF_SETTINGS],
+    'the reset sends the pending sound with its settings; the evaluation does not send them a second time, the sound is already there',
+  );
+  plan.commit();
+  assert.deepEqual(r.errors, []);
+});
+
+test('a replug sends the settings of the code that plays after the sound, in the setup and in the second setup; the evaluation being prepared wins', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  const before = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [TEMPORARY_TONE, ...SETUP_OF_SETTINGS]);
+  await r.wait(midiOutModule.RECONNECT_REPEAT_MS);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before + 1 + SETUP_OF_SETTINGS.length), SETUP_OF_SETTINGS, 'the second setup holds the same settings, and the scene after the channels');
+
+  // An evaluation being prepared while the port returns: its settings, not the playing code's.
+  const next = r.out.prepareSetup(settingsCode('Alpha 2', ', tone: { filterCutoff: 600 }, part: { level: 100 }'));
+  assert.equal(next.refusal, null, next.refusal ?? '');
+  const mark = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(
+    bytesOf(r.native('Port A')).slice(mark),
+    [TEMPORARY_TONE, [0xc2, 1], CUTOFF_600, dataSet([1, 0, 16, 5], [100]), ...VOLUMES],
+    'its tone and part settings of channel 3; it writes no scene setting, so none goes out: the playing code\'s scene setting left the code',
+  );
+  assert.deepEqual(r.errors, []);
+});
+
+test('a reset uses one record: the evaluation being prepared when there is one, for every slot and the scene, else the code that plays', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  // The evaluation being prepared writes no setting at all: the playing code's settings left the code and are not sent.
+  const next = r.out.prepareSetup(settingsCode('Alpha 2', ''));
+  assert.equal(next.refusal, null, next.refusal ?? '');
+  let mark = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(mark), [TEMPORARY_TONE, [0xc2, 1], ...VOLUMES], 'no tone, part or scene setting');
+  await r.wait(midiOutModule.RECONNECT_REPEAT_MS);
+  const sending = next.send();
+  await r.wait(1000);
+  await sending;
+  next.commit();
+  // Nothing prepared: the code that plays now (no settings) is the record.
+  mark = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(mark), [TEMPORARY_TONE, [0xc2, 1], ...VOLUMES]);
+  assert.deepEqual(r.errors, []);
+});
+
+test('a failed evaluation whose settings a reset sent puts the playing code\'s settings back, and names what left the code', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  const next = r.out.prepareSetup(settingsCode('Alpha 2', ', part: { level: 100 }'));
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  const mark = r.native('Port A').sent.length;
+  await next.rollback();
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(mark), [CUTOFF_600, PAN_40, REVERB_80], 'the reset sent the failed evaluation\'s level, so the playing code\'s settings go back');
+  const left = r.published.flatMap((facts) => facts.events).filter((event) => event.kind === 'settings-left');
+  assert.deepEqual(left, [{ kind: 'settings-left', instrument: 'plain', level: 'part', channel: 3, names: ['level'] }]);
+});
+
+test('an instrument that left the file and came back gets no settings of code that no longer names it', async () => {
+  const r = makeResetRig({ present: ['Port A', 'Port B'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  r.out.setRig({ setup: 'valid', instruments: [SETTINGS_RESET_RIG.instruments[1]] });
+  const before = r.native('Port A').sent.length;
+  r.out.setRig(SETTINGS_RESET_RIG);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [TEMPORARY_TONE, ...VOLUMES], 'the reset and the volumes only');
+});
+
+test('switching an instrument on sends the settings of the code that plays with its setup', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  const off = { setup: 'valid', instruments: [{ ...SETTINGS_RESET_RIG.instruments[0], enabled: false }, SETTINGS_RESET_RIG.instruments[1]] };
+  r.out.setRig(off);
+  const before = r.native('Port A').sent.length;
+  r.out.setRig(SETTINGS_RESET_RIG);
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [TEMPORARY_TONE, ...SETUP_OF_SETTINGS]);
+  assert.deepEqual(r.errors, []);
+});
+
+test('taking the playing role back keeps the settings of the code, and the replay evaluation sends them again with the sound', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: SETTINGS_RESET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  const before = r.native('Port A').sent.length;
+  r.out.setActive(false);
+  r.out.setActive(true);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [[0xc2, 1], CUTOFF_600, PAN_40, REVERB_80]);
+  // The settings of the code are still the playing code's: a replug brings them back.
+  const mark = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(mark), [TEMPORARY_TONE, ...SETUP_OF_SETTINGS]);
+  assert.deepEqual(r.errors, []);
+});
+
+test('a model edit that keeps its id drops the settings of the playing code for that instrument: a replug sends no stale bytes', async () => {
+  const guarded = { setup: 'valid', instruments: [instrumentOf('plain', 'Port A', 'none', withSettings({ reset: null }))] };
+  const r = makeResetRig({ present: ['Port A'], rig: guarded });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, settingsCode('Alpha 2'));
+  // The same description in a new object keeps them: a replug sends them again.
+  r.out.setRig(structuredClone(guarded));
+  let before = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), SETUP_OF_SETTINGS, 'unchanged description: the settings come back');
+  await r.wait(midiOutModule.RECONNECT_REPEAT_MS);
+  // The cutoff row moves to another address under the same model id: the bytes built from the old row must never go out.
+  const moved = { ...SETTINGS_OF_MODEL, tone: [settingRow('filterCutoff', [2, 16, 0, 0x50], 4, 0, 1023), SETTINGS_OF_MODEL.tone[1]] };
+  r.out.setRig({ setup: 'valid', instruments: [instrumentOf('plain', 'Port A', 'none', withSettings({ reset: null, settings: moved }))] });
+  before = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [[0xc2, 1], ...VOLUMES], 'the sound and the volumes, no data set');
+  // A model ID with no known temporary areas is a changed description too: nothing to refuse, nothing sent.
+  r.out.setRig({ setup: 'valid', instruments: [instrumentOf('plain', 'Port A', 'none', withSettings({ reset: null, settings: { ...moved, rolandModel: [0, 0, 0, 0x64] } }))] });
+  assert.deepEqual(r.errors, []);
+});
+
+// --- Put back after a failure: the rollback and the dropped waiting change send the settings of the code they return to ---
+
+const SETTINGS_SETUP_RIG = { setup: 'valid', instruments: [instrumentOf('plain', 'Port A', 'none', withSettings())] };
+const LFO_128 = hexBytes('F0 41 10 00 00 00 65 12 02 10 00 0B 08 00 5B F7');
+const PLAYING_SETTINGS = ', tone: { filterCutoff: 600 }, part: { pan: 40 }, scene: { reverbLevel: 80 }';
+
+/** Plays `first` on the settings rig, sends `failing` (not committed) and returns what it put on the port and what its rollback does. */
+async function failedEvaluation(first, failing, setupRig = SETTINGS_SETUP_RIG) {
+  const rig = makeSetupRig({ names: ['Port A'], rig: setupRig });
+  const { out, natives, clock } = rig;
+  await play(out, clock, first);
+  const plan = out.prepareSetup(failing);
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const mark = natives[0].sent.length;
+  const sending = plan.send();
+  clock.advance(1000);
+  await sending;
+  const refused = bytesOf(natives[0]).slice(mark);
+  await plan.rollback();
+  return { ...rig, refused, back: bytesOf(natives[0]).slice(mark + refused.length) };
+}
+
+test('a failed evaluation that sent tone settings and changed a sound: the rollback sends the old sound, then all the settings of the playing code, then its scene', async () => {
+  const t = await failedEvaluation(settingsCode('Alpha 1', PLAYING_SETTINGS), settingsCode('Alpha 2', ', tone: { lfoOscDepth: 128 }'));
+  assert.deepEqual(t.refused, [[0xc2, 1], LFO_128]);
+  assert.deepEqual(t.back, [[0xc2, 0], CUTOFF_600, PAN_40, REVERB_80], 'the sound, the tone and part settings of its channel, the scene after');
+  assert.deepEqual(t.errors, []);
+});
+
+test('a failed evaluation that sent settings while the playing code writes none sends no settings back', async () => {
+  const t = await failedEvaluation(soundCode('Port A', 3, 'Alpha 1'), settingsCode('Alpha 2', BELL_SETTINGS));
+  assert.deepEqual(t.refused, [[0xc2, 1], CUTOFF_600, PAN_40, REVERB_80]);
+  assert.deepEqual(t.back, [[0xc2, 0]], 'only the sound goes back: there are no settings to send back');
+});
+
+test('a failed evaluation that sent no settings and changed no sound sends none back, even when the playing code writes some', async () => {
+  const t = await failedEvaluation(settingsCode('Alpha 1', PLAYING_SETTINGS), settingsCode('Alpha 1', ', controls: { volume: 90 }'));
+  assert.deepEqual(t.refused, [[0xb2, 7, 90]]);
+  assert.deepEqual(t.back, [[0xb2, 7, 100]], 'only the control goes back');
+});
+
+test('a failed evaluation that sent no settings but put an old sound back also puts the tone and part settings of that channel back: a program change erases them', async () => {
+  const t = await failedEvaluation(settingsCode('Alpha 1', PLAYING_SETTINGS), soundCode('Port A', 3, 'Alpha 2'));
+  assert.deepEqual(t.refused, [[0xc2, 1]]);
+  assert.deepEqual(t.back, [[0xc2, 0], CUTOFF_600, PAN_40], 'the scene settings survive a program change, so they are not sent');
+});
+
+test('after a failed evaluation the settings-left events name only settings that were sent, not those of a channel the send never reached', async () => {
+  const rig = makeSetupRig({ names: ['Port A'], rig: SETTINGS_SETUP_RIG });
+  const { out, natives, clock, published } = rig;
+  await play(out, clock, settingsCode('Alpha 1', ', part: { pan: 40 }'));
+  const send = natives[0].send.bind(natives[0]);
+  // Channel 4's program change fails, so the send stops before channel 4's settings.
+  natives[0].send = function (data, ...rest) {
+    if (data[0] === 0xc3) throw new Error('gone');
+    return send(data, ...rest);
+  };
+  const failing = `a: ${settingsCode('Alpha 1', ', part: { level: 100 }')}\nb: note("c3").midi('Port A', { midichannel: 4, sound: 'Alpha 2', part: { pan: 20 } })`;
+  const plan = out.prepareSetup(failing);
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const mark = natives[0].sent.length;
+  const sending = plan.send();
+  clock.advance(1000);
+  await sending;
+  assert.deepEqual(bytesOf(natives[0]).slice(mark), [dataSet([1, 0, 16, 5], [100])], 'only channel 3\'s level went out');
+  await plan.rollback();
+  const left = [...published.flatMap((facts) => facts.events), ...out.facts().events].filter((event) => event.kind === 'settings-left');
+  assert.deepEqual(left, [{ kind: 'settings-left', instrument: 'plain', level: 'part', channel: 3, names: ['level'] }], 'never the pan of channel 4');
+});
+
+test('a refused check sends nothing, and neither does its rollback', async () => {
+  const { out, natives, clock } = makeSetupRig({ names: ['Port A'], rig: SETTINGS_SETUP_RIG });
+  await play(out, clock, settingsCode('Alpha 1', PLAYING_SETTINGS));
+  const mark = natives[0].sent.length;
+  const plan = out.prepareSetup(settingsCode('Alpha 2', ', tone: { filterCutof: 600 }'));
+  assert.equal(typeof plan.refusal, 'string');
+  const sending = plan.send();
+  clock.advance(1000);
+  await sending;
+  await plan.rollback();
+  assert.deepEqual(natives[0].sent.slice(mark), []);
+});
+
+test('a waiting change dropped after its stamped settings went out: the settings of the playing code follow them, just after the stamp', async () => {
+  const s = await makeSoundStampRig(soundOn(4, 'Bell 1', ', part: { level: 100 }'), undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const c = r.native('Port C');
+  const line = lineAhead(r, 400);
+  const next = `${NAMES_B}${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 50 }')}`;
+  const plan = r.out.prepareSetup(next, { atCycle: line.cycle });
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const mark = c.sent.length;
+  await plan.send();
+  const canceled = c.sent.slice(mark);
+  assert.deepEqual(canceled.map((entry) => entry.data), [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 1], CUTOFF_600, dataSet([1, 0, 17, 5], [50])]);
+  const afterSend = c.sent.length;
+  plan.drop();
+  await nextTick();
+  const back = c.sent.slice(afterSend);
+  assert.deepEqual(back.map((entry) => entry.data), [[0xb2, 0, 0], [0xb2, 32, 0], [0xc2, 0], LEVEL_100], 'the old sound of channel 3, then the playing code\'s part setting of channel 4');
+  for (const entry of back) {
+    assert.equal(entry.argc, 2, 'timed');
+    assert.ok(Math.abs(entry.ts - (canceled[0].ts + AFTER())) < 1e-6, `ts ${entry.ts} against the canceled setup at ${canceled[0].ts}`);
+  }
+  assert.deepEqual(r.errors, []);
+});
+
+test('a waiting change dropped by an immediate change that prepared its own setup: the immediate change\'s settings follow the stamped ones, not the old code\'s', async () => {
+  const t = await immediateAfterTimed({
+    rig: SETTINGS_STAMP_RIG,
+    extra: soundOn(4, 'Bell 1', ', part: { level: 100 }'),
+    timed: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 50 }')}`,
+    immediate: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 60 }')}`,
+  });
+  const level60 = dataSet([1, 0, 17, 5], [60]);
+  assert.deepEqual(t.immediateSent.map((entry) => entry.data), [CUTOFF_600, level60], 'the immediate change sends its settings at once');
+  assert.deepEqual(t.dropSent.map((entry) => entry.data), [CUTOFF_600, level60], 'and again after the stamped ones; never the old 100');
+  const stamp = t.timedSent.find((entry) => entry.data[0] === 0xf0).ts;
+  for (const entry of t.dropSent) {
+    assert.equal(entry.argc, 2);
+    assert.ok(Math.abs(entry.ts - (stamp + AFTER())) < 1e-6, `ts ${entry.ts} against the canceled setup at ${stamp}`);
+  }
+  assert.deepEqual(t.r.errors, []);
+});
+
+test('a dropped waiting change that sent no settings puts none back, even when the playing code writes some', async () => {
+  const s = await makeSoundStampRig(soundOn(4, 'Bell 1', ', part: { level: 100 }'), undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const c = r.native('Port C');
+  const plan = r.out.prepareSetup(`${NAMES_B}${soundOn(3, 'Alpha 1', ', controls: { volume: 90 }')}\n${soundOn(4, 'Bell 1')}`, { atCycle: lineAhead(r, 400).cycle });
+  const mark = c.sent.length;
+  await plan.send();
+  const stamped = c.sent.slice(mark);
+  assert.deepEqual(stamped.map((entry) => entry.data), [[0xb2, 7, 90]], 'it sent a control and no setting');
+  const afterSend = c.sent.length;
+  plan.drop();
+  await nextTick();
+  assert.deepEqual(c.sent.slice(afterSend).map((entry) => entry.data), [[0xb2, 7, 100]], 'only the control goes back');
+  assert.deepEqual(r.errors, []);
+});
+
+// --- what Claude is told when a waiting change is dropped: the settings it sent that the code returned to does not write ---
+
+const leftEvents = (r) => r.published.flatMap((facts) => facts.events).filter((event) => event.kind === 'settings-left');
+
+test('a dropped waiting change that sent a part setting the playing code does not write tells it stays; the settings are not sent again', async () => {
+  const s = await makeSoundStampRig('', undefined, undefined, SETTINGS_STAMP_RIG);
+  const { r } = s;
+  const c = r.native('Port C');
+  const plan = r.out.prepareSetup(`${NAMES_B}${soundOn(3, 'Alpha 1', ', part: { level: 50 }')}`, { atCycle: lineAhead(r, 400).cycle });
+  await plan.send();
+  assert.deepEqual(c.sent.at(-1).data, dataSet([1, 0, 16, 5], [50]), 'the level of part 1 went out stamped on the line');
+  const afterSend = c.sent.length;
+  plan.drop();
+  await nextTick();
+  assert.deepEqual(leftEvents(r), [{ kind: 'settings-left', instrument: 'wide', level: 'part', channel: 3, names: ['level'] }]);
+  assert.equal(c.sent.length, afterSend, 'nothing is sent for it: the instrument keeps the value');
+  assert.deepEqual(r.errors, []);
+});
+
+test('a dropped waiting change replaced by an immediate change compares with the immediate change: what both write is not told', async () => {
+  const t = await immediateAfterTimed({
+    rig: SETTINGS_STAMP_RIG,
+    extra: soundOn(4, 'Bell 1'),
+    timed: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 50 }')}`,
+    immediate: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 60 }')}`,
+  });
+  assert.deepEqual(leftEvents(t.r), [], 'the immediate change writes both settings, so both are sent again and none stays');
+});
+
+test('a dropped waiting change replaced by an immediate change that no longer writes a setting tells it stays', async () => {
+  const t = await immediateAfterTimed({
+    rig: SETTINGS_STAMP_RIG,
+    extra: soundOn(4, 'Bell 1'),
+    timed: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1', ', part: { level: 50 }')}`,
+    immediate: `${soundOn(3, 'Alpha 2', ', tone: { filterCutoff: 600 }')}\n${soundOn(4, 'Bell 1')}`,
+  });
+  assert.deepEqual(leftEvents(t.r), [{ kind: 'settings-left', instrument: 'wide', level: 'part', channel: 4, names: ['level'] }]);
+});
+
+
+// --- NRPN offsets: the same setup path as the data sets, checked again when they are sent ---
+
+const nrpnRow = (name, lsb) => ({ name, min: 14, max: 114, message: { kind: 'nrpn', msb: 1, lsb } });
+const OFFSET_SETTINGS = {
+  engines: [],
+  rolandModel: null,
+  nrpnFamily: 'gs',
+  tone: [],
+  part: [nrpnRow('cutoffOffset', 0x20), nrpnRow('releaseOffset', 0x66)],
+  scene: [],
+};
+const offsetInstrument = (rest = {}) => instrumentOf('plain', 'Port A', 'none', withSettings({ settings: OFFSET_SETTINGS, reset: { messages: RESET_A, waitMs: 100 }, ...rest }));
+const OFFSET_RIG = { setup: 'valid', instruments: [offsetInstrument()] };
+const offsetCode = (sound, part = ', part: { cutoffOffset: 90 }') => `note("c3").midi('Port A', { midichannel: 3, sound: '${sound}'${part} })`;
+// The five messages of cutoffOffset 90 and of releaseOffset 100 on channel 3 (status B2), from the manual's NRPN list: control 99 the
+// MSB 01, control 98 the LSB (20 and 66 hex), control 6 the value, then control 101 and control 100 at 127.
+const CUTOFF_OFFSET_90 = [0xb2, 0x63, 1, 0xb2, 0x62, 0x20, 0xb2, 6, 90, 0xb2, 0x65, 0x7f, 0xb2, 0x64, 0x7f];
+const RELEASE_OFFSET_100 = [0xb2, 0x63, 1, 0xb2, 0x62, 0x66, 0xb2, 6, 100, 0xb2, 0x65, 0x7f, 0xb2, 0x64, 0x7f];
+// What a setup sends for offsetCode('Alpha 2'): the sound, the offset right after it, then the volume of every declared channel.
+const SETUP_OF_OFFSETS = [[0xc2, 1], CUTOFF_OFFSET_90, ...VOLUMES];
+
+test('a reset at page start sends the offset of the evaluation being prepared right after the sound of its channel', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: OFFSET_RIG });
+  await r.out.enableIfGranted();
+  const plan = r.out.prepareSetup(offsetCode('Alpha 2'));
+  assert.equal(plan.refusal, null, plan.refusal ?? '');
+  const sending = plan.send();
+  await r.wait(100);
+  await r.wait(1000);
+  await sending;
+  assert.deepEqual(bytesOf(r.native('Port A')), [...RESET_A, ...SETUP_OF_OFFSETS]);
+  plan.commit();
+  assert.deepEqual(r.errors, []);
+});
+
+test('a replug sends the offset of the code that plays in the setup and in the second setup; switching the instrument on sends it with its setup', async () => {
+  const r = makeResetRig({ present: ['Port A'], rig: OFFSET_RIG });
+  await r.out.enableIfGranted();
+  await r.wait(200);
+  await play(r.out, r.clock, offsetCode('Alpha 2'));
+  let before = r.native('Port A').sent.length;
+  r.unplug('Port A');
+  r.plug('Port A');
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [...RESET_A, ...SETUP_OF_OFFSETS]);
+  await r.wait(midiOutModule.RECONNECT_REPEAT_MS);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before + RESET_A.length + SETUP_OF_OFFSETS.length), SETUP_OF_OFFSETS, 'the second setup holds the same offset');
+
+  r.out.setRig({ setup: 'valid', instruments: [offsetInstrument({ enabled: false })] });
+  before = r.native('Port A').sent.length;
+  r.out.setRig(OFFSET_RIG);
+  await r.wait(500);
+  await r.wait(100);
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [...RESET_A, ...SETUP_OF_OFFSETS]);
+  assert.deepEqual(r.errors, []);
+});
+
+test('a failed evaluation that changed a sound puts the old sound back and then the offsets of the playing code', async () => {
+  const rig = { setup: 'valid', instruments: [offsetInstrument({ reset: null })] };
+  const t = await failedEvaluation(offsetCode('Alpha 1'), offsetCode('Alpha 2', ', part: { releaseOffset: 100 }'), rig);
+  assert.deepEqual(t.refused, [[0xc2, 1], RELEASE_OFFSET_100]);
+  assert.deepEqual(t.back, [[0xc2, 0], CUTOFF_OFFSET_90], 'the sound, then the offset of the code that plays; no value is made up');
+  assert.deepEqual(t.errors, []);
+});
+
+test('an offset taken out of the code sends nothing for it: no value 64 goes out by itself, and the part level is told it stays', async () => {
+  const rig = { setup: 'valid', instruments: [offsetInstrument({ reset: null })] };
+  const { out, natives, clock, published, errors } = makeSetupRig({ names: ['Port A'], rig });
+  await play(out, clock, offsetCode('Alpha 1'));
+  const mark = natives[0].sent.length;
+  await play(out, clock, offsetCode('Alpha 1', ''));
+  assert.deepEqual(bytesOf(natives[0]).slice(mark), [], 'the sound is the same and no offset is written: nothing at all is sent');
+  const left = published.flatMap((facts) => facts.events).filter((event) => event.kind === 'settings-left');
+  assert.deepEqual(left, [{ kind: 'settings-left', instrument: 'plain', level: 'part', channel: 3, names: ['cutoffOffset'] }]);
+  // Nothing in what the page ever sent is an NRPN value of 64.
+  const sent = bytesOf(natives[0]);
+  assert.equal(sent.some((data) => data.length === 15 && data[8] === 64), false);
+  assert.deepEqual(errors, []);
+});
+
+test('the NRPN set is checked again when it is sent, against the rig as it is then: no family, a rhythm channel', async () => {
+  const refusedAfter = async (changed, kind = 'nrpn') => {
+    const { out, natives, clock, published, errors } = makeSetupRig({ names: ['Port A'], rig: { setup: 'valid', instruments: [offsetInstrument({ reset: null })] } });
+    const plan = out.prepareSetup(offsetCode('Alpha 2'));
+    assert.equal(plan.refusal, null, plan.refusal ?? '');
+    out.setRig({ setup: 'valid', instruments: [changed] });
+    const sending = plan.send();
+    clock.advance(1000);
+    await sending;
+    out.publishFacts({ force: true });
+    return { sent: bytesOf(natives[0]), errors: errors.map((entry) => entry.text), events: published.flatMap((facts) => facts.events).filter((event) => event.kind === kind) };
+  };
+  // The family is gone: the sound goes out, the offset does not, and Claude hears the memory guard refused it.
+  const noFamily = await refusedAfter(offsetInstrument({ reset: null, settings: { ...OFFSET_SETTINGS, nrpnFamily: null } }), 'sysex-refused');
+  assert.deepEqual(noFamily.sent, [[0xc2, 1]]);
+  assert.deepEqual(noFamily.errors, ['Moontide: a part setting for "plain" was not sent: the NRPN family of this instrument is not known.']);
+  assert.deepEqual(noFamily.events, [{ kind: 'sysex-refused', instrument: 'plain', source: 'settings', reason: 'nrpn' }]);
+  // Channel 3 is now a rhythm channel of the model.
+  const rhythm = await refusedAfter(offsetInstrument({ reset: null, modelChannels: [{ channel: 3, role: 'rhythm' }, { channel: 4, role: 'melodic' }, { channel: 10, role: 'rhythm' }] }), 'sysex-refused');
+  assert.deepEqual(rhythm.sent, [[0xc2, 1]]);
+  assert.deepEqual(rhythm.errors, ['Moontide: a part setting for "plain" was not sent: it is an offset of a melodic part sent to a rhythm channel.']);
+  // The same rig, unchanged: the offset goes out, so the two refusals above come from the check at send time.
+  const same = await refusedAfter(offsetInstrument({ reset: null }), 'sysex-refused');
+  assert.deepEqual(same.sent, [[0xc2, 1], CUTOFF_OFFSET_90]);
+  assert.deepEqual(same.errors, []);
+});
+
+// --- Listen: the note on and note off the Scratchpad plays on a chosen instrument ---
+
+const listenRig = (options = {}) => makeSetupRig({ ...options, options: { perfNow: () => 1000, ...(options.options ?? {}) } });
+const noteOf = (extra = {}) => ({ instrumentId: 'plain', channel: 3, kind: 'on', pitch: 60, velocity: 100, at: 1050, ...extra });
+
+test('a Listen note goes to the one output that contains the port, as exactly its status, pitch and velocity, at the stamp', () => {
+  const { out, natives, errors } = listenRig();
+  assert.deepEqual(out.sendListenNote(noteOf()), { ok: true });
+  assert.deepEqual(out.sendListenNote(noteOf({ kind: 'off', velocity: 0, at: 1100 })), { ok: true });
+  assert.deepEqual(out.sendListenNote(noteOf({ channel: 16, pitch: 127, velocity: 127, at: undefined })), { ok: true });
+  assert.deepEqual(natives[0].sent, [
+    { data: [0x92, 60, 100], ts: 1050, argc: 2 },
+    { data: [0x82, 60, 0], ts: 1100, argc: 2 },
+    { data: [0x9f, 127, 127], ts: undefined, argc: 1 },
+  ]);
+  assert.deepEqual([natives[1].sent.length, natives[2].sent.length], [0, 0]);
+  assert.deepEqual(errors, []);
+});
+
+test('a Listen note off ignores the velocity it is given and never sends one', () => {
+  const { out, natives } = listenRig();
+  out.sendListenNote(noteOf({ kind: 'off', velocity: 90 }));
+  assert.deepEqual(natives[0].sent.map((entry) => entry.data), [[0x82, 60, 0]]);
+});
+
+test('nothing but a note on or a note off ever reaches an output, whatever Listen is asked to send', () => {
+  const { out, natives } = listenRig();
+  for (const kind of ['on', 'off']) {
+    for (const channel of [1, 5, 16]) {
+      for (const pitch of [0, 60, 127]) out.sendListenNote(noteOf({ kind, channel, pitch }));
+    }
+  }
+  const bad = [
+    { channel: 0 }, { channel: 17 }, { channel: 2.5 }, { channel: '3' }, { pitch: -1 }, { pitch: 128 }, { pitch: 60.5 }, { velocity: 0 }, { velocity: 128 },
+    { velocity: 3.5 }, { kind: 'cc' }, { kind: 'program' }, { kind: undefined }, { at: Number.NaN }, { at: 'now' }, { at: 1000 + midiOutModule.NOTE_STAMP_MAX_AHEAD_MS + 1 },
+  ];
+  const before = natives[0].sent.length;
+  for (const extra of bad) assert.deepEqual(out.sendListenNote(noteOf(extra)), { refused: 'invalid' }, JSON.stringify(extra));
+  assert.equal(natives[0].sent.length, before, 'a refused note sends nothing');
+  assert.equal(natives[0].sent.length, 18);
+  for (const { data } of natives[0].sent) {
+    assert.equal(data.length, 3);
+    assert.ok(data[0] >= 0x80 && data[0] <= 0x9f, `status ${data[0]}`);
+    assert.ok(data[0] < 0xa0, 'no polyphonic pressure, controller, program change or system message');
+  }
+  assert.ok(natives.every((native) => native.sent.every(({ data }) => data[0] >= 0x80 && data[0] <= 0x9f)));
+});
+
+test('a stamp at the limit ahead is used and one past it is refused', () => {
+  const { out, natives } = listenRig();
+  assert.deepEqual(out.sendListenNote(noteOf({ at: 1000 + midiOutModule.NOTE_STAMP_MAX_AHEAD_MS })), { ok: true });
+  assert.deepEqual(out.sendListenNote(noteOf({ at: 500 })), { ok: true }, 'a stamp in the past goes out at once');
+  assert.equal(natives[0].sent.length, 2);
+});
+
+test('Listen refuses, and never throws, for a superseded tab, no valid setup file, an unknown instrument and an instrument that is off', () => {
+  const r = listenRig();
+  const words = (extra) => r.out.sendListenNote(noteOf(extra));
+  assert.deepEqual(r.out.listenTarget('plain'), { ok: true, id: 'plain', port: 'Port A' });
+  assert.deepEqual(words({ instrumentId: 'nobody' }), { refused: 'no-instrument' });
+  assert.deepEqual(r.out.listenTarget('nobody'), { refused: 'no-instrument' });
+  r.out.setRig({ ...SETUP_RIG, instruments: SETUP_RIG.instruments.map((instrument) => (instrument.id === 'plain' ? { ...instrument, enabled: false } : instrument)) });
+  assert.deepEqual(words(), { refused: 'off' });
+  assert.deepEqual(r.out.listenTarget('plain'), { refused: 'off' });
+  assert.equal(r.out.listenTarget('bank').ok, true, 'an instrument that is on is still a target');
+  r.out.setRig({ setup: 'absent', instruments: [] });
+  assert.deepEqual(words(), { refused: 'no-rig' });
+  assert.deepEqual(r.out.listenTarget('plain'), { refused: 'no-rig' });
+  r.out.setRig(SETUP_RIG);
+  r.out.setActive(false);
+  assert.deepEqual(words(), { refused: 'superseded' });
+  assert.deepEqual(r.out.listenTarget('plain'), { refused: 'superseded' });
+  r.out.setActive(true);
+  const mark = r.natives[0].sent.length;
+  assert.equal(words().ok, true);
+  assert.deepEqual(r.natives[0].sent.slice(mark).map((entry) => entry.data), [[0x92, 60, 100]], 'a refused note sent nothing, and the note after the tab was back went out');
+});
+
+test('a Listen note off is not held by the checks that keep a new note from sounding, and goes to the port of the last note on', () => {
+  const r = listenRig();
+  const off = () => r.out.sendListenNote(noteOf({ kind: 'off', at: undefined }));
+  assert.equal(r.out.sendListenNote(noteOf()).ok, true);
+  r.out.setActive(false);
+  assert.deepEqual(r.out.sendListenNote(noteOf()), { refused: 'superseded' }, 'a note on is still refused');
+  assert.deepEqual(off(), { ok: true }, 'another tab plays');
+  r.out.setActive(true);
+  r.out.setRig({ ...SETUP_RIG, instruments: SETUP_RIG.instruments.map((instrument) => (instrument.id === 'plain' ? { ...instrument, enabled: false } : instrument)) });
+  assert.deepEqual(off(), { ok: true }, 'the instrument is switched off');
+  r.out.setRig({ ...SETUP_RIG, instruments: SETUP_RIG.instruments.map((instrument) => (instrument.id === 'plain' ? { ...instrument, port: 'Port B' } : instrument)) });
+  assert.deepEqual(off(), { ok: true }, 'the setup file names another port');
+  r.out.setRig({ setup: 'absent', instruments: [] });
+  assert.deepEqual(off(), { ok: true }, 'there is no setup file any more');
+  // A switch-off sends its own silence (controllers); only the notes are Listen's.
+  const notes = (native) => bytesOf(native).filter((data) => data[0] >= 0x80 && data[0] <= 0x9f);
+  assert.deepEqual(notes(r.natives[0]), [[0x92, 60, 100], [0x82, 60, 0], [0x82, 60, 0], [0x82, 60, 0], [0x82, 60, 0]]);
+  assert.deepEqual([notes(r.natives[1]).length, notes(r.natives[2]).length], [0, 0], 'every off went to the port the note on went to');
+  assert.deepEqual(r.out.sendListenNote(noteOf({ kind: 'off', instrumentId: 'nobody' })), { refused: 'no-instrument' }, 'an off for an instrument never played and not in the file has no port');
+});
+
+test('a Listen note off goes out while the instrument resets, where a note on is refused', async () => {
+  const r = makeResetRig({ present: ['Port A'] });
+  r.out.setRig(RESET_RIG);
+  await r.out.enableIfGranted();
+  const before = bytesOf(r.native('Port A')).length;
+  assert.deepEqual(r.out.sendListenNote({ instrumentId: 'plain', channel: 3, kind: 'on', pitch: 60, velocity: 100 }), { refused: 'resetting' });
+  assert.deepEqual(r.out.sendListenNote({ instrumentId: 'plain', channel: 3, kind: 'off', pitch: 60, velocity: 0 }), { ok: true });
+  assert.deepEqual(bytesOf(r.native('Port A')).slice(before), [[0x82, 60, 0]]);
+  await r.wait(100);
+});
+
+test('Listen says which outputs there are when none contains the port, and how many when several do, and sends nothing', () => {
+  const none = listenRig({ names: ['Port Z', 'Other'] });
+  assert.deepEqual(none.out.sendListenNote(noteOf()), { refused: 'no-output', port: 'Port A', names: ['Port Z', 'Other'] });
+  assert.deepEqual(none.out.listenTarget('plain'), { refused: 'no-output', port: 'Port A', names: ['Port Z', 'Other'] });
+  const many = listenRig({ names: ['Port A', 'Port A 2', 'Port B'] });
+  assert.deepEqual(many.out.sendListenNote(noteOf()), { refused: 'ambiguous', port: 'Port A', count: 2 });
+  assert.deepEqual(many.out.listenTarget('plain'), { refused: 'ambiguous', port: 'Port A', count: 2 });
+  assert.deepEqual(many.natives.map((native) => native.sent.length), [0, 0, 0]);
+  const gone = listenRig({ names: ['Port A', 'Port B', 'Port C'] });
+  gone.natives[0].state = 'disconnected';
+  assert.deepEqual(gone.out.sendListenNote(noteOf()), { refused: 'no-output', port: 'Port A', names: ['Port B', 'Port C'] }, 'a port that is not connected is not an output');
+});
+
+test('Listen finds the output again at every call and never keeps it', () => {
+  const r = listenRig();
+  assert.equal(r.out.sendListenNote(noteOf()).ok, true);
+  r.natives[0].state = 'disconnected';
+  assert.equal(r.out.sendListenNote(noteOf({ kind: 'off' })).refused, 'no-output');
+  r.natives[0].state = 'connected';
+  assert.equal(r.out.sendListenNote(noteOf({ kind: 'off' })).ok, true);
+  assert.deepEqual(r.natives[0].sent.map((entry) => entry.data[0]), [0x92, 0x82]);
+});
+
+test('Listen turns an exception of the output into a refusal word, once per call, and never throws', () => {
+  const r = listenRig({ names: ['Port A', 'Port B', 'Port C'] });
+  r.natives[0].failing = true;
+  assert.deepEqual(r.out.sendListenNote(noteOf()), { refused: 'send-failed' });
+  assert.deepEqual(r.out.sendListenNote(noteOf({ kind: 'off' })), { refused: 'send-failed' });
+  assert.doesNotThrow(() => r.out.listenTarget('plain'));
+});
+
+test('Listen is refused while the instrument resets and the same note goes out once the reset is over', async () => {
+  const r = makeResetRig({ present: ['Port A'] });
+  r.out.setRig(RESET_RIG);
+  await r.out.enableIfGranted();
+  assert.deepEqual(r.out.sendListenNote({ instrumentId: 'plain', channel: 3, kind: 'on', pitch: 60, velocity: 100 }), { refused: 'resetting' });
+  assert.deepEqual(r.out.listenTarget('plain'), { refused: 'resetting' });
+  assert.deepEqual(bytesOf(r.native('Port A')), RESET_A, 'the device would drop the note: it is not sent');
+  await r.wait(100);
+  assert.deepEqual(r.out.sendListenNote({ instrumentId: 'plain', channel: 3, kind: 'on', pitch: 60, velocity: 100 }), { ok: true });
+});
+
+test('Listen sends no program change, no controller and no sound setup, and does not record anything for a later Stop of the music', async () => {
+  const { out, natives, clock } = listenRig();
+  await play(out, clock, `note("c3").midi('Port A', { midichannel: 3, sound: 'Alpha 1' })`);
+  const mark = natives[0].sent.length;
+  out.sendListenNote(noteOf({ at: 1020 }));
+  out.sendListenNote(noteOf({ kind: 'off', at: 1090 }));
+  assert.deepEqual(natives[0].sent.slice(mark).map((entry) => entry.data), [[0x92, 60, 100], [0x82, 60, 0]]);
+});
+
+// --- Listen: the tracks of the playing code on an instrument's output and channel ---
+
+const trackCode = (...lines) => `${lines.join('\n')}\n`;
+const onPort = (label, port, channel) => `${label}: note("c3").midi('${port}', { midichannel: ${channel} })`;
+/** A rig of fake ports that is playing `code`, like a successful evaluation left it. */
+function playingRig(code, options = {}) {
+  const r = listenRig(options);
+  r.out.recordSuccess(code);
+  return r;
+}
+
+test('playingTracksOn gives the display names of the unmuted tracks of the playing code that sit on the instrument\'s output and channel, in code order', () => {
+  const r = playingRig(trackCode(onPort('lead', 'Port A', 3), onPort('bass', 'Port A', 4), onPort('pad', 'Port A', 3), onPort('other', 'Port B', 3)));
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), ['lead', 'pad']);
+  assert.deepEqual(r.out.playingTracksOn('plain', 4), ['bass']);
+  assert.deepEqual(r.out.playingTracksOn('plain', 5), [], 'a channel no track uses');
+  assert.deepEqual(r.out.playingTracksOn('bank', 3), ['other'], 'the other device has its own track');
+});
+
+test('playingTracksOn leaves out a muted track, a track of another device and a track that is no longer in the code', () => {
+  const r = playingRig(trackCode(onPort('_lead', 'Port A', 3), onPort('pad', 'Port B', 3)));
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), []);
+  r.out.recordSuccess(trackCode(onPort('lead', 'Port A', 3)));
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), ['lead']);
+  r.out.recordSuccess(trackCode(onPort('lead', 'Port A', 4)));
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), [], 'the edited code is the one that counts');
+});
+
+test('playingTracksOn matches a track by the way a track reaches an output: the one connected output of the instrument contains the track\'s port', () => {
+  const r = playingRig(trackCode(onPort('usb', 'USB', 3), onPort('full', 'Port A (USB)', 3), onPort('long', 'Port A (USB) Extra', 3)), { names: ['Port A (USB)', 'Port B', 'Port C'] });
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), ['usb', 'full'], 'a part of the output name or the whole name, never a longer name');
+});
+
+test('playingTracksOn compares the two port strings as written when the instrument resolves to no single output', () => {
+  const none = playingRig(trackCode(onPort('same', 'Port A', 3), onPort('part', 'Port', 3), onPort('other', 'Port B', 3)), { names: ['Elsewhere'] });
+  assert.deepEqual(none.out.playingTracksOn('plain', 3), ['same']);
+  const many = playingRig(trackCode(onPort('same', 'Port A', 3), onPort('other', 'Port B', 3)), { names: ['Port A', 'Port A 2', 'Port B'] });
+  assert.deepEqual(many.out.playingTracksOn('plain', 3), ['same'], 'two outputs contain the port: still the strings as written');
+});
+
+test('playingTracksOn gives none while the music is stopped, in a superseded tab, with no valid setup file, for an unknown instrument and before any code played', () => {
+  const r = playingRig(trackCode(onPort('lead', 'Port A', 3)));
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), ['lead']);
+  r.state.playing = false;
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), [], 'stopped music');
+  r.state.playing = true;
+  r.out.setActive(false);
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), [], 'another tab has the music');
+  r.out.setActive(true);
+  assert.deepEqual(r.out.playingTracksOn('nobody', 3), []);
+  r.out.setRig({ setup: 'absent', instruments: [] });
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), []);
+  assert.deepEqual(listenRig().out.playingTracksOn('plain', 3), [], 'no code has played');
+});
+
+test('playingTracksOn never throws: code that does not parse and a channel that is no number give none', () => {
+  const r = playingRig('this is not ( code');
+  assert.deepEqual(r.out.playingTracksOn('plain', 3), []);
+  assert.deepEqual(r.out.playingTracksOn('plain', 'x'), []);
+  assert.deepEqual(r.out.playingTracksOn(undefined, undefined), []);
+  assert.deepEqual(r.errors, []);
+});
+
+test('a track name is cut at the name limit', () => {
+  const long = 'x'.repeat(300);
+  const r = playingRig(trackCode(onPort(long, 'Port A', 3)));
+  const [name] = r.out.playingTracksOn('plain', 3);
+  assert.equal(Array.from(name).length, 200);
+  assert.ok(name.startsWith('xxxx') && name.endsWith('…'), name);
 });

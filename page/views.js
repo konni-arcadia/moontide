@@ -6,14 +6,14 @@
 import { CHANGE_TIMINGS } from './change-timing.js';
 import { parseStoredSplit } from './split-model.js';
 
-/** View numbers are fixed forever: 1 History, 2 Timeline, 3 Mixer, 4 Parts, 5 Jam, 6 Instruments. */
-export const VIEW_KEYS = { '1': 'history', '2': 'timeline', '3': 'mixer', '4': 'parts', '5': 'jam', '6': 'instruments' };
+/** View numbers are fixed forever: 1 History, 2 Timeline, 3 Mixer, 4 Parts, 5 Jam, 6 Instruments, 7 Scratchpad. */
+export const VIEW_KEYS = { '1': 'history', '2': 'timeline', '3': 'mixer', '4': 'parts', '5': 'jam', '6': 'instruments', '7': 'scratchpad' };
 
 /** Views built so far. A key whose view is not in this list does nothing. */
-export const BUILT_VIEWS = ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments'];
+export const BUILT_VIEWS = ['history', 'timeline', 'mixer', 'parts', 'jam', 'instruments', 'scratchpad'];
 
 /** Display name for a built view, used by viewButtonParts(). */
-export const VIEW_TITLES = { history: 'History', timeline: 'Timeline', mixer: 'Mixer', parts: 'Parts', jam: 'Jam', instruments: 'Instruments' };
+export const VIEW_TITLES = { history: 'History', timeline: 'Timeline', mixer: 'Mixer', parts: 'Parts', jam: 'Jam', instruments: 'Instruments', scratchpad: 'Scratchpad' };
 
 /** a = bottom strip, b = side panel, c = full screen over faint code. */
 export const LAYOUTS = ['a', 'b', 'c'];
@@ -235,7 +235,7 @@ export function setSongLaunch(state, value) {
 }
 
 /**
- * The view buttons of the top bar as an ordered list, listing only the given built views in key order (1..6)
+ * The view buttons of the top bar as an ordered list, listing only the given built views in key order (1..7)
  * whatever order `builtViews` lists them in. Each part is { key, digit, name, label, title }: `key` is the digit the
  * button sends to applyKey, `name` the view title, `label` the accessible name `{digit} {Name}` (it contains the
  * visible text at every fit step) and `title` the tooltip `{Name} (key {digit})`. A view without a fixed key

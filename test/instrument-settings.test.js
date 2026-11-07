@@ -524,3 +524,21 @@ test('no instruments.json, no store and an unknown instrument are refused', (t) 
   sendSettings(known.session, known.page, GOOD, 'zz');
   assert.equal(known.page.sent.slice(known.mark)[0].reason, 'there is no instrument "zz" in instruments.json');
 });
+
+test('a settings edit keeps a hand-written inputs list as it was, in the same order', (t) => {
+  const context = setup(t, { ...BASE, inputs: [{ port: 'Keys B' }, { port: 'Keys A' }] });
+  const outcome = applyInstrumentSettings(context.store, 'sc55', { ...SC55, clock: true });
+  assert.equal(outcome.kind, 'saved', JSON.stringify(outcome));
+  const written = JSON.parse(fs.readFileSync(context.file, 'utf8'));
+  assert.deepEqual(written.inputs, [{ port: 'Keys B' }, { port: 'Keys A' }]);
+  assert.equal(written.instruments[1].clock, true, 'the edit itself was written');
+  const state = new RigStore({ dataDir: context.dir }).read();
+  assert.equal(state.setup, 'valid');
+  assert.deepEqual(state.inputs, ['Keys B', 'Keys A']);
+});
+
+test('a settings edit that is refused leaves a file with inputs byte for byte as it was', (t) => {
+  const context = setup(t, { ...BASE, inputs: [{ port: 'Keys' }] });
+  assertProblem(applyInstrumentSettings(context.store, 'sc55', { ...SC55, port: '' }), 'instruments[1].port', 'must not be empty');
+  untouched(context);
+});

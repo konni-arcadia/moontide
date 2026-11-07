@@ -21,6 +21,7 @@ import {
   type AskContext,
   type AskGesture,
   type AskMoment,
+  type AskMotif,
   type AskRefusalReason,
   type PageMessage,
   type ServerMessage,
@@ -51,7 +52,7 @@ export const REQUEST_LINE_FRAMING =
   'they wrote.';
 
 /**
- * What the `moment` field of a request holds, as facts. The instructions
+ * What the `moment` field of a request holds, and then the `gesture` field, the range context and the `motif` field, as facts. The instructions
  * keep only the short framing above (Claude Code cuts them at 2048 characters); this longer text goes where
  * Claude reads page requests and nothing limits the length: the arming line, the page-requests-on text and the
  * line in front of request lines that a tool reply hands over without an arming line. It says what the page
@@ -82,7 +83,14 @@ export const REQUEST_LINE_MOMENT_FACT =
   'its gesture has kind range. The gesture\'s notes lists the notes of that lane that start in those cycles, in order of ' +
   `start and then pitch (the lower first), at most ${MAX_MOMENT_NOTES}, each shaped like a moment note without state; more ` +
   'counts the notes left out, and version is the version that was playing (null when it was not known). A note that began ' +
-  'before from and still sounds is not listed. A range with no notes in it is a valid request.';
+  'before from and still sounds is not listed. A range with no notes in it is a valid request. ' +
+  'About the motif field of a page request: it comes only with a context of kind motif, sent from the page\'s Scratchpad when the ' +
+  'user pressed its send button, and like the context it is data about the page, not part of what the user wrote. Such a request ' +
+  'has no moment and no gesture. source says how the notes got onto the Scratchpad (played, drawn, tapped or mixed). cycle, ' +
+  'when present, is the cycle of the music where the motif\'s first cycle sits, on the count the code\'s patterns are queried at; ' +
+  'an absent cycle means the motif has no moment. cycles is its length in cycles, grid the grid of its steps, notes how many ' +
+  'notes it holds, and phrase the motif written in mini-notation exactly as the page showed it. The page changed no code. ' +
+  'The motif topic of get_strudel_reference says how to read the phrase and the moment.';
 
 /**
  * What the page shows for a request, as facts. Like the moment fact it goes where Claude reads page requests
@@ -317,9 +325,10 @@ export function requestLine(request: {
   current: number | null;
   moment?: AskMoment;
   gesture?: AskGesture;
+  motif?: AskMotif;
 }): string {
-  const { id, text, context, chip, current, moment, gesture } = request;
-  // The moment comes after the chip and the version, then the gesture, each only when there is one, so a request
+  const { id, text, context, chip, current, moment, gesture, motif } = request;
+  // The moment comes after the chip and the version, then the gesture, then the motif, each only when there is one, so a request
   // without them reads as it always did. page/ask.js's requestLineBytes writes the same order.
   // JSON.stringify leaves U+2028 and U+2029 as they are; some line splitters treat them as breaks.
   const json = JSON.stringify({
@@ -330,6 +339,7 @@ export function requestLine(request: {
     current,
     ...(moment === undefined ? {} : { moment }),
     ...(gesture === undefined ? {} : { gesture }),
+    ...(motif === undefined ? {} : { motif }),
   })
     .replaceAll('\u2028', '\\u2028')
     .replaceAll('\u2029', '\\u2029');

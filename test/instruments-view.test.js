@@ -179,6 +179,7 @@ function drumCard(id, drumMaps, overrides = {}) {
     modelChannels: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((channel) => ({ channel, role: channel === 10 ? 'rhythm' : 'melodic' })),
     usedChannels: [],
     inUse: { lead: null, lines: ['not used by the code'], muted: true },
+    synthSettings: null,
     drumKit: { lines: [{ text: 'not used by the code', title: null, muted: true }] },
     drumMaps,
     drumDeclared: 'declared',
@@ -531,6 +532,68 @@ test('the In use row of an off instrument starts with the muted silent line, the
     ['silent while switched off', 'instrument-inuse-line instrument-muted'],
     ['lead · ch 3', 'instrument-inuse-line'],
   ]);
+});
+
+// --- The Synth settings row ---
+
+const SYNTH_STAYS = 'A setting taken out of the code is not sent again: the instrument keeps its value until the instrument itself changes it, and a tone setting until the instrument loads the tone again. Moontide stores no setting.';
+const synthLines = (lines) => ({ lines });
+const labelsOf = (document, id) => byClass(cardOfId(document, id), 'instrument-label').map((node) => node.textContent);
+const synthValueOf = (document, id) => {
+  const rows = byClass(cardOfId(document, id), 'instrument-row');
+  const found = rows.find((wrapper) => wrapper.children[0].textContent === 'Synth settings');
+  return found === undefined ? null : found.children[1].children[0];
+};
+
+test('a card with no synth settings has no Synth settings row', () => {
+  const document = fakeDocument();
+  const view = createInstrumentsView({ document, onInstrumentSwitch: () => {}, onInstrumentSettings: () => {} });
+  view.render(cardsModel(drumCard('a', [STANDARD])));
+  assert.ok(!labelsOf(document, 'a').includes('Synth settings'));
+  assert.equal(synthValueOf(document, 'a'), null);
+});
+
+test('the Synth settings row comes right after In use and draws one line per model line, the standing rule muted', () => {
+  const document = fakeDocument();
+  const view = createInstrumentsView({ document, onInstrumentSwitch: () => {}, onInstrumentSettings: () => {} });
+  const lines = [
+    { text: 'tone, ch 1: filterCutoff 600', muted: false },
+    { text: 'scene: reverbLevel 80, reaches every part', muted: false },
+    { text: SYNTH_STAYS, muted: true },
+  ];
+  view.render(cardsModel(drumCard('a', [STANDARD], { synthSettings: synthLines(lines) })));
+  const labels = labelsOf(document, 'a');
+  assert.equal(labels[labels.indexOf('In use') + 1], 'Synth settings');
+  const value = synthValueOf(document, 'a');
+  assert.deepEqual(value.children.map((node) => [node.textContent, node.className]), [
+    ['tone, ch 1: filterCutoff 600', 'instrument-inuse-line'],
+    ['scene: reverbLevel 80, reaches every part', 'instrument-inuse-line'],
+    [SYNTH_STAYS, 'instrument-inuse-line instrument-muted'],
+  ]);
+});
+
+test('the Synth settings lines are redrawn in place when the playing code\'s settings change, and left alone when they do not', () => {
+  const document = fakeDocument();
+  const view = createInstrumentsView({ document, onInstrumentSwitch: () => {}, onInstrumentSettings: () => {} });
+  const staying = [{ text: SYNTH_STAYS, muted: true }];
+  view.render(cardsModel(drumCard('a', [STANDARD], { synthSettings: synthLines([{ text: 'none in the code', muted: true }, ...staying]) })));
+  const value = synthValueOf(document, 'a');
+  const card = cardOfId(document, 'a');
+  view.render(cardsModel(drumCard('a', [STANDARD], { synthSettings: synthLines([{ text: 'part, ch 2: pan 40', muted: false }, ...staying]) })));
+  assert.equal(cardOfId(document, 'a'), card, 'the card keeps its node');
+  assert.equal(synthValueOf(document, 'a'), value, 'and so does the value node');
+  assert.deepEqual(value.children.map((node) => node.textContent), ['part, ch 2: pan 40', SYNTH_STAYS]);
+  const before = value.children;
+  view.render(cardsModel(drumCard('a', [STANDARD], { synthSettings: synthLines([{ text: 'part, ch 2: pan 40', muted: false }, ...staying]), inUse: { lead: null, lines: ['lead · ch 2'], muted: false } })));
+  assert.equal(value.children, before, 'an unchanged row writes nothing');
+});
+
+test('a card that gains the row because its model now describes settings is replaced with the row', () => {
+  const document = fakeDocument();
+  const view = createInstrumentsView({ document, onInstrumentSwitch: () => {}, onInstrumentSettings: () => {} });
+  view.render(cardsModel(drumCard('a', [STANDARD])));
+  view.render(cardsModel(drumCard('a', [STANDARD], { synthSettings: synthLines([{ text: SYNTH_STAYS, muted: true }]) })));
+  assert.ok(labelsOf(document, 'a').includes('Synth settings'));
 });
 
 // --- The settings editor ---

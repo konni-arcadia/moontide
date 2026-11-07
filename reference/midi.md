@@ -76,6 +76,8 @@ A track's `.midi()` options are sent once when the code is evaluated, not at a s
 
 The Moontide page also reads `controls` when the user has described instruments in instruments.json: `.midi('port name', { midichannel: 3, controls: { volume: 100 } })` sets one static level per control of that instrument, in the control's own range, and the page sends it before the new code plays. Control ids and ranges come from get_midi_instruments; a control that leaves the code goes back to the instrument's default; a sweep stays `ccn` and `ccv`. With a change that waits for a bar or phrase line, the page sends the controls just before the line, timestamped at the line.
 
+The tone, part and scene options of `.midi()` set the synth settings of an instrument whose model describes them; the settings topic has their rules.
+
 ## What a MIDI track ignores
 
 A track with `.midi()` plays nothing in the browser, so browser sounds and effects on it (`s`, `lpf`, `room`, `delay`) do nothing.

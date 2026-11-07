@@ -53,6 +53,12 @@
 // a change that restates its target, a hand edit, a change that fails and a change that waits for its bar, that another tempo or no
 // tempo in the code cancels it, that a new ramp replaces it, that a ramp that cannot be made is refused whole, and that Stop and a
 // reload end it, and that Claude hears about a ramp that goes on, one that starts at a line and one that ended early; they run once after the Requests checks in a full run, or alone with `--only ramp`.
+// Scratchpad: the checks of scratchBlocks() prove in real Chrome that key 7 opens the Scratchpad, that its piano roll is drawn on the
+// cycle grid, that the keyboard writes a motif and the information line reads it, that the motif stays across a view switch and is
+// gone after a reload, and that editing sends no socket message and writes no browser storage, that the grid, the length and the pitch
+// window change from the toolbar, that the velocity lane sets each note's velocity, and that undo and redo step through the motif's own
+// edits without touching the code, the History or the code editor's own undo; they run once after the Tempo ramp checks in a full run,
+// or alone with `--only scratch`.
 // One check, many times: `--check <name> --times <n>` runs one named check n times alone after the clock check and prints one
 // tally line, `probe:page check <name>: P of N runs passed`; it is the way to prove that a flaky check is fixed. The names are
 // PAGE_CHECK_NAMES, and the flag cannot be combined with `--only`.
@@ -91,6 +97,7 @@ import { HAND_EDIT_NOTE, STOPPED_NOTE, UNKNOWN_ANSWERING_NOTE, glideLine } from 
 import { MAX_ASK_CONTEXT_LENGTH } from '../dist/protocol.js';
 import { sessionLabel } from '../dist/session-label.js';
 import { LOAD_FAILURE_COPY } from '../page/load-failure.js';
+import { GRIDS, SCRATCH_COPY, emptyMotif, fillScratch, lengthText, motifPhrase, noteParts, placeNote, rangeText, rangeSpoken, shownRows, spokenNote } from '../page/scratch-model.js';
 import { structureTemplateText } from '../dist/reference.js';
 
 const DIST_ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
@@ -152,7 +159,7 @@ export function shotsFolder(env = process.env) {
 }
 
 /** The groups of checks `--only` accepts, in the order a full run runs them. */
-export const PAGE_GROUPS = Object.freeze(['jam', 'bar', 'harmony', 'load-failure', 'identity', 'song', 'grid', 'mixer', 'timeline', 'requests', 'ramp']);
+export const PAGE_GROUPS = Object.freeze(['jam', 'bar', 'harmony', 'load-failure', 'identity', 'song', 'grid', 'mixer', 'timeline', 'requests', 'ramp', 'scratch']);
 
 /** Quoted names joined with commas and "and" before the last: `"a", "b" and "c"`. */
 function quotedList(names) {
@@ -165,7 +172,7 @@ function quotedList(names) {
  * declaration checks, "load-failure", the notice for a page whose scripts did not load, "identity", the tab
  * title and the Session card row that name the session, "song", the Strudel facts the song structure relies on, and
  * "grid", the Song grid in the Parts view, "mixer", the groups in the Mixer, "timeline", the notes you edit on the Timeline,
- * "requests", the Requests panel, and "ramp", the tempo ramp in the real page,
+ * "requests", the Requests panel, "ramp", the tempo ramp in the real page, and "scratch", the Scratchpad piano roll,
  * each about a minute instead of nine:
  * `npm run probe:page -- --only bar`), --check <name> (run one named check alone after the clock check) and
  * --times <n> (run it n times, a whole number from 1 to 200; the default is once):
@@ -1260,23 +1267,24 @@ function keyInfo(key) {
 }
 
 /** Dispatches a real keydown+keyup for `key` via Input.dispatchKeyEvent (with Shift held when `shift` is
- * true: modifiers 8 on both events, and Control held when `ctrl` is true: modifiers 2), exactly the fields a
+ * true: modifiers 8 on both events, Control held when `ctrl` is true: modifiers 2, and Alt held when `alt` is true:
+ * modifiers 1; with `plain` the key carries no text, as a shortcut such as Ctrl+Z does), exactly the fields a
  * real browser keyboard event carries (key, code, windowsVirtualKeyCode, and text for a
  * printable key) — the same event shape page/main.js's document keydown listener reads.
  *
  * There is no nativeVirtualKeyCode, on purpose: on macOS, Chrome sends a key event that carries one
  * and that the page does not consume (Escape with no view open) back to the page as a new keydown,
  * again and again. Thousands of keydowns a second starve the page's timers and every CDP call. */
-export async function pressKey(cdp, key, { shift = false, ctrl = false } = {}) {
+export async function pressKey(cdp, key, { shift = false, ctrl = false, alt = false, plain = false } = {}) {
   const info = keyInfo(key);
-  const modifiers = (shift ? 8 : 0) | (ctrl ? 2 : 0);
+  const modifiers = (shift ? 8 : 0) | (ctrl ? 2 : 0) | (alt ? 1 : 0);
   const base = {
     key,
     code: info.code,
     windowsVirtualKeyCode: info.windowsVirtualKeyCode,
     ...(modifiers === 0 ? {} : { modifiers }),
   };
-  await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...base, ...(info.text ? { text: info.text } : {}) });
+  await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...base, ...(info.text && !plain ? { text: info.text } : {}) });
   await cdp('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
 }
 
@@ -4291,7 +4299,7 @@ export async function tempoBlocks(context) {
 
 /**
  * The Views and Layout buttons against the live page (invariants
- * I5 for the nine buttons and I6, Tab order equals visual order). `context` is { cdp, client, report, port, pageUrl }, the
+ * I5 for the ten buttons and I6, Tab order equals visual order). `context` is { cdp, client, report, port, pageUrl }, the
  * same object barBlocks gets. It leaves the page as it found it: no view open, layout a, no focus, the viewport override
  * cleared.
  */
@@ -4313,7 +4321,7 @@ async function controlsBlocks(context) {
 
   await reset();
 
-  // The nine buttons: at least 24 x 24 CSS px at three widths, the right names, and the pressed state follows the view and the layout.
+  // The ten buttons: at least 24 x 24 CSS px at three widths, the right names, and the pressed state follows the view and the layout.
   {
     await pressKey(cdp, '4');
     await viewIs('parts');
@@ -4353,7 +4361,7 @@ async function controlsBlocks(context) {
     const problems = [];
     for (const [index, width] of [1024, 1366, 1920].entries()) {
       const m = measured[index];
-      if (m.buttons.length !== 9) problems.push(`${width}: ${m.buttons.length} buttons`);
+      if (m.buttons.length !== 10) problems.push(`${width}: ${m.buttons.length} buttons`);
       if (m.groups.join('|') !== 'Views|Layout' || m.groupRoles.join('|') !== 'group|group') problems.push(`${width}: groups ${m.groups} ${m.groupRoles}`);
       m.buttons.forEach((b, i) => {
         const part = parts[i];
@@ -4390,7 +4398,7 @@ async function controlsBlocks(context) {
     // After a mouse click the button gave up focus, so the keys work at once.
     const bodyFocused = await evaluateExpr(cdp, 'document.activeElement === document.body');
     const keyResults = {};
-    for (const key of ['1', '2', '3', '4', '5', '6']) {
+    for (const key of ['1', '2', '3', '4', '5', '6', '7']) {
       await pressKey(cdp, key);
       const wanted = VIEW_KEYS[key];
       keyResults[key] = (await viewIs(wanted)) === true && JSON.stringify(await pressedViews()) === JSON.stringify([key]);
@@ -4854,7 +4862,7 @@ async function fitBlocks(context) {
           clientWidth: bar.clientWidth,
           spacer: document.getElementById('bar-spacer').getBoundingClientRect().width,
           root: parseFloat(getComputedStyle(document.documentElement).fontSize),
-          buttonsInside: buttons.length === 9 && buttons.every((b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.right <= bar.getBoundingClientRect().right + 0.5; }),
+          buttonsInside: buttons.length === 10 && buttons.every((b) => { const r = b.getBoundingClientRect(); return r.width > 0 && r.right <= bar.getBoundingClientRect().right + 0.5; }),
         };
       })()`,
     );
@@ -5090,6 +5098,10 @@ async function fitBlocks(context) {
       JSON.stringify(idle),
     );
 
+    // A window wide enough for the first step with the longest strings: the steps are forced one by one, so the first one
+    // must fit the window or its chip would stand outside the bar for the width alone.
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1920, height: 768, deviceScaleFactor: 1, mobile: false });
+    await sleep(300);
     const saved = await setWorstCase(cdp);
     let m;
     try {
@@ -5115,6 +5127,7 @@ async function fitBlocks(context) {
       );
     } finally {
       await restoreWorstCase(cdp, saved);
+      await cdp('Emulation.clearDeviceMetricsOverride');
     }
     await waitFor(cdp, `(() => { const bar = document.getElementById('top-bar'); return bar.scrollWidth <= bar.clientWidth ? true : null; })()`, 3000);
     const kept = (s) => s.wordDisplay !== 'none' && s.countDisplay !== 'none' && s.wordWidth > 0 && s.countWidth > 0 && s.inside;
@@ -18524,6 +18537,2142 @@ export async function rampBlocks(context) {
   await rampViewsCheck(context);
 }
 
+/** The Scratchpad against the real page: key 7 opens it, the roll is drawn on the cycle grid, the keyboard writes a motif and the
+ * information line reads it, the motif stays across a view switch and is gone after a reload, and editing sends and stores nothing.
+ * Runs alone with `--only scratch`. */
+export async function scratchBlocks(context) {
+  const { cdp, client, report } = context;
+  const askBoxOpen = () => evaluateExpr(cdp, "!document.getElementById('ask-box').hidden");
+  const closeAsk = async () => {
+    if (await askBoxOpen()) await pressKey(cdp, 'Escape');
+    await waitFor(cdp, "document.getElementById('ask-box').hidden ? true : null", 2000);
+  };
+  const blurActive = () => evaluateExpr(cdp, `(() => { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); })()`);
+  // Leaves the page with no view open and no focus in a field, so the next key press is a view key.
+  const clearViews = async () => {
+    await closeAsk();
+    await blurActive();
+    if ((await evaluateExpr(cdp, "document.getElementById('workspace').dataset.view")) !== 'none') await pressKey(cdp, 'Escape');
+    await blurActive();
+  };
+  // Switches the layout with its key and waits for the page to follow; the last block of the group puts layout a back.
+  const setLayoutKey = async (letter) => {
+    await blurActive();
+    await pressKey(cdp, letter);
+    await waitFor(cdp, `document.getElementById('workspace').dataset.layout === ${JSON.stringify(letter)} ? true : null`, 3000);
+  };
+  const scratchHidden = () => evaluateExpr(cdp, "document.getElementById('scratch-view').hidden");
+  // Opens the Scratchpad with key 7 unless it is already open (a stored view comes back open after a reload).
+  const openScratch = async () => {
+    if (await scratchHidden()) await pressKey(cdp, '7');
+    return waitFor(cdp, "document.getElementById('scratch-view').hidden ? null : true", 3000);
+  };
+  const focusRoll = () => evaluateExpr(cdp, "document.getElementById('scratch-roll').focus()");
+  const readNotes = () =>
+    evaluateExpr(
+      cdp,
+      `[...document.querySelectorAll('#scratch-notes .sp-note')].map((el) => ({
+        id: Number(el.dataset.id), pitch: Number(el.dataset.pitch), start: Number(el.dataset.start),
+        length: Number(el.dataset.length), velocity: Number(el.dataset.velocity), label: el.getAttribute('aria-label'),
+      }))`,
+    );
+  const readLine = () =>
+    evaluateExpr(
+      cdp,
+      `({
+        kind: document.getElementById('scratch-note-line').dataset.kind,
+        name: document.getElementById('scratch-note-name').textContent,
+        rest: document.getElementById('scratch-note-rest').textContent,
+        spoken: document.getElementById('scratch-note-spoken').textContent,
+      })`,
+    );
+  const readRoll = () =>
+    evaluateExpr(
+      cdp,
+      `({
+        cycles: document.getElementById('scratch-view').dataset.cycles,
+        grid: document.getElementById('scratch-view').dataset.grid,
+        windowStart: document.getElementById('scratch-view').dataset.windowStart,
+        rows: document.getElementById('scratch-view').dataset.rows,
+        rowLow: document.getElementById('scratch-view').dataset.rowLow,
+        rowHigh: document.getElementById('scratch-view').dataset.rowHigh,
+        notes: document.getElementById('scratch-view').dataset.notes,
+        cursorUnit: document.getElementById('scratch-roll').dataset.cursorUnit,
+        cursorPitch: document.getElementById('scratch-roll').dataset.cursorPitch,
+      })`,
+    );
+
+  // Moves the cursor to a pitch with the arrow keys, an octave at a time while it is far away.
+  const cursorTo = async (pitch) => {
+    for (let guard = 0; guard < 140; guard += 1) {
+      const at = Number((await readRoll()).cursorPitch);
+      if (at === pitch) return;
+      await pressKey(cdp, pitch > at ? 'ArrowUp' : 'ArrowDown', { alt: Math.abs(pitch - at) >= 12 });
+    }
+  };
+
+  // The music is stopped, so the page has nothing of its own to send while the quiet check counts.
+  if ((await readStateWord(cdp)) === SOUND_LABELS.playing) await stopMusic(cdp);
+  await clearViews();
+
+  // --- Key 7 opens the Scratchpad and the roll is drawn on the cycle grid ---
+  {
+    await pressKey(cdp, '7');
+    const opened = await waitFor(cdp, "document.getElementById('scratch-view').hidden ? null : true", 3000);
+    const layout = await evaluateExpr(
+      cdp,
+      `(() => {
+        const button = document.querySelector('#view-buttons button[data-key="7"]');
+        const grid = document.getElementById('scratch-grid');
+        const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+        return {
+          pressed: button.getAttribute('aria-pressed'),
+          label: button.getAttribute('aria-label'),
+          title: button.title,
+          view: document.getElementById('workspace').dataset.view,
+          keys: [...document.querySelectorAll('#scratch-gutter .sp-key')].map((cell) => cell.textContent),
+          ruler: [...document.querySelectorAll('#scratch-ruler .sp-beat')].map((label) => label.textContent),
+          firstBeats: [...document.querySelectorAll('#scratch-ruler .sp-beat-first')].map((label) => label.textContent),
+          gridBeats: Math.round(grid.getBoundingClientRect().width / rootPx / 4),
+          gridLines: (getComputedStyle(grid).backgroundImage.match(/repeating-linear-gradient/g) || []).length,
+          earlyText: document.getElementById('scratch-early').textContent,
+          earlyTitle: document.getElementById('scratch-early').title,
+          earlyShown: document.getElementById('scratch-early').getClientRects().length > 0 && document.getElementById('scratch-early').getBoundingClientRect().width > 0,
+          earlyInside: (() => {
+            const early = document.getElementById('scratch-early').getBoundingClientRect();
+            const bar = document.getElementById('scratch-controls').getBoundingClientRect();
+            return early.left >= bar.left - 1 && early.right <= bar.right + 1 && early.top >= bar.top - 1 && early.bottom <= bar.bottom + 1;
+          })(),
+        };
+      })()`,
+    );
+    const roll = await readRoll();
+    const line = await readLine();
+    const expectedKeys = Array.from({ length: 24 }, (_, row) => (row === 11 ? 'C4' : row === 23 ? 'C3' : ''));
+    const expectedRuler = Array.from({ length: 8 }, (_, beat) => `${Math.floor(beat / 4) + 1}.${(beat % 4) + 1}`);
+    await pressKey(cdp, '7');
+    const closed = await evaluateExpr(cdp, `({ hidden: document.getElementById('scratch-view').hidden, view: document.getElementById('workspace').dataset.view })`);
+    report(
+      'scratchpad: key 7 opens the view with its button pressed, the roll shows C3 to B4 on 2 cycles of sixteenths, key 7 again closes it, and its toolbar shows the Early experimental label with its sentence',
+      opened === true &&
+        layout.view === 'scratchpad' &&
+        layout.pressed === 'true' &&
+        layout.label === '7 Scratchpad' &&
+        layout.title === 'Scratchpad (key 7)' &&
+        JSON.stringify(layout.keys) === JSON.stringify(expectedKeys) &&
+        JSON.stringify(layout.ruler) === JSON.stringify(expectedRuler) &&
+        JSON.stringify(layout.firstBeats) === JSON.stringify(['1.1', '2.1']) &&
+        layout.gridBeats >= 8 &&
+        layout.gridLines === 3 &&
+        layout.earlyText === SCRATCH_COPY.early &&
+        layout.earlyTitle === SCRATCH_COPY.earlyTitle &&
+        layout.earlyShown === true &&
+        layout.earlyInside === true &&
+        roll.cycles === '2' &&
+        roll.grid === 'sixteenth' &&
+        roll.windowStart === '48' &&
+        roll.notes === '0' &&
+        line.name === SCRATCH_COPY.emptyHeading &&
+        closed.hidden === true &&
+        closed.view === 'none',
+      JSON.stringify({ opened, layout, roll, line, closed }),
+    );
+  }
+
+  // --- Enter places a note at the cursor and Enter again removes it; the line reads each ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    await pressKey(cdp, 'Enter');
+    const placed = await readNotes();
+    const placedLine = await readLine();
+    const cursorShown = await evaluateExpr(cdp, "!document.getElementById('scratch-cursor').hidden");
+    await pressKey(cdp, 'Enter');
+    const removed = await readNotes();
+    const removedLine = await readLine();
+    const expectedNote = { id: 1, pitch: 60, start: 0, length: 3, velocity: 80 };
+    report(
+      'scratchpad: Enter places C4 at cycle 1, beat 1 and the line says so; Enter again removes it and the line says that',
+      placed.length === 1 &&
+        JSON.stringify({ ...placed[0], label: undefined }) === JSON.stringify(expectedNote) &&
+        placed[0].label === spokenNote(expectedNote, 'sixteenth') &&
+        placedLine.kind === 'notice' &&
+        placedLine.spoken === fillScratch(SCRATCH_COPY.placed, { name: 'C4', cycle: 1, beat: '1' }) &&
+        cursorShown === true &&
+        removed.length === 0 &&
+        removedLine.spoken === fillScratch(SCRATCH_COPY.erased, { name: 'C4', cycle: 1, beat: '1' }),
+      JSON.stringify({ placed, placedLine, cursorShown, removed, removedLine }),
+    );
+  }
+
+  // --- The motif stays when another view opens and the Scratchpad comes back, and is gone after a reload ---
+  {
+    await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'Enter');
+    const before = await readNotes();
+    await pressKey(cdp, '5');
+    const away = await waitFor(cdp, "document.getElementById('scratch-view').hidden && !document.getElementById('jam-view').hidden ? true : null", 3000);
+    await pressKey(cdp, '7');
+    const back = await waitFor(cdp, "document.getElementById('scratch-view').hidden ? null : true", 3000);
+    const after = await readNotes();
+    await reloadPage(cdp);
+    await clearViews();
+    await openScratch();
+    const reloaded = await readNotes();
+    const reloadedRoll = await readRoll();
+    report(
+      'scratchpad: a placed note stays when Jam opens and the Scratchpad comes back, and is gone after a reload',
+      before.length === 1 &&
+        before[0].start === 3 &&
+        away === true &&
+        back === true &&
+        JSON.stringify(after) === JSON.stringify(before) &&
+        reloaded.length === 0 &&
+        reloadedRoll.notes === '0',
+      JSON.stringify({ before, away, back, after, reloaded, reloadedRoll }),
+    );
+  }
+
+  // --- Editing sends no socket message and writes no browser storage, and the code and History stay as they were ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    const codeBefore = await callTool(client, 'get_code', {});
+    const historyBefore = await callTool(client, 'list_history', {});
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        window.__scratchSpy = { sends: 0, sets: 0, send: WebSocket.prototype.send, setItem: Storage.prototype.setItem };
+        WebSocket.prototype.send = function (...args) { window.__scratchSpy.sends += 1; return window.__scratchSpy.send.apply(this, args); };
+        Storage.prototype.setItem = function (...args) { window.__scratchSpy.sets += 1; return window.__scratchSpy.setItem.apply(this, args); };
+      })()`,
+    );
+    let counts;
+    try {
+      for (const key of ['Enter', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'Enter']) await pressKey(cdp, key);
+      counts = await evaluateExpr(cdp, `({ sends: window.__scratchSpy.sends, sets: window.__scratchSpy.sets })`);
+    } finally {
+      await evaluateExpr(
+        cdp,
+        `(() => {
+          const spy = window.__scratchSpy;
+          WebSocket.prototype.send = spy.send;
+          Storage.prototype.setItem = spy.setItem;
+          delete window.__scratchSpy;
+        })()`,
+      );
+    }
+    const codeAfter = await callTool(client, 'get_code', {});
+    const historyAfter = await callTool(client, 'list_history', {});
+    const notes = await readNotes();
+    report(
+      'scratchpad: editing sends no socket message and writes no browser storage, and the code and History do not change',
+      counts.sends === 0 && counts.sets === 0 && codeAfter === codeBefore && historyAfter === historyBefore && notes.length === 0,
+      JSON.stringify({ counts, sameCode: codeAfter === codeBefore, sameHistory: historyAfter === historyBefore, notes }),
+    );
+  }
+
+  // --- Send to Claude: a drawn motif goes out as one page request with the phrase the strip shows, and the code and History stay as they were ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    for (const key of ['Enter', 'ArrowRight', 'ArrowUp', 'Enter']) await pressKey(cdp, key);
+    const sentNotes = await readNotes();
+    const phraseShown = await evaluateExpr(cdp, "document.getElementById('scratch-phrase').textContent");
+    // Anything waiting from earlier is handed over now, so the reply after the press holds only this request.
+    await callTool(client, 'get_code', {});
+    const codeBefore = await callTool(client, 'get_code', {});
+    const historyBefore = await callTool(client, 'list_history', {});
+    await clickElement(cdp, '#scratch-send-button');
+    // The request waits for Claude (no monitor runs here): the strip says so after the sent line, and Send is free again at once.
+    const status = await waitFor(cdp, "document.getElementById('scratch-send-status').textContent.includes('It waits') ? document.getElementById('scratch-send-status').textContent : null", 3000);
+    const freeWhileWaiting = await evaluateExpr(cdp, "document.getElementById('scratch-send-button').getAttribute('aria-disabled') === 'false'");
+    const row = await waitFor(cdp, `[...document.querySelectorAll('#requests-panel .rq-item')].some((li) => li.querySelector('.rq-text').getAttribute('title') === 'Add this motif to the music.') ? true : null`, 3000);
+    // Any tool reply hands the waiting request over; the history reply carries it, and the code is read once it is gone.
+    const handed = await callTool(client, 'list_history', {});
+    const lines = handed
+      .split('\n')
+      .filter((line) => line.startsWith(PAGE_REQUEST_LINE))
+      .map((line) => JSON.parse(line.slice(PAGE_REQUEST_LINE.length)))
+      .filter((request) => request.context.kind === 'motif');
+    const codeAfter = await callTool(client, 'get_code', {});
+    const historyAfter = await callTool(client, 'list_history', {});
+    await foldRequestsPanel(cdp);
+    const request = lines[0];
+    report(
+      'scratchpad: Send to Claude sends the drawn motif as one page request whose phrase is the one shown, with no moment while the music is stopped, says it waits for Claude with Send free again, and the code and History do not change',
+      lines.length === 1 &&
+        sentNotes.length === 2 &&
+        request.text === 'Add this motif to the music.' &&
+        request.motif.source === 'drawn' &&
+        !Object.hasOwn(request.motif, 'cycle') &&
+        request.motif.cycles === 2 &&
+        request.motif.grid === 'sixteenth' &&
+        request.motif.notes === 2 &&
+        request.motif.phrase === phraseShown &&
+        phraseShown.startsWith('note("[c4 c#4 ') &&
+        row === true &&
+        status === "Sent to Claude with no moment. The Requests panel shows what becomes of it. It waits until Claude's next Moontide call; Send can send another motif meanwhile." &&
+        freeWhileWaiting === true &&
+        codeAfter === codeBefore &&
+        historyAfter === historyBefore,
+      JSON.stringify({ lines, phraseShown, status, freeWhileWaiting, row, sameCode: codeAfter === codeBefore, sameHistory: historyAfter === historyBefore, sentNotes }),
+    );
+    await focusRoll();
+    for (const key of ['Delete', 'ArrowLeft', 'ArrowDown', 'Delete']) await pressKey(cdp, key);
+  }
+
+  // --- Listen: the hear strip sits between the keyboard strip and the send strip; with no instrument to play on it says why, and a press does nothing ---
+  {
+    await clearViews();
+    await openScratch();
+    const hear = await evaluateExpr(
+      cdp,
+      `(() => {
+        const get = (id) => document.getElementById(id);
+        const follows = (a, b) => (get(a).compareDocumentPosition(get(b)) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+        const rect = get('scratch-play').getBoundingClientRect();
+        return {
+          order: follows('scratch-listen', 'scratch-play') && follows('scratch-play', 'scratch-send'),
+          tabOrder: ['scratch-play-output', 'scratch-play-music', 'scratch-play-now', 'scratch-play-loop', 'scratch-play-listen', 'scratch-play-stop'].every((id, index, ids) => index === 0 || follows(ids[index - 1], id)),
+          note: get('scratch-play-note').textContent,
+          live: get('scratch-play-note').getAttribute('aria-live'),
+          listen: get('scratch-play-listen').getAttribute('aria-disabled'),
+          stop: get('scratch-play-stop').getAttribute('aria-disabled'),
+          plain: ['scratch-play-music', 'scratch-play-now', 'scratch-play-loop', 'scratch-play-listen', 'scratch-play-stop'].every((id) => !get(id).hasAttribute('disabled') && get(id).tagName === 'BUTTON'),
+          options: get('scratch-play-output').options.length,
+          shown: rect.width > 0 && rect.height > 0,
+          hear: get('scratch-view').dataset.hear,
+        };
+      })()`,
+    );
+    await clickElement(cdp, '#scratch-play-listen');
+    const afterPress = await evaluateExpr(cdp, "({ hear: document.getElementById('scratch-view').dataset.hear, note: document.getElementById('scratch-play-note').textContent })");
+    report(
+      'scratchpad: the hear strip sits between the keyboard strip and the send strip; with no instrument it says why, Listen and Stop carry aria-disabled and a press changes nothing',
+      hear.order === true &&
+        hear.tabOrder === true &&
+        hear.plain === true &&
+        hear.shown === true &&
+        hear.live === 'polite' &&
+        hear.note.startsWith('No instrument to listen on: ') &&
+        hear.listen === 'true' &&
+        hear.stop === 'true' &&
+        hear.options === 1 &&
+        hear.hear === 'idle' &&
+        afterPress.hear === 'idle' &&
+        afterPress.note === hear.note,
+      JSON.stringify({ hear, afterPress }),
+    );
+  }
+
+  // --- Send to Claude: an empty motif is refused in the strip and sends no socket message; Enter in the words field sends like the button ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    const emptyNotes = await readNotes();
+    await evaluateExpr(
+      cdp,
+      `(() => {
+        window.__scratchSpy = { sends: 0, send: WebSocket.prototype.send };
+        WebSocket.prototype.send = function (...args) { window.__scratchSpy.sends += 1; return window.__scratchSpy.send.apply(this, args); };
+      })()`,
+    );
+    let emptySends;
+    let emptyButton;
+    try {
+      await clickElement(cdp, '#scratch-send-button');
+      emptyButton = await evaluateExpr(cdp, `({ disabled: document.getElementById('scratch-send-button').getAttribute('aria-disabled'), title: document.getElementById('scratch-send-button').title, plain: !document.getElementById('scratch-send-button').hasAttribute('disabled') })`);
+      emptySends = await evaluateExpr(cdp, 'window.__scratchSpy.sends');
+    } finally {
+      await evaluateExpr(cdp, '(() => { WebSocket.prototype.send = window.__scratchSpy.send; delete window.__scratchSpy; })()');
+    }
+    const emptyStatus = await evaluateExpr(cdp, "document.getElementById('scratch-send-status').textContent");
+    report(
+      'scratchpad: a press on Send to Claude with no notes says so in the strip and sends no socket message',
+      emptyNotes.length === 0 &&
+        emptySends === 0 &&
+        emptyStatus === 'Nothing to send: the motif has no notes.' &&
+        emptyButton.disabled === 'true' &&
+        emptyButton.title === 'Nothing to send: the motif has no notes.' &&
+        emptyButton.plain === true,
+      JSON.stringify({ emptyNotes, emptySends, emptyStatus, emptyButton }),
+    );
+
+    // A second motif with one note: the words are typed, view keys typed in the field do nothing, and Enter in the field sends.
+    await callTool(client, 'get_code', {});
+    await focusRoll();
+    await pressKey(cdp, 'Enter');
+    await evaluateExpr(cdp, "(() => { const field = document.getElementById('scratch-words'); field.focus(); field.select(); })()");
+    await cdp('Input.insertText', { text: 'Put it on top of the pad ' });
+    await pressKey(cdp, '7');
+    await pressKey(cdp, 't');
+    const typed = await evaluateExpr(
+      cdp,
+      `({ words: document.getElementById('scratch-words').value, view: document.getElementById('workspace').dataset.view, tap: document.getElementById('scratch-view').dataset.tap, notes: document.getElementById('scratch-view').dataset.notes, active: document.activeElement.id })`,
+    );
+    // The first request has reached the server (the tool reply above handed it over), so the button is free again.
+    await waitFor(cdp, "document.getElementById('scratch-send-button').getAttribute('aria-disabled') === 'false' ? true : null", 3000);
+    await pressKey(cdp, 'Enter');
+    const enterStatus = await waitFor(cdp, "document.getElementById('scratch-send-status').textContent.startsWith('Sent to Claude') ? document.getElementById('scratch-send-status').textContent : null", 3000);
+    const handed = await callTool(client, 'list_history', {});
+    const lines = handed
+      .split('\n')
+      .filter((line) => line.startsWith(PAGE_REQUEST_LINE))
+      .map((line) => JSON.parse(line.slice(PAGE_REQUEST_LINE.length)))
+      .filter((request) => request.context.kind === 'motif');
+    await foldRequestsPanel(cdp);
+    report(
+      'scratchpad: Enter in the words field sends the motif with the words typed, and view keys typed in the field change nothing',
+      typed.words === 'Put it on top of the pad 7t' &&
+        typed.view === 'scratchpad' &&
+        typed.tap === 'off' &&
+        typed.notes === '1' &&
+        typed.active === 'scratch-words' &&
+        lines.length === 1 &&
+        lines[0].text === 'Put it on top of the pad 7t' &&
+        lines[0].motif.notes === 1 &&
+        lines[0].motif.source === 'drawn' &&
+        enterStatus.startsWith('Sent to Claude with no moment. The Requests panel shows what becomes of it.'),
+      JSON.stringify({ typed, enterStatus, lines }),
+    );
+    // The strip goes back to the default sentence for the checks that follow, and the roll is emptied.
+    await evaluateExpr(cdp, "(() => { const field = document.getElementById('scratch-words'); field.focus(); field.select(); })()");
+    await cdp('Input.insertText', { text: 'Add this motif to the music.' });
+    await focusRoll();
+    await pressKey(cdp, 'Delete');
+  }
+
+  // --- The keyboard lengthens the note under the cursor, selects it with s, moves it by a beat and an octave with Alt and erases it, and each key is read back from the line ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    const start = await readRoll();
+    const readSelectedCount = () => evaluateExpr(cdp, "document.getElementById('scratch-view').dataset.selectedCount");
+    const key = async (name, options = {}) => {
+      await pressKey(cdp, name, options);
+      return { notes: await readNotes(), line: await readLine(), roll: await readRoll(), selected: await readSelectedCount() };
+    };
+    const placed = await key('Enter');
+    const lengthened = await key('ArrowRight', { shift: true });
+    const selected = await key('s');
+    const moved = await key('ArrowRight', { alt: true });
+    const raised = await key('ArrowUp', { alt: true });
+    const erased = await key('Delete');
+    // The window followed the note up an octave; it comes back for the checks that follow.
+    await pressKey(cdp, 'PageDown');
+    const where = { cycle: 1, beat: '2' };
+    const expectedLast = { id: raised.notes[0]?.id, pitch: 72, start: 12, length: 6, velocity: 80 };
+    report(
+      'scratchpad: Shift+Right lengthens the note, s selects it, Alt+Right moves it one beat, Alt+Up moves it one octave and Delete erases it, and the line follows each key',
+      start.cursorPitch === '60' &&
+        placed.notes.length === 1 &&
+        placed.selected === '0' &&
+        lengthened.notes[0].length === 6 &&
+        lengthened.line.spoken === fillScratch(SCRATCH_COPY.lasts, { name: 'C4', length: lengthText(6, 'sixteenth') }) &&
+        selected.selected === '1' &&
+        moved.notes[0].start === 12 &&
+        moved.roll.cursorUnit === '12' &&
+        moved.line.spoken === fillScratch(SCRATCH_COPY.moved, { name: 'C4', ...where }) &&
+        raised.notes[0].pitch === 72 &&
+        raised.roll.cursorPitch === '72' &&
+        raised.line.spoken === fillScratch(SCRATCH_COPY.movedPitch, { from: 'C4', name: 'C5', ...where }) &&
+        raised.notes[0].label === spokenNote(expectedLast, 'sixteenth') &&
+        erased.notes.length === 0 &&
+        erased.line.spoken === fillScratch(SCRATCH_COPY.erased, { name: 'C5', ...where }),
+      JSON.stringify({ start, placed, lengthened, selected, moved, raised, erased }),
+    );
+  }
+
+  // --- Ctrl+A selects every note, a held arrow key moves them all and is one undo step, and Delete erases the selection in one step ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    for (let note = 0; note < 3; note += 1) {
+      await pressKey(cdp, 'Enter');
+      if (note < 2) for (let step = 0; step < 4; step += 1) await pressKey(cdp, 'ArrowRight');
+    }
+    const starts = async () => (await readNotes()).map((note) => note.start);
+    const placedStarts = await starts();
+    await pressKey(cdp, 'a', { ctrl: true, plain: true });
+    const allSelected = await evaluateExpr(cdp, "document.getElementById('scratch-view').dataset.selectedCount");
+    // One press and two auto-repeats of the same key, the way a held key arrives.
+    const arrow = { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 };
+    await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...arrow });
+    await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...arrow, autoRepeat: true });
+    await cdp('Input.dispatchKeyEvent', { type: 'keyDown', ...arrow, autoRepeat: true });
+    await cdp('Input.dispatchKeyEvent', { type: 'keyUp', ...arrow });
+    const movedStarts = await starts();
+    const movedLine = await readLine();
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const undoneStarts = await starts();
+    const undoneLine = await readLine();
+    await pressKey(cdp, 'a', { ctrl: true, plain: true });
+    await pressKey(cdp, 'Delete');
+    const afterDelete = await readNotes();
+    const deleteLine = await readLine();
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const backCount = (await readNotes()).length;
+    await pressKey(cdp, 'a', { ctrl: true, plain: true });
+    await pressKey(cdp, 'Delete');
+    report(
+      'scratchpad: Ctrl+A selects every note, a held arrow key moves them all and Undo takes the whole run back in one step, and Delete erases the selection in one step',
+      JSON.stringify(placedStarts) === JSON.stringify([0, 12, 24]) &&
+        allSelected === '3' &&
+        JSON.stringify(movedStarts) === JSON.stringify([9, 21, 33]) &&
+        movedLine.spoken === fillScratch(SCRATCH_COPY.movedMany, { who: SCRATCH_COPY.theMotif, how: '3 sixteenths later' }) &&
+        JSON.stringify(undoneStarts) === JSON.stringify(placedStarts) &&
+        undoneLine.spoken === fillScratch(SCRATCH_COPY.undid, { what: 'moved 3 notes' }) &&
+        afterDelete.length === 0 &&
+        deleteLine.spoken === fillScratch(SCRATCH_COPY.erasedMany, { notes: '3 notes' }) &&
+        backCount === 3,
+      JSON.stringify({ placedStarts, allSelected, movedStarts, movedLine, undoneStarts, undoneLine, afterDelete, deleteLine, backCount }),
+    );
+    await clearViews();
+  }
+
+  // --- Align puts the first note on a beat and Clear empties the roll: each is one undo step, and the code and the History stay as they were ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    const codeBefore = await callTool(client, 'get_code', {});
+    const historyBefore = await callTool(client, 'list_history', {});
+    await pressKey(cdp, 'Home');
+    // Three notes off the beat, at units 3, 15 and 36, placed with Enter and the arrows.
+    await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'Enter');
+    for (let step = 0; step < 4; step += 1) await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'Enter');
+    for (let step = 0; step < 7; step += 1) await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'Enter');
+    const pressButton = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+    const starts = async () => (await readNotes()).map((note) => note.start);
+    const placedStarts = await starts();
+    await pressButton('scratch-align');
+    const alignedStarts = await starts();
+    const alignedLine = await readLine();
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const undoneStarts = await starts();
+    await pressButton('scratch-clear');
+    const clearedCount = (await readNotes()).length;
+    const clearedLine = await readLine();
+    const clearDisabled = await evaluateExpr(cdp, "document.getElementById('scratch-clear').getAttribute('aria-disabled')");
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const backStarts = await starts();
+    await pressKey(cdp, 'a', { ctrl: true, plain: true });
+    await pressKey(cdp, 'Delete');
+    const codeAfter = await callTool(client, 'get_code', {});
+    const historyAfter = await callTool(client, 'list_history', {});
+    report(
+      'scratchpad: Align puts the first note on the beat and keeps the spacing, Clear empties the roll, each is one Undo step, and the code and the History do not change',
+      JSON.stringify(placedStarts) === JSON.stringify([3, 15, 36]) &&
+        JSON.stringify(alignedStarts) === JSON.stringify([0, 12, 33]) &&
+        alignedLine.spoken === fillScratch(SCRATCH_COPY.aligned, { distance: 'one sixteenth', direction: SCRATCH_COPY.movedEarlier, cycle: 1, beat: '1' }) &&
+        JSON.stringify(undoneStarts) === JSON.stringify(placedStarts) &&
+        clearedCount === 0 &&
+        clearedLine.spoken === fillScratch(SCRATCH_COPY.clearedMany, { count: 3 }) &&
+        clearDisabled === 'true' &&
+        JSON.stringify(backStarts) === JSON.stringify(placedStarts) &&
+        codeAfter === codeBefore &&
+        historyAfter === historyBefore,
+      JSON.stringify({ placedStarts, alignedStarts, alignedLine, undoneStarts, clearedCount, clearedLine, clearDisabled, backStarts, sameCode: codeAfter === codeBefore, sameHistory: historyAfter === historyBefore }),
+    );
+    await clearViews();
+  }
+
+  // --- Up past the base brings in the next octave of rows; PageUp and PageDown move the base window and the cursor with it ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    // The base window and the cursor keep where earlier checks left them: bring both to C3 and C4 first.
+    for (let guard = 0; guard < 12 && (await readRoll()).windowStart !== '48'; guard += 1) await pressKey(cdp, Number((await readRoll()).windowStart) < 48 ? 'PageUp' : 'PageDown');
+    for (let guard = 0; guard < 40 && (await readRoll()).cursorPitch !== '60'; guard += 1) await pressKey(cdp, Number((await readRoll()).cursorPitch) < 60 ? 'ArrowUp' : 'ArrowDown');
+    const before = await readRoll();
+    const climb = 71 - Number(before.cursorPitch);
+    for (let step = 0; step < climb; step += 1) await pressKey(cdp, 'ArrowUp');
+    const top = await readRoll();
+    await pressKey(cdp, 'ArrowUp');
+    const over = await readRoll();
+    const names = await evaluateExpr(cdp, `[...document.querySelectorAll('#scratch-gutter .sp-key')].map((cell) => cell.textContent).filter((text) => text !== '')`);
+    await pressKey(cdp, 'PageDown');
+    const down = await readRoll();
+    await pressKey(cdp, 'PageUp');
+    const up = await readRoll();
+    report(
+      'scratchpad: Up past the base brings in the next octave of rows, and PageUp and PageDown move the base window by one octave with the cursor',
+      before.windowStart === '48' &&
+        before.rows === '24' &&
+        top.cursorPitch === '71' &&
+        top.windowStart === '48' &&
+        top.rowHigh === '83' &&
+        over.windowStart === '48' &&
+        over.cursorPitch === '72' &&
+        over.rows === '36' &&
+        JSON.stringify(names) === JSON.stringify(['C5', 'C4', 'C3']) &&
+        down.windowStart === '36' &&
+        down.cursorPitch === '60' &&
+        down.rowLow === '36' &&
+        down.rowHigh === '71' &&
+        up.windowStart === '48' &&
+        up.cursorPitch === '72' &&
+        up.rowHigh === '83',
+      JSON.stringify({ before, top, over, names, down, up }),
+    );
+    await clearViews();
+  }
+
+  // --- Closing the view while the roll has focus puts focus on the 7 Scratchpad button ---
+  {
+    await clearViews();
+    await openScratch();
+    await focusRoll();
+    const focusedBefore = await evaluateExpr(cdp, "document.activeElement.id");
+    await pressKey(cdp, 'Escape');
+    const closed = await waitFor(cdp, "document.getElementById('scratch-view').hidden ? true : null", 3000);
+    const focus = await evaluateExpr(cdp, `({ key: document.activeElement.dataset.key ?? null, inView: document.getElementById('view-buttons').contains(document.activeElement) })`);
+    report(
+      'scratchpad: Escape with focus in the roll closes the view and focus lands on the 7 Scratchpad button',
+      focusedBefore === 'scratch-roll' && closed === true && focus.key === '7' && focus.inView === true,
+      JSON.stringify({ focusedBefore, closed, focus }),
+    );
+    await clearViews();
+  }
+
+  // --- The mouse: draw, select, move, resize and erase on the roll; a right-click on the roll asks nothing; a blur cancels a drag ---
+  {
+    await clearViews();
+    await setLayoutKey('c');
+    await openScratch();
+    // The pitch window comes back to C3 to B4, where the keyboard checks above may have left it higher.
+    await focusRoll();
+    for (let guard = 0; guard < 12 && (await readRoll()).windowStart !== '48'; guard += 1) await pressKey(cdp, 'PageDown');
+    // The rows follow the cursor too, so it goes back to C4, inside the two octaves, before any point is worked out from the grid.
+    for (let guard = 0; guard < 40 && (await readRoll()).cursorPitch !== '60'; guard += 1) await pressKey(cdp, Number((await readRoll()).cursorPitch) < 60 ? 'ArrowUp' : 'ArrowDown');
+    // Points are worked out from the grid's box and the view's data attributes (the motif's units and the window), never from page text.
+    const geometry = () =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const box = document.getElementById('scratch-grid').getBoundingClientRect();
+          const view = document.getElementById('scratch-view');
+          return { left: box.left, top: box.top, width: box.width, height: box.height, units: Number(view.dataset.cycles) * 48, rows: Number(view.dataset.rows), high: Number(view.dataset.rowHigh) };
+        })()`,
+      );
+    const pointAt = (geo, unit, pitch) => ({
+      x: geo.left + (unit / geo.units) * geo.width,
+      y: geo.top + (geo.high - pitch + 0.5) * (geo.height / geo.rows),
+    });
+    const mouse = (type, point, buttons) => cdp('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: buttons === 0 && type === 'mouseMoved' ? 'none' : 'left', buttons, clickCount: 1 });
+    const hoverAt = (point) => mouse('mouseMoved', point, 0);
+    const pressAt = (point) => mouse('mousePressed', point, 1);
+    const stepTo = async (from, to, steps) => {
+      for (let step = 1; step <= steps; step += 1) {
+        await mouse('mouseMoved', { x: from.x + ((to.x - from.x) * step) / steps, y: from.y + ((to.y - from.y) * step) / steps }, 1);
+        await sleep(20);
+      }
+    };
+    const drag = async (from, to) => {
+      await pressAt(from);
+      await stepTo(from, to, 6);
+      await mouse('mouseReleased', to, 0);
+    };
+    const click = async (point) => {
+      await pressAt(point);
+      await mouse('mouseReleased', point, 0);
+    };
+    // Two clicks of a double-click, the way Chrome counts them: the second press and release carry clickCount 2, and the grid still holds the pointer.
+    const doubleClick = async (point) => {
+      for (const clickCount of [1, 2]) {
+        await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount });
+        await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount });
+      }
+      await sleep(100);
+    };
+    // Draw mode is the visible toggle: a drag on an empty cell writes a note only while it is on, and selects a box while it is off.
+    const readDraw = () => evaluateExpr(cdp, "document.getElementById('scratch-view').dataset.draw");
+    const setDraw = async (on) => {
+      if ((await readDraw()) !== (on ? 'on' : 'off')) await evaluateExpr(cdp, "document.getElementById('scratch-draw').click()");
+      await waitFor(cdp, `document.getElementById('scratch-view').dataset.draw === ${JSON.stringify(on ? 'on' : 'off')} ? true : null`, 2000);
+    };
+    // The one way a check draws a note by dragging: Draw on first.
+    const drawDrag = async (from, to) => {
+      await setDraw(true);
+      await drag(from, to);
+    };
+    const rightClick = async (point) => {
+      await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'right', buttons: 2, clickCount: 1 });
+      await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'right', buttons: 0, clickCount: 1 });
+      await sleep(150);
+    };
+    const readSelected = () => evaluateExpr(cdp, "document.getElementById('scratch-view').dataset.selected");
+    const shape = (note) => ({ pitch: note.pitch, start: note.start, length: note.length, velocity: note.velocity });
+    const startNotes = await readNotes();
+
+    // A drag from cycle 1, beat 1 on C4 across four sixteenths draws one note of 12 units at 0.80.
+    let geo = await geometry();
+    await drawDrag(pointAt(geo, 1, 60), pointAt(geo, 10.5, 60));
+    const drawn = await readNotes();
+    const drawnLine = await readLine();
+    report(
+      'scratchpad: a drag from cycle 1, beat 1 on C4 across four sixteenths draws C4 of 12 units at velocity 80, selects it and the line says so',
+      startNotes.length === 0 &&
+        drawn.length === 1 &&
+        JSON.stringify(shape(drawn[0])) === JSON.stringify({ pitch: 60, start: 0, length: 12, velocity: 80 }) &&
+        (await readSelected()) === String(drawn[0].id) &&
+        drawnLine.spoken === fillScratch(SCRATCH_COPY.placed, { name: 'C4', cycle: 1, beat: '1' }),
+      JSON.stringify({ startNotes, drawn, drawnLine }),
+    );
+
+    // A plain click on an empty cell writes nothing, with Draw on or off; a double-click writes a one-step note in the step that holds it.
+    await click(pointAt(geo, 30.5, 62));
+    const afterPlainClick = await readNotes();
+    await setDraw(false);
+    await click(pointAt(geo, 30.5, 62));
+    const afterPlainClickSelect = await readNotes();
+    await doubleClick(pointAt(geo, 30.5, 62));
+    const stepped = await readNotes();
+    report(
+      'scratchpad: a plain click on an empty cell writes no note in either mode, and a double-click writes a one-step note on the grid at the row and the step of the click and selects it',
+      afterPlainClick.length === 1 &&
+        afterPlainClickSelect.length === 1 &&
+        stepped.length === 2 &&
+        JSON.stringify(shape(stepped[1])) === JSON.stringify({ pitch: 62, start: 30, length: 3, velocity: 80 }) &&
+        (await readSelected()) === String(stepped[1].id),
+      JSON.stringify({ afterPlainClick, afterPlainClickSelect, stepped }),
+    );
+
+    // A click on a note selects it and changes nothing else.
+    const beforeClick = await readNotes();
+    await click(pointAt(geo, 5, 60));
+    const afterClick = await readNotes();
+    report(
+      'scratchpad: a click on a note selects it and puts nothing new on the roll',
+      JSON.stringify(afterClick) === JSON.stringify(beforeClick) && (await readSelected()) === String(beforeClick[0].id) && (await readRoll()).notes === '2',
+      JSON.stringify({ beforeClick, afterClick, selected: await readSelected() }),
+    );
+
+    // Hovering a note reads it in the hover line without touching the live region; hovering an empty cell outlines the cell (in Draw mode).
+    await setDraw(true);
+    const spokenBefore = (await readLine()).spoken;
+    await hoverAt(pointAt(geo, 5, 60));
+    await sleep(100);
+    const hovered = await evaluateExpr(
+      cdp,
+      `({
+        hidden: document.getElementById('scratch-note-hover').hidden,
+        ariaHidden: document.getElementById('scratch-note-hover').getAttribute('aria-hidden'),
+        text: document.getElementById('scratch-note-hover').textContent,
+        outlined: document.querySelectorAll('#scratch-notes .sp-hover').length,
+        cellHidden: document.getElementById('scratch-hover-cell').hidden,
+        spoken: document.getElementById('scratch-note-spoken').textContent,
+      })`,
+    );
+    await hoverAt(pointAt(geo, 60.5, 66));
+    await sleep(100);
+    const overEmpty = await evaluateExpr(
+      cdp,
+      `({ hidden: document.getElementById('scratch-note-hover').hidden, outlined: document.querySelectorAll('#scratch-notes .sp-hover').length, cellHidden: document.getElementById('scratch-hover-cell').hidden, start: document.getElementById('scratch-hover-cell').style.getPropertyValue('--sp-start') })`,
+    );
+    const hoveredParts = noteParts(beforeClick[0], 'sixteenth');
+    report(
+      'scratchpad: hovering a note shows its line and outlines it, hovering an empty cell outlines the snapped cell, and the live region stays as it was',
+      hovered.hidden === false &&
+        hovered.ariaHidden === 'true' &&
+        hovered.text === hoveredParts.name + hoveredParts.rest &&
+        hovered.outlined === 1 &&
+        hovered.cellHidden === true &&
+        hovered.spoken === spokenBefore &&
+        overEmpty.hidden === true &&
+        overEmpty.outlined === 0 &&
+        overEmpty.cellHidden === false &&
+        overEmpty.start === '60',
+      JSON.stringify({ hovered, overEmpty, spokenBefore }),
+    );
+
+    // A drag on a note's body moves it one beat later and two semitones up.
+    await drag(pointAt(geo, 31, 62), pointAt(geo, 43, 64));
+    const moved = await readNotes();
+    const second = moved.find((note) => note.id === stepped[1].id);
+    report(
+      'scratchpad: dragging a note by its body moves it one beat later and two semitones up on the grid',
+      moved.length === 2 && second !== undefined && JSON.stringify(shape(second)) === JSON.stringify({ pitch: 64, start: 42, length: 3, velocity: 80 }),
+      JSON.stringify({ moved }),
+    );
+
+    // A drag on a note's right edge makes it two beats long.
+    // The press is three pixels inside the right end of the note, in the handle however wide a beat is.
+    const edgeAt = (unit, pitch) => ({ ...pointAt(geo, unit, pitch), x: pointAt(geo, unit, pitch).x - 3 });
+    await drag(edgeAt(12, 60), pointAt(geo, 24.2, 60));
+    const resized = await readNotes();
+    const first = resized.find((note) => note.id === drawn[0].id);
+    report(
+      'scratchpad: dragging the right edge of a note makes it two beats long, snapped to the grid',
+      first !== undefined && JSON.stringify(shape(first)) === JSON.stringify({ pitch: 60, start: 0, length: 24, velocity: 80 }) && resized.length === 2,
+      JSON.stringify({ resized }),
+    );
+
+    // A right-click on empty roll space leaves the motif as it was and opens no Ask box.
+    await rightClick(pointAt(geo, 70, 66));
+    const afterEmptyRight = await readNotes();
+    const askAfterEmpty = await askBoxOpen();
+    report(
+      'scratchpad: a right-click on empty roll space leaves the motif as it was and the Ask box closed',
+      JSON.stringify(afterEmptyRight) === JSON.stringify(resized) && askAfterEmpty === false,
+      JSON.stringify({ afterEmptyRight, askAfterEmpty }),
+    );
+
+    // A right-click on a note erases it and opens no Ask box.
+    await rightClick(pointAt(geo, 5, 60));
+    const afterErase = await readNotes();
+    const eraseLine = await readLine();
+    const askAfterErase = await askBoxOpen();
+    report(
+      'scratchpad: a right-click on a note erases it, the line says so and the Ask box stays closed',
+      afterErase.length === 1 && afterErase[0].id === second.id && eraseLine.spoken === fillScratch(SCRATCH_COPY.erased, { name: 'C4', cycle: 1, beat: '1' }) && askAfterErase === false,
+      JSON.stringify({ afterErase, eraseLine, askAfterErase }),
+    );
+
+    // A drag interrupted by the window losing focus commits nothing.
+    geo = await geometry();
+    const before = await readNotes();
+    const from = pointAt(geo, 60.5, 55);
+    await pressAt(from);
+    await stepTo(from, pointAt(geo, 66.5, 55), 3);
+    const previewShown = await evaluateExpr(cdp, "!document.getElementById('scratch-preview').hidden");
+    await evaluateExpr(cdp, "window.dispatchEvent(new Event('blur'))");
+    await stepTo(pointAt(geo, 66.5, 55), pointAt(geo, 80.5, 55), 3);
+    await mouse('mouseReleased', pointAt(geo, 80.5, 55), 0);
+    const after = await readNotes();
+    const previewAfter = await evaluateExpr(cdp, "!document.getElementById('scratch-preview').hidden");
+    report(
+      'scratchpad: a drag interrupted by the window losing focus commits nothing and takes the preview away',
+      previewShown === true && previewAfter === false && JSON.stringify(after) === JSON.stringify(before),
+      JSON.stringify({ previewShown, previewAfter, before, after }),
+    );
+
+    // A right-click on the rest of the view still opens the Ask box.
+    const ruler = await evaluateExpr(
+      cdp,
+      `(() => { const box = document.querySelector('#scratch-ruler .sp-beat').getBoundingClientRect(); return { x: box.left + box.width / 2, y: box.top + box.height / 2 }; })()`,
+    );
+    await rightClick(ruler);
+    const askOnRuler = await waitFor(cdp, "!document.getElementById('ask-box').hidden ? true : null", 3000);
+    await closeAsk();
+    report('scratchpad: a right-click on the ruler, outside the roll, still opens the Ask box', askOnRuler === true, JSON.stringify({ askOnRuler }));
+
+    // In Select mode a drag across two notes writes nothing: the notes, get_code and list_history stay as they were, two notes are selected,
+    // the box showed during the drag and is gone after it. A double-click on an empty cell then adds one note and selects it.
+    await setDraw(false);
+    geo = await geometry();
+    await doubleClick(pointAt(geo, 61, 66));
+    const twoNotes = await readNotes();
+    const codeBeforeBox = await callTool(client, 'get_code', {});
+    const historyBeforeBox = await callTool(client, 'list_history', {});
+    const boxFrom = pointAt(geo, 36, 70);
+    await pressAt(boxFrom);
+    await stepTo(boxFrom, pointAt(geo, 70, 61), 6);
+    const boxShown = await evaluateExpr(cdp, "!document.getElementById('scratch-select-rect').hidden");
+    const countDuring = await evaluateExpr(cdp, "document.getElementById('scratch-view').dataset.selectedCount");
+    await mouse('mouseReleased', pointAt(geo, 70, 61), 0);
+    const boxAfter = await evaluateExpr(cdp, "!document.getElementById('scratch-select-rect').hidden");
+    const afterBox = await readNotes();
+    const selectedAfterBox = await readSelected();
+    const codeAfterBox = await callTool(client, 'get_code', {});
+    const historyAfterBox = await callTool(client, 'list_history', {});
+    report(
+      'scratchpad: in Select mode a drag across two notes writes no note and no code, selects both, shows the box during the drag and not after it',
+      twoNotes.length === 2 &&
+        JSON.stringify(afterBox) === JSON.stringify(twoNotes) &&
+        boxShown === true &&
+        countDuring === '2' &&
+        boxAfter === false &&
+        selectedAfterBox.split(',').length === 2 &&
+        codeAfterBox === codeBeforeBox &&
+        historyAfterBox === historyBeforeBox,
+      JSON.stringify({ twoNotes, afterBox, boxShown, countDuring, boxAfter, selectedAfterBox, sameCode: codeAfterBox === codeBeforeBox, sameHistory: historyAfterBox === historyBeforeBox }),
+    );
+
+    await doubleClick(pointAt(geo, 40.5, 56));
+    const afterDouble = await readNotes();
+    report(
+      'scratchpad: a double-click on an empty cell adds one note and selects it, while the grid holds the pointer',
+      afterDouble.length === 3 && (await readSelected()) === String(afterDouble.find((note) => !twoNotes.some((old) => old.id === note.id)).id),
+      JSON.stringify({ afterDouble, selected: await readSelected() }),
+    );
+    // Shift with a click on a note adds it to the selection (the double-click left only the new note selected).
+    const shiftClick = async (point) => {
+      for (const type of ['mousePressed', 'mouseReleased']) {
+        await cdp('Input.dispatchMouseEvent', { type, x: point.x, y: point.y, button: 'left', buttons: type === 'mousePressed' ? 1 : 0, clickCount: 1, modifiers: 8 });
+      }
+    };
+    const before3 = await readSelected();
+    const other = afterDouble.find((note) => String(note.id) !== before3);
+    await shiftClick(pointAt(geo, other.start + 1, other.pitch));
+    const afterShift = await readSelected();
+    report(
+      'scratchpad: Shift with a click on a note adds it to the selection',
+      before3.split(',').length === 1 && afterShift.split(',').length === 2 && afterShift.split(',').includes(String(other.id)) && afterShift.split(',').includes(before3) && (await readNotes()).length === 3,
+      JSON.stringify({ before3, afterShift, other }),
+    );
+    await setDraw(false);
+
+    await clearViews();
+    await setLayoutKey('a');
+  }
+
+  // --- The fit: the roll sizes itself from the room in layouts a, b and c, and 2 cycles need no sideways scroll at 1920 wide ---
+  {
+    await clearViews();
+    await openScratch();
+    const settle = () => evaluateExpr(cdp, 'new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))');
+    // The beat is read from the spacing of the ruler labels and the row from the spacing of the piano names, in rem.
+    const readFit = () =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+          const labels = [...document.querySelectorAll('#scratch-ruler .sp-beat')];
+          const keys = [...document.querySelectorAll('#scratch-gutter .sp-key')];
+          const scroll = document.getElementById('scratch-scroll');
+          const grid = document.getElementById('scratch-grid').getBoundingClientRect();
+          const box = getComputedStyle(scroll);
+          // The room the beats share: the box without its right padding, less the piano names (4.5 rem).
+          const roomRem = (scroll.clientWidth - parseFloat(box.paddingRight)) / rootPx - 4.5;
+          return {
+            beatRem: (labels[1].getBoundingClientRect().left - labels[0].getBoundingClientRect().left) / rootPx,
+            rowRem: (keys[1].getBoundingClientRect().top - keys[0].getBoundingClientRect().top) / rootPx,
+            gridRem: grid.height / rootPx,
+            rows: keys.length,
+            spareRem: roomRem - grid.width / rootPx,
+            sideways: scroll.scrollWidth > scroll.clientWidth + 1,
+          };
+        })()`,
+      );
+    const fits = [];
+    try {
+      for (const [width, height] of [[1920, 1080], [1280, 800]]) {
+        await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+        for (const layout of ['a', 'b', 'c']) {
+          await setLayoutKey(layout);
+          await settle();
+          fits.push({ width, layout, ...(await readFit()) });
+        }
+      }
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    await setLayoutKey('a');
+    const near = (value, low, high) => value >= low - 0.02 && value <= high + 0.02;
+    report(
+      'scratchpad: in layouts a, b and c at 1920x1080 and 1280x800 a beat is at least 4 rem wide and fills the room when it is wider, a row is 0.625 to 1.25 rem high and the roll keeps its two octaves',
+      fits.length === 6 &&
+        fits.every((fit) => fit.beatRem >= 4 - 0.02 && (fit.beatRem <= 4.02 || Math.abs(fit.spareRem) < 0.1) && near(fit.rowRem, 0.625, 1.25) && fit.rows === 24 && Math.abs(fit.gridRem - 24 * fit.rowRem) < 0.05),
+      JSON.stringify(fits),
+    );
+    report(
+      'scratchpad: with 2 cycles the beat is wider than 8 rem at 1920 wide in layouts a and c, the old cap is gone',
+      fits.filter((fit) => fit.width === 1920 && fit.layout !== 'b').length === 2 && fits.filter((fit) => fit.width === 1920 && fit.layout !== 'b').every((fit) => fit.beatRem > 8),
+      JSON.stringify(fits.filter((fit) => fit.width === 1920).map((fit) => ({ layout: fit.layout, beatRem: fit.beatRem }))),
+    );
+    report(
+      'scratchpad: 2 cycles fit without a sideways scroll at 1920 wide in every layout',
+      fits.filter((fit) => fit.width === 1920).length === 3 && fits.filter((fit) => fit.width === 1920).every((fit) => fit.sideways === false),
+      JSON.stringify(fits.filter((fit) => fit.width === 1920).map((fit) => ({ layout: fit.layout, sideways: fit.sideways }))),
+    );
+
+    // The ruler label 2.1 sits on the cycle line, where a note placed at cycle 2, beat 1 starts.
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    for (let step = 0; step < 16; step += 1) await pressKey(cdp, 'ArrowRight');
+    await pressKey(cdp, 'Enter');
+    const lines = await evaluateExpr(
+      cdp,
+      `(() => {
+        const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+        const label = [...document.querySelectorAll('#scratch-ruler .sp-beat')].find((el) => el.textContent === '2.1');
+        const note = document.querySelector('#scratch-notes .sp-note[data-start="48"]');
+        const grid = document.getElementById('scratch-grid').getBoundingClientRect();
+        return label && note ? { label: label.getBoundingClientRect().left, note: note.getBoundingClientRect().left - 0.125 * rootPx, middle: grid.left + grid.width / 2 } : null;
+      })()`,
+    );
+    await pressKey(cdp, 'Delete');
+    report(
+      'scratchpad: the ruler label 2.1 sits on the cycle line, within a pixel of a note placed at cycle 2, beat 1',
+      lines !== null && Math.abs(lines.label - lines.note) <= 1 && Math.abs(lines.label - lines.middle) <= 1,
+      JSON.stringify(lines),
+    );
+
+    // A strip shorter than the roll scrolls the view, and its bottom can be reached.
+    await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 600, deviceScaleFactor: 1, mobile: false });
+    let strip;
+    try {
+      await settle();
+      strip = await evaluateExpr(
+        cdp,
+        `(() => {
+          const view = document.getElementById('scratch-view');
+          const before = view.scrollHeight > view.clientHeight + 1;
+          view.scrollTop = view.scrollHeight;
+          const viewBox = view.getBoundingClientRect();
+          const hint = document.getElementById('scratch-hint').getBoundingClientRect();
+          const note = document.getElementById('scratch-note').getBoundingClientRect();
+          return { layout: document.getElementById('workspace').dataset.layout, scrolls: before, noteBottom: note.bottom, hintBottom: hint.bottom, viewBottom: viewBox.bottom };
+        })()`,
+      );
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    report(
+      'scratchpad: in layout a at 1280x600 the view scrolls vertically and the bottom of the strip can be reached',
+      strip.layout === 'a' && strip.scrolls === true && strip.noteBottom <= strip.viewBottom + 1 && strip.hintBottom <= strip.viewBottom + 1,
+      JSON.stringify(strip),
+    );
+    await clearViews();
+    await setLayoutKey('a');
+  }
+
+  // --- A tall range scrolls the box up and down while the ruler, the piano names and the velocity lane stay in place ---
+  {
+    await clearViews();
+    await openScratch();
+    await setLayoutKey('a');
+    const measure = () =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+          const box = document.getElementById('scratch-scroll');
+          const edge = box.getBoundingClientRect();
+          const ruler = document.getElementById('scratch-ruler').getBoundingClientRect();
+          const lane = document.getElementById('scratch-lane').getBoundingClientRect();
+          const keys = document.querySelectorAll('#scratch-gutter .sp-key');
+          const note = document.querySelector('#scratch-notes .sp-note').getBoundingClientRect();
+          const cursor = document.getElementById('scratch-cursor').getBoundingClientRect();
+          return {
+            boxTop: edge.top + box.clientTop,
+            boxBottom: edge.top + box.clientTop + box.clientHeight,
+            boxLeft: edge.left + box.clientLeft,
+            rulerTop: ruler.top,
+            rulerBottom: ruler.bottom,
+            laneTop: lane.top,
+            laneBottom: lane.bottom,
+            gutterLeft: keys[0].getBoundingClientRect().left,
+            noteTop: note.top,
+            noteLeft: note.left,
+            cursorTop: cursor.top,
+            cursorBottom: cursor.bottom,
+            rows: keys.length,
+            rowRem: (keys[1].getBoundingClientRect().top - keys[0].getBoundingClientRect().top) / rootPx,
+            scrollTop: box.scrollTop,
+            scrollLeft: box.scrollLeft,
+            scrollsDown: box.scrollHeight > box.clientHeight + 1,
+            scrollsSideways: box.scrollWidth > box.clientWidth + 1,
+          };
+        })()`,
+      );
+    try {
+      await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 600, deviceScaleFactor: 1, mobile: false });
+      for (let n = 0; n < 6; n += 1) await evaluateExpr(cdp, "document.getElementById('scratch-more').click()");
+      await sleep(300);
+      await focusRoll();
+      await cursorTo(36);
+      await pressKey(cdp, 'Enter');
+      await cursorTo(96);
+      await pressKey(cdp, 'Enter');
+      await sleep(200);
+      const still = await measure();
+      await evaluateExpr(cdp, "(() => { const box = document.getElementById('scratch-scroll'); box.scrollTop = 300; box.scrollLeft = 200; return true; })()");
+      await sleep(150);
+      const moved = await measure();
+      // The cursor walks to the lowest row, and the box scrolls so its row shows between the ruler and the lane.
+      await evaluateExpr(cdp, "(() => { document.getElementById('scratch-scroll').scrollTop = 0; return true; })()");
+      await focusRoll();
+      await cursorTo(24);
+      await sleep(150);
+      const lowest = await measure();
+      await cursorTo(107);
+      await sleep(150);
+      const highest = await measure();
+      report(
+        'scratchpad: on a short window a motif over five octaves scrolls the box up and down, the ruler stays at its top, the piano names at its left and the lane at its bottom, and the cursor row is kept in view',
+        still.rows >= 84 &&
+          still.rowRem >= 0.62 &&
+          still.rowRem <= 0.63 &&
+          still.scrollsDown === true &&
+          still.scrollsSideways === true &&
+          moved.scrollTop > 0 &&
+          moved.scrollLeft > 0 &&
+          Math.abs(moved.noteTop - still.noteTop) > 20 &&
+          Math.abs(moved.rulerTop - moved.boxTop) <= 1.5 &&
+          Math.abs(moved.laneBottom - moved.boxBottom) <= 1.5 &&
+          Math.abs(moved.gutterLeft - moved.boxLeft) <= 1.5 &&
+          lowest.cursorTop >= lowest.rulerBottom - 1 &&
+          lowest.cursorBottom <= lowest.laneTop + 1 &&
+          lowest.scrollTop > 0 &&
+          highest.cursorTop >= highest.rulerBottom - 1 &&
+          highest.cursorBottom <= highest.laneTop + 1,
+        JSON.stringify({ still, moved, lowest, highest }),
+      );
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+    }
+    await reloadPage(cdp);
+    await clearViews();
+    await setLayoutKey('a');
+  }
+
+  // --- The toolbar, the velocity lane and undo: the grid, the length, the pitch window, the lane, and the motif's own history ---
+  {
+    const mouse = (type, x, y, buttons = 0) => cdp('Input.dispatchMouseEvent', { type, x, y, button: buttons === 0 && type === 'mouseMoved' ? 'none' : 'left', buttons, clickCount: 1 });
+    const centerOf = (selector) =>
+      evaluateExpr(
+        cdp,
+        `(() => { const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: box.left + box.width / 2, y: box.top + box.height / 2 }; })()`,
+      );
+    // A strip shorter than the view scrolls it, and focusing the roll can scroll the toolbar or the lane out of sight: bring the part into view first.
+    const reveal = (selector) => evaluateExpr(cdp, `(() => { document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: 'nearest', inline: 'nearest' }); return true; })()`);
+    const clickOn = async (selector) => {
+      await reveal(selector);
+      const point = await centerOf(selector);
+      await mouse('mousePressed', point.x, point.y, 1);
+      await mouse('mouseReleased', point.x, point.y, 0);
+      await sleep(60);
+    };
+    // The motif starts empty: a reload clears the motif and its history, and the page may come back with the Scratchpad open.
+    const fresh = async () => {
+      await clearViews();
+      await reloadPage(cdp);
+      await clearViews();
+      await openScratch();
+    };
+    const readBar = () =>
+      evaluateExpr(
+        cdp,
+        `({
+          pressed: [...document.querySelectorAll('#scratch-grids button')].filter((button) => button.getAttribute('aria-pressed') === 'true').map((button) => button.dataset.grid),
+          cycles: document.getElementById('scratch-cycles').textContent,
+          window: document.getElementById('scratch-window').textContent,
+          windowName: document.getElementById('scratch-window').getAttribute('aria-label'),
+          steps: document.getElementById('scratch-roll').style.getPropertyValue('--sp-steps'),
+          undoDisabled: document.getElementById('scratch-undo').getAttribute('aria-disabled'),
+          redoDisabled: document.getElementById('scratch-redo').getAttribute('aria-disabled'),
+        })`,
+      );
+    const readBars = () =>
+      evaluateExpr(
+        cdp,
+        `[...document.querySelectorAll('#scratch-bars .sp-bar')].map((el) => ({
+          id: Number(el.dataset.id), start: Number(el.dataset.start), velocity: Number(el.dataset.velocity), selected: el.classList.contains('sp-selected'),
+        }))`,
+      );
+    const starts = (notes) => notes.map((note) => note.start);
+    const codeBefore = await callTool(client, 'get_code', {});
+    const historyBefore = await callTool(client, 'list_history', {});
+
+    // The grid: Quarters moves every note onto quarters at once and Ctrl+Z puts the sixteenths back.
+    {
+      await fresh();
+      await focusRoll();
+      await pressKey(cdp, 'Home');
+      await pressKey(cdp, 'ArrowRight');
+      await pressKey(cdp, 'Enter');
+      for (let step = 0; step < 5; step += 1) await pressKey(cdp, 'ArrowRight');
+      await pressKey(cdp, 'Enter');
+      for (let step = 0; step < 5; step += 1) await pressKey(cdp, 'ArrowRight');
+      await pressKey(cdp, 'Enter');
+      const before = await readNotes();
+      const barBefore = await readBar();
+      await clickOn('#scratch-grid-quarter');
+      const after = await readNotes();
+      const barAfter = await readBar();
+      const line = await readLine();
+      const expectedNotice = fillScratch(SCRATCH_COPY.gridNotice, { grid: 'quarters', rest: fillScratch(SCRATCH_COPY.gridMoved, { notes: '3 notes', merged: '' }) });
+      report(
+        'scratchpad: three notes drawn on sixteenths move to multiples of 12 when Quarters is pressed, Quarters is pressed alone, the step lines follow and the line says how many moved',
+        JSON.stringify(starts(before)) === JSON.stringify([3, 18, 33]) &&
+          JSON.stringify(barBefore.pressed) === JSON.stringify(['sixteenth']) &&
+          JSON.stringify(starts(after)) === JSON.stringify([0, 12, 36]) &&
+          after.every((note) => note.length === 12) &&
+          JSON.stringify(barAfter.pressed) === JSON.stringify(['quarter']) &&
+          barAfter.steps === '4' &&
+          line.spoken === expectedNotice,
+        JSON.stringify({ before, after, barBefore, barAfter, line }),
+      );
+
+      await pressKey(cdp, 'z', { ctrl: true, plain: true });
+      const undone = await readNotes();
+      const barUndone = await readBar();
+      const undoneLine = await readLine();
+      report(
+        'scratchpad: Ctrl+Z after the grid change puts the sixteenth starts and the Sixteenths segment back and says what it undid',
+        JSON.stringify(starts(undone)) === JSON.stringify([3, 18, 33]) &&
+          JSON.stringify(barUndone.pressed) === JSON.stringify(['sixteenth']) &&
+          barUndone.steps === '16' &&
+          undoneLine.spoken === fillScratch(SCRATCH_COPY.undid, { what: 'changed the grid to quarters' }),
+        JSON.stringify({ undone, barUndone, undoneLine }),
+      );
+    }
+
+    // The length: Fewer is refused while a note starts in the cycle that would go, and cuts a note that runs into it.
+    {
+      await fresh();
+      await clickOn('#scratch-more');
+      const three = await readBar();
+      await focusRoll();
+      await pressKey(cdp, 'End');
+      await pressKey(cdp, 'Enter');
+      await clickOn('#scratch-fewer');
+      const refusedRoll = await readRoll();
+      const refusedLine = await readLine();
+      report(
+        'scratchpad: More cycles gives 3 cycles, and Fewer is refused with the cycle-3 line while a note starts in cycle 3',
+        three.cycles === '3 cycles' &&
+          refusedRoll.cycles === '3' &&
+          refusedRoll.notes === '1' &&
+          refusedLine.spoken === fillScratch(SCRATCH_COPY.cyclesRefused, { cycle: 3, notes: SCRATCH_COPY.oneNote }),
+        JSON.stringify({ three, refusedRoll, refusedLine }),
+      );
+
+      await focusRoll();
+      await pressKey(cdp, 'Delete');
+      await pressKey(cdp, 'Home');
+      for (let step = 0; step < 30; step += 1) await pressKey(cdp, 'ArrowRight');
+      await pressKey(cdp, 'Enter');
+      for (let step = 0; step < 3; step += 1) await pressKey(cdp, 'ArrowRight', { shift: true });
+      const long = await readNotes();
+      await clickOn('#scratch-fewer');
+      const cut = await readNotes();
+      const cutRoll = await readRoll();
+      const cutLine = await readLine();
+      report(
+        'scratchpad: with the cycle-3 note erased, a note from cycle 2 that runs into cycle 3 is cut at the new end by Fewer and the line says so',
+        long.length === 1 &&
+          long[0].start === 90 &&
+          long[0].length === 12 &&
+          cut.length === 1 &&
+          cut[0].length === 6 &&
+          cutRoll.cycles === '2' &&
+          cutLine.spoken === fillScratch(SCRATCH_COPY.cyclesNow, { cycles: '2 cycles' }) + SCRATCH_COPY.cyclesCut,
+        JSON.stringify({ long, cut, cutRoll, cutLine }),
+      );
+    }
+
+    // Eight cycles in layout b scroll sideways, and a note in cycle 8 lines up with its lane bar at the end.
+    {
+      await fresh();
+      await setLayoutKey('b');
+      for (let step = 0; step < 6; step += 1) await clickOn('#scratch-more');
+      await focusRoll();
+      await pressKey(cdp, 'End');
+      await pressKey(cdp, 'Enter');
+      const aligned = await evaluateExpr(
+        cdp,
+        `(() => {
+          const scroll = document.getElementById('scratch-scroll');
+          const sideways = scroll.scrollWidth > scroll.clientWidth + 1;
+          scroll.scrollLeft = scroll.scrollWidth;
+          const rootPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+          const note = document.querySelector('#scratch-notes .sp-note').getBoundingClientRect();
+          const bar = document.querySelector('#scratch-bars .sp-bar').getBoundingClientRect();
+          return { cycles: document.getElementById('scratch-view').dataset.cycles, sideways, scrolled: scroll.scrollLeft > 0, noteLeft: note.left - 0.125 * rootPx, barLeft: bar.left - 0.0625 * rootPx, visible: bar.right <= scroll.getBoundingClientRect().right + 1 };
+        })()`,
+      );
+      report(
+        'scratchpad: 8 cycles in layout b scroll sideways, and scrolled to the end a note in cycle 8 and its lane bar line up within 1 pixel',
+        aligned.cycles === '8' && aligned.sideways === true && aligned.scrolled === true && aligned.visible === true && Math.abs(aligned.noteLeft - aligned.barLeft) <= 1,
+        JSON.stringify(aligned),
+      );
+      await clearViews();
+      await setLayoutKey('a');
+    }
+
+    // The pitch window: Higher moves the base window, and a C3 note below it stays drawn, because the rows follow the notes.
+    {
+      await fresh();
+      await focusRoll();
+      for (let step = 0; step < 12; step += 1) await pressKey(cdp, 'ArrowDown');
+      await pressKey(cdp, 'Enter');
+      const low = await readNotes();
+      await clickOn('#scratch-higher');
+      const bar = await readBar();
+      const roll = await readRoll();
+      const drawn = await readNotes();
+      const bars = await readBars();
+      const range = shownRows({ notes: low.map((note) => ({ pitch: note.pitch })) }, { base: 60, cursor: 60 });
+      report(
+        'scratchpad: Higher moves the base window up, a C3 note below it stays drawn, the readout names the whole shown range and counts no notes above or below',
+        low.length === 1 &&
+          low[0].pitch === 48 &&
+          roll.windowStart === '60' &&
+          range.low === 36 &&
+          range.high === 83 &&
+          bar.window === rangeText(range.low, range.high) &&
+          bar.window === 'C2–B5' &&
+          bar.windowName === rangeSpoken(range.low, range.high) &&
+          !/above|below/.test(bar.window + bar.windowName) &&
+          roll.rows === '48' &&
+          drawn.length === 1 &&
+          bars.length === 1,
+        JSON.stringify({ low, bar, roll, drawn, bars }),
+      );
+    }
+
+    // A motif that spans more than three octaves is shown whole; Clear and Undo bring the rows back.
+    {
+      await fresh();
+      await focusRoll();
+      await pressKey(cdp, 'ArrowDown', { alt: true });
+      await pressKey(cdp, 'ArrowDown', { alt: true });
+      await pressKey(cdp, 'Enter');
+      for (let step = 0; step < 4; step += 1) await pressKey(cdp, 'ArrowUp', { alt: true });
+      await pressKey(cdp, 'Enter');
+      const wide = await readRoll();
+      const inside = await evaluateExpr(
+        cdp,
+        `(() => {
+          const grid = document.getElementById('scratch-grid').getBoundingClientRect();
+          const inside = [...document.querySelectorAll('#scratch-notes .sp-note')].every((el) => {
+            const box = el.getBoundingClientRect();
+            return box.top >= grid.top - 1 && box.bottom <= grid.bottom + 1 && box.left >= grid.left - 1 && box.right <= grid.right + 1;
+          });
+          return { inside, keys: document.querySelectorAll('#scratch-gutter .sp-key').length };
+        })()`,
+      );
+      const drawnWide = await readNotes();
+      await clickOn('#scratch-clear');
+      const cleared = await readRoll();
+      await clickOn('#scratch-undo');
+      const back = await readRoll();
+      const drawnBack = await readNotes();
+      report(
+        'scratchpad: a motif with notes at C2 and C6 shows every note in its row (60 rows or more), Clear gives fewer rows, and Undo shows every note again',
+        drawnWide.length === 2 &&
+          drawnWide.map((note) => note.pitch).sort((a, b) => a - b).join() === '36,84' &&
+          Number(wide.rows) >= 48 &&
+          wide.rows === '72' &&
+          inside.inside === true &&
+          inside.keys === Number(wide.rows) &&
+          Number(cleared.rows) < Number(wide.rows) &&
+          cleared.notes === '0' &&
+          back.rows === wide.rows &&
+          drawnBack.length === 2,
+        JSON.stringify({ wide, inside, cleared, back, drawnBack: drawnBack.length }),
+      );
+    }
+
+    // On a short window, a note written far above the others scrolls the low ones out of view. Undo takes it away and the box must show a
+    // remaining note with the cursor row; Redo brings it back and the box must show it with the cursor row. A#7 sits 38 rows above G#4:
+    // the box is at least 22 rem high, so its band between the ruler and the lane holds about 27 rows at the smallest row height, and a
+    // note nearer than that (A#6 is 26 rows up) could share the view with the low ones and prove nothing.
+    {
+      await fresh();
+      await setLayoutKey('a');
+      try {
+        await cdp('Emulation.setDeviceMetricsOverride', { width: 1280, height: 600, deviceScaleFactor: 1, mobile: false });
+        await sleep(300);
+        await focusRoll();
+        for (const pitch of [50, 55, 60, 64, 68]) {
+          await cursorTo(pitch);
+          await pressKey(cdp, 'Enter');
+          await pressKey(cdp, 'ArrowRight');
+        }
+        await cursorTo(106);
+        await pressKey(cdp, 'Enter');
+        await sleep(200);
+        const measureBand = () =>
+          evaluateExpr(
+            cdp,
+            `(() => {
+              const bandTop = document.getElementById('scratch-ruler').getBoundingClientRect().bottom;
+              const bandBottom = document.getElementById('scratch-lane').getBoundingClientRect().top;
+              const inBand = (box) => box.height > 0 && box.top >= bandTop - 1 && box.bottom <= bandBottom + 1;
+              const box = document.getElementById('scratch-scroll');
+              return {
+                bandTop,
+                bandBottom,
+                notes: [...document.querySelectorAll('#scratch-notes .sp-note')].map((el) => ({ pitch: Number(el.dataset.pitch), inBand: inBand(el.getBoundingClientRect()) })),
+                cursorInBand: inBand(document.getElementById('scratch-cursor').getBoundingClientRect()),
+                cursorPitch: Number(document.getElementById('scratch-roll').dataset.cursorPitch),
+                scrollTop: box.scrollTop,
+                scrollHeight: box.scrollHeight,
+                clientHeight: box.clientHeight,
+              };
+            })()`,
+          );
+        const written = await measureBand();
+        await pressKey(cdp, 'z', { ctrl: true, plain: true });
+        await sleep(150);
+        const undone = await measureBand();
+        await pressKey(cdp, 'z', { ctrl: true, shift: true, plain: true });
+        await sleep(150);
+        const redone = await measureBand();
+        const low = (measure) => measure.notes.filter((note) => note.pitch < 100);
+        report(
+          'scratchpad: on a short window, after Undo of a high note the box scrolls so a remaining note shows between the ruler and the lane with the cursor row, and Redo shows the note it brought back with the cursor row',
+          written.notes.length === 6 &&
+            low(written).every((note) => note.inBand === false) &&
+            written.cursorInBand === true &&
+            undone.notes.length === 5 &&
+            undone.notes.some((note) => note.inBand) &&
+            undone.cursorInBand === true &&
+            redone.notes.length === 6 &&
+            redone.notes.some((note) => note.pitch === 106 && note.inBand) &&
+            redone.cursorInBand === true,
+          JSON.stringify({ written, undone, redone }),
+        );
+      } finally {
+        await cdp('Emulation.clearDeviceMetricsOverride');
+      }
+    }
+
+    // The lane: a bar dragged to the top gives 1.00, the keys change it by 0.05 and 0.01, and v moves focus to it from the roll.
+    {
+      await fresh();
+      await focusRoll();
+      await pressKey(cdp, 'Enter');
+      const note = (await readNotes())[0];
+      await reveal('#scratch-bars');
+      const lane = await evaluateExpr(
+        cdp,
+        `(() => {
+          const area = document.getElementById('scratch-bars').getBoundingClientRect();
+          const bar = document.querySelector('#scratch-bars .sp-bar').getBoundingClientRect();
+          return { x: bar.left + bar.width / 2, top: area.top, middle: area.top + area.height / 2 };
+        })()`,
+      );
+      await mouse('mousePressed', lane.x, lane.middle, 1);
+      for (let step = 1; step <= 6; step += 1) {
+        await mouse('mouseMoved', lane.x, lane.middle + ((lane.top - 8 - lane.middle) * step) / 6, 1);
+        await sleep(20);
+      }
+      await mouse('mouseReleased', lane.x, lane.top - 8, 0);
+      const dragged = await readNotes();
+      const draggedBars = await readBars();
+      const draggedLine = await readLine();
+      report(
+        'scratchpad: a lane bar dragged to the top gives velocity 100, in the note, the bar and the line',
+        dragged.length === 1 &&
+          dragged[0].velocity === 100 &&
+          draggedBars.length === 1 &&
+          draggedBars[0].velocity === 100 &&
+          draggedBars[0].selected === true &&
+          draggedLine.spoken === fillScratch(SCRATCH_COPY.velocitySet, { name: 'C4', velocity: '1.00' }),
+        JSON.stringify({ dragged, draggedBars, draggedLine }),
+      );
+
+      await evaluateExpr(cdp, "document.getElementById('scratch-lane').focus()");
+      await pressKey(cdp, 'ArrowDown');
+      await pressKey(cdp, 'ArrowDown');
+      const down = (await readNotes())[0].velocity;
+      await pressKey(cdp, 'ArrowUp');
+      const up = (await readNotes())[0].velocity;
+      await pressKey(cdp, 'ArrowDown', { shift: true });
+      const fine = (await readNotes())[0].velocity;
+      const keyLine = await readLine();
+      report(
+        'scratchpad: on the focused lane Down twice takes 0.10, Up adds 0.05 and Shift+Down takes 0.01',
+        down === 90 && up === 95 && fine === 94 && keyLine.spoken === fillScratch(SCRATCH_COPY.velocitySet, { name: 'C4', velocity: '0.94' }),
+        JSON.stringify({ down, up, fine, keyLine }),
+      );
+
+      await focusRoll();
+      await pressKey(cdp, 'v');
+      const focus = await evaluateExpr(cdp, `({ active: document.activeElement.id, selected: document.getElementById('scratch-view').dataset.selected })`);
+      report(
+        'scratchpad: v in the roll moves focus to the velocity lane with the note under the cursor selected',
+        focus.active === 'scratch-lane' && focus.selected === String(note.id),
+        JSON.stringify({ focus, note }),
+      );
+
+      // A right-click on a lane bar is not the roll's: it opens the Ask box as elsewhere in the page.
+      await reveal('#scratch-bars');
+      const barPoint = await centerOf('#scratch-bars .sp-bar');
+      await cdp('Input.dispatchMouseEvent', { type: 'mousePressed', x: barPoint.x, y: barPoint.y, button: 'right', buttons: 2, clickCount: 1 });
+      await cdp('Input.dispatchMouseEvent', { type: 'mouseReleased', x: barPoint.x, y: barPoint.y, button: 'right', buttons: 0, clickCount: 1 });
+      const askOnLane = await waitFor(cdp, "!document.getElementById('ask-box').hidden ? true : null", 3000);
+      const keptNotes = await readNotes();
+      await closeAsk();
+      report('scratchpad: a right-click on a lane bar opens the Ask box and leaves the motif as it was', askOnLane === true && keptNotes.length === 1, JSON.stringify({ askOnLane, keptNotes }));
+    }
+
+    // Undo and redo: Delete then Ctrl+Z brings the note back, and Shift+Ctrl+Z erases it again.
+    {
+      await fresh();
+      await focusRoll();
+      await pressKey(cdp, 'Enter');
+      await pressKey(cdp, 'Delete');
+      const erased = await readNotes();
+      await pressKey(cdp, 'z', { ctrl: true, plain: true });
+      const back = await readNotes();
+      const backLine = await readLine();
+      const backBar = await readBar();
+      await pressKey(cdp, 'z', { ctrl: true, shift: true, plain: true });
+      const gone = await readNotes();
+      const goneLine = await readLine();
+      report(
+        'scratchpad: Delete on a note then Ctrl+Z brings it back ("Undid: erased C4."), and Shift+Ctrl+Z erases it again ("Redid: erased C4.")',
+        erased.length === 0 &&
+          back.length === 1 &&
+          backLine.spoken === fillScratch(SCRATCH_COPY.undid, { what: 'erased C4' }) &&
+          backBar.redoDisabled !== 'true' &&
+          gone.length === 0 &&
+          goneLine.spoken === fillScratch(SCRATCH_COPY.redid, { what: 'erased C4' }),
+        JSON.stringify({ erased, back, backLine, backBar, gone, goneLine }),
+      );
+
+      // With focus in the code editor Ctrl+Z is the editor's: the motif stays as it was.
+      await focusRoll();
+      await pressKey(cdp, 'z', { ctrl: true, plain: true });
+      const before = await readNotes();
+      await evaluateExpr(cdp, `(() => { const el = document.querySelector('#editor-area .cm-content'); if (el) el.focus(); })()`);
+      const inEditor = await evaluateExpr(cdp, "document.getElementById('editor-area').contains(document.activeElement)");
+      await pressKey(cdp, 'z', { ctrl: true, plain: true });
+      await pressKey(cdp, 'z', { ctrl: true, shift: true, plain: true });
+      const after = await readNotes();
+      await blurActive();
+      report(
+        'scratchpad: with focus in the code editor, Ctrl+Z and Shift+Ctrl+Z leave the motif as it was',
+        inEditor === true && before.length === 1 && JSON.stringify(after) === JSON.stringify(before),
+        JSON.stringify({ inEditor, before, after }),
+      );
+    }
+
+    const codeAfter = await callTool(client, 'get_code', {});
+    const historyAfter = await callTool(client, 'list_history', {});
+    report(
+      "scratchpad: the code and the music's History are the same after the grid, length, window, lane and undo edits",
+      codeAfter === codeBefore && historyAfter === historyBefore,
+      JSON.stringify({ sameCode: codeAfter === codeBefore, sameHistory: historyAfter === historyBefore }),
+    );
+    await clearViews();
+    await setLayoutKey('a');
+  }
+
+  // --- Tap: a Space press while the quiet piece plays puts a note where it fell, through the one page clock ---
+  {
+    const TAP_CODE = 'setcps(0.5)\nscratch_tap: s("bd*4").gain(0)';
+    const playingWord = JSON.stringify(SOUND_LABELS.playing);
+    const playQuiet = async (label) => {
+      await callTool(client, 'set_code', { code: TAP_CODE, label });
+      return waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${playingWord} ? true : null)()`, 8000);
+    };
+    const readTap = () =>
+      evaluateExpr(
+        cdp,
+        `({
+          tap: document.getElementById('scratch-view').dataset.tap,
+          now: document.getElementById('scratch-view').dataset.nowUnit,
+          pressed: document.getElementById('scratch-tap').getAttribute('aria-pressed'),
+          disabled: document.getElementById('scratch-tap').getAttribute('aria-disabled'),
+          markerShown: !document.getElementById('scratch-now').hidden,
+          markerWidth: getComputedStyle(document.getElementById('scratch-now')).width,
+        })`,
+      );
+    const readNow = async () => {
+      const tap = await readTap();
+      return tap.now === '' ? null : Number(tap.now);
+    };
+    const stateWord = () => readStateWord(cdp);
+    const spaceDown = (extra = {}) => cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ', ...extra });
+    const spaceUp = () => cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
+    // How far a start is from the span of the marker readings taken before and after the press, around the motif's end.
+    const distanceToSpan = (start, before, after, units) => {
+      const to = after >= before ? after : after + units;
+      let best = Infinity;
+      for (const shift of [-units, 0, units]) {
+        const at = start + shift;
+        best = Math.min(best, at < before ? before - at : at > to ? at - to : 0);
+      }
+      return best;
+    };
+
+    // A fresh page and motif, with the quiet piece playing and the Scratchpad open.
+    await clearViews();
+    await reloadPage(cdp);
+    await clearViews();
+    const playing = await playQuiet('probe scratch tap');
+    await openScratch();
+    const codeBefore = await callTool(client, 'get_code', {});
+    const historyBefore = await callTool(client, 'list_history', {});
+    await focusRoll();
+    const offAtFirst = await readTap();
+
+    // t turns Tap on; the button is pressed and the marker appears and moves with the music.
+    await pressKey(cdp, 't');
+    const marker = await waitFor(cdp, "document.getElementById('scratch-view').dataset.nowUnit !== '' ? true : null", 8000);
+    const onNow = await readTap();
+    const firstReading = await readNow();
+    await sleep(500);
+    const secondReading = await readNow();
+    report(
+      'scratchpad: t in the roll turns Tap on with the button pressed, and a 1px marker appears and moves with the music',
+      playing === true &&
+        offAtFirst.tap === 'off' &&
+        offAtFirst.pressed === 'false' &&
+        marker === true &&
+        onNow.tap === 'on' &&
+        onNow.pressed === 'true' &&
+        onNow.markerShown === true &&
+        onNow.markerWidth === '1px' &&
+        firstReading !== null &&
+        secondReading !== null &&
+        firstReading !== secondReading,
+      JSON.stringify({ playing, offAtFirst, marker, onNow, firstReading, secondReading }),
+    );
+
+    // Space with focus on the roll places a one-step note at the cursor's pitch, near where the marker was.
+    const units = 96;
+    const before = await readNow();
+    await spaceDown();
+    await spaceUp();
+    const after = await readNow();
+    const tapped = await readNotes();
+    const tappedLine = await readLine();
+    const wordAfterTap = await stateWord();
+    report(
+      'scratchpad: Space with Tap on puts a one-step C4 at velocity 80 within one grid step of where the marker was, and the line says so',
+      tapped.length === 1 &&
+        tapped[0].pitch === 60 &&
+        tapped[0].length === 3 &&
+        tapped[0].velocity === 80 &&
+        tapped[0].start % 3 === 0 &&
+        before !== null &&
+        after !== null &&
+        distanceToSpan(tapped[0].start, before, after, units) <= 3 &&
+        tappedLine.kind === 'notice' &&
+        /^Tapped C4 at cycle \d, beat /.test(tappedLine.spoken) &&
+        wordAfterTap === SOUND_LABELS.playing,
+      JSON.stringify({ before, after, tapped, tappedLine, wordAfterTap }),
+    );
+
+    // A held key's repeats place nothing.
+    await sleep(450);
+    await spaceDown({ autoRepeat: true });
+    await spaceDown({ autoRepeat: true });
+    await spaceUp();
+    const afterRepeat = await readNotes();
+    report('scratchpad: the repeats of a held Space place nothing', afterRepeat.length === 1, JSON.stringify({ afterRepeat }));
+
+    // With focus on the transport button Space taps, and the button is not clicked: the music keeps playing.
+    await sleep(450);
+    await evaluateExpr(cdp, "document.getElementById('transport-button').focus()");
+    const transportBefore = await readTransport(cdp);
+    await spaceDown();
+    await spaceUp();
+    await sleep(150);
+    const fromButton = await readNotes();
+    const transportAfter = await readTransport(cdp);
+    report(
+      'scratchpad: Space with focus on the transport button places a note and does not press the button, so the music keeps playing',
+      fromButton.length === 2 &&
+        fromButton[1].start !== fromButton[0].start &&
+        transportAfter.word === transportBefore.word &&
+        transportAfter.label === transportBefore.label &&
+        transportAfter.word === SOUND_LABELS.playing,
+      JSON.stringify({ fromButton, transportBefore, transportAfter }),
+    );
+
+    // Each tap is one undo step: Ctrl+Z in the Scratchpad takes the last tapped note away.
+    await focusRoll();
+    await pressKey(cdp, 'z', { ctrl: true, plain: true });
+    const undone = await readNotes();
+    const undoneLine = await readLine();
+    report(
+      'scratchpad: Ctrl+Z removes the last tapped note and the line says "Undid: tapped C4."',
+      undone.length === 1 && undone[0].id === fromButton[0].id && undoneLine.spoken === fillScratch(SCRATCH_COPY.undid, { what: 'tapped C4' }),
+      JSON.stringify({ undone, undoneLine }),
+    );
+
+    // A tap changes neither the code nor the music's History.
+    const codeAfter = await callTool(client, 'get_code', {});
+    const historyAfter = await callTool(client, 'list_history', {});
+    report('scratchpad: the code and the music\'s History are the same after the taps', codeAfter === codeBefore && historyAfter === historyBefore, JSON.stringify({ sameCode: codeAfter === codeBefore, sameHistory: historyAfter === historyBefore }));
+
+    // When the music stops Tap turns itself off; the button then says why it cannot be turned on.
+    await callTool(client, 'stop', {});
+    const stoppedTap = await waitFor(cdp, "document.getElementById('scratch-view').dataset.tap === 'off' ? true : null", 6000);
+    const stopped = await readTap();
+    const stoppedLine = await readLine();
+    await evaluateExpr(cdp, "document.getElementById('scratch-tap').click()");
+    const pressedStopped = await readTap();
+    const pressedLine = await readLine();
+    const notesWhenStopped = await readNotes();
+    report(
+      'scratchpad: when the music stops Tap turns itself off, and pressing the Tap button then says the music must play, in the line',
+      stoppedTap === true &&
+        stopped.tap === 'off' &&
+        stopped.pressed === 'false' &&
+        stopped.disabled === 'true' &&
+        stopped.markerShown === false &&
+        stoppedLine.spoken === SCRATCH_COPY.tapMusicStopped &&
+        pressedStopped.tap === 'off' &&
+        pressedLine.spoken === SCRATCH_COPY.tapNeedsMusic &&
+        notesWhenStopped.length === 1,
+      JSON.stringify({ stoppedTap, stopped, stoppedLine, pressedStopped, pressedLine, notesWhenStopped }),
+    );
+
+    // Tap turns off when the view closes, and stays off when it opens again.
+    const again = await playQuiet('probe scratch tap again');
+    await waitFor(cdp, "document.getElementById('scratch-tap').getAttribute('aria-disabled') !== 'true' ? true : null", 6000);
+    await focusRoll();
+    await pressKey(cdp, 't');
+    const onAgain = await readTap();
+    await pressKey(cdp, '7');
+    await waitFor(cdp, "document.getElementById('scratch-view').hidden ? true : null", 3000);
+    const closedTap = await readTap();
+    await pressKey(cdp, '7');
+    await waitFor(cdp, "document.getElementById('scratch-view').hidden ? null : true", 3000);
+    const reopened = await readTap();
+    report(
+      'scratchpad: closing the view turns Tap off and it is still off when the view opens again',
+      again === true && onAgain.tap === 'on' && closedTap.tap === 'off' && closedTap.pressed === 'false' && closedTap.markerShown === false && reopened.tap === 'off',
+      JSON.stringify({ again, onAgain, closedTap, reopened }),
+    );
+
+    // The music is left stopped, as this group found it.
+    if ((await stateWord()) === SOUND_LABELS.playing) await stopMusic(cdp);
+    await clearViews();
+  }
+
+  // --- Send to Claude: the phrase plays as the roll shows it, the moment and source words reach the line, and the request is followed ---
+  {
+    const replState = "document.getElementById('repl').editor.repl.state";
+    const playingWord = JSON.stringify(SOUND_LABELS.playing);
+    const QUIET = 'setcps(1)\nscratch_send_quiet: s("bd*4").gain(0)';
+    const runs = (code) => waitFor(cdp, `${replState}.activeCode === ${JSON.stringify(code)} && (${STATE_WORD_EXPR}) === ${playingWord} ? true : null`, 8000);
+    // Every request line of a motif in the reply of one tool call, as Claude reads them.
+    const motifLines = (reply) =>
+      String(reply)
+        .split('\n')
+        .filter((line) => line.startsWith(PAGE_REQUEST_LINE))
+        .map((line) => JSON.parse(line.slice(PAGE_REQUEST_LINE.length)))
+        .filter((request) => request.context.kind === 'motif');
+    const sendFree = () => waitFor(cdp, "document.getElementById('scratch-send-button').getAttribute('aria-disabled') === 'false' ? true : null", 3000);
+    const sendStatus = () => waitFor(cdp, "document.getElementById('scratch-send-status').textContent.startsWith('Sent to Claude') ? document.getElementById('scratch-send-status').textContent : null", 3000);
+    const typeWords = async (words) => {
+      await evaluateExpr(cdp, "(() => { const field = document.getElementById('scratch-words'); field.focus(); field.select(); })()");
+      await cdp('Input.insertText', { text: words });
+    };
+    const spaceTap = async () => {
+      await cdp('Input.dispatchKeyEvent', { type: 'keyDown', key: ' ', code: 'Space', windowsVirtualKeyCode: 32, text: ' ' });
+      await cdp('Input.dispatchKeyEvent', { type: 'keyUp', key: ' ', code: 'Space', windowsVirtualKeyCode: 32 });
+    };
+    // Presses Send to Claude and takes the request out of the reply of the next tool call.
+    const sendNow = async () => {
+      if ((await sendFree()) !== true) throw new ProbeCouldNotRun('the Send to Claude button stayed unavailable for 3 seconds');
+      await callTool(client, 'get_code', {});
+      await clickElement(cdp, '#scratch-send-button');
+      const status = await sendStatus();
+      return { status, lines: motifLines(await callTool(client, 'list_history', {})) };
+    };
+
+    // 1. The phrase a motif is sent as plays the notes the roll shows, on all five grids. Each fixture is built with the model's own
+    //    commands, set as the code of one labeled track (silenced with gain 0 at its end), and the page's playing pattern is read.
+    //    A fresh page first, so the roll holds no note from an earlier check.
+    await clearViews();
+    await reloadPage(cdp);
+    await clearViews();
+    const toPhraseFixture = (grid) => {
+      const unit = grid.unit;
+      let motif = { ...emptyMotif(), grid: grid.id, cycles: 2 };
+      const put = (pitch, step, steps, velocity) => {
+        motif = placeNote(motif, { pitch, start: step * unit, length: steps * unit, velocity }).motif;
+      };
+      put(60, 1, 2, 80); // step 0 is a rest, then a note held two steps
+      put(72, grid.steps - 1, 2, 100); // held across the cycle line
+      put(64, grid.steps + 1, 1, 50); // a chord of two pitches at one velocity
+      put(67, grid.steps + 1, 1, 50);
+      put(69, grid.steps + 2, 1, 1); // two pitches at one step with different velocities, so the phrase stacks lanes
+      put(71, grid.steps + 2, 1, 100);
+      put(55, grid.steps + 3, 1, 37);
+      return motif;
+    };
+    const readHaps = (cycles) =>
+      evaluateExpr(
+        cdp,
+        `(() => {
+          const repl = document.getElementById('repl').editor.repl;
+          if (typeof noteToMidi !== 'function') throw new Error('the page has no global noteToMidi');
+          return repl.state.pattern.queryArc(0, ${cycles}).filter((hap) => hap.hasOnset()).map((hap) => {
+            const note = hap.value.note;
+            return { midi: typeof note === 'number' ? note : noteToMidi(note), begin: hap.whole.begin.valueOf(), end: hap.whole.end.valueOf(), velocity: hap.value.velocity };
+          });
+        })()`,
+      );
+    const phraseResults = [];
+    for (const grid of GRIDS) {
+      const motif = toPhraseFixture(grid);
+      const phrase = motifPhrase(motif);
+      const code = `scratch_phrase: ${phrase}.gain(0)`;
+      await callTool(client, 'set_code', { code, label: `probe scratch phrase ${grid.id}`, at: 'now' });
+      const running = await runs(code);
+      const haps = running === true ? await readHaps(motif.cycles) : [];
+      const differing = [];
+      if (haps.length !== motif.notes.length) differing.push(`hap count ${haps.length}, notes ${motif.notes.length}`);
+      for (const note of motif.notes) {
+        const begin = note.start / 48;
+        const end = (note.start + note.length) / 48;
+        const hap = haps.find((candidate) => candidate.midi === note.pitch && Math.abs(candidate.begin - begin) <= 1e-9);
+        if (hap === undefined) differing.push(`pitch ${note.pitch} at ${begin}: no hap`);
+        else if (Math.abs(hap.end - end) > 1e-9 || Math.abs(hap.velocity - note.velocity / 100) > 1e-9) differing.push(`pitch ${note.pitch} at ${begin}: end ${hap.end} (wanted ${end}), velocity ${hap.velocity} (wanted ${note.velocity / 100})`);
+      }
+      phraseResults.push({ grid: grid.id, running, notes: motif.notes.length, haps: haps.length, lanes: phrase.startsWith('stack(') ? phrase.split('), note(').length : 1, differing });
+    }
+    report(
+      'scratchpad: each phrase plays as the roll shows it, on every grid',
+      phraseResults.length === 5 && phraseResults.every((result) => result.running === true && result.notes === 7 && result.differing.length === 0 && result.lanes >= 2),
+      JSON.stringify(phraseResults),
+    );
+
+    // 2. A drawn motif sent while the music plays carries the cycle where the roll's first cycle stands at the press: the largest
+    //    multiple of the motif's 2 cycles at or below the music's cycle. The press is made from cycle 2 on (so a cycle of 0 cannot be
+    //    right by accident) and where the cycle is well inside one run of the motif.
+    await callTool(client, 'set_code', { code: QUIET, label: 'probe scratch send quiet piece', at: 'now' });
+    const quietRuns = await runs(QUIET);
+    await openScratch();
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    await pressKey(cdp, 'Enter');
+    let drawnTry = null;
+    for (let attempt = 1; attempt <= 3 && (drawnTry === null || drawnTry.split === true); attempt += 1) {
+      await waitFor(cdp, "(() => { const now = document.getElementById('repl').editor.repl.scheduler.now(); const part = now % 2; return now >= 2 && part >= 0.4 && part <= 1.6 ? true : null; })()", 8000);
+      if ((await sendFree()) !== true) throw new ProbeCouldNotRun('the Send to Claude button stayed unavailable for 3 seconds');
+      await callTool(client, 'get_code', {});
+      const around = await evaluateExpr(
+        cdp,
+        `(() => {
+          const scheduler = document.getElementById('repl').editor.repl.scheduler;
+          const before = scheduler.now();
+          document.getElementById('scratch-send-button').click();
+          return { before, after: scheduler.now() };
+        })()`,
+      );
+      const status = await sendStatus();
+      const lines = motifLines(await callTool(client, 'list_history', {}));
+      drawnTry = { attempt, ...around, split: Math.floor(around.before / 2) !== Math.floor(around.after / 2), status, lines };
+    }
+    const wantedCycle = drawnTry === null ? null : Math.floor(drawnTry.before / 2) * 2;
+    report(
+      "scratchpad: a drawn motif sent while the music plays carries the cycle where the roll's first cycle stands",
+      quietRuns === true &&
+        drawnTry !== null &&
+        drawnTry.split === false &&
+        wantedCycle >= 2 &&
+        drawnTry.lines.length === 1 &&
+        drawnTry.lines[0].motif.source === 'drawn' &&
+        drawnTry.lines[0].motif.cycle === wantedCycle &&
+        drawnTry.lines[0].motif.cycles === 2 &&
+        drawnTry.lines[0].chip.endsWith(`at cycle ${wantedCycle}`) &&
+        drawnTry.status.startsWith(`Sent to Claude at cycle ${wantedCycle}.`),
+      JSON.stringify({ quietRuns, wantedCycle, drawnTry }),
+    );
+    await foldRequestsPanel(cdp);
+
+    // 3. Tap makes the motif tapped, and a note drawn after it makes it mixed.
+    await focusRoll();
+    await pressKey(cdp, 'Home');
+    await pressKey(cdp, 'Delete');
+    const emptied = await readNotes();
+    await pressKey(cdp, 't');
+    const markerShown = await waitFor(cdp, "document.getElementById('scratch-view').dataset.nowUnit !== '' ? true : null", 8000);
+    await spaceTap();
+    const tappedNotes = await readNotes();
+    const tappedSend = await sendNow();
+    await foldRequestsPanel(cdp);
+    await focusRoll();
+    await pressKey(cdp, 'ArrowUp');
+    await pressKey(cdp, 'ArrowUp');
+    await pressKey(cdp, 'Enter');
+    const mixedNotes = await readNotes();
+    const mixedSend = await sendNow();
+    await foldRequestsPanel(cdp);
+    report(
+      'scratchpad: Tap makes the motif tapped, and a note drawn after makes it mixed',
+      emptied.length === 0 &&
+        markerShown === true &&
+        tappedNotes.length === 1 &&
+        tappedSend.lines.length === 1 &&
+        tappedSend.lines[0].motif.source === 'tapped' &&
+        mixedNotes.length === 2 &&
+        mixedSend.lines.length === 1 &&
+        mixedSend.lines[0].motif.source === 'mixed' &&
+        mixedSend.lines[0].motif.notes === 2,
+      JSON.stringify({ emptied, markerShown, tappedNotes, tappedSend, mixedNotes, mixedSend }),
+    );
+    await pressKey(cdp, 't');
+
+    // 4. A motif request is followed like any other: Applied after a change that names it, Answered after answer_request.
+    const stamp = Date.now();
+    const appliedWords = `motif request probe ${stamp} applied`;
+    const answeredWords = `motif request probe ${stamp} answered`;
+    await typeWords(appliedWords);
+    const forApplied = await sendNow();
+    const appliedId = forApplied.lines[0]?.id;
+    const appliedPhrase = forApplied.lines[0]?.motif.phrase;
+    if (appliedId === undefined) throw new ProbeCouldNotRun('the reply of list_history did not carry the motif request line of the check');
+    const waiting = await waitFor(cdp, requestRowReads(appliedWords, REQUEST_STATUS_COPY.phrases.received), 4000);
+    await callTool(client, 'set_code', { code: `scratch_applied: ${appliedPhrase}.gain(0)`, label: 'probe scratch motif applied', at: 'now', answering: appliedId });
+    const top = /^#(\d+) /m.exec(await callTool(client, 'list_history', {}));
+    const appliedRow = await waitFor(cdp, requestRowReads(appliedWords, LINK_PROMISED ? statePhrase({ state: 'applied', version: top === null ? null : Number(top[1]) }) : REQUEST_STATUS_COPY.phrases.started), 4000);
+    await typeWords(answeredWords);
+    const forAnswered = await sendNow();
+    const answeredId = forAnswered.lines[0]?.id;
+    if (answeredId === undefined) throw new ProbeCouldNotRun('the reply of list_history did not carry the second motif request line of the check');
+    const closing = 'The motif is already in the music, so nothing changes.';
+    await callTool(client, 'answer_request', { id: answeredId, outcome: 'answered', text: closing });
+    const answeredRow = await waitFor(cdp, requestRowReads(answeredWords, CLOSE_PROMISED ? statePhrase({ state: 'answered', answer: closing }) : REQUEST_STATUS_COPY.phrases.started), 4000);
+    await foldRequestsPanel(cdp);
+    report(
+      'scratchpad: a motif request reads applied after a change that answers it, and answered after answer_request',
+      top !== null && waiting === true && appliedRow === true && answeredRow === true && forApplied.lines[0].text === appliedWords && forAnswered.lines[0].text === answeredWords,
+      JSON.stringify({ top: top && top[1], waiting, appliedRow, answeredRow }),
+    );
+
+    // The group finds the music stopped and leaves it so, with the strip's default sentence back.
+    await typeWords('Add this motif to the music.');
+    if ((await readStateWord(cdp)) === SOUND_LABELS.playing) await stopMusic(cdp);
+    await clearViews();
+  }
+
+  // --- The pictures: the five views in layouts a, b and c, a short window, the base moved away from the notes, a motif over three octaves and the focus rings ---
+  // Off unless MOONTIDE_PROBE_SHOTS names a folder outside the repository. File names are built from the constants below only, never
+  // from text of the page. The pictures are for the look to be judged by eye; the checks above prove the numbers.
+  const scratchShotsFolder = shotsFolder();
+  if (scratchShotsFolder !== null) {
+    const SHOT_LAYOUTS = ['a', 'b', 'c'];
+    const SHOT_WIDTH = 1920;
+    const SHOT_HEIGHT = 1080;
+    const written = [];
+    const problems = [];
+    const shot = async (state, layout, width = SHOT_WIDTH, height = SHOT_HEIGHT) => {
+      await sleep(250);
+      written.push(await saveShot(cdp, scratchShotsFolder, state, width, height, layout, 'scratch'));
+    };
+    const setViewport = async (width, height) => {
+      await cdp('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
+      await sleep(400);
+    };
+    const click = (id) => evaluateExpr(cdp, `document.getElementById(${JSON.stringify(id)}).click()`);
+    const scrollToEnd = () => evaluateExpr(cdp, `(() => { const el = document.getElementById('scratch-scroll'); el.scrollLeft = el.scrollWidth; return true; })()`);
+    const cursorNow = async () => {
+      const roll = await readRoll();
+      return { unit: Number(roll.cursorUnit), pitch: Number(roll.cursorPitch) };
+    };
+    // Moves the keyboard cursor onto a cell by the shortest run of arrow presses, using Home or End when one is closer.
+    const goTo = async (unit, pitch, { step, units }) => {
+      let at = await cursorNow();
+      const last = units - step;
+      if (Math.abs(unit) < Math.abs(unit - at.unit) && Math.abs(unit) <= Math.abs(last - unit)) {
+        await pressKey(cdp, 'Home');
+        at = { ...at, unit: 0 };
+      } else if (Math.abs(last - unit) < Math.abs(unit - at.unit)) {
+        await pressKey(cdp, 'End');
+        at = { ...at, unit: last };
+      }
+      for (let n = Math.abs(unit - at.unit) / step; n > 0; n -= 1) await pressKey(cdp, unit > at.unit ? 'ArrowRight' : 'ArrowLeft');
+      for (let n = Math.abs(pitch - at.pitch); n > 0; n -= 1) await pressKey(cdp, pitch > at.pitch ? 'ArrowUp' : 'ArrowDown');
+    };
+    // The arrows move the selection when there is one, so a picture that walks the cursor clears it first.
+    const selectNone = () => pressKey(cdp, 'a', { ctrl: true, shift: true, plain: true });
+    const putNote = async (unit, pitch, size) => {
+      await goTo(unit, pitch, size);
+      await pressKey(cdp, 'Enter');
+    };
+    const inLayout = async (layout, act) => {
+      await setLayoutKey(layout);
+      await sleep(400);
+      await focusRoll();
+      await act();
+    };
+    const fresh = async () => {
+      await clearViews();
+      await reloadPage(cdp);
+      await clearViews();
+      await openScratch();
+      await setViewport(SHOT_WIDTH, SHOT_HEIGHT);
+    };
+    try {
+      if ((await readStateWord(cdp)) === SOUND_LABELS.playing) await stopMusic(cdp);
+      await fresh();
+      const sixteenths = { step: 3, units: 96 };
+
+      // (1) The empty motif, the roll not focused.
+      for (const layout of SHOT_LAYOUTS) {
+        await setLayoutKey(layout);
+        await sleep(400);
+        await shot('empty', layout);
+      }
+
+      // (2) Two cycles with a chord, a long note, a quiet note and a selected note, the roll focused so the cursor shows.
+      await setLayoutKey('a');
+      await focusRoll();
+      await pressKey(cdp, 'Home');
+      for (const pitch of [60, 64, 67]) await putNote(0, pitch, sixteenths);
+      await putNote(12, 62, sixteenths);
+      await putNote(24, 65, sixteenths);
+      for (let n = 0; n < 5; n += 1) await pressKey(cdp, 'ArrowRight', { shift: true });
+      await putNote(48, 69, sixteenths);
+      await putNote(60, 67, sixteenths);
+      await putNote(72, 64, sixteenths);
+      await pressKey(cdp, 'v');
+      for (let n = 0; n < 14; n += 1) await pressKey(cdp, 'ArrowDown');
+      await selectNone();
+      await focusRoll();
+      await putNote(84, 60, sixteenths);
+      await goTo(24, 65, sixteenths);
+      const populated = await readNotes();
+      if (populated.length !== 9 || populated.filter((note) => note.velocity === 10).length !== 1) problems.push(`populated: the motif was not built as planned (${populated.length} notes, velocities ${populated.map((note) => note.velocity).join(',')})`);
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, () => shot('populated', layout));
+      }
+
+      // A short strip: layout a on a 1280 by 600 window.
+      await setViewport(1280, 600);
+      await inLayout('a', async () => {
+        const scrollView = (to) => evaluateExpr(cdp, `(() => { const el = document.getElementById('scratch-view'); el.scrollTop = ${to === 'end' ? 'el.scrollHeight' : '0'}; return true; })()`);
+        await scrollView('top');
+        await shot('short', 'a', 1280, 600);
+        await scrollView('end');
+        await shot('short-end', 'a', 1280, 600);
+        await scrollView('top');
+      });
+      await setViewport(SHOT_WIDTH, SHOT_HEIGHT);
+
+      // The focus rings: on the roll, then on the lane.
+      await inLayout('a', () => shot('focus-roll', 'a'));
+      await pressKey(cdp, 'v');
+      await shot('focus-lane', 'a');
+      await selectNone();
+      await focusRoll();
+
+      // Notes beyond the base window: the base two octaves up leaves every note below it, and the rows still show them all.
+      await pressKey(cdp, 'PageUp');
+      await pressKey(cdp, 'PageUp');
+      const outside = await evaluateExpr(cdp, "document.getElementById('scratch-window').textContent");
+      if (/above|below/.test(outside)) problems.push(`outside: the readout says ${outside}`);
+      await shot('outside', 'a');
+      await pressKey(cdp, 'PageDown');
+      await pressKey(cdp, 'PageDown');
+
+      // A motif over three octaves: notes at C1 and C7 beside the others make the rows grow to show every note. One picture per layout,
+      // and layout a on a short window, where the box scrolls up and down with the ruler, the piano names and the lane held in place.
+      await focusRoll();
+      await putNote(0, 24, sixteenths);
+      await putNote(90, 96, sixteenths);
+      const tall = await readRoll();
+      if (Number(tall.rows) < 72) problems.push(`tall: the roll shows ${tall.rows} rows`);
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, () => shot('tall', layout));
+      }
+      await setViewport(1280, 600);
+      await inLayout('a', async () => {
+        const scrollBox = (to) => evaluateExpr(cdp, `(() => { const el = document.getElementById('scratch-scroll'); el.scrollTop = ${to === 'end' ? 'el.scrollHeight' : '0'}; return true; })()`);
+        await scrollBox('top');
+        await shot('tall-short', 'a', 1280, 600);
+        await scrollBox('end');
+        await shot('tall-short-scrolled', 'a', 1280, 600);
+        await scrollBox('top');
+      });
+      await setViewport(SHOT_WIDTH, SHOT_HEIGHT);
+      await inLayout('a', async () => {
+        await goTo(90, 96, sixteenths);
+        await pressKey(cdp, 'Delete');
+        await goTo(0, 24, sixteenths);
+        await pressKey(cdp, 'Delete');
+      });
+      {
+        const left = await readNotes();
+        if (left.length !== 9) problems.push(`tall: the two extra notes were not taken away again (${left.length} notes left)`);
+      }
+
+      // (3) Eight cycles on sixteenths with notes in the last cycle, scrolled to the end.
+      for (let n = 0; n < 6; n += 1) await click('scratch-more');
+      const eight = { step: 3, units: 384 };
+      for (const [unit, pitch] of [[336, 60], [348, 64], [360, 67], [372, 62], [381, 65]]) await putNote(unit, pitch, eight);
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, async () => {
+          await scrollToEnd();
+          await shot('sixteenths', layout);
+        });
+      }
+
+      // (4) Eight cycles on sixteenth triplets, with notes in the last cycle.
+      await click('scratch-grid-sixteenth-triplet');
+      const triplets = { step: 2, units: 384 };
+      for (const [unit, pitch] of [[338, 67], [342, 64], [346, 62], [350, 60], [382, 66]]) await putNote(unit, pitch, triplets);
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, async () => {
+          await scrollToEnd();
+          await shot('triplets', layout);
+        });
+      }
+
+      // (5) Tap on, with the quiet piece playing and the marker showing.
+      await fresh();
+      await callTool(client, 'set_code', { code: 'setcps(0.5)\nscratch_tap: s("bd*4").gain(0)', label: 'probe scratch pictures' });
+      const picturesPlaying = await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+      if (picturesPlaying !== true) problems.push('tap: the quiet piece did not play');
+      await setLayoutKey('a');
+      await focusRoll();
+      await pressKey(cdp, 'Home');
+      for (const [unit, pitch] of [[0, 60], [12, 64], [24, 67], [48, 62], [60, 65]]) await putNote(unit, pitch, sixteenths);
+      await pressKey(cdp, 't');
+      const markerThere = await waitFor(cdp, "document.getElementById('scratch-view').dataset.nowUnit !== '' ? true : null", 8000);
+      if (markerThere !== true) problems.push('tap: the marker did not appear');
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, () => shot('tap', layout));
+      }
+
+      // (6) The send strip with a phrase and the line that says it was sent.
+      await fresh();
+      await callTool(client, 'set_code', { code: 'setcps(0.5)\nscratch_tap: s("bd*4").gain(0)', label: 'probe scratch pictures send' });
+      const sendPlaying = await waitFor(cdp, `(() => (${STATE_WORD_EXPR}) === ${JSON.stringify(SOUND_LABELS.playing)} ? true : null)()`, 8000);
+      if (sendPlaying !== true) problems.push('send: the quiet piece did not play');
+      await setLayoutKey('a');
+      await focusRoll();
+      await pressKey(cdp, 'Home');
+      for (const [unit, pitch] of [[0, 60], [12, 64], [24, 67], [48, 62], [60, 65]]) await putNote(unit, pitch, sixteenths);
+      await click('scratch-send-button');
+      const sentShown = await waitFor(cdp, "document.getElementById('scratch-send-status').textContent.startsWith('Sent to Claude') ? true : null", 4000);
+      if (sentShown !== true) problems.push('send: the strip did not say it sent the motif');
+      for (const layout of SHOT_LAYOUTS) {
+        await inLayout(layout, () => shot('send', layout));
+      }
+      await callTool(client, 'list_history', {});
+      await foldRequestsPanel(cdp);
+    } finally {
+      await cdp('Emulation.clearDeviceMetricsOverride');
+      await blurActive();
+      await setLayoutKey('a');
+      if ((await readStateWord(cdp)) === SOUND_LABELS.playing) await stopMusic(cdp);
+      await clearViews();
+    }
+    const pictureProblems = [...problems];
+    for (const name of written) {
+      const file = path.join(scratchShotsFolder, name);
+      if (!fs.existsSync(file)) pictureProblems.push(`${name} is missing`);
+      else if (fs.readFileSync(file).subarray(0, 4).toString('hex') !== '89504e47') pictureProblems.push(`${name} is not a PNG`);
+    }
+    report(
+      `scratchpad: ${written.length} pictures of the five views in layouts a, b and c, a short window, the outside-the-window readout and the focus rings are saved outside the repository`,
+      pictureProblems.length === 0 && written.length >= 18 && shotsSavedOutside(scratchShotsFolder),
+      JSON.stringify({ written: written.length, problems: pictureProblems.slice(0, 6) }),
+    );
+    console.log('probe:page scratchpad pictures saved in a scratch folder outside the repository');
+  }
+}
+
 /** The Jam view against the real page: the scale states, the status line, the coming-up list, the piano, the guitar,
  * the chord tones, the ask contexts and the layouts. Runs alone with `--only jam`. */
 export async function jamBlocks(context) {
@@ -20663,6 +22812,11 @@ async function main() {
     }
     if (args.only === 'ramp') {
       await rampBlocks({ cdp, client, report, port, pageUrl });
+      summarize();
+      return;
+    }
+    if (args.only === 'scratch') {
+      await scratchBlocks({ cdp, client, report, port, pageUrl });
       summarize();
       return;
     }
@@ -27001,11 +29155,11 @@ async function main() {
                 fit,
                 barFits: bar.scrollWidth <= bar.clientWidth,
                 // No button wraps onto a second line: none is taller than the bar.
-                noWrap: buttons.length === 9 && buttons.every((b) => b.getBoundingClientRect().height <= barBox.height + 1),
+                noWrap: buttons.length === 10 && buttons.every((b) => b.getBoundingClientRect().height <= barBox.height + 1),
                 // From step 2 on the unselected names are gone and the digits stay; each button keeps digit and name in its accessible name.
                 namesGoAtStep2: fit < 2 || names.every((n) => getComputedStyle(n).display === 'none'),
                 namesShownBeforeStep2: fit >= 2 || names.every((n) => getComputedStyle(n).display !== 'none'),
-                digitsStay: digits.length === 6 && digits.every((d) => d.getBoundingClientRect().width > 0),
+                digitsStay: digits.length === 7 && digits.every((d) => d.getBoundingClientRect().width > 0),
                 namesKept: [...document.querySelectorAll('#view-buttons button')].every((b) => b.getAttribute('aria-label').startsWith(b.querySelector('.view-digit').textContent + ' ') && b.getAttribute('aria-label').endsWith(b.querySelector('.view-name').textContent)),
                 motionShown: motion.shown,
                 motionInside: motion.whole,
@@ -27060,7 +29214,7 @@ async function main() {
         const narrow = await barState();
         report(
           'the top-bar buttons are at least 24x24 with a hit area to their edges and nothing in the bar moves',
-          hitArea.count === 9 &&
+          hitArea.count === 10 &&
             hitArea.sizes.every(([width, height]) => width >= 24 && height >= 24) &&
             shift <= 0.5 &&
             hitArea.firstLeftHit === true &&
@@ -29988,6 +32142,7 @@ async function main() {
     await timelineBlocks({ cdp, client, report, port, pageUrl });
     await requestsBlocks({ cdp, client, report, port, pageUrl });
     await rampBlocks({ cdp, client, report, port, pageUrl });
+    await scratchBlocks({ cdp, client, report, port, pageUrl });
     summarize();
   } catch (err) {
     if (err instanceof ProbeCouldNotRun) {

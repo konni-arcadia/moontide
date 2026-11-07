@@ -6,12 +6,19 @@
 import { BEATS_PER_CYCLE } from './change-timing.js';
 import { MAX_MOMENT_NOTES, MAX_RANGE_CYCLES } from './timeline.js';
 import { cleanText } from './structure.js';
+import { GRIDS, MAX_CYCLES, MIN_CYCLES, MOTIF_SOURCES, assertPhraseCode, cyclesText, notesText } from './scratch-model.js';
 
 /** Mirrors src/protocol.ts's MAX_ASK_TEXT_LENGTH by hand (test/ask.test.js checks both are 2000). */
 export const MAX_ASK_TEXT_LENGTH = 2000;
 
 /** Mirrors src/protocol.ts's MAX_REQUEST_LINE_BYTES by hand (test/ask.test.js checks both are 8192). */
 export const MAX_REQUEST_LINE_BYTES = 8192;
+
+/**
+ * Mirrors src/protocol.ts's MAX_MOTIF_PHRASE_LENGTH by hand (test/ask.test.js checks both are 8000). The motif's sources, grid ids, cycle bounds and
+ * phrase shape come from page/scratch-model.js, which src/protocol.ts mirrors by hand (the same test checks them).
+ */
+export const MAX_MOTIF_PHRASE_LENGTH = 8000;
 
 /** Mirrors src/ask.ts's REQUEST_LINE_PREFIX by hand (test/ask.test.js checks both). */
 export const REQUEST_LINE_PREFIX = 'Request from the Moontide page:';
@@ -380,13 +387,49 @@ function checkedMoment(kind, moment) {
 }
 
 /**
+ * A motif of a motif descriptor checked by the schema's rules (src/protocol.ts's askMotifShape) and copied field by field: the source, the cycle
+ * when there is one (a whole number of at least 0), the cycles, the grid, the notes count and the phrase, which must have the phrase shape. The
+ * phrase is never cut. A wrong value throws like every other context, so a bug is loud.
+ */
+function checkedMotif(motif) {
+  const bad = (field) => missing('motif', field);
+  if (motif === null || typeof motif !== 'object') throw bad('a motif');
+  const { source, cycle, cycles, grid, notes, phrase } = motif;
+  if (!MOTIF_SOURCES.includes(source)) throw bad(`a source of ${MOTIF_SOURCES.join(', ')}`);
+  if (cycle !== undefined && !isNonNegativeInteger(cycle)) throw bad('a whole number cycle of at least 0, or no cycle');
+  if (!Number.isInteger(cycles) || cycles < MIN_CYCLES || cycles > MAX_CYCLES) throw bad(`cycles as a whole number from ${MIN_CYCLES} to ${MAX_CYCLES}`);
+  if (!GRIDS.some((candidate) => candidate.id === grid)) throw bad(`a grid of ${GRIDS.map((candidate) => candidate.id).join(', ')}`);
+  if (!Number.isInteger(notes) || notes < 1) throw bad('a notes count of at least 1');
+  if (typeof phrase !== 'string' || phrase === '' || phrase.length > MAX_MOTIF_PHRASE_LENGTH) throw bad(`a phrase of 1 to ${MAX_MOTIF_PHRASE_LENGTH} characters`);
+  assertPhraseCode(phrase);
+  return { source, ...(cycle === undefined ? {} : { cycle }), cycles, grid, notes, phrase };
+}
+
+/**
+ * The chip of a motif context: the source, the cycles, the notes and, when there is a moment, its cycle, cut to the context limit. The
+ * motif is not checked here (describeContext checks it); the Ask view also uses this to measure the line of a motif it refuses.
+ */
+export function motifChip(motif) {
+  return cutText(`Motif${SEPARATOR}${motif.source}${SEPARATOR}${cyclesText(motif.cycles)}${SEPARATOR}${notesText(motif.notes)}${motif.cycle === undefined ? '' : `${SEPARATOR}at cycle ${motif.cycle}`}`);
+}
+
+/**
  * The size in bytes (UTF-8) of the line the server builds from one request: src/ask.ts's requestLine, the
  * prefix, a space and the JSON of the fields in the same order (U+2028 and U+2029 escaped), so the page can
  * tell before it sends whether the server will take the line.
  */
-export function requestLineBytes({ id, text, context, chip, current, moment, gesture }) {
-  // The moment, then the gesture, each only when there is one (the order of src/ask.ts's requestLine).
-  const fields = { id, text, context, chip, current, ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }) };
+export function requestLineBytes({ id, text, context, chip, current, moment, gesture, motif }) {
+  // The moment, then the gesture, then the motif, each only when there is one (the order of src/ask.ts's requestLine).
+  const fields = {
+    id,
+    text,
+    context,
+    chip,
+    current,
+    ...(moment === undefined ? {} : { moment }),
+    ...(gesture === undefined ? {} : { gesture }),
+    ...(motif === undefined ? {} : { motif }),
+  };
   const json = JSON.stringify(fields).replaceAll('\u2028', '\\u2028').replaceAll('\u2029', '\\u2029');
   return new TextEncoder().encode(`${REQUEST_LINE_PREFIX} ${json}`).length;
 }
@@ -504,6 +547,8 @@ export function describeContext(descriptor) {
   const kind = descriptor && descriptor.kind;
   let moment = descriptor ? descriptor.moment : undefined;
   let gesture = descriptor ? descriptor.gesture : undefined;
+  let motif;
+  if (kind !== 'motif' && descriptor && descriptor.motif !== undefined) throw new Error(`Moontide: ask context ${kind} cannot carry a motif`);
   // A moment is the Timeline's facts at the pointer: a lane, a part header over the lanes and the rest of the
   // Timeline (a session descriptor) carry one; nothing else does.
   if (moment !== undefined && kind !== 'lane' && kind !== 'part' && kind !== 'session') throw new Error(`Moontide: ask context ${kind} cannot carry a moment`);
@@ -743,9 +788,17 @@ export function describeContext(descriptor) {
       chip = `Group "${name}"${parent === undefined ? '' : `${SEPARATOR}in "${parent}"`}`;
       break;
     }
+    case 'motif': {
+      // A motif sent from the Scratchpad: the context is only the kind, the motif rides next to it and carries its own moment.
+      motif = checkedMotif(descriptor.motif);
+      context = { kind };
+      chip = motifChip(motif);
+      break;
+    }
     default:
       throw new Error(`Moontide: unknown ask context kind ${kind}`);
   }
+
   // A gesture is about one note of a lane: it rides only on a lane that carries a moment (the range gesture is the range
   // context's own and is checked in its case above).
   if (gesture !== undefined) {
@@ -753,7 +806,7 @@ export function describeContext(descriptor) {
     gesture = checkedGesture(gesture);
     if (gesture.kind === 'range') throw new Error('Moontide: a range gesture goes only with a range context');
   }
-  return { context, chip: cutText(chip), ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }) };
+  return { context, chip: cutText(chip), ...(moment === undefined ? {} : { moment }), ...(gesture === undefined ? {} : { gesture }), ...(motif === undefined ? {} : { motif }) };
 }
 
 /**

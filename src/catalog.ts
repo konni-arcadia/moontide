@@ -12,7 +12,7 @@ import { z } from 'zod';
 import { drumMapById, kitDrumMap, unknownMapReason } from './drum-maps.js';
 import { renameWithRetry } from './history.js';
 import type { InstrumentModel } from './instruments.js';
-import { MAX_RIG_CATALOG_KITS, MAX_RIG_CATALOG_SOUNDS, MAX_RIG_PROBLEMS } from './protocol.js';
+import { MAX_RIG_CATALOG_KITS, MAX_RIG_CATALOG_SOUNDS, MAX_RIG_ENGINES, MAX_RIG_PROBLEMS } from './protocol.js';
 import {
   CONTROL_CHARS,
   cleanProblemText,
@@ -45,10 +45,18 @@ const catalogSoundSchema = z.strictObject({
 /** A drum kit of a catalog: a sound that also may name its drum map (null: no map is known for the kit). */
 const catalogKitSchema = catalogSoundSchema.extend({ noteMap: idSchema.nullable().optional() });
 
-/** A catalog file: the model it extends (equal to the file name), where the list came from, the sounds and the drum kits. */
+/** The banks whose tones belong to one engine of the model; a bank is the exact MSB and LSB pair a sound is sent with. */
+const catalogEngineSchema = z.strictObject({
+  engine: idSchema,
+  banks: z.array(z.strictObject({ msb: dataByteSchema, lsb: dataByteSchema.optional() })).min(1, 'at least one bank is required').max(128, 'at most 128 banks'),
+});
+
+/** A catalog file: the model it extends (equal to the file name), where the list came from, the engine table, the sounds and the drum kits. */
 export const catalogSchema = z.strictObject({
   model: modelIdSchema,
   source: z.string().min(1, 'must not be empty').max(200, 'at most 200 characters'),
+  // Optional, so earlier catalogs stay valid: which engine of the model each bank of melodic tones belongs to.
+  engines: z.array(catalogEngineSchema).max(MAX_RIG_ENGINES, 'at most 16 engines').optional(),
   // At least one sound or one kit is required: catalogProblems checks that, with the words of a catalog without sounds.
   sounds: z.array(catalogSoundSchema).max(MAX_CATALOG_SOUNDS, 'at most 5000 sounds'),
   kits: z.array(catalogKitSchema).max(MAX_CATALOG_KITS, 'at most 512 kits').optional(),
@@ -57,6 +65,55 @@ export const catalogSchema = z.strictObject({
 export type Catalog = z.infer<typeof catalogSchema>;
 export type CatalogSound = Catalog['sounds'][number];
 export type CatalogKit = z.infer<typeof catalogKitSchema>;
+
+/**
+ * The bank as the instrument gets it: an absent bank is 0/0 and an absent LSB is 0, as the sender in
+ * page/midi-out.js sends it, so `97` and `97/0` are one bank. A model that takes an MSB only never has an LSB here
+ * (a catalog with one is refused), so the key needs no bank select.
+ */
+function bankKey(bank: { msb: number; lsb?: number } | undefined): string {
+  return `${bank?.msb ?? 0}/${bank?.lsb ?? 0}`;
+}
+
+/** `97/64`, or `97` where the bank has no LSB. */
+function bankText(bank: { msb: number; lsb?: number }): string {
+  return bank.lsb === undefined ? String(bank.msb) : `${bank.msb}/${bank.lsb}`;
+}
+
+/**
+ * The checks of the engine table against the model: the model declares engines and has a bank select, each
+ * engine is declared and listed once, each bank is in one engine only and fits the model's bank select.
+ */
+function engineProblems(catalog: Catalog, model: InstrumentModel, add: (field: string, reason: string) => void): void {
+  if (catalog.engines === undefined) return;
+  const declared = model.settings?.engines;
+  if (declared === undefined) {
+    add('engines', 'the model declares no engines');
+    return;
+  }
+  if (model.bankSelect === 'none') {
+    add('engines', 'this model has no bank select');
+    return;
+  }
+  const firstEngine = new Map<string, number>();
+  const firstBank = new Map<string, number>();
+  catalog.engines.forEach((entry, index) => {
+    if (!declared.some((engine) => engine.id === entry.engine)) {
+      add(`engines[${index}].engine`, `unknown engine "${entry.engine}", engines of model ${model.id}: ${declared.map((engine) => engine.id).join(', ')}`);
+    }
+    const earlier = firstEngine.get(entry.engine);
+    if (earlier === undefined) firstEngine.set(entry.engine, index);
+    else add(`engines[${index}].engine`, `same engine as engines[${earlier}]`);
+    entry.banks.forEach((bank, position) => {
+      const at = `engines[${index}].banks[${position}]`;
+      if (model.bankSelect === 'msb' && bank.lsb !== undefined) add(`${at}.lsb`, 'this model takes a bank MSB only');
+      const key = bankKey(bank);
+      const seen = firstBank.get(key);
+      if (seen === undefined) firstBank.set(key, index);
+      else add(at, `bank ${bankText(bank)} is also in engines[${seen}]`);
+    });
+  });
+}
 
 /** The checks that need more than one field, or the model; the shape is already valid. Paths are bare (no file prefix). */
 function catalogProblems(catalog: Catalog, model: InstrumentModel, file: string | undefined): Problem[] {
@@ -73,6 +130,7 @@ function catalogProblems(catalog: Catalog, model: InstrumentModel, file: string 
   noControl('source', catalog.source);
   const kits = catalog.kits ?? [];
   if (catalog.sounds.length === 0 && kits.length === 0) add('sounds', 'at least one sound is required');
+  engineProblems(catalog, model, add);
   // Sounds are melodic, so only the model's melodic names are taken; kits are checked below against its rhythm names.
   const modelKeys = new Map(model.sounds.melodic.map((own) => [soundKey(own.name), own.name]));
   const firstByKey = new Map<string, number>();
@@ -121,6 +179,32 @@ function catalogProblems(catalog: Catalog, model: InstrumentModel, file: string 
     }
   });
   return problems;
+}
+
+/**
+ * The engine whose banks hold this bank as the instrument gets it (see bankKey: no bank is 0/0, no LSB is 0),
+ * or null when there is no catalog, no engine table, or no engine holds the bank.
+ */
+export function engineOf(catalog: Catalog | null | undefined, bank: { msb: number; lsb?: number } | undefined): string | null {
+  if (catalog === null || catalog === undefined || catalog.engines === undefined) return null;
+  const key = bankKey(bank);
+  const found = catalog.engines.find((entry) => entry.banks.some((candidate) => bankKey(candidate) === key));
+  return found === undefined ? null : found.engine;
+}
+
+/**
+ * What a reply says of the engine of a melodic sound: `engine "<name>"` when the catalog places the bank in one, `in no
+ * engine` when it places it in none (also when there is no catalog or no engine table, since the page then knows no
+ * engine for the sound), and null (say nothing) for a model that declares no engines. The name is the model's, quoted
+ * like a port name.
+ */
+export function engineClause(catalog: Catalog | null | undefined, model: InstrumentModel, bank: { msb: number; lsb?: number } | undefined): string | null {
+  const declared = model.settings?.engines;
+  if (declared === undefined) return null;
+  const id = engineOf(catalog, bank);
+  if (id === null) return 'in no engine';
+  const engine = declared.find((entry) => entry.id === id);
+  return engine === undefined ? 'in no engine' : `engine ${quote(engine.name)}`;
 }
 
 /**
@@ -263,11 +347,11 @@ export function categoriesSentence(catalog: Catalog, prefix: string): string {
   return counts.length === 0 ? 'The catalog has no categories.' : `${prefix}${categoryList(counts, 30)}.`;
 }
 
-/** A match line: facts only, in the order name, program, bank, category; a drum kit is marked and ends with its drum map. */
-function matchLine(sound: CatalogKit, kit: { model: InstrumentModel } | null): string {
+/** A match line: facts only, in the order name, program, bank, category, engine; a drum kit is marked and ends with its drum map. */
+function matchLine(sound: CatalogKit, kit: { model: InstrumentModel } | null, engine: string | null): string {
   const bank = sound.bank === undefined ? '' : `, bank ${sound.bank.lsb === undefined ? sound.bank.msb : `${sound.bank.msb}/${sound.bank.lsb}`}`;
   const category = sound.category === undefined ? '' : `, category ${quote(sound.category)}`;
-  if (kit === null) return `- ${quote(sound.name)}: program ${sound.program}${bank}${category}`;
+  if (kit === null) return `- ${quote(sound.name)}: program ${sound.program}${bank}${category}${engine === null ? '' : `, ${engine}`}`;
   const use = kitDrumMap(kit.model, sound);
   const map = use.state === 'known' ? `, drum map ${quote(use.map.name)} (${use.map.notes.length} notes)` : ', drum map unknown';
   return `- ${quote(sound.name)} (drum kit): program ${sound.program}${bank}${category}${map}`;
@@ -285,7 +369,10 @@ export function searchReply(options: { id: string; modelName: string; model: Ins
   }
   if (result.total === 1) lines.push('1 match:');
   else lines.push(result.total > MAX_SEARCH_RESULTS ? `${result.total} matches, first ${MAX_SEARCH_RESULTS}:` : `${result.total} matches:`);
-  result.matches.forEach((sound, index) => lines.push(matchLine(sound, result.kits[index] === true ? { model } : null)));
+  result.matches.forEach((sound, index) => {
+    const isKit = result.kits[index] === true;
+    lines.push(matchLine(sound, isKit ? { model } : null, isKit ? null : engineClause(catalog, model, sound.bank)));
+  });
   if (result.total > MAX_SEARCH_RESULTS) lines.push(`${result.total - MAX_SEARCH_RESULTS} more, refine your search.`);
   if (result.matches.some((sound) => /['\\]/.test(sound.name))) {
     lines.push("A name with ' or \\ takes a backslash before that character inside the single quotes of the code.");
@@ -304,7 +391,8 @@ export class CatalogSaveError extends Error {
 }
 
 /**
- * The text of a catalog file: the model and source lines, then one sound per line (about 420 KB for
+ * The text of a catalog file: the model and source lines, then the engine table when there is one (one engine
+ * per line), then one sound per line (about 420 KB for
  * 5,000 sounds, where indented JSON is nearly twice that), then the kits list when there are kits,
  * ending with a newline.
  */
@@ -312,7 +400,8 @@ export function catalogFileText(catalog: Catalog): string {
   const list = (items: object[]): string => `[\n${items.map((item) => `  ${JSON.stringify(item)}`).join(',\n')}\n  ]`;
   const sounds = catalog.sounds.length === 0 ? '[]' : list(catalog.sounds);
   const kits = catalog.kits === undefined || catalog.kits.length === 0 ? '' : `,\n  "kits": ${list(catalog.kits)}`;
-  return `{\n  "model": ${JSON.stringify(catalog.model)},\n  "source": ${JSON.stringify(catalog.source)},\n  "sounds": ${sounds}${kits}\n}\n`;
+  const engines = catalog.engines === undefined || catalog.engines.length === 0 ? '' : `,\n  "engines": ${list(catalog.engines)}`;
+  return `{\n  "model": ${JSON.stringify(catalog.model)},\n  "source": ${JSON.stringify(catalog.source)}${engines},\n  "sounds": ${sounds}${kits}\n}\n`;
 }
 
 /**
@@ -422,6 +511,20 @@ function summaryLine(label: string, sound: CatalogKit): string {
   return `${label}: ${quote(sound.name)} (${parts.join(', ')}).`;
 }
 
+/** `Engines: <id> (N banks, M sounds), ...; in no engine: K sounds.`, singular for one; kits are not counted. */
+function engineSummaryLine(catalog: Catalog): string {
+  const count = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? '' : 's'}`;
+  const sounds = new Map<string, number>();
+  let loose = 0;
+  for (const sound of catalog.sounds) {
+    const engine = engineOf(catalog, sound.bank);
+    if (engine === null) loose++;
+    else sounds.set(engine, (sounds.get(engine) ?? 0) + 1);
+  }
+  const parts = (catalog.engines ?? []).map((entry) => `${entry.engine} (${count(entry.banks.length, 'bank')}, ${count(sounds.get(entry.engine) ?? 0, 'sound')})`);
+  return `Engines: ${parts.join(', ')}; in no engine: ${count(loose, 'sound')}.`;
+}
+
 /**
  * The summary the user is shown before a catalog drafted from a sound list is saved, one fact per line:
  * the model and the source, how the list numbers programs, the categories with counts, the bank select
@@ -446,9 +549,10 @@ export function summarizeCatalog(options: { catalog: Catalog; model: InstrumentM
   if (model.bankSelect === 'none') {
     lines.push('Bank select: none.');
   } else {
-    const banks = new Set([...sounds, ...kits].map((sound) => `${sound.bank?.msb ?? 0}/${sound.bank?.lsb ?? 0}`)).size;
+    const banks = new Set([...sounds, ...kits].map((sound) => bankKey(sound.bank))).size;
     lines.push(`Bank select: ${model.bankSelect === 'msb' ? 'CC0' : 'CC0 then CC32'}; ${banks} ${banks === 1 ? 'bank' : 'banks'}.`);
   }
+  if (catalog.engines !== undefined && catalog.engines.length > 0) lines.push(engineSummaryLine(catalog));
   if (total >= 1) lines.push(summaryLine('First', sounds[0] as CatalogSound));
   if (total >= 3) lines.push(summaryLine('Middle', sounds[Math.floor((total - 1) / 2)] as CatalogSound));
   if (total >= 2) lines.push(summaryLine('Last', sounds[total - 1] as CatalogSound));

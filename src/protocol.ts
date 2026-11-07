@@ -60,6 +60,15 @@ export interface MidiPortFact {
 }
 
 /**
+ * Why the memory guard refused a message: not readable as bytes, longer than it reads, a system exclusive message that
+ * does not end, not a Roland data set for the instrument's model, an instrument whose temporary areas are not known,
+ * an address outside the temporary scene and tones, a wrong checksum, or an NRPN message that is not one of the part offsets of
+ * the NRPN family of the instrument. Worded in src/midi-state.ts.
+ */
+export const MEMORY_GUARD_REASONS = ['not-bytes', 'too-long', 'incomplete', 'not-data-set', 'unknown-areas', 'outside', 'checksum', 'nrpn'] as const;
+export type MemoryGuardReason = (typeof MEMORY_GUARD_REASONS)[number];
+
+/**
  * Something that happened in the page's MIDI layer that Claude must hear once: each event is sent with
  * one midi-state message and worded once by the server (src/midi-state.ts). page/midi-out.js builds them.
  */
@@ -67,7 +76,15 @@ export type MidiEvent =
   | { kind: 'reset'; instrument: string; reason: 'start' | 'reconnect' }
   | { kind: 'sound-cut'; instrument: string; channel: number }
   | { kind: 'sound-kept'; instrument: string; channel: number; sound: string }
-  | { kind: 'send-failed'; instrument: string; what: 'reset' | 'setup'; failure: string }
+  | { kind: 'send-failed'; instrument: string; what: 'reset' | 'setup' | 'settings'; failure: string }
+  // Scene settings the playing code writes changed: a scene setting reaches every part of the instrument.
+  | { kind: 'settings-scene'; instrument: string; names: string[] }
+  // Settings the code that played wrote and the code that plays does not: nothing is sent for them, so the instrument
+  // keeps its last value. The channel is 1 to 16 for the tone and part level and null for the scene.
+  | { kind: 'settings-left'; instrument: string; level: 'tone' | 'part' | 'scene'; channel: number | null; names: string[] }
+  // The memory guard refused a message: one from the code (the first one per instrument), a settings message, or the
+  // instrument's reset.
+  | { kind: 'sysex-refused'; instrument: string; source: 'code' | 'settings' | 'reset'; reason: MemoryGuardReason }
   // The playing code wrote MIDI clock or transport (Strudel's own bytes), and the page dropped them.
   | { kind: 'clock-dropped' };
 
@@ -107,6 +124,8 @@ export const MAX_MIDI_EVENTS = 20;
 // message. page/midi-rig.js mirrors the limits below (RIG_LIMITS) and the message shape
 // by hand; test/midi-rig.test.js checks both sides.
 export const MAX_RIG_INSTRUMENTS = 16;
+// The most MIDI input ports the setup file may name (its inputs list); mirrored by RIG_LIMITS.inputs in page/midi-rig.js.
+export const MAX_RIG_INPUTS = 4;
 export const MAX_RIG_SOUNDS = 512;
 // The most controls a model may declare: the model schema's own `.max(32)` of `controls` in
 // src/instruments.ts; mirrored by RIG_LIMITS.controls in page/midi-rig.js.
@@ -121,6 +140,12 @@ export const MAX_RIG_PROBLEMS = 20;
 export const MAX_RIG_DRUM_MAPS = 16;
 export const MAX_RIG_DRUM_NOTES = 128;
 export const MAX_RIG_DRUM_NAME = 40;
+// The most setting rows one level (tone, part or scene) of a model may describe, and the most engines a model may
+// declare; mirrored by RIG_LIMITS.settings and RIG_LIMITS.engines in page/midi-rig.js. The page cannot import the
+// vocabulary, so this is a fixed number; test/vocabulary.test.js checks that the whole vocabulary fits in it. It is 512
+// because the MT-32 map holds about 250 tone settings, and a settings event may name every one of them.
+export const MAX_RIG_SETTINGS = 512;
+export const MAX_RIG_ENGINES = 16;
 
 /** One problem of the setup file: the exact field and the reason, both plain text. */
 export interface RigProblem {
@@ -132,6 +157,8 @@ export interface RigSound {
   name: string;
   program: number;
   bank?: { msb: number; lsb?: number };
+  // Melodic sounds only, present only when the sound catalog places the sound's bank in an engine of the model.
+  engine?: string;
   // Rhythm sounds only, present only when the model or catalog sets it: the id of the kit's drum map, or null when no map is known for the kit.
   noteMap?: string | null;
 }
@@ -156,6 +183,40 @@ export interface RigControl {
   min: number;
   max: number;
   default: number;
+}
+
+/**
+ * The message a setting becomes: a Roland data set (the address as the model writes it, for part 1 of a tone or a
+ * part setting; the page adds the part), an NRPN or a control change. The page builds the bytes from it.
+ */
+export type RigSettingMessage =
+  | { kind: 'roland-dt1'; address: number[]; size: 1 | 2 | 4 }
+  | { kind: 'nrpn'; msb: number; lsb: number }
+  | { kind: 'cc'; cc: number };
+
+/** One setting a model describes: its name from the vocabulary, the range in the device's own units and the message it becomes. */
+export interface RigSetting {
+  name: string;
+  min: number;
+  max: number;
+  // Tone settings only, and only when the model declares engines: the ids of the engines that have this setting.
+  engines?: string[];
+  message: RigSettingMessage;
+}
+
+/**
+ * The settings a model describes, by level; the engines are the ones the model declares ([] when it declares none).
+ * `rolandModel` is the model ID of the Roland data sets as bytes, or null when the model gives none.
+ * `nrpnFamily` is the NRPN family of the model's NRPN rows, or null.
+ */
+export interface RigSettings {
+  engines: { id: string; name: string }[];
+  rolandModel: number[] | null;
+  // The NRPN family of the model's NRPN rows ('gs' is the only one Moontide knows), or null when the model names none.
+  nrpnFamily: 'gs' | null;
+  tone: RigSetting[];
+  part: RigSetting[];
+  scene: RigSetting[];
 }
 
 /** One instrument of the setup file, already resolved to its model; reset bytes are built on the server. */
@@ -187,8 +248,12 @@ export interface RigInstrumentMessage {
   // The fields the Instruments view's switch and settings editor read; modelChannels follows enabled.
   // False when the user switched the instrument off in the page (instruments-state.json); it is still a valid instrument of the file.
   enabled: boolean;
+  // True when the instrument's model states that it plays one note at a time; false when it says nothing (unknown, never polyphonic).
+  monophonic: boolean;
   // Every channel of the instrument's model, ascending, with the role the model gives it; `channels` holds the ones in use.
   modelChannels: RigChannel[];
+  // The settings the model describes, or null when it describes none.
+  settings: RigSettings | null;
 }
 
 /** When a change takes over: at once (the default), on the next bar line or on the next phrase line. */
@@ -313,7 +378,7 @@ export type ServerMessage =
   // mirrors it by hand.
   | { type: 'midi-rig'; setup: 'absent' }
   | { type: 'midi-rig'; setup: 'invalid'; problems: RigProblem[]; more: number }
-  | { type: 'midi-rig'; setup: 'valid'; instruments: RigInstrumentMessage[] }
+  | { type: 'midi-rig'; setup: 'valid'; instruments: RigInstrumentMessage[]; inputs: string[] }
   // The answer to an instrument-switch (and to a settings edit), sent to the page that
   // asked. It follows the midi-rig push the change caused, so the page applies the new rig before it clears its pending
   // look. ok false: 'refused' (a plain reason, nothing changed), 'write-failed' (the file could not be saved; nothing
@@ -448,8 +513,9 @@ export type PageMessage =
   // `current` the version id the top bar showed at Enter (null before any version). `moment` is
   // the Timeline's music under the pointer at the click, facts only (absent when nothing was drawn there).
   // `gesture` is what the user did to a note of the Timeline before asking, only with a lane context and a moment, or the
-  // notes of a range of cycles, only with a range context and no moment.
-  | { type: 'ask'; id: string; text: string; context: AskContext; chip: string; current: number | null; moment?: AskMoment; gesture?: AskGesture }
+  // notes of a range of cycles, only with a range context and no moment. `motif` is a motif from the Scratchpad, only with a motif
+  // context and neither a moment nor a gesture.
+  | { type: 'ask'; id: string; text: string; context: AskContext; chip: string; current: number | null; moment?: AskMoment; gesture?: AskGesture; motif?: AskMotif }
   // The MIDI facts of the page, sent when they change and before `evaluated`
   // (facts only, never wording). page/main.js mirrors this shape by hand.
   | ({ type: 'midi-state' } & MidiFacts)
@@ -510,6 +576,30 @@ export const MAX_ASK_ID_LENGTH = 64;
 // row and whole in the detail.
 export const MAX_ANSWER_TEXT_LENGTH = 200;
 
+// How the notes of a motif sent from the Scratchpad got on its roll, in the order the request lists them; `mixed` is more than one way.
+// page/scratch-model.js mirrors it by hand (test/ask.test.js checks both sides).
+export const MOTIF_SOURCES = ['played', 'drawn', 'tapped', 'mixed'] as const;
+
+// The ids of the five grids of the Scratchpad, in the page's order. page/scratch-model.js mirrors them by hand
+// (test/ask.test.js checks both sides).
+export const MOTIF_GRIDS = ['quarter', 'eighth', 'sixteenth', 'eighth-triplet', 'sixteenth-triplet'] as const;
+
+// The fewest and the most cycles one motif has. page/scratch-model.js mirrors them by hand (test/ask.test.js checks both sides).
+export const MIN_MOTIF_CYCLES = 1;
+export const MAX_MOTIF_CYCLES = 8;
+
+// The most characters the phrase of a motif has. A bound below MAX_REQUEST_LINE_BYTES so the schema is bounded; the line's own
+// bound stays the real limit, and a phrase is refused whole and never cut. page/ask.js mirrors it by hand (test/ask.test.js checks
+// both sides).
+export const MAX_MOTIF_PHRASE_LENGTH = 8000;
+
+// The lane of a phrase: note("...").velocity("..."), with only the characters of the phrase inside the quotes.
+const MOTIF_PHRASE_LANE = 'note\\("[a-g0-9#.~_\\[\\],/ <>]*"\\)\\.velocity\\("[a-g0-9#.~_\\[\\],/ <>]*"\\)';
+
+// The shape of a phrase: one lane, or stack(...) of two or more. Nothing but notes and velocities can travel in the phrase field.
+// page/scratch-model.js's PHRASE_SHAPE is the same pattern, written by hand (test/ask.test.js checks both sides).
+export const MOTIF_PHRASE_SHAPE = new RegExp(`^(${MOTIF_PHRASE_LANE}|stack\\(${MOTIF_PHRASE_LANE}(, ${MOTIF_PHRASE_LANE})+\\))$`);
+
 // The kinds of thing a right-click can point at. The Jam view is
 // the source of 'note' (a pitch class with its role in the scale) and 'warning' (a chord that leaves it).
 export const ASK_CONTEXT_KINDS = [
@@ -532,6 +622,7 @@ export const ASK_CONTEXT_KINDS = [
   'cell',
   'group',
   'range',
+  'motif',
 ] as const;
 
 // One note of a moment: an event the Timeline drew at the instant. `track` is the lane's shown name,
@@ -614,7 +705,21 @@ export type AskContext =
   // that do not fit (only with 'does-not-fit'); both are absent while the grid has no answer.
   | { kind: 'cell'; section: string; track: string; variation?: string; rest?: true; fit?: 'fits' | 'does-not-fit' | 'cannot-check'; outside?: string }
   // A group row of the Song grid; `parent` is the group it sits in, absent at the top.
-  | { kind: 'group'; name: string; parent?: string };
+  | { kind: 'group'; name: string; parent?: string }
+  // A motif sent from the Scratchpad; the motif itself rides in the `motif` field of the request.
+  | { kind: 'motif' };
+
+// A motif sent from the Scratchpad, facts only: how its notes got on the roll, the cycle where the music stood at its first cycle
+// (absent means no moment: the music was stopped), its length in cycles, the grid, how many notes it has and its phrase, the
+// Strudel code that plays exactly those notes. The page changed no code.
+export type AskMotif = {
+  source: (typeof MOTIF_SOURCES)[number];
+  cycle?: number;
+  cycles: number;
+  grid: (typeof MOTIF_GRIDS)[number];
+  notes: number;
+  phrase: string;
+};
 
 // Why the server refused a request; the page maps each to its own line.
 // 'too-long' is the text over MAX_ASK_TEXT_LENGTH characters; 'line-too-long' is a whole line over
@@ -626,6 +731,12 @@ const audioStateSchema = z.enum(['playing', 'waiting-for-click', 'stopped']);
 
 const midiName = z.string().max(MAX_MIDI_NAME_LENGTH);
 const midiChannel = z.number().int().min(1).max(16);
+// The names of the settings an event is about: a setting name is a lowercase letter, then letters and digits
+// (page/midi-rig.js reads the same pattern), and a level holds at most MAX_RIG_SETTINGS of them.
+const settingNames = z
+  .array(z.string().regex(/^[a-z][A-Za-z0-9]{0,39}$/))
+  .min(1)
+  .max(MAX_RIG_SETTINGS);
 
 // A longer string is rejected, never trimmed (the page cuts before it sends).
 const askString = z.string().max(MAX_ASK_CONTEXT_LENGTH);
@@ -687,6 +798,20 @@ export const askGestureSchema = z.discriminatedUnion('kind', [
     more: z.number().int().nonnegative(),
   }),
 ]);
+
+// The keys of a motif. z.object drops a key it does not name, so test/ask.test.js pins these keys equal to the ones page/scratch-model.js's
+// motifRequest can give. A cycle, a count or a phrase out of bounds is rejected, never trimmed, and a phrase that is not in the phrase form
+// is rejected whole.
+export const askMotifShape = {
+  source: z.enum(MOTIF_SOURCES),
+  cycle: z.number().int().nonnegative().optional(),
+  cycles: z.number().int().min(MIN_MOTIF_CYCLES).max(MAX_MOTIF_CYCLES),
+  grid: z.enum(MOTIF_GRIDS),
+  notes: z.number().int().min(1),
+  phrase: z.string().min(1).max(MAX_MOTIF_PHRASE_LENGTH).regex(MOTIF_PHRASE_SHAPE),
+};
+
+const askMotifSchema = z.object(askMotifShape);
 
 const askContextSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session') }),
@@ -766,6 +891,7 @@ const askContextSchema = z.discriminatedUnion('kind', [
       message: 'outside notes come only with a fit of does-not-fit',
     }),
   z.object({ kind: z.literal('group'), name: askName, parent: askName.optional() }),
+  z.object({ kind: z.literal('motif') }),
 ]);
 
 /** A structure note holds at most this many lines, each at most this many characters. */
@@ -908,9 +1034,10 @@ const pageMessageSchema = z.union([
     context: askContextSchema,
     chip: z.string().min(1).max(MAX_ASK_CONTEXT_LENGTH),
     current: z.number().int().positive().nullable(),
-    // z.object drops a key it does not name, so the moment and the gesture must be named here to reach Claude.
+    // z.object drops a key it does not name, so the moment, the gesture and the motif must be named here to reach Claude.
     moment: askMomentSchema.optional(),
     gesture: askGestureSchema.optional(),
+    motif: askMotifSchema.optional(),
   })
     // A gesture about one note of a lane rides only on a lane context that carries a moment; the range gesture and the range
     // context come together and carry no moment (the notes of the range are in the gesture).
@@ -921,7 +1048,11 @@ const pageMessageSchema = z.union([
         return ask.gesture === undefined || (ask.context.kind === 'lane' && ask.moment !== undefined);
       },
       { message: 'a gesture needs a lane context and a moment, and a range gesture goes only with a range context' },
-    ),
+    )
+    // A motif goes only with the motif context and the motif context needs one; a motif request carries no moment and no gesture.
+    .refine((ask) => (ask.motif !== undefined) === (ask.context.kind === 'motif') && (ask.motif === undefined || (ask.moment === undefined && ask.gesture === undefined)), {
+      message: 'a motif goes only with a motif context, which needs it, and carries no moment and no gesture',
+    }),
   z.object({
     type: z.literal('midi-state'),
     access: z.enum(['idle', 'pending', 'enabled', 'denied', 'unsupported', 'failed']),
@@ -952,8 +1083,27 @@ const pageMessageSchema = z.union([
           z.object({
             kind: z.literal('send-failed'),
             instrument: midiName,
-            what: z.enum(['reset', 'setup']),
+            what: z.enum(['reset', 'setup', 'settings']),
             failure: z.string().max(MAX_MIDI_FAILURE_LENGTH),
+          }),
+          z.object({ kind: z.literal('settings-scene'), instrument: midiName, names: settingNames }),
+          z
+            .object({
+              kind: z.literal('settings-left'),
+              instrument: midiName,
+              level: z.enum(['tone', 'part', 'scene']),
+              channel: midiChannel.nullable(),
+              names: settingNames,
+            })
+            // A tone or part setting belongs to a channel; a scene setting reaches every part and has none.
+            .refine((event) => (event.level === 'scene') === (event.channel === null), {
+              message: 'a scene setting has no channel, a tone or part setting has one',
+            }),
+          z.object({
+            kind: z.literal('sysex-refused'),
+            instrument: midiName,
+            source: z.enum(['code', 'settings', 'reset']),
+            reason: z.enum(MEMORY_GUARD_REASONS),
           }),
           z.object({ kind: z.literal('clock-dropped') }),
         ]),

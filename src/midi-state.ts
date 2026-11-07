@@ -8,7 +8,7 @@
 // Everything Claude reads from here is a fact, never a style or behavior instruction. Names that
 // come from the page (devices, code) are cleaned and quoted before they are written into a line.
 
-import type { MidiEvent, MidiFacts } from './protocol.js';
+import type { MemoryGuardReason, MidiEvent, MidiFacts } from './protocol.js';
 
 /** At most this many lines wait in the queue; the rest are counted and said in one line. */
 export const MAX_MIDI_NOTICES = 20;
@@ -143,6 +143,23 @@ export function midiFailedLine(failure: string | null): string {
   return `MIDI: Web MIDI could not start${reason}, so tracks using .midi() are silent. Other tracks keep playing.`;
 }
 
+/** Setting names joined by ', ': the schema holds each to a letter and then letters and digits, and cleaning keeps it so. */
+function settingNameList(names: string[]): string {
+  return names.map(cleanMidiName).join(', ');
+}
+
+/** The words of each reason the memory guard gives (src/protocol.ts lists them). */
+const GUARD_REASON_WORDS: Record<MemoryGuardReason, string> = {
+  'not-bytes': 'it is not a list of numbers, so it cannot be checked',
+  'too-long': 'it is too long to be checked',
+  incomplete: 'it is not a complete system exclusive message',
+  'not-data-set': 'it is not a Roland data set (command 12) for the model of the instrument',
+  'unknown-areas': 'Moontide does not know which addresses of this instrument are temporary',
+  outside: 'it would write outside the temporary scene and tones',
+  checksum: 'its checksum does not match',
+  nrpn: 'it is not one of the NRPN part offsets Moontide knows for this instrument',
+};
+
 /**
  * The line of one event the page sent: a reset of an instrument, a sound change that may
  * cut a note, a sound kept after a failed evaluation, a send that failed, and clock or transport the
@@ -170,8 +187,35 @@ export function midiEventLine(event: MidiEvent): string {
     }
     case 'send-failed': {
       const id = quoteMidiName(event.instrument);
-      const what = event.what === 'reset' ? 'the reset' : 'the sound setup';
+      const what = event.what === 'reset' ? 'the reset' : event.what === 'settings' ? 'the settings' : 'the sound setup';
       return `MIDI: ${what} could not be sent to instrument ${id} (${quoteMidiName(event.failure)}).`;
+    }
+    case 'settings-scene': {
+      const id = quoteMidiName(event.instrument);
+      return `MIDI: the scene settings ${settingNameList(event.names)} of ${id} reach every part of the instrument, not only the channel of their .midi() call.`;
+    }
+    case 'settings-left': {
+      const id = quoteMidiName(event.instrument);
+      const names = settingNameList(event.names);
+      const nothing = 'are no longer in the code that plays. Nothing is sent for them, so the instrument keeps the last value';
+      if (event.level === 'scene') return `MIDI: the scene settings ${names} of ${id} ${nothing} until the instrument itself changes it.`;
+      if (event.level === 'part') return `MIDI: the part settings ${names} of ${id} channel ${event.channel} ${nothing} until the instrument itself changes it.`;
+      return `MIDI: the tone settings ${names} of ${id} channel ${event.channel} ${nothing} until it loads the tone again.`;
+    }
+    case 'sysex-refused': {
+      const id = quoteMidiName(event.instrument);
+      const unread = event.reason === 'not-bytes' || event.reason === 'too-long';
+      const what =
+        event.source === 'reset'
+          ? `the reset of ${id} was`
+          : event.source === 'settings'
+            ? `the settings for ${id} were`
+            : `a ${unread ? 'MIDI' : 'system exclusive'} message from the code to ${id} was`;
+      const only =
+        event.reason === 'nrpn'
+          ? 'only Roland data sets into its temporary scene and tones, and the NRPN part offsets it knows.'
+          : 'only Roland data sets into its temporary scene and tones.';
+      return `MIDI: ${what} not sent: ${GUARD_REASON_WORDS[event.reason]}. Moontide sends nothing to an instrument that could write to its memory, ${only}`;
     }
     case 'clock-dropped':
       return MIDI_CLOCK_DROPPED_LINE;
