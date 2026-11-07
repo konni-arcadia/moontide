@@ -154,13 +154,18 @@ test('changelog: a paragraph says early experimental and names the Scratchpad', 
 });
 
 /** The newest section of the changelog: from the first `## [` heading up to the next one. */
+// The newest section that ships features. A maintenance release (its section opens with "A maintenance
+// release.") changes nothing in Moontide, so the features and open checks stay those of the release before.
 function newestChangelogSection() {
   const lines = read('CHANGELOG.md').split(/\r?\n/);
-  const start = lines.findIndex((line) => line.startsWith('## ['));
-  assert.notEqual(start, -1, 'CHANGELOG.md has no version heading');
-  const rest = lines.slice(start + 1);
-  const next = rest.findIndex((line) => line.startsWith('## ['));
-  return rest.slice(0, next === -1 ? rest.length : next).join('\n');
+  const starts = lines.flatMap((line, index) => (line.startsWith('## [') ? [index] : []));
+  assert.notEqual(starts.length, 0, 'CHANGELOG.md has no version heading');
+  for (const [i, start] of starts.entries()) {
+    const body = lines.slice(start + 1, starts[i + 1] ?? lines.length);
+    if (body.find((line) => line.trim() !== '')?.startsWith('A maintenance release.')) continue;
+    return body.join('\n');
+  }
+  assert.fail('CHANGELOG.md has only maintenance sections');
 }
 
 test('changelog: the newest section points into the manual, at the settings page and the Scratchpad page', async () => {

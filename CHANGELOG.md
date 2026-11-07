@@ -3,6 +3,19 @@
 Notable changes are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.1] - 2026-11-07
+
+A maintenance release. Nothing changes in Moontide itself.
+
+### Added
+
+- A `glama.json` file that names the maintainer for the Glama MCP directory.
+- Code scanning with CodeQL on the JavaScript and TypeScript sources: on every push to main, every pull
+  request to main, and once a week.
+- Dependabot, kept quiet: at most one grouped pull request a month for npm and one for GitHub Actions.
+  This repository is a mirror, so such a pull request is not merged here: the update lands in a
+  release.
+
 ## [2.4.0] - 2026-11-07
 
 Moontide is early: a young project with known bugs, tried on one setup. The whole Scratchpad is early
@@ -201,6 +214,7 @@ A maintenance release: nothing changes in how Moontide works.
 - Moontide starts when you ask for music or say start, not with every Claude session. Each page and its
   tab title name the folder and the port of their server.
 
+[2.4.1]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.1
 [2.4.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.4.0
 [2.2.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.2.0
 [2.1.0]: https://github.com/konni-arcadia/moontide/releases/tag/v2.1.0

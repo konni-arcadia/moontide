@@ -1,0 +1,44 @@
+# This workflow runs GitHub's code scanning (CodeQL) on the JavaScript and TypeScript sources, for
+# every push to main, every pull request to main, and once a week. Its findings show under the
+# repository's Security tab. Nothing is built: CodeQL reads the sources as they are.
+#
+# Every action reference is a full commit SHA with its version as a comment. Do not use a tag or
+# a branch name: a tag can be moved, a commit cannot.
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays at 05:17 UTC.
+    - cron: '17 5 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: analyze (javascript-typescript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: javascript-typescript
+          build-mode: none
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:javascript-typescript

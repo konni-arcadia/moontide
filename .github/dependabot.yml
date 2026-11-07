@@ -1,0 +1,24 @@
+# Dependabot opens at most one pull request a month per ecosystem, with every update of that
+# ecosystem grouped in it. Security alerts are separate and stay on.
+#
+# The public repository is a mirror: do not merge these pull requests on GitHub. Land the change in
+# the private repository and release it, then close the pull request.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      npm:
+        patterns: ['*']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 1
+    groups:
+      github-actions:
+        patterns: ['*']
