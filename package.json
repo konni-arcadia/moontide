@@ -54,14 +54,14 @@
     "bench:edit": "npm run build && node scripts/bench-edit-code.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.32.1",
-    "ws": "8.21.3",
-    "zod": "4.6.5"
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ws": "8.22.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@types/node": "22.20.4",
-    "@types/ws": "8.18.1",
-    "acorn": "8.18.0",
+    "@types/node": "26.6.6",
+    "@types/ws": "8.18.2",
+    "acorn": "8.19.0",
     "typescript": "7.0.2"
   }
 }
